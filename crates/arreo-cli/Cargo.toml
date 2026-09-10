@@ -1,0 +1,14 @@
+[package]
+name = "arreo-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "arreo"
+path = "src/main.rs"
+
+[dependencies]
+arreo-core = { path = "../arreo-core" }

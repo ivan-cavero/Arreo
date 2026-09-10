@@ -1,0 +1,17 @@
+[workspace]
+members = [
+    "crates/arreo-core",
+    "crates/arreo-server",
+    "crates/arreo-cli",
+    "crates/arreo-relay",
+    "crates/arreo-plugin-api",
+    "xtask",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/arreo/arreo"
+rust-version = "1.98.0"

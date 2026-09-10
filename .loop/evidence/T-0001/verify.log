@@ -1,0 +1,21 @@
+## T-0001 evidence (2026-09-10, linux x86_64, rustc 1.98.0)
+
+### cargo build --workspace
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.02s
+
+### cargo clippy (zero warnings)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.12s
+
+### cargo test --workspace (gate)
+     12 test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+      1 test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+### xtask stubs
+xtask e2e: not implemented (real harness lands in T-0007/T-0008/T-0021)
+e2e exit=0
+xtask e2e: not implemented (real harness lands in T-0007/T-0008/T-0021)
+xtask e2e: --enforce given but no budgets exist yet; failing
+e2e --enforce exit=1
+
+### Negative test (gate catches violation)
+Added `arreo-server = { path = "../arreo-server" }` to crates/arreo-relay/Cargo.toml → `nothing_depends_on_server` FAILED as designed; restored → 2 passed.

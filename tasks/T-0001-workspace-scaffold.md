@@ -3,7 +3,7 @@ id: T-0001
 title: Scaffold the Cargo workspace with crates, xtask skeleton and CI stub
 phase: 0
 priority: 1
-status: todo
+status: in-progress
 depends_on: []
 scope:
   - Cargo.toml
