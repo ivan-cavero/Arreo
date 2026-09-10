@@ -1,11 +1,11 @@
 # .loop/PROGRESS.md
 ## State snapshot          ← REWRITTEN (not appended) at every checkpoint
-Task: T-0012 · daemon lifecycle — DONE + PUSHED (4c3f548; 2 unit + slice green, evidence in .loop/evidence/T-0012/)
-Where you are: 14 of 22 tasks done and pushed (Phase 1 underway); remote == local
-Next step: next turn picks T-0013 (protocol v0) or T-0014 (socket API v1); Phase-0 gate needs-human flag still stands
+Task: T-0013 · protocol framing v0 — DONE + PUSHED (ebeb926; 10 proto tests + bench probe PASS, evidence in .loop/evidence/T-0013/)
+Where you are: 15 of 22 tasks done and pushed (Phase 1 underway); remote == local
+Next step: next turn picks T-0014 (socket API v1 — the MessagePack cutover); Phase-0 gate needs-human flag still stands
 Open workers: (none)
 Known broken: (none) · Parked: (none)
-Findings: ?-in-loop scan bug fixed; crash restore honestly deferred to T-0018 (slice asserts empty, not faked)
+Findings: debug timing noise is real (6-30ms single-shot vs 0ms best-of-5/release) — timing gates go release-only with written policy, not silent skips
 ## Event log               ← append-only; newest last; never rewrite
 - 2026-09-10 [turn 1] ledger created; repo at e489fac (docs only); T-0001 + T-0022 (AGENTS.md gardened) done
 - 2026-09-10 [turn 2] T-0002 PTY manager done+pushed (342606c; 9 tests); PROMPT.md v2 synced + ADR 0001 (ef6c595)
@@ -20,3 +20,4 @@ Findings: ?-in-loop scan bug fixed; crash restore honestly deferred to T-0018 (s
 - 2026-09-10 [turn 10] T-0009 chaos done+pushed (4a74bf4; 7 probes green, F1+F3 fixed with regression tests); remote == local
 - 2026-09-10 [turn 11] T-0021 exit demo done+pushed (85324b7; demo 5/5 PASS, PHASE-DONE.md written); Phase 0 gate flagged needs-human; remote == local
 - 2026-09-10 [turn 12] T-0012 lifecycle done+pushed (4c3f548; service units + SIGTERM drain + crash honesty + CI slice); remote == local
+- 2026-09-10 [turn 13] T-0013 protocol done+pushed (ebeb926; msgpack codec + negotiation + 10 tests + bench probe); ADR 0006; remote == local
