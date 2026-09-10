@@ -1,6 +1,11 @@
 //! T-0018 failing-first probes: session store, audit redaction, migrations.
 //!
 //! Written before `src/store.rs` exists — MUST fail to compile until it lands.
+//!
+//! Gated on the `sqlite` feature (T-0010 lite pass): the store is the one
+//! C-backed module, so `cargo check --no-default-features --all-targets`
+//! — the foreign-target portability gate — must not try to compile this file.
+#![cfg(feature = "sqlite")]
 
 use arreo_core::store::{AuditEvent, SessionStore, StoredPane};
 

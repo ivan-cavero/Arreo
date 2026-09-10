@@ -2,8 +2,11 @@
 //!
 //! Written before `src/enforce.rs` exists — MUST fail to compile until it lands.
 //! NOTE: these tests touch the LIVE cgroupfs (own scope only, cleaned up by
-//! Drop). They self-skip when cgroup v2 is unavailable (CI macOS/Windows,
-//! containers without delegation) — skip, never fake.
+//! Drop). They self-skip when cgroup v2 is unavailable (containers without
+//! delegation) — skip, never fake. The mechanism is Linux-only by definition
+//! (Windows Job Objects / macOS rlimit are separate platform work), so the
+//! file is gated to Linux rather than pretending to run elsewhere.
+#![cfg(target_os = "linux")]
 
 use arreo_core::enforce::{Budget, Guard};
 
