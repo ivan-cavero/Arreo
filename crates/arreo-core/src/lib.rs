@@ -6,4 +6,5 @@
 
 pub mod fixtures;
 pub mod pty;
+pub mod state;
 pub mod vt;

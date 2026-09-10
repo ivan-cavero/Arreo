@@ -1,0 +1,27 @@
+## T-0004 evidence (2026-09-10, linux x86_64, rustc 1.98.0)
+
+### cargo test -p arreo-core --test state → 13 passed
+test adapter_rejects_unknown_fields_and_bad_regex ... ok
+test detection_latency_within_200ms_budget ... ok
+test permission_prompt_is_question_inferred_with_pattern ... ok
+test default_adapter_loads_and_validates ... ok
+test mid_line_question_marks_are_not_prompts ... ok
+test bell_means_attention_not_silence ... ok
+test question_fixture_timeline_is_working_then_question ... ok
+test child_exit_maps_to_done_with_code ... ok
+test streaming_output_is_working_then_idle_after_silence ... ok
+test traceback_shape_is_blocked ... ok
+test done_is_terminal_and_unknown_never_emits ... ok
+test vim_screen_silence_is_not_a_question ... ok
+test unknown_stays_unknown_without_evidence ... ok
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.17s
+
+### question timeline (deterministic): Working(0) → Question(2510, inferred, pattern [y/n])
+### adversarial: mid-line-? idle ok, vim-screen no-false-question ok, spinner working ok, toggle-recovery ok, done-terminal ok, bell routing ok
+### full battery: fmt clean, clippy -D warnings clean, workspace green (see counts)
+     12 test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+      1 test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.70s
+      1 test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.34s
+      1 test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+      1 test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s
+      1 test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 1.53s

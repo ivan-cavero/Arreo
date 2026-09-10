@@ -3,7 +3,7 @@ id: T-0004
 title: State engine v0 — universal tier detection with deterministic fixtures
 phase: 0
 priority: 2
-status: todo
+status: done
 depends_on: [T-0003]
 scope:
   - crates/arreo-core/src/state/**

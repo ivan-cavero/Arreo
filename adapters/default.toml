@@ -1,0 +1,43 @@
+# Default universal-tier adapter (T-0004 draft; populated per-harness in T-0017).
+#
+# Fields:
+# - question_patterns: regexes matched against the TAIL (last 3 lines) of
+#   terminal-visible text after silence. First match wins; its string is
+#   recorded as the event's matched_pattern (honest `inferred` labeling).
+# - error_patterns: output shapes that arm the `blocked` transition once
+#   followed by silence (tracebacks, failures, fatal lines).
+# - bell_means_attention: BEL (\x07) → question-or-blocked immediately.
+# - idle_after_ms: silence with a plain shell prompt tail → idle.
+# - question_after_ms: silence with a prompt-shaped tail → question.
+# - blocked_after_ms: silence after an error shape → blocked.
+# - done_on_exit: child exit always emits done (with the code).
+
+idle_after_ms = 2000
+question_after_ms = 2000
+blocked_after_ms = 2500
+bell_means_attention = true
+done_on_exit = true
+
+question_patterns = [
+  "\\[y/n\\]",
+  "\\(y/n\\)",
+  "\\byes\\b.*\\bno\\b",
+  "\\?\\s*$",
+  "❯\\s*$",
+  "›\\s*$",
+  "may i (run|execute|install|delete|modify)",
+  "proceed\\?",
+  "confirm\\b.*\\?",
+  "allow\\?",
+  "permission.*\\?",
+]
+
+error_patterns = [
+  "Traceback \\(most recent call last\\)",
+  "(?m)^(Error|FAILED|FATAL|panic)(:|\\b)",
+  "command not found",
+  "exit code \\d+",
+  "ValueError",
+  "TypeError",
+  "Segmentation fault",
+]
