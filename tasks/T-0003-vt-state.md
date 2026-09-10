@@ -3,7 +3,7 @@ id: T-0003
 title: VT state per pane — alacritty_terminal grid + scrollback paging
 phase: 0
 priority: 2
-status: todo
+status: done
 depends_on: [T-0002]
 scope:
   - crates/arreo-core/src/vt/**

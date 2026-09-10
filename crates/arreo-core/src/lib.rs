@@ -5,3 +5,4 @@
 //! `xtask/tests/workspace_deps.rs`, T-0001).
 
 pub mod pty;
+pub mod vt;

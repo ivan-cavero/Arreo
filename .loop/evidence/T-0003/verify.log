@@ -1,0 +1,18 @@
+## T-0003 evidence (2026-09-10, linux x86_64, rustc 1.98.0)
+
+### cargo test -p arreo-core --test vt → 9 passed
+test empty_feed_reports_no_damage ... ok
+test alt_screen_never_pollutes_scrollback ... ok
+test binary_garbage_cannot_corrupt_the_log ... ok
+test escape_sequences_never_leak_into_cell_text ... ok
+test plain_text_lands_in_cells_with_cursor_after_it ... ok
+test scrollback_pages_back_losslessly ... ok
+test feed_cost_scales_with_input_not_grid ... ok
+test giant_terminated_line_is_capped_and_counted ... ok
+test million_line_replay_stays_bounded ... ok
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 13.22s
+
+### full battery → fmt clean, clippy -D warnings clean, workspace green
+
+### adversarial probe (throwaway, removed): alt-screen isolation ok, binary-garbage ok, zero-feed ok, giant-line capped ok, wrap-cursor ok, oob-page ok → 4 promoted to permanent tests
+### perf: 1M-line replay → VT RAM ≤ 12 KiB, total_lines exact, page(0)/page(999999) byte-exact (~13 s, disk log)
