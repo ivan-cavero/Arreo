@@ -1,0 +1,4 @@
+# Makes the documented `cargo xtask …` commands (CONTRIBUTING.md, docs/) work
+# verbatim instead of requiring `cargo run -p xtask -- …`.
+[alias]
+xtask = "run -p xtask --"

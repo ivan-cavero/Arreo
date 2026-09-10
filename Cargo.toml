@@ -5,6 +5,7 @@ members = [
     "crates/arreo-cli",
     "crates/arreo-relay",
     "crates/arreo-plugin-api",
+    "crates/arreo-tui",
     "xtask",
 ]
 resolver = "2"

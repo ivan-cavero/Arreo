@@ -59,5 +59,7 @@ jobs:
         run: cargo run -p xtask -- adapters --check
       - name: persistence (T-0018 — kill -9 restore + audit)
         run: cargo run -p xtask -- e2e --slice persistence
+      - name: "tui (T-0015 — real pty: sidebar, focus, mouse, resize, search, quit)"
+        run: cargo run -p xtask -- e2e --slice tui
       - name: xtask stubs
         run: cargo xtask e2e

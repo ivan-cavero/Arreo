@@ -13,4 +13,8 @@ rust-version.workspace = true
 # the store through arreo-core's own default.
 arreo-core = { version = "0.1.0", path = "../crates/arreo-core", default-features = false }
 arreo-server = { version = "0.1.0", path = "../crates/arreo-server" }
+# The TUI slice drives arreo-tui on a real pty — same backend as the
+# product (arreo-core already depends on it), so no new crate enters the
+# graph and the pty behavior under test is the shipped one.
+portable-pty = "0.9"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "time", "io-util", "net"] }

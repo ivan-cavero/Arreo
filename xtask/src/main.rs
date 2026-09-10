@@ -18,6 +18,7 @@ mod enforcement_slice;
 mod lifecycle_slice;
 mod package;
 mod persistence_slice;
+mod tui_slice;
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -56,8 +57,9 @@ fn e2e(rest: &[String]) -> ExitCode {
         Some("lifecycle") => lifecycle_slice::run(rest),
         Some("enforcement") => enforcement_slice::run(rest),
         Some("persistence") => persistence_slice::run(rest),
+        Some("tui") => tui_slice::run(rest),
         Some(other) => {
-            eprintln!("xtask e2e: unknown slice {other:?} (have: chaos, api, lifecycle, persistence, state, enforcement)");
+            eprintln!("xtask e2e: unknown slice {other:?} (have: chaos, api, lifecycle, persistence, state, enforcement, tui)");
             ExitCode::from(2)
         }
         None => stub("e2e", rest),
