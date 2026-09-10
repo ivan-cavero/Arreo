@@ -1,11 +1,11 @@
 # .loop/PROGRESS.md
 ## State snapshot          ← REWRITTEN (not appended) at every checkpoint
-Task: T-0018 · persistence — DONE + PUSHED (15e42e8; store 4/4 + persist 2/2 + slice 3/3, evidence in .loop/evidence/T-0018/)
-Where you are: 18 of 22 tasks done and pushed (Phase 1 nearly done); remote == local
-Next step: next turn picks T-0015+T-0016 (TUI+themes, coupled), T-0019 (enforcement), or T-0020 (supply chain); Phase-0 gate needs-human flag still stands
+Task: T-0019 · resource enforcement v0 — DONE + PUSHED (6503ca5; parser unit + contract + slice green, evidence in .loop/evidence/T-0019/)
+Where you are: 19 of 22 tasks done and pushed (Phase 1 nearly done); remote == local
+Next step: next turn picks T-0015+T-0016 (TUI+themes, coupled) or T-0020 (supply chain); Phase-0 gate needs-human flag still stands
 Open workers: (none)
 Known broken: (none) · Parked: (none)
-Findings: keystroke-replay executes scrollback (proven PWNED) → ring pre-seed; corrupt DB heals aside; T-0012 honesty test flipped to restore
+Findings: this box denies cgroup delegation (subtree_control unwritable even with Delegate=yes — nested harness scope); systemd-set limits work; mechanism correct, tests skip honestly here and run on CI
 ## Event log               ← append-only; newest last; never rewrite
 - 2026-09-10 [turn 1] ledger created; repo at e489fac (docs only); T-0001 + T-0022 (AGENTS.md gardened) done
 - 2026-09-10 [turn 2] T-0002 PTY manager done+pushed (342606c; 9 tests); PROMPT.md v2 synced + ADR 0001 (ef6c595)
@@ -24,3 +24,4 @@ Findings: keystroke-replay executes scrollback (proven PWNED) → ring pre-seed;
 - 2026-09-10 [turn 14] T-0014 socket API done+pushed (3696258; msgpack cutover + 8 verbs + skill doc + api slice); ADR 0007; remote == local
 - 2026-09-10 [turn 15] T-0017 adapters done+pushed (d676ab2; pi+opencode suite, 8 fixtures, registry gate, 2 bugfixes); remote == local
 - 2026-09-10 [turn 16] T-0018 persistence done+pushed (15e42e8; v2 schema + restore + audit + injection fix); remote == local
+- 2026-09-10 [turn 17] T-0019 enforcement done+pushed (6503ca5; cgroup guard + notify/kill + slice + CI); remote == local
