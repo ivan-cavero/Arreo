@@ -1,0 +1,12 @@
+## T-0012 evidence (2026-09-10, linux x86_64, rustc 1.98.0)
+
+### lifecycle tests (2) + slice (2 PASS):
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.15s
+     Running `target/debug/xtask e2e --slice lifecycle`
+[PASS] lifecycle: SIGTERM drain → exit 0, socket released
+[PASS] lifecycle: kill -9 → restart clean, registry honestly empty (restore lands in T-0018)
+lifecycle: 2 passed, 0 failed
+
+### install round-trip live: enabled → unit present → status installed:true → uninstall → not-found (box left clean)
+### review finds fixed: ?-in-loop PID scan (returned None on first non-PID /proc entry); lifecycle types moved to core (gate)
+### honest deferral: kill -9 loses panes pre-T-0018 (asserted empty, not faked); full restore is T-0018

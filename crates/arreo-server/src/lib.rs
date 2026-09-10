@@ -6,7 +6,9 @@
 //! module, enforced by the `v` field).
 
 pub mod daemon;
+pub mod lifecycle;
 pub mod protocol;
 
 pub use daemon::Daemon;
+pub use lifecycle::{unit_file, unit_path, DrainReport, ServiceKind, SHUTDOWN_DEADLINE};
 pub use protocol::{Request, Response};

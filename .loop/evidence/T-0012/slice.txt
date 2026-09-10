@@ -1,0 +1,5 @@
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.15s
+     Running `target/debug/xtask e2e --slice lifecycle`
+[PASS] lifecycle: SIGTERM drain → exit 0, socket released
+[PASS] lifecycle: kill -9 → restart clean, registry honestly empty (restore lands in T-0018)
+lifecycle: 2 passed, 0 failed

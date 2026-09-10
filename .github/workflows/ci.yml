@@ -31,5 +31,7 @@ jobs:
         run: cargo run -p xtask -- check-targets
       - name: demo phase0 (T-0021 — exit proof pack; writes PHASE-DONE.md)
         run: cargo run -p xtask -- demo phase0
+      - name: lifecycle (T-0012 — SIGTERM drain + crash restart)
+        run: cargo run -p xtask -- e2e --slice lifecycle
       - name: xtask stubs
         run: cargo xtask e2e

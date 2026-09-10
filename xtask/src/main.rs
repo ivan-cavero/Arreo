@@ -12,6 +12,7 @@ mod bench;
 mod chaos;
 mod check_targets;
 mod demo;
+mod lifecycle_slice;
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -43,6 +44,7 @@ fn e2e(rest: &[String]) -> ExitCode {
         .map(|w| w[1].as_str());
     match slice {
         Some("chaos") => chaos::run(rest),
+        Some("lifecycle") => lifecycle_slice::run(rest),
         Some(other) => {
             eprintln!("xtask e2e: unknown slice {other:?} (have: chaos)");
             ExitCode::from(2)

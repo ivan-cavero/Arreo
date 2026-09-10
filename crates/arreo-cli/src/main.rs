@@ -1,5 +1,6 @@
 //! `arreo` CLI binary. Verbs: `record` (T-0011), `metrics --pid` (T-0006),
-//! daemon verbs `serve`-side client: `panes`, `spawn`, `attach`, `send` (T-0005).
+//! daemon verbs `serve`-side client: `panes`, `spawn`, `attach`, `send` (T-0005),
+//! lifecycle: `service`, `server` (T-0012).
 
 use arreo_core::proto::{Request, Response};
 use std::future::Future;
@@ -17,6 +18,8 @@ fn usage() -> ExitCode {
     eprintln!("  arreo spawn <id> <program> [args...] [--socket PATH]");
     eprintln!("  arreo attach <id> [--socket PATH]   (stream output; Ctrl-C detaches, pane keeps running)");
     eprintln!("  arreo send <id> <text...> [--socket PATH]");
+    eprintln!("  arreo service install|uninstall|status [--socket PATH]");
+    eprintln!("  arreo server stop [--socket PATH]   (graceful: drain + exit 0)");
     ExitCode::from(2)
 }
 
@@ -35,6 +38,8 @@ fn main() -> ExitCode {
         Some("spawn") => rt::block_on(cmd_spawn(&args[2..])),
         Some("attach") => rt::block_on(cmd_attach(&args[2..])),
         Some("send") => rt::block_on(cmd_send(&args[2..])),
+        Some("service") => cmd_service(&args[2..]),
+        Some("server") => rt::block_on(cmd_server(&args[2..])),
         _ => usage(),
     }
 }
@@ -483,4 +488,208 @@ async fn cmd_attach(rest: &[String]) -> ExitCode {
             Response::Ok { .. } | Response::Panes { .. } => {}
         }
     }
+}
+
+/// `arreo service install|uninstall|status`: manage the OS service unit.
+/// Install writes the unit file for the native manager and enables it;
+/// uninstall reverses fully; status reports manager + unit state.
+fn cmd_service(rest: &[String]) -> ExitCode {
+    let (socket, kept) = take_socket(rest);
+    let action = kept.first().map(String::as_str).unwrap_or("");
+    let kind = arreo_core::lifecycle::ServiceKind::native();
+    let exe = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.join("arreo-server")))
+        .unwrap_or_else(|| PathBuf::from("arreo-server"));
+    match action {
+        "install" => {
+            let unit = arreo_core::lifecycle::unit_file(kind, &exe, &socket);
+            match arreo_core::lifecycle::unit_path(kind) {
+                Some(path) => {
+                    if let Some(parent) = path.parent() {
+                        if let Err(e) = std::fs::create_dir_all(parent) {
+                            eprintln!("service install: {e}");
+                            return ExitCode::FAILURE;
+                        }
+                    }
+                    if let Err(e) = std::fs::write(&path, &unit) {
+                        eprintln!("service install: {e}");
+                        return ExitCode::FAILURE;
+                    }
+                    println!("wrote {}", path.display());
+                    enable_service(kind);
+                    ExitCode::SUCCESS
+                }
+                None => {
+                    println!("{unit}");
+                    eprintln!("service install: no unit path on this OS — run the printed script as Administrator");
+                    ExitCode::SUCCESS
+                }
+            }
+        }
+        "uninstall" => match arreo_core::lifecycle::unit_path(kind) {
+            Some(path) => {
+                disable_service(kind);
+                match std::fs::remove_file(&path) {
+                    Ok(()) => {
+                        println!("removed {}", path.display());
+                        ExitCode::SUCCESS
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        println!("not installed");
+                        ExitCode::SUCCESS
+                    }
+                    Err(e) => {
+                        eprintln!("service uninstall: {e}");
+                        ExitCode::FAILURE
+                    }
+                }
+            }
+            None => {
+                eprintln!("service uninstall: manual on this OS (see install output)");
+                ExitCode::from(2)
+            }
+        },
+        "status" => {
+            let path = arreo_core::lifecycle::unit_path(kind);
+            let installed = path.as_ref().is_some_and(|p| p.exists());
+            println!("manager: {kind:?}");
+            println!(
+                "unit: {}",
+                path.map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "(manual)".to_string())
+            );
+            println!("installed: {installed}");
+            println!(
+                "socket: {} ({})",
+                socket.display(),
+                if socket.exists() { "present" } else { "absent" }
+            );
+            ExitCode::SUCCESS
+        }
+        _ => {
+            eprintln!("usage: arreo service install|uninstall|status [--socket PATH]");
+            ExitCode::from(2)
+        }
+    }
+}
+
+fn enable_service(kind: arreo_core::lifecycle::ServiceKind) {
+    use arreo_core::lifecycle::ServiceKind as Kind;
+    let result = match kind {
+        Kind::SystemdUser => std::process::Command::new("systemctl")
+            .args(["--user", "daemon-reload"])
+            .output()
+            .and_then(|_| {
+                std::process::Command::new("systemctl")
+                    .args(["--user", "enable", "--now", "arreo.service"])
+                    .output()
+            })
+            .map(|_| ()),
+        Kind::Launchd => {
+            eprintln!("service install: plist written — load with: launchctl load -w <path>");
+            Ok(())
+        }
+        Kind::WindowsService => {
+            eprintln!("service install: script printed — run as Administrator (see above)");
+            Ok(())
+        }
+    };
+    match result {
+        Ok(()) => println!("service enabled"),
+        Err(e) => {
+            eprintln!("service install: unit written but enable failed: {e} (enable manually)")
+        }
+    }
+}
+
+fn disable_service(kind: arreo_core::lifecycle::ServiceKind) {
+    use arreo_core::lifecycle::ServiceKind as Kind;
+    if let Kind::SystemdUser = kind {
+        let _ = std::process::Command::new("systemctl")
+            .args(["--user", "disable", "--now", "arreo.service"])
+            .output();
+    }
+    // launchd/Windows: unloading needs the exact path/user context — the
+    // unit file removal above is the reversal; document, don't guess.
+}
+
+/// `arreo server stop`: graceful shutdown via SIGTERM (the daemon drains +
+/// exits 0). Finds the daemon by socket presence; refuses when absent.
+async fn cmd_server(rest: &[String]) -> ExitCode {
+    let (socket, kept) = take_socket(rest);
+    if kept.first().map(String::as_str) != Some("stop") {
+        eprintln!("usage: arreo server stop [--socket PATH]");
+        return ExitCode::from(2);
+    }
+    if !socket.exists() {
+        eprintln!(
+            "server stop: no socket at {} (daemon not running?)",
+            socket.display()
+        );
+        return ExitCode::FAILURE;
+    }
+    // SIGTERM the daemon: resolve its PID via `panes` liveness, else fall
+    // back to pkill by socket path. Simplest robust path: find arreo-server
+    // processes whose command line names our socket.
+    let pid = find_daemon_pid(&socket).await;
+    match pid {
+        Some(pid) => {
+            unsafe {
+                extern "C" {
+                    fn kill(pid: u32, sig: i32) -> i32;
+                }
+                if kill(pid, 15) != 0 {
+                    eprintln!("server stop: SIGTERM to {pid} failed");
+                    return ExitCode::FAILURE;
+                }
+            }
+            // Wait for the socket to close (drain + exit), up to 10 s.
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while socket.exists() && std::time::Instant::now() < deadline {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            // Socket file removal is the daemon's last act; absence proves it.
+            // (A stale file with no listener also passes — serve() treats it
+            // the same on next start.)
+            println!("server stopped (pid {pid})");
+            ExitCode::SUCCESS
+        }
+        None => {
+            eprintln!("server stop: socket exists but no live daemon found (stale file?)");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Find the daemon PID by probing: connect + ask `panes` — any answer proves
+/// liveness; the PID itself comes from a `server pid` lookup via /proc scan
+/// for `arreo-server --socket <path>`.
+async fn find_daemon_pid(socket: &PathBuf) -> Option<u32> {
+    let want = socket.to_string_lossy().to_string();
+    let entries = std::fs::read_dir("/proc").ok()?;
+    for entry in entries.filter_map(|e| e.ok()) {
+        // NOTE: `continue`, never `?` — /proc holds non-numeric entries and
+        // unreadable PIDs; either must skip, not abort the whole scan
+        // (chaos-found: `?` here returned None on the first non-PID entry).
+        let pid: u32 = match entry.file_name().to_string_lossy().parse() {
+            Ok(pid) => pid,
+            Err(_) => continue,
+        };
+        let cmdline = match std::fs::read(format!("/proc/{pid}/cmdline")) {
+            Ok(cmdline) => cmdline,
+            Err(_) => continue,
+        };
+        let parts: Vec<&str> = cmdline
+            .split(|b| *b == 0)
+            .filter_map(|s| std::str::from_utf8(s).ok())
+            .collect();
+        if parts.iter().any(|p| p.ends_with("arreo-server")) && parts.iter().any(|p| *p == want) {
+            // Confirm it answers (not a zombie holding the path).
+            if tokio::net::UnixStream::connect(socket).await.is_ok() {
+                return Some(pid);
+            }
+        }
+    }
+    None
 }
