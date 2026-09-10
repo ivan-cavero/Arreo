@@ -5,6 +5,7 @@
 //! `xtask/tests/workspace_deps.rs`, T-0001).
 
 pub mod fixtures;
+pub mod metrics;
 pub mod pty;
 pub mod state;
 pub mod vt;

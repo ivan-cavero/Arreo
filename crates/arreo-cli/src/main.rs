@@ -1,4 +1,4 @@
-//! `arreo` CLI binary. Verbs land per task: `record` (T-0011), full suite (T-0005+).
+//! `arreo` CLI binary. Verbs land per task: `record` (T-0011), `metrics --pid` (T-0006), full suite (T-0005+).
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -9,6 +9,7 @@ fn usage() -> ExitCode {
     eprintln!("  arreo --version");
     eprintln!("  arreo record <command> [args...] -o <fixture.pty> [--timeout-secs N]");
     eprintln!("  arreo replay <fixture.pty> [--speed N]");
+    eprintln!("  arreo metrics --pid <PID> [--samples N]   (live table; daemon-backed `arreo metrics <pane>` lands with T-0005/T-0012)");
     ExitCode::from(2)
 }
 
@@ -22,6 +23,7 @@ fn main() -> ExitCode {
     match verb {
         Some("record") => cmd_record(&args[2..]),
         Some("replay") => cmd_replay(&args[2..]),
+        Some("metrics") => cmd_metrics(&args[2..]),
         _ => usage(),
     }
 }
@@ -156,6 +158,66 @@ fn cmd_replay(rest: &[String]) -> ExitCode {
             eprintln!("replay: {e}");
             return ExitCode::FAILURE;
         }
+    }
+    ExitCode::SUCCESS
+}
+
+/// `arreo metrics --pid <PID> [--samples N]`: live per-tree table.
+/// The daemon-backed `arreo metrics <pane>` (socket query) lands with
+/// T-0005/T-0012; this verb proves the sampler over real PIDs today.
+fn cmd_metrics(rest: &[String]) -> ExitCode {
+    let mut pid: Option<u32> = None;
+    let mut samples = 3u32;
+    let mut i = 0;
+    while i < rest.len() {
+        match rest[i].as_str() {
+            "--pid" => {
+                i += 1;
+                pid = rest.get(i).and_then(|s| s.parse().ok());
+            }
+            "--samples" => {
+                i += 1;
+                samples = rest.get(i).and_then(|s| s.parse().ok()).unwrap_or(3).max(1);
+            }
+            flag => {
+                eprintln!("metrics: unknown flag {flag} (want --pid <PID> [--samples N])");
+                return ExitCode::from(2);
+            }
+        }
+        i += 1;
+    }
+    let Some(pid) = pid else {
+        eprintln!("metrics: missing --pid <PID>");
+        return ExitCode::from(2);
+    };
+    let mut sampler = arreo_core::metrics::Sampler::new();
+    println!(
+        "{:>8} {:>12} {:>8} {:>6}  CGROUP",
+        "PID", "RSS", "CPU%", "PIDS"
+    );
+    for _ in 0..samples {
+        match sampler.sample_tree(pid) {
+            Ok(sample) => {
+                let cpu = sample
+                    .cpu_percent
+                    .map(|c| format!("{c:.1}"))
+                    .unwrap_or_else(|| "—".to_string());
+                let cgroup = sample
+                    .cgroup_bytes
+                    .map(|b| format!("{}M", b / 1_048_576))
+                    .unwrap_or_else(|| "—".to_string());
+                println!(
+                    "{pid:>8} {:>10}KiB {cpu:>8} {:>6}  {cgroup}",
+                    sample.rss_bytes / 1024,
+                    sample.pids.len(),
+                );
+            }
+            Err(e) => {
+                eprintln!("metrics: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+        std::thread::sleep(Duration::from_secs(1));
     }
     ExitCode::SUCCESS
 }

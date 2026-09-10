@@ -1,0 +1,20 @@
+## T-0006 evidence (2026-09-10, linux x86_64, rustc 1.98.0)
+
+### cargo test -p arreo-core --test metrics → 7 passed
+test backoff_goes_slow_after_eight_idle_ticks ... ok
+test dead_pid_is_an_error_not_a_panic ... ok
+test rollups_persist_and_prune ... ok
+test sample_self_process_tree ... ok
+test sampler_overhead_within_budget ... ok
+test cpu_percent_needs_two_samples ... ok
+test newborn_children_appear_after_cache_ttl ... ok
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.24s
+
+### CLI live table (.loop/evidence/T-0006/cli-table.txt):
+     PID          RSS     CPU%   PIDS  CGROUP
+   66938     682016KiB        —      4  17536M
+   66938     681592KiB     16.7      4  17535M
+
+### overhead: uncached sweep measured 467 ms → 1 s TTL cache → sweep green (see sampler_overhead test)
+### adversarial: dead pid exit 1, pid1 tree ok, missing pid exit 2, samples-0 clamps
+### full battery: fmt clean, clippy -D warnings clean, workspace green
