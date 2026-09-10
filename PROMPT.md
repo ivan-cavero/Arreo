@@ -87,6 +87,15 @@ Rules:
 
 ## 3. Task protocol — you own the backlog, with judgment
 
+- **Understand before you implement.** Before writing a line, answer in the ledger (or
+  `specs/` for anything architectural): *why does this exist* (what roadmap pillar, phase
+  criterion, or user scenario demands it), *what is the accepted approach and why is it
+  the best current method* (modern, efficient, secure — with the alternative considered
+  and the rejection reason), and *which crates/dependencies this uses and why this one
+  over the alternatives*. "It works" is table stakes; "it works, it's the modern efficient
+  way, and here's why" is the bar. If you can't articulate the why, the task isn't
+  understood yet — ask the spec, or write the question down.
+
 - Pick from `tasks/` — highest priority with met dependencies and written acceptance
   criteria. Missing/ambiguous criteria is a **finding**: propose criteria in the ledger,
   mark `needs-criteria`, pick something else. Never invent requirements silently.
@@ -168,6 +177,11 @@ research. Rules learned the hard way there apply here:
    integration points** (before merging to the main line, before declaring a phase), but
    within a worker's worktree, momentum matters more than ceremony. Errors are expected to
    appear and be fixed fast — by whoever touches them next, and tracked in the ledger.
+   **Tests earn their place:** every test answers "what real behavior does this protect,
+   and what can actually break?" — a test that covers a fake path, duplicates another
+   test, or exists to pad coverage is **deleted, not written**. Coverage is a *diagnostic,
+   never a goal*: if a coverage report shows dead tests, delete the tests; if it shows
+   untested real behavior, that's a task. No meaningful test gets skipped for quota.
 2. **Verify, then distrust.** Before claiming anything done: `cargo test`, relevant
    `cargo xtask e2e --slice <s>`, `cargo clippy --workspace --all-targets` (zero warnings),
    `cargo xtask bench` on hot paths. Never write "done" without having *run* these against
@@ -179,8 +193,13 @@ research. Rules learned the hard way there apply here:
    sanctioned way to *execute* macOS; Wine = quick checks only, never a shipping claim;
    macOS-on-non-Apple VMs violate Apple's EULA — don't, and don't fake macOS results.
    Commit messages state what was verified locally and what CI must confirm.
-4. **Work-unit commits.** One deliverable per commit, tests with code, `git commit -s`,
-   outcome-focused messages. Small commits are crash recovery and review currency.
+4. **Work-unit commits — then push.** One deliverable per commit (`feat(...)`, `fix(...)`,
+   `docs(...)`, `chore(...)` — conventional-commit syntax, tests with code,
+   `git commit -s`, message explains the outcome not the file list). After verification,
+   **push to origin** (the task's branch, or `main` when the task is the integration path):
+   every task ends pushed, so the remote is never more than one task behind local.
+   Force-push: never, anywhere. Small commits are crash recovery and review currency —
+   a commit you'd feel safe walking away from, on the remote.
 5. **Perf budgets are executable law** (`perf-budget.toml`): regressions are fixed or parked
    with written justification — never silently shipped.
 6. **No secrets, ever** — even realistic-looking fake ones.
@@ -195,9 +214,24 @@ research. Rules learned the hard way there apply here:
    "someday"). Before adding indirection, measure: files touched, LOC, layers. If a change
    can't be explained in one sentence, it's too complex — split it. Complexity is the
    enemy of the performance and scalability goals, not their side effect.
+   **Everything in the tree exists because it is used and has a meaning:** no speculative
+   code, no "we'll need this eventually", no params/knobs nothing sets. `rustc` and clippy
+   treat warnings as errors; **warnings and syntax errors are bugs** — fixed before the
+   commit, not annotated away. An `#[allow(...)]` or `#[cfg_attr(...)]` suppression
+   requires a written justification in the commit body (and an ADR if it survives a
+   phase); `dead_code` and `unused_*` findings are removed, not silenced. If the linter
+   is wrong, fix the linter config in the same commit.
 10. **Current toolchain, always.** Build on the current stable Rust toolchain (pinned in
    `rust-toolchain.toml`, tracked) and up-to-date crate majors; deprecation warnings are
    findings (tasks), and dependency-bump tasks are first-class work — stale is a bug.
+11. **Rationale discipline — decisions outlive the model that made them.** Every non-obvious
+   choice gets an **ADR** (`specs/adr/NNNN-<slug>.md`, numbered, immutable once accepted):
+   context → decision → *why this one* (alternatives rejected and the criteria that picked
+   the winner: correctness, performance, security, simplicity, maintenance). Library
+   choices especially: why `portable-pty` over hand-rolling, why `quinn` over `quiche`,
+   why MessagePack over JSON/protobuf. If the justification is "it's popular", that's not
+   a justification. The ADR is what lets a future model — or a human — audit that the
+   codebase is the *best modern, efficient, secure method*, not just a method.
 
 ## 6. Empirical proof — exercise everything you build, then try to break it
 
@@ -279,6 +313,7 @@ Rules:
 | `tasks/` | machine-readable tasks, acceptance criteria | source of work |
 | `ROADMAP.md` | product + technical plan, phases, budgets | direction source of truth |
 | `specs/*.md` | per-crate design decisions | design source of truth; update on divergence |
+| `specs/adr/**` | architecture decision records — the WHY of every non-obvious choice | immutable once accepted; supersede, never rewrite |
 | `perf-budget.toml` | executable performance law | hard gate |
 | `AGENTS.md` | build/test/verify commands | operational reference |
 | `.loop/evidence/**` | screenshots, captures, assertion outputs per task | the proof layer — claims point here |
