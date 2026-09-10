@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 mod bench;
 mod chaos;
 mod check_targets;
+mod demo;
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -24,6 +25,7 @@ fn main() -> ExitCode {
     match cmd {
         "e2e" => e2e(rest),
         "bench" => bench::bench(rest),
+        "demo" => demo::demo(rest),
         "conpty-smoke" => conpty_smoke(rest),
         "check-targets" => check_targets::check_targets(rest),
         other => {

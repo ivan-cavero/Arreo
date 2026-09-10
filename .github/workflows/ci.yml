@@ -29,5 +29,7 @@ jobs:
         run: cargo run -p xtask -- conpty-smoke --timeout-secs 60
       - name: check-targets (T-0010 — layered portability gate)
         run: cargo run -p xtask -- check-targets
+      - name: demo phase0 (T-0021 — exit proof pack; writes PHASE-DONE.md)
+        run: cargo run -p xtask -- demo phase0
       - name: xtask stubs
         run: cargo xtask e2e

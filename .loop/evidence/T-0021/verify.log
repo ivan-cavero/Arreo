@@ -1,0 +1,5 @@
+## T-0021 evidence (2026-09-10, linux x86_64, rustc 1.98.0)
+
+### demo phase0 PASS (exit 0), 5/5 legs; machine JSON in demo.json; .loop/PHASE-DONE.md written
+### debug finds fixed this turn: dead .output() block (30s stall → panes expired), 7/6 counter (brace-exact match), hardcoded date
+### full battery: fmt/clippy clean, workspace green, CI gains demo step
