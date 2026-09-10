@@ -1,0 +1,10 @@
+## T-0022 evidence (2026-09-10, linux x86_64, rustc 1.98.0)
+
+Every command in AGENTS.md executed verbatim this turn:
+
+### cargo build --workspace → Finished dev profile
+### cargo test --workspace → 13 ok suites, 0 FAILED
+### cargo clippy --workspace --all-targets -- -D warnings → Finished, zero warnings
+### cargo fmt --all -- --check → clean
+### xtask e2e/bench/conpty-smoke → stubs exit 0
+### arreo-cli --version → arreo 0.1.0
