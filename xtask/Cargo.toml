@@ -7,4 +7,8 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-arreo-core = { path = "../crates/arreo-core" }
+# default-features = false: xtask never touches the SQLite store, and this
+# keeps `cargo check --workspace --no-default-features` (T-0010 lite pass)
+# from re-enabling `sqlite` via feature unification. Normal builds still get
+# the store through arreo-core's own default.
+arreo-core = { path = "../crates/arreo-core", default-features = false }

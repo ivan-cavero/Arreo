@@ -15,7 +15,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
 regex = "1"
-rusqlite = { version = "0.31", features = ["bundled"] }
+rusqlite = { version = "0.31", features = ["bundled"], optional = true }
 base64 = "0.22"
 alacritty_terminal = "0.24"
 # Pinned: polling 3.11 pulls rustix 1.x while alacritty's rustix-openpty
@@ -25,3 +25,11 @@ polling = "=3.7.0"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "time", "io-util"] }
+
+[features]
+default = ["sqlite"]
+# SQLite rollup store (T-0006). The feature gate lets `check-targets` (T-0010)
+# verify all pure-Rust code for foreign targets without an SDK linker, while
+# `--no-default-features` skips the C build. CI (real OS runners) always
+# builds with default features — the store is never optional in product.
+sqlite = ["dep:rusqlite"]

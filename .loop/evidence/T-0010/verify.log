@@ -1,0 +1,8 @@
+## T-0010 evidence (2026-09-10, linux x86_64, rustc 1.98.0)
+
+### gate clean (.loop/evidence/T-0010/gate.txt): linux PASS, msvc SKIP-with-reason, exit 0; --enforce exit 1
+
+### negative test (.loop/evidence/T-0010/gate-negative.txt): planted std::os::unix without cfg → FAIL error[E0433], exit 1; reverted clean
+
+### no-default host: metrics 6 passed (sqlite test cfg'd out), default 7 passed
+### full battery: fmt clean, clippy -D warnings clean, workspace green

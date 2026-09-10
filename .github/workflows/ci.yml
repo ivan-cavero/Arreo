@@ -27,5 +27,7 @@ jobs:
         run: cargo test --workspace
       - name: conpty-smoke (T-0007 — ConPTY on Windows, portable proxy on unix)
         run: cargo run -p xtask -- conpty-smoke --timeout-secs 60
+      - name: check-targets (T-0010 — layered portability gate)
+        run: cargo run -p xtask -- check-targets
       - name: xtask stubs
         run: cargo xtask e2e

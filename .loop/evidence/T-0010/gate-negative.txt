@@ -1,0 +1,6 @@
+   Compiling arreo-core v0.1.0 (/home/dev/dev/Arreo/crates/arreo-core)
+   Compiling xtask v0.1.0 (/home/dev/dev/Arreo/xtask)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 2.05s
+     Running `target/debug/xtask check-targets --targets x86_64-pc-windows-msvc`
+check-targets: x86_64-pc-windows-msvc FAIL (rustc error: error[E0433]: cannot find `unix` in `os`)
+check-targets: FAILED targets: x86_64-pc-windows-msvc

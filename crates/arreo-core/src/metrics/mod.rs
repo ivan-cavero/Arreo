@@ -10,8 +10,10 @@
 
 pub mod platform;
 pub mod sampler;
+#[cfg(feature = "sqlite")]
 pub mod store;
 
 pub use platform::Probe;
 pub use sampler::{ProcessSample, Sampler};
+#[cfg(feature = "sqlite")]
 pub use store::{Rollup, Store};

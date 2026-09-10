@@ -1,28 +1,31 @@
 //! Arreo developer tooling: e2e battery, benchmarks, smoke tests.
 //!
 //! Verbs: `e2e` (battery, T-0008+), `bench` (budgets, T-0008), `conpty-smoke`
-//! (T-0007, real since this task). By contract (T-0001 notes): unimplemented
-//! verbs print "not implemented" and exit 0 — except with `--enforce`, which
-//! exits non-zero so CI gates distinguish "stub" from "gate".
+//! (T-0007, real), `check-targets` (T-0010, real). By contract (T-0001 notes):
+//! unimplemented verbs print "not implemented" and exit 0 — except with
+//! `--enforce`, which exits non-zero so CI gates distinguish "stub" from "gate".
 
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
+
+mod check_targets;
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let (cmd, rest) = match args.split_first() {
         Some((first, rest)) => (first.as_str(), rest),
         None => {
-            eprintln!("usage: xtask <e2e|bench|conpty-smoke> [options]");
+            eprintln!("usage: xtask <e2e|bench|conpty-smoke|check-targets> [options]");
             return ExitCode::from(2);
         }
     };
     match cmd {
         "e2e" | "bench" => stub(cmd, rest),
         "conpty-smoke" => conpty_smoke(rest),
+        "check-targets" => check_targets::check_targets(rest),
         other => {
             eprintln!("unknown xtask command: {other}");
-            eprintln!("usage: xtask <e2e|bench|conpty-smoke> [options]");
+            eprintln!("usage: xtask <e2e|bench|conpty-smoke|check-targets> [options]");
             ExitCode::from(2)
         }
     }

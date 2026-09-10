@@ -2,7 +2,9 @@
 //!
 //! Written before `src/metrics/` exists — MUST fail to compile until it lands.
 
-use arreo_core::metrics::{Sampler, Store};
+use arreo_core::metrics::Sampler;
+#[cfg(feature = "sqlite")]
+use arreo_core::metrics::Store;
 
 #[test]
 fn sample_self_process_tree() {
@@ -42,6 +44,7 @@ fn dead_pid_is_an_error_not_a_panic() {
 }
 
 #[test]
+#[cfg(feature = "sqlite")]
 fn rollups_persist_and_prune() {
     let store = Store::open_memory().expect("in-memory store");
     store
