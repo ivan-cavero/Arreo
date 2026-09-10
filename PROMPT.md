@@ -105,8 +105,13 @@ Rules:
 - Each task file: goal, scope fence (files/crates), acceptance criteria, verification
   commands. Outside the fence = bug, even if it looks like an improvement.
 - Update the tasks file's status as you go (`in-progress` → `done` with evidence links).
-- If `tasks/` is empty: consult ROADMAP phase exit criteria and write proposed tasks
-  (flagged `proposed`) — 10–30 of them, sized for one worker session each.
+- If `tasks/` is empty — or the current phase's exit criteria are met — **you don't stop:**
+  you draft the next phase's queue from `ROADMAP.md` (its phase section + exit criteria →
+  10–30 proposed tasks with criteria, flagged `proposed`), then either continue with the
+  highest-confidence proposed task or end the turn with the proposal for human review.
+  A phase boundary is a gate, not a wall: write `.loop/PHASE-DONE.md` with the evidence,
+  flag the phase transition `needs-human` for a release-quality review, and keep planning
+  the next phase unless the runner's goal says stop.
 
 ## 4. Delegation — spawn subagents, don't absorb everything (OMP)
 
@@ -258,9 +263,12 @@ Rules:
 3. Worker deliverables integrated or explicitly parked with owner and reason.
 4. Task completed? Evidence recorded (tests, e2e slice, bench numbers), tasks file updated;
    then start the next task if turn budget remains — otherwise end; the loop re-fires.
-5. Phase exit criteria all demonstrably met? Write `.loop/PHASE-DONE.md` with the evidence
-   and output the exact sentinel **`LOOP COMPLETE`** — reserved exclusively for that case,
-   never output silently otherwise.
+5. Phase exit criteria all demonstrably met? Write `.loop/PHASE-DONE.md` with the evidence,
+   then: if the runner's goal is that phase only, output the exact sentinel
+   **`LOOP COMPLETE`** — reserved for that case, never output silently otherwise. If the
+   runner's goal spans multiple phases (the default for Arreo), instead draft the next
+   phase's proposed task queue (§3) and keep going; the phase transition is flagged
+   `needs-human` so a human reviews the gate evidence when they return.
 
 ## 10. File map
 
