@@ -1,0 +1,15 @@
+## T-0007 evidence (2026-09-10, linux x86_64, rustc 1.98.0)
+
+### conpty tests → 3 passed
+test killed_pane_leaves_no_zombie ... ok
+test pane_holds_a_session_end_to_end ... ok
+test multibyte_output_survives_the_round_trip ... ok
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+### xtask conpty-smoke (unix proxy):
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.21s
+     Running `target/debug/xtask conpty-smoke --timeout-secs 20`
+conpty-smoke: PASS backend=linux pid=193051 resize=100x30 utf8=ok reap=ok
+
+### adversarial: --help 0, unknown verb 2, timeout-0 fails cleanly, e2e stub contract intact
+### Windows proof: CI matrix step added — ConPTY path executes on windows-latest push (this box cannot run ConPTY; no Wine fakery per task rules)

@@ -1,0 +1,3 @@
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.21s
+     Running `target/debug/xtask conpty-smoke --timeout-secs 20`
+conpty-smoke: PASS backend=linux pid=193051 resize=100x30 utf8=ok reap=ok

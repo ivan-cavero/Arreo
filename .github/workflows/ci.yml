@@ -25,5 +25,7 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: test (incl. dependency-direction gate)
         run: cargo test --workspace
+      - name: conpty-smoke (T-0007 — ConPTY on Windows, portable proxy on unix)
+        run: cargo run -p xtask -- conpty-smoke --timeout-secs 60
       - name: xtask stubs
         run: cargo xtask e2e
