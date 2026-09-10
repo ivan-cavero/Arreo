@@ -29,9 +29,27 @@ use std::time::{Duration, Instant};
 
 pub fn bench(rest: &[String]) -> ExitCode {
     if rest.iter().any(|a| a == "--help" || a == "-h") {
-        println!("usage: xtask bench [--panes N] [--json]");
+        println!("usage: xtask bench [--panes N] [--json] [--probe proto]");
         println!("  spawns N real panes, replays fixtures, asserts perf-budget.toml phase-0 rows.");
+        println!("  --probe proto: only the 1MB MessagePack codec check (T-0013).");
         return ExitCode::SUCCESS;
+    }
+    if rest.iter().any(|a| a == "--probe") {
+        let which = rest
+            .windows(2)
+            .find(|w| w[0] == "--probe")
+            .map(|w| w[1].as_str());
+        match which {
+            Some("proto") => return probe_proto(rest.iter().any(|a| a == "--json")),
+            Some(other) => {
+                eprintln!("bench: unknown probe {other:?} (have: proto)");
+                return ExitCode::from(2);
+            }
+            None => {
+                eprintln!("bench: --probe needs a name (have: proto)");
+                return ExitCode::from(2);
+            }
+        }
     }
     let panes: usize = rest
         .windows(2)
@@ -342,5 +360,53 @@ fn run(panes: usize, budget: &Budget) -> Report {
         panes,
         checks,
         elapsed: start.elapsed(),
+    }
+}
+
+/// T-0013 probe: 1 MB delta encode/decode vs the 5 ms budget, best-of-5
+/// (debug allocator noise defeated by repetition, not by wishing).
+/// Prints one line + JSON-ish detail; exit 1 on regression.
+fn probe_proto(json: bool) -> ExitCode {
+    use std::time::Instant;
+    let lines: Vec<String> = (0..1000).map(|i| format!("{:01024}", i)).collect();
+    let message = arreo_core::proto::Message::Delta {
+        v: arreo_core::proto::VERSION,
+        id: "bulk".to_string(),
+        from_line: 0,
+        lines,
+    };
+    // Warm up once (cold allocator lies).
+    let bytes = arreo_core::proto::codec::encode(&message).expect("encode");
+    assert!(bytes.len() >= 1_000_000);
+    let mut best_encode = u128::MAX;
+    let mut best_decode = u128::MAX;
+    for _ in 0..5 {
+        let start = Instant::now();
+        let bytes = arreo_core::proto::codec::encode(&message).expect("encode");
+        best_encode = best_encode.min(start.elapsed().as_millis());
+        let start = Instant::now();
+        let back = arreo_core::proto::codec::decode(&bytes).expect("decode");
+        best_decode = best_decode.min(start.elapsed().as_millis());
+        assert_eq!(back, message);
+    }
+    let pass = best_encode < 5 && best_decode < 5;
+    if json {
+        println!(
+            "{{\"probe\":\"proto\",\"bytes\":{},\"encode_ms\":{},\"decode_ms\":{},\"pass\":{}}}",
+            bytes.len(),
+            best_encode,
+            best_decode,
+            pass
+        );
+    } else {
+        println!(
+            "bench --probe proto: 1MB delta best-of-5: encode {best_encode} ms, decode {best_decode} ms (target < 5 ms) → {}",
+            if pass { "PASS" } else { "FAIL" }
+        );
+    }
+    if pass {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
     }
 }

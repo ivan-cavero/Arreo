@@ -1,0 +1,20 @@
+## T-0013 evidence (2026-09-10, linux x86_64, rustc 1.98.0)
+
+### proto tests → 10 passed (debug) + 10 passed (release, timing gate active)
+test proto_corpus_decode ... ok
+test frames_round_trip_over_a_stream_buffer ... ok
+test control_verbs_round_trip_1_to_1_with_jsonl ... ok
+test state_event_and_metrics_round_trip ... ok
+test version_negotiation_rejects_incompatible ... ok
+test decoder_rejects_garbage_without_panic ... ok
+test hello_snapshot_delta_round_trip ... ok
+test one_mb_delta_within_budget ... ok
+test decoder_total_on_arbitrary_bytes ... ok
+test any_message_round_trips ... ok
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.17s
+
+### bench --probe proto → PASS (1MB best-of-5 vs 5ms)
+bench --probe proto: 1MB delta best-of-5: encode 0 ms, decode 0 ms (target < 5 ms) → PASS
+
+### compat: daemon+CLI JSONL still green live (PROTO-OK streamed)
+### full battery: fmt/clippy clean, workspace green

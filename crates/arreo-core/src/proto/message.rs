@@ -1,0 +1,137 @@
+//! v0 message set (T-0013): the one schema every surface speaks.
+//!
+//! Every variant carries `v` (schema version, currently 0) so decoders can
+//! reject-or-adapt per the negotiation rule. New variants MUST be appended
+//! (never renumbered) and new fields MUST be `#[serde(default)]`-optional —
+//! that is the whole N−1 mechanism, enforced by the compat test in
+//! `tests/proto.rs`.
+
+use serde::{Deserialize, Serialize};
+
+/// Protocol version we speak.
+pub const VERSION: u32 = 0;
+
+/// Pane liveness (mirrors the daemon registry view).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PaneInfo {
+    pub id: String,
+    pub alive: bool,
+}
+
+/// Agent semantic state on the wire (subset of the engine states that
+/// clients render; `Unknown` included so absence is explicit, never null).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentState {
+    Unknown,
+    Working,
+    Idle,
+    Question,
+    Blocked,
+    Done,
+}
+
+/// The one message enum. Direction notes per variant; over the socket both
+/// sides frame with `codec::{encode_frame, decode_frame}`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "op", rename_all = "snake_case")]
+pub enum Message {
+    /// Client → server: identify + offer versions. First frame of every
+    /// connection; server answers `Welcome` or `Error`.
+    Hello {
+        v: u32,
+        client: String,
+        wants: Vec<u32>,
+    },
+    /// Server → client: accepted version + server identity.
+    Welcome { v: u32, server: String },
+    /// Either → either: full pane text + cursor (on attach, and on demand).
+    Snapshot {
+        v: u32,
+        id: String,
+        lines: Vec<String>,
+        cursor: (usize, usize),
+    },
+    /// Server → client: new lines since `from_line` (the hot path — grid
+    /// deltas in Phase 1 build on this shape via cell ranges).
+    Delta {
+        v: u32,
+        id: String,
+        from_line: usize,
+        lines: Vec<String>,
+    },
+    /// Client → server: resume a stream at a cursor (subway-tunnel /
+    /// sleep-survival primitive from ROADMAP §3.2).
+    Resume {
+        v: u32,
+        id: String,
+        from_line: usize,
+    },
+    /// Either → either: loud failure, never silent, never a hang.
+    Error { v: u32, message: String },
+    /// Server → client: agent state transition with confidence + pattern.
+    StateEvent {
+        v: u32,
+        id: String,
+        state: AgentState,
+        /// "direct" or "inferred:<rule>" — honesty travels on the wire.
+        confidence: String,
+        matched_pattern: Option<String>,
+    },
+    /// Server → client: resource truth (Pillar P3 on the wire).
+    Metrics {
+        v: u32,
+        id: String,
+        rss_bytes: u64,
+        cpu_percent: Option<f64>,
+        pids: usize,
+    },
+    // --- Pane control (mirrors the T-0005 verbs so the cutover is 1:1) ---
+    /// Client → server: spawn a pane.
+    Spawn {
+        v: u32,
+        id: String,
+        program: String,
+        #[serde(default)]
+        args: Vec<String>,
+        #[serde(default = "default_cols")]
+        cols: u16,
+        #[serde(default = "default_rows")]
+        rows: u16,
+    },
+    /// Server → client: pane list.
+    Panes { v: u32, panes: Vec<PaneInfo> },
+    /// Client → server: attach to a pane's stream.
+    Attach {
+        v: u32,
+        id: String,
+        #[serde(default)]
+        from_line: usize,
+    },
+    /// Client → server: send input bytes (UTF-8 text).
+    Send { v: u32, id: String, data: String },
+    /// Client → server: resize a pane.
+    Resize {
+        v: u32,
+        id: String,
+        cols: u16,
+        rows: u16,
+    },
+    /// Client → server: kill a pane.
+    Kill { v: u32, id: String },
+    /// Server → client: generic ack.
+    Ok { v: u32 },
+    /// Server → client: child exited.
+    Exited {
+        v: u32,
+        id: String,
+        code: Option<u32>,
+    },
+}
+
+fn default_cols() -> u16 {
+    80
+}
+fn default_rows() -> u16 {
+    24
+}
