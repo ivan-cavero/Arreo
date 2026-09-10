@@ -101,6 +101,9 @@ fn sigterm_drains_committed_output_and_exits() {
             ],
             cols: 80,
             rows: 24,
+            memory_max: None,
+            pids_max: None,
+            kill_on_breach: false,
         },
     );
     assert!(

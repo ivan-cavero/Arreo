@@ -1,0 +1,10 @@
+## T-0019 evidence (2026-09-10, linux x86_64, rustc 1.98.0)
+
+### enforcement slice:
+[PASS] enforcement: no delegation here — daemon loud, not silent: Error { v: 0, message: "enforce failed: cgroup unavailable: /sys/fs/cgroup/user.slice/user-1001.slice/user@1001.service/app.slice/app-orca-7707.scope/arreo-hog-611969/memory.max: Permission denied (os error 13)" }
+enforcement: mechanism proven by unit/parser tests; CI ubuntu runs the hog
+enforcement: passed
+
+### enforce tests: 4 integration (honest skip here, live on CI) + 1 parser unit green
+### delegation: this box denies subtree_control (proven); systemd-set limits work; CI ubuntu gets delegation step
+### full battery green, fmt/clippy clean

@@ -79,6 +79,9 @@ fn spawn_msg() -> Message {
         ],
         cols: 80,
         rows: 24,
+        memory_max: None,
+        pids_max: None,
+        kill_on_breach: false,
     }
 }
 

@@ -98,6 +98,18 @@ pub enum Message {
         cols: u16,
         #[serde(default = "default_rows")]
         rows: u16,
+        /// Optional enforcement budget (T-0019): memory bytes + pids ceiling.
+        /// `None` = unlimited. `#[serde(default)]` = N−1 safe (old clients
+        /// simply spawn unbudgeted panes).
+        #[serde(default)]
+        memory_max: Option<u64>,
+        #[serde(default)]
+        pids_max: Option<u32>,
+        /// Kill the pane when its budget breaches (default false = notify
+        /// only via a Blocked state event + audit row; the operator runs
+        /// `arreo kill`). Configurable per the criterion.
+        #[serde(default)]
+        kill_on_breach: bool,
     },
     /// Server → client: pane list.
     Panes { v: u32, panes: Vec<PaneInfo> },

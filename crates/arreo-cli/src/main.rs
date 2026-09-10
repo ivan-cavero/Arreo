@@ -446,6 +446,9 @@ async fn cmd_spawn(rest: &[String]) -> ExitCode {
         args: kept[2..].to_vec(),
         cols: 80,
         rows: 24,
+        memory_max: None,
+        pids_max: None,
+        kill_on_breach: false,
     };
     match request(&socket, &req).await {
         Ok(Message::Ok { .. }) => {

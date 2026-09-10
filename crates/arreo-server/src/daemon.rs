@@ -43,15 +43,30 @@ pub struct PaneEntry {
     pub engine: Mutex<Engine>,
     pub fed: Mutex<usize>,
     pub sampler: Mutex<Sampler>,
+    /// Enforcement guard (T-0019): present when the pane was spawned with a
+    /// budget. Held for its Drop (group removal) + breach polls.
+    pub guard: Option<arreo_core::enforce::Guard>,
+    /// Kill the pane on breach (from `Spawn.kill_on_breach`).
+    pub kill_on_breach: bool,
 }
 
 impl PaneEntry {
     fn new(pane: Arc<Pane>) -> Self {
+        Self::new_with_guard(pane, None, false)
+    }
+
+    fn new_with_guard(
+        pane: Arc<Pane>,
+        guard: Option<arreo_core::enforce::Guard>,
+        kill_on_breach: bool,
+    ) -> Self {
         Self {
             pane,
             engine: Mutex::new(Engine::new(Adapter::default(), 0)),
             fed: Mutex::new(0),
             sampler: Mutex::new(Sampler::new()),
+            guard,
+            kill_on_breach,
         }
     }
 
@@ -78,6 +93,42 @@ impl PaneEntry {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .state()
+    }
+
+    /// Poll the cgroup guard for breach. On breach: feed a synthetic
+    /// error-shape line through the ENGINE (not the pane — never types into
+    /// the shell), so the next `wait --state blocked` fires; audit the
+    /// event; kill when the spawn policy says so. Returns the breach, if any.
+    /// Idempotent per breach episode (engine dedups: already-Blocked stays).
+    fn poll_breach(&self, id: &str, db: &std::path::Path) -> Option<arreo_core::enforce::Breach> {
+        let guard = self.guard.as_ref()?;
+        let breach = guard.breached().ok()??;
+        let label = match breach {
+            arreo_core::enforce::Breach::Memory => "memory",
+            arreo_core::enforce::Breach::Pids => "pids",
+        };
+        // Notify via the state engine (synthetic, never typed). Phrased as
+        // `Error: ...` so the universal error-shape rule fires (no adapter
+        // change needed — our own daemon speaks the existing shape).
+        let note = format!("Error: {label} budget breached for pane {id} (enforce)\n");
+        self.engine
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .feed(note.as_bytes(), now_ms());
+        // Audit (you get told — `arreo audit` shows it).
+        if let Ok(store) = arreo_core::store::SessionStore::open(db) {
+            let _ = store.audit(arreo_core::store::AuditEvent {
+                ts_ms: now_ms(),
+                device: "daemon".to_string(),
+                agent: id.to_string(),
+                prompt: format!("[enforce] {label} budget breached"),
+            });
+        }
+        // Kill switch (only when configured — default is notify-only).
+        if self.kill_on_breach {
+            let _ = self.pane.kill_shared();
+        }
+        Some(breach)
     }
 }
 
@@ -163,6 +214,29 @@ impl Daemon {
         let listener = UnixListener::bind(&self.socket)?;
         // Boot restore BEFORE serving: crash survivors reappear with history.
         self.restore_boot().await;
+        // Enforcement sweeper (T-0019): 1 s tick over guarded panes —
+        // breach → state event + audit + policy kill. Unattached panes are
+        // covered too (attach loops only see their own pane).
+        {
+            let registry = Arc::clone(&self.registry);
+            let db = self.db.clone();
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    let entries: Vec<(String, Arc<PaneEntry>)> = registry
+                        .read()
+                        .await
+                        .iter()
+                        .map(|(id, entry)| (id.clone(), Arc::clone(entry)))
+                        .collect();
+                    for (id, entry) in entries {
+                        if entry.guard.is_some() {
+                            entry.poll_breach(&id, &db);
+                        }
+                    }
+                }
+            });
+        }
         loop {
             let (stream, _) = listener.accept().await?;
             let registry = Arc::clone(&self.registry);
@@ -419,6 +493,9 @@ async fn dispatch(message: &Message, registry: &Registry, db: &Path) -> Option<M
             args,
             cols,
             rows,
+            memory_max,
+            pids_max,
+            kill_on_breach,
         } => {
             if let Err(reply) = check_version(*v) {
                 return Some(reply);
@@ -454,7 +531,42 @@ async fn dispatch(message: &Message, registry: &Registry, db: &Path) -> Option<M
                     message: format!("pane {id:?} already exists"),
                 });
             }
-            registry.insert(id.clone(), Arc::new(PaneEntry::new(pane)));
+            // Enforcement (T-0019): when the client sets a budget, create a
+            // cgroup guard and move the child into it. Guard creation failure
+            // is LOUD (Error) — silently running unbudgeted would lie about
+            // enforcement. No budget = no guard (yesterday's behavior).
+            let guard = match (memory_max, pids_max) {
+                (None, None) => None,
+                _ => {
+                    let budget = arreo_core::enforce::Budget {
+                        memory_max: *memory_max,
+                        pids_max: *pids_max,
+                    };
+                    match arreo_core::enforce::Guard::create(id, budget) {
+                        Ok(guard) => Some(guard),
+                        Err(e) => {
+                            return Some(Message::Error {
+                                v: VERSION,
+                                message: format!("enforce failed: {e}"),
+                            });
+                        }
+                    }
+                }
+            };
+            if let Some(guard) = &guard {
+                if let Some(pid) = pane.child_pid() {
+                    if let Err(e) = guard.attach(pid) {
+                        return Some(Message::Error {
+                            v: VERSION,
+                            message: format!("enforce attach failed: {e}"),
+                        });
+                    }
+                }
+            }
+            registry.insert(
+                id.clone(),
+                Arc::new(PaneEntry::new_with_guard(pane, guard, *kill_on_breach)),
+            );
             Some(Message::Ok { v: VERSION })
         }
         Message::Panes { v, .. } => {

@@ -88,6 +88,9 @@ fn spawn_msg(id: &str) -> Message {
         args: vec!["-c".to_string(), "echo hello-api && sleep 30".to_string()],
         cols: 80,
         rows: 24,
+        memory_max: None,
+        pids_max: None,
+        kill_on_breach: false,
     }
 }
 
@@ -179,6 +182,9 @@ async fn spawn_panes_read_send_split() {
             args: vec!["-c".to_string(), "sleep 30".to_string()],
             cols: 80,
             rows: 24,
+            memory_max: None,
+            pids_max: None,
+            kill_on_breach: false,
         })
         .await;
     assert!(matches!(control.recv().await, Message::Ok { .. }));
@@ -216,6 +222,9 @@ async fn wait_watches_state_with_timeout() {
             ],
             cols: 80,
             rows: 24,
+            memory_max: None,
+            pids_max: None,
+            kill_on_breach: false,
         })
         .await;
     assert!(matches!(client.recv().await, Message::Ok { .. }));
@@ -285,4 +294,52 @@ async fn metrics_reports_tree_truth() {
         })
         .await;
     assert!(matches!(client.recv().await, Message::Error { .. }));
+}
+
+#[tokio::test]
+async fn spawn_with_budget_attaches_guard_or_errors_loudly() {
+    // On cgroup-less boxes Guard::create fails → daemon must answer Error
+    // (loud), never Ok-then-unenforced (lying). On delegated boxes it
+    // answers Ok. Either way the contract holds: no silent unenforced pane.
+    let socket = temp_socket("budget");
+    let _server = spawn_daemon(socket.clone()).await;
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    let mut client = Client::connect(&socket).await;
+    client
+        .send(&Message::Spawn {
+            v: VERSION,
+            id: "guarded".to_string(),
+            program: "/bin/sh".to_string(),
+            args: vec!["-c".to_string(), "sleep 30".to_string()],
+            cols: 80,
+            rows: 24,
+            memory_max: Some(256 * 1024 * 1024),
+            pids_max: Some(32),
+            kill_on_breach: false,
+        })
+        .await;
+    match client.recv().await {
+        Message::Ok { .. } => {
+            // Guard live: pane listed, breach poll runs (no breach expected).
+            client
+                .send(&Message::Panes {
+                    v: VERSION,
+                    panes: vec![],
+                })
+                .await;
+            match client.recv().await {
+                Message::Panes { panes, .. } => {
+                    assert!(panes.iter().any(|p| p.id == "guarded" && p.alive));
+                }
+                other => panic!("want panes, got {other:?}"),
+            }
+        }
+        Message::Error { message, .. } => {
+            assert!(
+                message.contains("enforce"),
+                "loud enforce failure, not silent: {message}"
+            );
+        }
+        other => panic!("want Ok or enforce Error, got {other:?}"),
+    }
 }

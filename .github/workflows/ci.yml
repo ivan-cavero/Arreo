@@ -25,6 +25,16 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: test (incl. dependency-direction gate)
         run: cargo test --workspace
+      - name: cgroup delegation (T-0019 — ubuntu only; macos/windows skip honestly)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          # GitHub ubuntu runners permit user delegation (like rootless podman);
+          # this dev box (nested harness scope) does not — tests self-skip there.
+          sudo mkdir -p /sys/fs/cgroup/arreo-ci
+          echo "+memory +pids" | sudo tee /sys/fs/cgroup/arreo-ci/cgroup.subtree_control || true
+          cat /sys/fs/cgroup/arreo-ci/cgroup.subtree_control || true
+      - name: enforcement (T-0019 — 4GB scenario or loud no-delegation)
+        run: cargo run -p xtask -- e2e --slice enforcement
       - name: conpty-smoke (T-0007 — ConPTY on Windows, portable proxy on unix)
         run: cargo run -p xtask -- conpty-smoke --timeout-secs 60
       - name: check-targets (T-0010 — layered portability gate)

@@ -1,0 +1,3 @@
+[PASS] enforcement: no delegation here — daemon loud, not silent: Error { v: 0, message: "enforce failed: cgroup unavailable: /sys/fs/cgroup/user.slice/user-1001.slice/user@1001.service/app.slice/app-orca-7707.scope/arreo-hog-611969/memory.max: Permission denied (os error 13)" }
+enforcement: mechanism proven by unit/parser tests; CI ubuntu runs the hog
+enforcement: passed

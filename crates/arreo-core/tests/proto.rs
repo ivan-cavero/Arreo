@@ -187,6 +187,9 @@ fn control_verbs_round_trip_1_to_1_with_jsonl() {
             args: vec![],
             cols: 80,
             rows: 24,
+            memory_max: None,
+            pids_max: None,
+            kill_on_breach: false,
         },
         Message::Panes {
             v: VERSION,

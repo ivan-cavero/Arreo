@@ -14,6 +14,7 @@ mod bench;
 mod chaos;
 mod check_targets;
 mod demo;
+mod enforcement_slice;
 mod lifecycle_slice;
 mod persistence_slice;
 
@@ -51,9 +52,10 @@ fn e2e(rest: &[String]) -> ExitCode {
         Some("api") => api_slice::run(rest),
         Some("state") => adapters_check::run(rest),
         Some("lifecycle") => lifecycle_slice::run(rest),
+        Some("enforcement") => enforcement_slice::run(rest),
         Some("persistence") => persistence_slice::run(rest),
         Some(other) => {
-            eprintln!("xtask e2e: unknown slice {other:?} (have: chaos, api, lifecycle, persistence, state)");
+            eprintln!("xtask e2e: unknown slice {other:?} (have: chaos, api, lifecycle, persistence, state, enforcement)");
             ExitCode::from(2)
         }
         None => stub("e2e", rest),
