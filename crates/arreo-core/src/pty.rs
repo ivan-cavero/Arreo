@@ -46,7 +46,15 @@ pub struct RingBuffer {
     pending: String,
     dropped: u64,
     dropped_bytes: u64,
+    /// Raw byte journal: every byte ever pushed (capped). Powers byte-exact
+    /// fixture recording (T-0011) without a second PTY read path.
+    raw: Vec<u8>,
+    raw_truncated: bool,
 }
+
+/// Cap for the raw journal (1 MiB — fixtures must stay small; larger
+/// sessions record truncated with `raw_truncated` set).
+pub const MAX_RAW_JOURNAL: usize = 1024 * 1024;
 
 impl RingBuffer {
     #[must_use]
@@ -57,12 +65,23 @@ impl RingBuffer {
             pending: String::new(),
             dropped: 0,
             dropped_bytes: 0,
+            raw: Vec::new(),
+            raw_truncated: false,
         }
     }
 
     /// Feed raw bytes; splits on `\n` (tolerates `\r\n`). Partial lines stay
-    /// in `pending` until terminated.
+    /// in `pending` until terminated. Also appends to the raw journal.
     pub fn push_bytes(&mut self, bytes: &[u8]) {
+        if !self.raw_truncated {
+            let room = MAX_RAW_JOURNAL.saturating_sub(self.raw.len());
+            if bytes.len() <= room {
+                self.raw.extend_from_slice(bytes);
+            } else {
+                self.raw.extend_from_slice(&bytes[..room]);
+                self.raw_truncated = true;
+            }
+        }
         let text = String::from_utf8_lossy(bytes);
         self.pending.push_str(&text);
         while let Some(pos) = self.pending.find('\n') {
@@ -130,10 +149,23 @@ impl RingBuffer {
         self.dropped_bytes
     }
 
-    /// Rough heap footprint of buffered text (for the ≤ 3 MB budget test).
+    /// Byte-exact journal of everything pushed (capped at `MAX_RAW_JOURNAL`).
+    #[must_use]
+    pub fn raw_bytes(&self) -> Vec<u8> {
+        self.raw.clone()
+    }
+
+    #[must_use]
+    pub fn raw_truncated(&self) -> bool {
+        self.raw_truncated
+    }
+
+    /// Rough heap footprint of buffered text + raw journal (for the ≤ 3 MB
+    /// budget test). The journal is capped at 1 MiB, so worst case is still
+    /// inside the per-pane budget alongside a full 512-line hot buffer.
     #[must_use]
     pub fn bytes_held(&self) -> usize {
-        self.lines.iter().map(String::len).sum::<usize>() + self.pending.len()
+        self.lines.iter().map(String::len).sum::<usize>() + self.pending.len() + self.raw.len()
     }
 }
 
@@ -254,6 +286,16 @@ impl Pane {
         } else {
             Vec::new()
         }
+    }
+
+    /// Byte-exact snapshot of all raw output so far (for fixture recording).
+    /// Returns `(bytes, truncated)`.
+    #[must_use]
+    pub fn raw_snapshot(&self) -> (Vec<u8>, bool) {
+        self.buffer
+            .lock()
+            .map(|b| (b.raw_bytes(), b.raw_truncated()))
+            .unwrap_or_default()
     }
 
     #[must_use]

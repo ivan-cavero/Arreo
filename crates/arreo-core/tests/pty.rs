@@ -164,3 +164,18 @@ fn concurrent_sends_never_deadlock_or_corrupt() {
     assert!(lines.len() <= HOT_LINES);
     assert!(pane.bytes_held() <= 3 * 1024 * 1024);
 }
+
+#[test]
+fn raw_journal_is_byte_exact_and_capped() {
+    use arreo_core::pty::{RingBuffer, MAX_RAW_JOURNAL};
+    let mut buf = RingBuffer::new(512);
+    buf.push_bytes(b"plain\n\x1b[1;32mgreen\x1b[0m\n");
+    let (raw, truncated) = (buf.raw_bytes(), buf.raw_truncated());
+    assert!(!truncated);
+    assert_eq!(raw, b"plain\n\x1b[1;32mgreen\x1b[0m\n");
+    // Flood past the cap: journal stops at exactly 1 MiB and flags it.
+    let mut buf = RingBuffer::new(512);
+    buf.push_bytes(&vec![b'z'; MAX_RAW_JOURNAL + 100]);
+    assert!(buf.raw_truncated());
+    assert_eq!(buf.raw_bytes().len(), MAX_RAW_JOURNAL);
+}

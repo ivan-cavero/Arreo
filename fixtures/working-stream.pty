@@ -1,0 +1,7 @@
+{"v":1,"cols":80,"rows":24,"argv":["/bin/sh","-c","for i in 1 2 3 4 5; do echo \"tool: reading file $i/5...\"; sleep 0.05; done; echo \"done: 5 files\""]}
+{"t_ms":10,"data":"dG9vbDogcmVhZGluZyBmaWxlIDEvNS4uLgo="}
+{"t_ms":82,"data":"dG9vbDogcmVhZGluZyBmaWxlIDIvNS4uLgo="}
+{"t_ms":131,"data":"dG9vbDogcmVhZGluZyBmaWxlIDMvNS4uLgo="}
+{"t_ms":224,"data":"dG9vbDogcmVhZGluZyBmaWxlIDQvNS4uLgo="}
+{"t_ms":256,"data":"dG9vbDogcmVhZGluZyBmaWxlIDUvNS4uLgo="}
+{"t_ms":328,"data":"ZG9uZTogNSBmaWxlcwo="}

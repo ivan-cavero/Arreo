@@ -1,0 +1,22 @@
+## T-0011 evidence (2026-09-10, linux x86_64, rustc 1.98.0)
+
+### cargo test -p arreo-core --test fixtures → 4 passed
+test secret_scan_flags_keys_before_commit ... ok
+test committed_fixtures_are_stable_and_clean ... ok
+test empty_session_records_and_replays_cleanly ... ok
+test record_replay_round_trip_is_byte_exact ... ok
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s
+
+### pty suite (journal regression) → 10 passed
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.63s
+
+### fixtures committed (all < 4 KiB, secret-free, deterministic)
+ 106 fixtures/idle-shell.pty
+ 186 fixtures/locale-utf8.pty
+ 183 fixtures/question-permission.pty
+3044 fixtures/vim-edit.pty
+ 491 fixtures/working-stream.pty
+4010 total
+
+### CLI adversarial: corrupt/bad-version/bad-b64/empty all exit 1; secret refused exit 1, --allow-secrets override exit 0
+### scope note: pty.rs raw journal re-scoped in task file with reason; bytes_held now counts journal (budget still green)
