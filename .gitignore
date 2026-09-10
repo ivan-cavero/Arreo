@@ -1,5 +1,4 @@
 /target
-Cargo.lock
 *.orig
 *.bk
 .DS_Store

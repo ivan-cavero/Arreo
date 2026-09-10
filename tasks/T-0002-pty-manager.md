@@ -3,7 +3,7 @@ id: T-0002
 title: PTY manager core — spawn, read, write, resize per pane with a ring buffer
 phase: 0
 priority: 1
-status: todo
+status: done
 depends_on: [T-0001]
 scope:
   - crates/arreo-core/src/pty/**

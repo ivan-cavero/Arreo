@@ -7,3 +7,10 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+portable-pty = "0.9"
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "time", "io-util"] }
+anyhow = "1"
+thiserror = "2"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "time", "io-util"] }

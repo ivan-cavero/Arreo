@@ -1,0 +1,24 @@
+## T-0002 evidence (2026-09-10, linux x86_64, rustc 1.98.0)
+
+### cargo test -p arreo-core --test pty → 9 passed
+test ring_buffer_evicts_oldest_and_counts_dropped ... ok
+test unterminated_prompt_line_is_visible_after_flush ... ok
+test child_exit_is_observed_and_zombie_free ... ok
+test kill_terminates_a_sleeping_child ... ok
+test concurrent_sends_never_deadlock_or_corrupt ... ok
+test ring_buffer_memory_per_pane_within_budget ... ok
+test spawn_echo_read_and_exit_code ... ok
+test write_input_reaches_shell_and_resize_propagates ... ok
+test giant_output_flood_never_grows_unbounded ... ok
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.66s
+
+### full battery → fmt clean, clippy -D warnings clean, workspace tests green (counts above)
+
+### adversarial probe (throwaway example, removed after run):
+resize-spam: ok (200 rapid resizes)
+binary-garbage: ok (lossy-decode, no panic)
+racing-writers: ok (8 threads x 50 sends, no deadlock) → promoted to permanent test concurrent_sends_never_deadlock_or_corrupt
+giant-line: ok (10 MB single line truncated to 64 KiB, budget holds)
+empty-send: ok
+
+### design finding: Pane is now Send+Sync (interior mutability on master/writer) — daemon shares panes via Arc<Pane>; proven by sync_probe example + race test
