@@ -1,0 +1,26 @@
+# REUSE.toml — SPDX licensing map (https://reuse.software)
+
+version = 1
+
+# Apache-2.0: everything except the relay.
+[[annotations]]
+path = ["crates/arreo-core/**", "crates/arreo-server/**", "crates/arreo-cli/**",
+        "crates/arreo-plugin-api/**", "crates/arreo-tui/**", "mobile/**", "web/**",
+        "adapters/**", "themes/**", "docs/**", "README.md", "CONTRIBUTING.md", "ROADMAP.md"]
+precedence = "aggregate"
+SPDX-FileCopyrightText = "2026 Arreo contributors"
+SPDX-License-Identifier = "Apache-2.0"
+
+# AGPL-3.0-or-later: the relay — the network component.
+[[annotations]]
+path = ["crates/arreo-relay/**", "crates/arreo-relay-proto/**", "LICENSE-RELAY"]
+precedence = "aggregate"
+SPDX-FileCopyrightText = "2026 Arreo contributors"
+SPDX-License-Identifier = "AGPL-3.0-or-later"
+
+# License texts themselves.
+[[annotations]]
+path = ["LICENSE", "LICENSE-RELAY"]
+precedence = "aggregate"
+SPDX-FileCopyrightText = "Apache Software Foundation / Free Software Foundation"
+SPDX-License-Identifier = "Apache-2.0 AND AGPL-3.0-or-later"
