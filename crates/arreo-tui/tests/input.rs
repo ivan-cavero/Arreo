@@ -2,9 +2,20 @@
 //! rendered on that row (0-based terminal coordinates), and the key map must
 //! keep `q` = quit, `/` = search with Esc cancel.
 
+use arreo_core::theme::{Depth, Variant};
 use arreo_tui::model::PaneView;
+use arreo_tui::theme::ThemeState;
 use arreo_tui::ui::{wall_grid, App, ViewMode, SIDEBAR_DEFAULT, SIDEBAR_MAX, SIDEBAR_MIN};
 use crossterm::event::KeyCode;
+use ratatui::style::Color as UiColor;
+
+fn areo_depth(truecolor: bool) -> Depth {
+    if truecolor {
+        Depth::Truecolor
+    } else {
+        Depth::Ansi256
+    }
+}
 
 fn views() -> Vec<PaneView> {
     // Attention order sorts question first, so the sidebar renders
@@ -182,4 +193,78 @@ fn wall_toggle_and_scrollback() {
     app.on_scroll(20);
     app.on_key(KeyCode::Char('j'));
     assert_eq!(app.scroll, 0);
+}
+
+#[test]
+fn picker_opens_navigates_applies_and_cancels() {
+    let mut app = App::new();
+    // Pin the depth: the test process may run under NO_COLOR, and this test
+    // is about the picker, not about detection.
+    app.theme = ThemeState::with_depth(Depth::Truecolor, Variant::Dark);
+    app.model.set_panes(many_views(2));
+    let names = app.theme.names();
+    assert!(names.len() >= 5, "expected the built-ins, got {names:?}");
+    let original = app.theme.theme().name().to_string();
+    let original_primary = app.theme.color("primary");
+
+    // `t` opens it; the cursor starts on the active theme.
+    app.on_key(KeyCode::Char('t'));
+    let picker = app.picker.as_ref().expect("picker open");
+    assert_eq!(picker.selected(), Some(original.as_str()));
+
+    // j/k move and wrap.
+    app.on_key(KeyCode::Char('k'));
+    assert_eq!(
+        app.picker.as_ref().expect("open").selected(),
+        Some(names.last().expect("non-empty").as_str())
+    );
+    app.on_key(KeyCode::Char('j'));
+    assert_eq!(
+        app.picker.as_ref().expect("open").selected(),
+        Some(original.as_str())
+    );
+
+    // Enter applies the highlighted theme and closes the picker.
+    app.on_key(KeyCode::Char('j'));
+    let wanted = names.get(1).expect("at least two").clone();
+    app.on_key(KeyCode::Enter);
+    assert!(app.picker.is_none());
+    assert_eq!(app.theme.theme().name(), wanted);
+    assert_ne!(
+        app.theme.color("primary"),
+        original_primary,
+        "palette changed"
+    );
+
+    // Esc cancels back to the theme the picker opened with.
+    app.on_key(KeyCode::Char('t'));
+    app.on_key(KeyCode::Char('j'));
+    app.on_key(KeyCode::Esc);
+    assert!(app.picker.is_none());
+    assert_eq!(
+        app.theme.theme().name(),
+        wanted,
+        "cancel restores the open theme"
+    );
+
+    // `/theme` is the documented command path to the same picker.
+    app.on_key(KeyCode::Char('/'));
+    for c in "theme".chars() {
+        app.on_key(KeyCode::Char(c));
+    }
+    assert!(app.searching, "still typing in the prompt");
+    app.on_key(KeyCode::Enter);
+    assert!(app.picker.is_some(), "/theme must open the picker");
+    app.on_key(KeyCode::Esc);
+    assert!(app.picker.is_none());
+}
+
+#[test]
+fn depth_reaches_every_widget_through_the_theme_state() {
+    // The TUI never hardcodes a color: switching the depth re-quantizes what
+    // the sidebar asks for.
+    let truecolor = ThemeState::with_depth(areo_depth(true), Variant::Dark);
+    let ansi = ThemeState::with_depth(areo_depth(false), Variant::Dark);
+    assert!(matches!(truecolor.color("working"), UiColor::Rgb(_, _, _)));
+    assert!(matches!(ansi.color("working"), UiColor::Indexed(_)));
 }

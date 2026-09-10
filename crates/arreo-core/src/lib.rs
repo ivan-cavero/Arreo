@@ -13,4 +13,5 @@ pub mod pty;
 pub mod state;
 #[cfg(feature = "sqlite")]
 pub mod store;
+pub mod theme;
 pub mod vt;

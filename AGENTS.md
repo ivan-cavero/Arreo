@@ -5,8 +5,9 @@
 
 ## Layout
 
-Workspace crates: `arreo-core` (PTY, VT state, state engine, metrics, protocol),
-`arreo-server` (daemon), `arreo-cli` (`arreo` binary), `arreo-relay` (AGPL relay,
+Workspace crates: `arreo-core` (PTY, VT state, state engine, metrics, protocol,
+themes), `arreo-server` (daemon), `arreo-cli` (`arreo` binary), `arreo-tui`
+(ratatui client: sidebar, pane wall, theme picker), `arreo-relay` (AGPL relay,
 Phase 2+), `arreo-plugin-api` (WASM plugin host, Phase 4+). Dev tooling: `xtask`.
 
 **Dependency direction (enforced by `cargo test`, see `xtask/tests/workspace_deps.rs`):**
@@ -24,15 +25,17 @@ cargo build --workspace                  # build everything
 cargo test --workspace                   # full unit suite (incl. dep-direction gate)
 cargo clippy --workspace --all-targets -- -D warnings   # must be zero warnings
 cargo fmt --all -- --check               # must be clean
-cargo run -p xtask -- e2e                # e2e battery (stubs until wired per task)
-cargo run -p xtask -- bench              # benchmarks vs perf-budget.toml
-cargo run -p xtask -- conpty-smoke       # Windows ConPTY smoke (T-0007)
-cargo run -p xtask -- <cmd> --enforce    # fail when budgets exist but unmet
+cargo xtask e2e                          # e2e battery (stubs until wired per task)
+cargo xtask e2e --slice tui              # TUI: sidebar/wall/mouse on a real pty
+cargo xtask e2e --slice theme            # theming: depth fallback + shared tokens
+cargo xtask bench                        # benchmarks vs perf-budget.toml
+cargo xtask conpty-smoke                 # Windows ConPTY smoke (T-0007)
+cargo xtask <cmd> --enforce              # fail when budgets exist but unmet
 cargo run -p arreo-cli -- --version      # CLI smoke
 ```
 
-`cargo xtask` is an alias-free zone: always invoke as `cargo run -p xtask -- <verb>`
-until a `[alias]` ships (no aliases configured yet).
+`cargo xtask` is a plain cargo alias for `cargo run -p xtask --` (`.cargo/config.toml`),
+so the documented form and the long form are the same thing.
 
 ## Task protocol
 

@@ -15,9 +15,11 @@ mod chaos;
 mod check_targets;
 mod demo;
 mod enforcement_slice;
+mod harness;
 mod lifecycle_slice;
 mod package;
 mod persistence_slice;
+mod theme_slice;
 mod tui_slice;
 
 fn main() -> ExitCode {
@@ -58,8 +60,9 @@ fn e2e(rest: &[String]) -> ExitCode {
         Some("enforcement") => enforcement_slice::run(rest),
         Some("persistence") => persistence_slice::run(rest),
         Some("tui") => tui_slice::run(rest),
+        Some("theme") => theme_slice::run(rest),
         Some(other) => {
-            eprintln!("xtask e2e: unknown slice {other:?} (have: chaos, api, lifecycle, persistence, state, enforcement, tui)");
+            eprintln!("xtask e2e: unknown slice {other:?} (have: chaos, api, lifecycle, persistence, state, enforcement, tui, theme)");
             ExitCode::from(2)
         }
         None => stub("e2e", rest),

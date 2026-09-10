@@ -61,5 +61,7 @@ jobs:
         run: cargo run -p xtask -- e2e --slice persistence
       - name: "tui (T-0015 — real pty: sidebar, focus, mouse, resize, search, quit)"
         run: cargo run -p xtask -- e2e --slice tui
+      - name: "theme (T-0016 — depth fallback proven by the bytes each terminal gets)"
+        run: cargo run -p xtask -- e2e --slice theme
       - name: xtask stubs
         run: cargo xtask e2e

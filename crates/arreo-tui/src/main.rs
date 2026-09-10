@@ -4,8 +4,10 @@
 //! streams the focused pane, quits on `q`/Esc/Ctrl-C. Mouse clicks focus.
 
 use arreo_core::proto::{AgentState, Message, VERSION};
+use arreo_core::theme::{Depth, Variant};
 use arreo_tui::client::{default_socket, Client, PaneSummary};
 use arreo_tui::model::PaneView;
+use arreo_tui::theme::ThemeState;
 use arreo_tui::ui::{App, ViewMode};
 use crossterm::event::{self, Event, KeyEventKind};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
@@ -19,12 +21,21 @@ use std::time::Duration;
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let mut socket: Option<PathBuf> = None;
+    let mut theme: Option<String> = None;
+    let mut variant: Option<String> = None;
+    let mut depth: Option<String> = None;
     let mut args = std::env::args().skip(1).peekable();
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--socket" => socket = args.next().map(PathBuf::from),
+            "--theme" => theme = args.next(),
+            "--variant" => variant = args.next(),
+            "--depth" => depth = args.next(),
             "--help" | "-h" => {
-                println!("usage: arreo-tui [--socket PATH]");
+                println!(
+                    "usage: arreo-tui [--socket PATH] [--theme NAME] \
+                     [--variant dark|light] [--depth truecolor|256|16|none]"
+                );
                 return Ok(());
             }
             other => {
@@ -34,6 +45,11 @@ async fn main() -> anyhow::Result<()> {
         }
     }
     let socket = socket.unwrap_or_else(default_socket);
+    let request = ThemeRequest {
+        theme,
+        variant: variant.as_deref().and_then(parse_variant),
+        depth: depth.as_deref().and_then(parse_depth),
+    };
 
     enable_raw_mode()?;
     crossterm::execute!(
@@ -43,7 +59,7 @@ async fn main() -> anyhow::Result<()> {
     )?;
     let backend = CrosstermBackend::new(std::io::stdout());
     let mut terminal = Terminal::new(backend)?;
-    let result = run(&socket, &mut terminal).await;
+    let result = run(&socket, request, &mut terminal).await;
     disable_raw_mode()?;
     crossterm::execute!(
         std::io::stdout(),
@@ -66,11 +82,54 @@ enum Poll {
     },
 }
 
+/// Theme options from the command line (they override detection).
+#[derive(Debug, Default, Clone)]
+struct ThemeRequest {
+    theme: Option<String>,
+    variant: Option<Variant>,
+    depth: Option<Depth>,
+}
+
+fn parse_variant(raw: &str) -> Option<Variant> {
+    match raw.to_ascii_lowercase().as_str() {
+        "dark" => Some(Variant::Dark),
+        "light" => Some(Variant::Light),
+        other => {
+            eprintln!("arreo-tui: unknown variant {other:?} (dark|light)");
+            None
+        }
+    }
+}
+
+fn parse_depth(raw: &str) -> Option<Depth> {
+    match raw.to_ascii_lowercase().as_str() {
+        "truecolor" | "24bit" => Some(Depth::Truecolor),
+        "256" | "ansi256" => Some(Depth::Ansi256),
+        "16" | "ansi16" => Some(Depth::Ansi16),
+        "none" | "nocolor" => Some(Depth::NoColor),
+        other => {
+            eprintln!("arreo-tui: unknown depth {other:?} (truecolor|256|16|none)");
+            None
+        }
+    }
+}
+
 async fn run(
     socket: &std::path::Path,
+    request: ThemeRequest,
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
 ) -> anyhow::Result<()> {
     let mut app = App::new();
+    app.theme = ThemeState::with_depth(
+        request.depth.unwrap_or_else(Depth::detect),
+        request.variant.unwrap_or_default(),
+    );
+    if let Some(name) = request.theme.as_deref() {
+        if let Err(e) = app.theme.select(name) {
+            // A bad --theme is worth saying out loud, not silently ignoring.
+            app.status = format!("theme {name:?}: {e}");
+        }
+    }
     // Daemon traffic lives in its own task: a slow socket must never delay
     // input. The UI loop only drains events and applies finished snapshots.
     let (tx, mut rx) = tokio::sync::mpsc::channel::<Poll>(8);
@@ -133,7 +192,7 @@ async fn run(
                     // Preserve scrollback lines across polls (merge by id).
                     merge_views(&mut app, views);
                     app.status = format!(
-                        "{} panes · j/k move · Enter attach · w wall · / search · q quit",
+                        "{} panes · j/k move · Enter attach · w wall · t theme · / search · q quit",
                         summaries.len()
                     );
                 }

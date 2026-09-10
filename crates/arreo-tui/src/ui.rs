@@ -4,14 +4,16 @@
 //! The right region is either the focused pane (scrollback text) or the pane
 //! wall (every pane tiled, focused one highlighted).
 //! Keys: j/k or arrows (move), Enter (attach/focus), / (search), q (quit),
-//! w (wall ↔ focus), [ / ] (sidebar narrower/wider), Tab (cycle panes).
+//! w (wall ↔ focus), t (theme picker), [ / ] (sidebar narrower/wider),
+//! Tab (cycle panes). The `/theme` command in the search prompt opens the
+//! same picker.
 //! Mouse: click a sidebar row or a wall tile to focus it, drag the sidebar
 //! border to resize the split.
 //! Rendering is delta-driven: only changed lines re-render (the model's
 //! dirty cache); steady state redraws chrome only.
 
 use crate::model::{Focus, Model};
-use crate::theme::Theme;
+use crate::theme::ThemeState;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -35,7 +37,7 @@ pub const SIDEBAR_DEFAULT: u16 = 28;
 
 pub struct App {
     pub model: Model,
-    pub theme: Theme,
+    pub theme: ThemeState,
     pub search: String,
     pub searching: bool,
     pub status: String,
@@ -51,6 +53,49 @@ pub struct App {
     /// Scrollback offset for the focused pane, in lines back from the tail
     /// (0 = follow live output).
     pub scroll: usize,
+    /// Open theme picker, if any (opened by `t` or the `/theme` command).
+    pub picker: Option<Picker>,
+}
+
+/// The `/theme` picker: a list of every loaded theme, cursor included.
+#[derive(Debug, Clone)]
+pub struct Picker {
+    pub items: Vec<String>,
+    pub index: usize,
+    /// The theme to restore if the user cancels.
+    original: String,
+    /// Set when applying the highlighted theme failed (shown in the list).
+    pub error: Option<String>,
+}
+
+impl Picker {
+    #[must_use]
+    pub fn new(items: Vec<String>, current: &str) -> Self {
+        let index = items.iter().position(|name| name == current).unwrap_or(0);
+        Self {
+            items,
+            index,
+            original: current.to_string(),
+            error: None,
+        }
+    }
+
+    #[must_use]
+    pub fn selected(&self) -> Option<&str> {
+        self.items.get(self.index).map(String::as_str)
+    }
+
+    pub fn next(&mut self) {
+        if !self.items.is_empty() {
+            self.index = (self.index + 1) % self.items.len();
+        }
+    }
+
+    pub fn prev(&mut self) {
+        if !self.items.is_empty() {
+            self.index = (self.index + self.items.len() - 1) % self.items.len();
+        }
+    }
 }
 
 impl Default for App {
@@ -64,7 +109,7 @@ impl App {
     pub fn new() -> Self {
         Self {
             model: Model::new(),
-            theme: Theme::default(),
+            theme: ThemeState::new(),
             search: String::new(),
             searching: false,
             status: "connecting…".to_string(),
@@ -74,6 +119,7 @@ impl App {
             screen_rows: 30,
             screen_cols: 120,
             scroll: 0,
+            picker: None,
         }
     }
 
@@ -97,7 +143,65 @@ impl App {
             ViewMode::Focus => self.render_pane(frame, chunks[1]),
             ViewMode::Wall => self.render_wall(frame, chunks[1]),
         }
+        if let Some(picker) = self.picker.clone() {
+            self.render_picker(frame, area, &picker);
+        }
         self.render_status(frame, area);
+    }
+
+    /// Theme picker overlay: names, the current marker, and any load error.
+    fn render_picker(&self, frame: &mut Frame, area: Rect, picker: &Picker) {
+        let width = 44.min(area.width.saturating_sub(4));
+        let height = (picker.items.len() as u16 + 4).min(area.height.saturating_sub(2));
+        let overlay = Rect {
+            x: area.x + (area.width.saturating_sub(width)) / 2,
+            y: area.y + (area.height.saturating_sub(height)) / 2,
+            width,
+            height,
+        };
+        frame.render_widget(ratatui::widgets::Clear, overlay);
+        let items: Vec<ListItem> = picker
+            .items
+            .iter()
+            .map(|name| {
+                let marker = if Some(name.as_str()) == picker.selected() {
+                    "▸"
+                } else if name == self.theme.theme().name() {
+                    "•"
+                } else {
+                    " "
+                };
+                ListItem::new(Line::from(vec![
+                    Span::styled(format!("{marker} {name}"), self.theme.text_style()),
+                    Span::styled(
+                        match self.theme.source_of(name) {
+                            Some(path) => format!("  {path}"),
+                            None => "  built-in".to_string(),
+                        },
+                        self.theme.muted_style(),
+                    ),
+                ]))
+            })
+            .collect();
+        let title = format!(
+            "theme: {} ({})",
+            self.theme.theme().name(),
+            self.theme.depth_name()
+        );
+        let mut block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(self.theme.color("borderActive")))
+            .title(title)
+            .title_style(self.theme.text_style())
+            .style(Style::default().bg(self.theme.color("backgroundPanel")));
+        if let Some(error) = &picker.error {
+            block = block.title_bottom(Line::from(Span::styled(
+                format!(" {error}"),
+                Style::default().fg(self.theme.color("error")),
+            )));
+        }
+        let list = List::new(items).block(block);
+        frame.render_widget(list, overlay);
     }
 
     /// Pane wall: every pane tiled in a near-square grid, focused highlighted.
@@ -105,7 +209,13 @@ impl App {
         let panes = self.model.panes();
         if panes.is_empty() {
             let empty = Paragraph::new("no panes")
-                .block(Block::default().borders(Borders::ALL).title("wall"));
+                .style(self.theme.muted_style())
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_style(self.theme.border_style())
+                        .title("wall"),
+                );
             frame.render_widget(empty, area);
             return;
         }
@@ -126,15 +236,16 @@ impl App {
                 let focused = self.model.focused_id() == Some(pane.id.as_str());
                 let block = Block::default()
                     .borders(Borders::ALL)
-                    .title(format!("{} [{}]", pane.id, pane.state));
+                    .title(format!("{} [{}]", pane.id, pane.state))
+                    .title_style(Style::default().fg(self.theme.state_color(pane.state)));
                 let block = if focused {
                     block.border_style(
                         Style::default()
-                            .fg(self.theme.state_color(pane.state))
+                            .fg(self.theme.color("borderActive"))
                             .add_modifier(Modifier::BOLD),
                     )
                 } else {
-                    block
+                    block.border_style(self.theme.border_style())
                 };
                 // Tail of the scrollback: the wall shows what just happened.
                 let visible = wall_tail(&pane.lines, cell.height.saturating_sub(2) as usize);
@@ -178,12 +289,21 @@ impl App {
                 let bar = ram_bar(ram);
                 let human = human_ram(ram);
                 items.push(ListItem::new(Line::from(vec![
-                    Span::raw(format!("{marker} {id:<9}{human:>6}")),
+                    Span::styled(
+                        format!("{marker} {id:<9}{human:>6}"),
+                        self.theme.text_style(),
+                    ),
                     Span::styled(bar, Style::default().fg(color)),
                 ])));
             }
         }
-        let list = List::new(items).block(Block::default().borders(Borders::ALL).title("agents"));
+        let list = List::new(items).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(self.theme.border_style())
+                .title("agents")
+                .title_style(self.theme.text_style()),
+        );
         frame.render_widget(list, area);
     }
 
@@ -223,8 +343,13 @@ impl App {
             .iter()
             .map(|l| Line::from(l.as_str()))
             .collect::<Vec<_>>();
-        let paragraph = Paragraph::new(text)
-            .block(Block::default().borders(Borders::ALL).title(title.as_str()));
+        let paragraph = Paragraph::new(text).style(self.theme.text_style()).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(self.theme.border_style())
+                .title(title)
+                .title_style(self.theme.text_style()),
+        );
         frame.render_widget(paragraph, area);
     }
 
@@ -249,20 +374,53 @@ impl App {
         } else {
             self.status.clone()
         };
-        let status = Paragraph::new(text);
+        let status = Paragraph::new(text).style(self.theme.text_style()).block(
+            Block::default().style(Style::default().bg(self.theme.color("backgroundPanel"))),
+        );
         frame.render_widget(status, bar);
     }
 
     /// Keyboard input. Returns false when the app should quit.
     pub fn on_key(&mut self, code: crossterm::event::KeyCode) -> bool {
         use crossterm::event::KeyCode as K;
+        if self.picker.is_some() {
+            match code {
+                K::Esc | K::Char('q') => {
+                    // Cancel restores the theme the picker opened with.
+                    if let Some(picker) = self.picker.take() {
+                        let _ = self.theme.select(&picker.original);
+                    }
+                }
+                K::Char('j') | K::Down => {
+                    if let Some(picker) = self.picker.as_mut() {
+                        picker.next();
+                    }
+                }
+                K::Char('k') | K::Up => {
+                    if let Some(picker) = self.picker.as_mut() {
+                        picker.prev();
+                    }
+                }
+                K::Enter => self.apply_picked_theme(),
+                _ => {}
+            }
+            return true;
+        }
         if self.searching {
             match code {
                 K::Esc => {
                     self.search.clear();
                     self.searching = false;
                 }
-                K::Enter => self.searching = false,
+                K::Enter => {
+                    self.searching = false;
+                    // The prompt is also the TUI's command line: `/theme`
+                    // opens the picker, exactly like the docs promise.
+                    if self.search.trim() == "theme" {
+                        self.search.clear();
+                        self.open_picker();
+                    }
+                }
                 K::Backspace => {
                     self.search.pop();
                 }
@@ -273,6 +431,10 @@ impl App {
         }
         match code {
             K::Char('q') | K::Esc => false,
+            K::Char('t') => {
+                self.open_picker();
+                true
+            }
             K::Char('w') => {
                 self.view = match self.view {
                     ViewMode::Focus => ViewMode::Wall,
@@ -336,6 +498,31 @@ impl App {
                 true
             }
             _ => true,
+        }
+    }
+
+    /// Open the theme picker over every theme the catalog found.
+    pub fn open_picker(&mut self) {
+        let names = self.theme.names();
+        let current = self.theme.theme().name().to_string();
+        self.picker = Some(Picker::new(names, &current));
+    }
+
+    /// Apply the highlighted theme. A broken user theme is reported in the
+    /// picker and leaves the current theme untouched.
+    pub fn apply_picked_theme(&mut self) {
+        let Some(picker) = self.picker.as_mut() else {
+            return;
+        };
+        let Some(name) = picker.selected().map(str::to_string) else {
+            return;
+        };
+        match self.theme.select(&name) {
+            Ok(()) => {
+                self.picker = None;
+                self.status = format!("theme: {name}");
+            }
+            Err(e) => picker.error = Some(e.to_string()),
         }
     }
 
