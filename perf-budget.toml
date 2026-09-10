@@ -1,0 +1,41 @@
+# perf-budget.toml — executable performance law (ROADMAP §5).
+#
+# Phase applicability: rows marked `phase0 = true` are asserted by
+# `cargo xtask bench` TODAY (all deps landed). Phone/relay/sync/handoff rows
+# are `phase0 = false` — recorded here so the law is complete from day one,
+# enforced when their crates land (bench skips them with a note, never
+# silently). A regression is fixed or parked with written justification —
+# never silently shipped (PROMPT.md §5.5).
+
+[phase0]
+panes = 10
+clients = 0
+# Phase 0 exit demo (ROADMAP §6): 10 agents, < 100 MB RSS, TUI-less CLI.
+max_server_rss_mb = 100
+
+[budgets]
+# [metric] phase0, target, unit, notes
+
+# Server RSS @ 30 panes, 5 clients ≤ 120 MB (excl. agents). Phase 0 proves
+# the 10-pane point (≤ 100 MB incl. harness); linear extrapolation guards 30.
+server_rss_30panes_mb = { phase0 = false, target = 120, unit = "MB" }
+server_rss_10panes_mb = { phase0 = true, target = 100, unit = "MB" }
+# Per-pane harness overhead ≤ 3 MB hot RAM (ring + VT + journal caps).
+per_pane_hot_kb = { phase0 = true, target = 3072, unit = "KB" }
+# State detection latency ≤ 200 ms after output (engine is O(bytes), sync).
+detection_latency_ms = { phase0 = true, target = 200, unit = "ms" }
+# 30-pane sampler sweep ≤ 1% CPU at 1 s cadence → ≤ 10 ms wall.
+sampler_sweep_30panes_ms = { phase0 = true, target = 300, unit = "ms" }
+# VT feed cost: 1-byte feed p99 < 50 ms (guards O(grid-scan) regressions).
+vt_feed_1byte_ms = { phase0 = true, target = 50, unit = "ms" }
+# Fixture replay determinism: byte-exact, always (no threshold — boolean).
+replay_determinism = { phase0 = true, target = 0, unit = "mismatches" }
+
+# Later phases (recorded, not yet enforced):
+phone_cold_attach_s = { phase0 = false, target = 1, unit = "s" }
+phone_idle_delta_kbs = { phase0 = false, target = 5, unit = "KB/s" }
+tui_attach_30panes_ms = { phase0 = false, target = 300, unit = "ms" }
+cross_machine_attach_s = { phase0 = false, target = 3, unit = "s" }
+config_sync_s = { phase0 = false, target = 10, unit = "s" }
+server_handoff_reattach_s = { phase0 = false, target = 2, unit = "s" }
+queued_loss = { phase0 = false, target = 0, unit = "messages" }

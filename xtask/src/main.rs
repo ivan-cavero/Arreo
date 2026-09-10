@@ -8,6 +8,7 @@
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
+mod bench;
 mod check_targets;
 
 fn main() -> ExitCode {
@@ -20,7 +21,8 @@ fn main() -> ExitCode {
         }
     };
     match cmd {
-        "e2e" | "bench" => stub(cmd, rest),
+        "e2e" => stub(cmd, rest),
+        "bench" => bench::bench(rest),
         "conpty-smoke" => conpty_smoke(rest),
         "check-targets" => check_targets::check_targets(rest),
         other => {

@@ -1,0 +1,7 @@
+bench: 10 panes in 263.199411ms (budgets: perf-budget.toml)
+  [PASS] server_rss_10panes_mb    actual      10 MB  target ≤ 100 MB  
+  [PASS] per_pane_hot_kb          actual     211 KB  target ≤ 3072 KB 
+  [PASS] detection_latency_ms     actual       0 ms  target ≤ 200 ms  
+  [PASS] sampler_sweep_30panes_ms actual      59 ms  target ≤ 300 ms  
+  [PASS] vt_feed_1byte_ms         actual       0 ms  target ≤ 50 ms   
+  [PASS] replay_determinism       actual          0  target 0         
