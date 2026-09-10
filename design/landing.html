@@ -1,0 +1,392 @@
+<!doctype html>
+<html lang="en" data-theme="arreo">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Arreo — the agent runtime</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@125,500..900&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+<style>
+  :root, [data-theme="arreo"] {
+    --bg:#121110; --bg-elev:#1A1816; --bg-inset:#0C0B0A;
+    --border:#2A2724; --border-active:#3E3A35;
+    --text:#EDE7DC; --muted:#9A938A;
+    --primary:#6FD3E8; --primary-strong:#A8E4F2; --sand:#D9C6A5;
+    --working:#6FD3E8; --question:#E8B45A; --blocked:#FF9E64;
+    --done:#8FD19E; --error:#E5636F; --idle:#6E6A64;
+  }
+  [data-theme="tokyonight"] {
+    --bg:#1A1B26; --bg-elev:#24283B; --bg-inset:#16161E;
+    --border:#2F334D; --border-active:#414868;
+    --text:#C0CAF5; --muted:#7982A9;
+    --primary:#7DCFFF; --primary-strong:#B4F0FF; --sand:#E0AF68;
+    --working:#7DCFFF; --question:#E0AF68; --blocked:#FF9E64;
+    --done:#9ECE6A; --error:#F7768E; --idle:#565F89;
+  }
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html { scroll-behavior:smooth; }
+  body {
+    background:var(--bg); color:var(--text);
+    font:400 16.5px/1.65 "Inter", system-ui, sans-serif;
+    -webkit-font-smoothing:antialiased;
+  }
+  ::selection { background:var(--primary-strong); color:#121110; }
+  a { color:inherit; text-decoration:none; }
+  .wrap { max-width:1152px; margin:0 auto; padding:0 28px; }
+  .mono { font-family:"JetBrains Mono", ui-monospace, monospace; }
+
+  /* nav */
+  nav { border-bottom:1px solid var(--border); background:var(--bg); position:sticky; top:0; z-index:10; }
+  .nav-in { display:flex; align-items:center; gap:26px; height:60px; }
+  .logo { display:flex; align-items:center; gap:9px; font-weight:700; font-size:19px; letter-spacing:-.01em; }
+  .braid { width:20px; height:20px; }
+  .braid path { stroke:var(--primary); stroke-width:2.4; fill:none; stroke-linecap:round; }
+  .nav-links { display:flex; gap:22px; margin-left:auto; font-size:12.5px; letter-spacing:.14em; }
+  .nav-links a { color:var(--muted); text-transform:uppercase; font-family:"JetBrains Mono",monospace; }
+  .nav-links a:hover { color:var(--text); }
+  .btn { display:inline-block; font-family:"JetBrains Mono",monospace; font-size:12.5px; letter-spacing:.14em; text-transform:uppercase;
+    border:1px solid var(--border-active); padding:9px 18px; border-radius:6px; background:var(--bg-elev); }
+  .btn:hover { border-color:var(--primary); color:var(--primary-strong); }
+  .btn.primary { background:var(--primary); color:#0E2A31; border-color:var(--primary); font-weight:700; }
+  .btn.primary:hover { background:var(--primary-strong); color:#0E2A31; }
+
+  /* kicker */
+  .kicker { display:flex; align-items:center; gap:10px; font-family:"JetBrains Mono",monospace;
+    font-size:12px; letter-spacing:.22em; text-transform:uppercase; color:var(--sand); }
+  .kicker::before { content:""; width:26px; height:1px; background:var(--sand); }
+
+  /* hero */
+  .hero { padding:84px 0 40px; position:relative; overflow:hidden; }
+  .hero h1 {
+    font-family:"Archivo", "Inter", sans-serif;
+    font-variation-settings:"wdth" 125; font-weight:800;
+    font-size:clamp(46px, 8.6vw, 96px); line-height:.98; letter-spacing:-.02em;
+    margin:18px 0 22px; max-width:15ch;
+  }
+  .hero h1 em { font-style:normal; color:var(--primary-strong); }
+  .hero p.lead { max-width:52ch; color:var(--muted); font-size:18.5px; margin-bottom:34px; }
+  .install { display:inline-flex; align-items:stretch; border:1px solid var(--border-active); border-radius:8px; overflow:hidden; background:var(--bg-inset); }
+  .install .cmd { font-family:"JetBrains Mono",monospace; font-size:14.5px; padding:14px 20px; }
+  .install .cmd .dollar { color:var(--sand); }
+  .install .cmd .pipe { color:var(--muted); }
+  .install button { border:0; border-left:1px solid var(--border); background:var(--bg-elev); color:var(--muted);
+    font-family:"JetBrains Mono",monospace; font-size:12px; letter-spacing:.14em; padding:0 20px; cursor:pointer; }
+  .install button:hover { color:var(--primary-strong); }
+  .meta-line { margin-top:16px; font-size:13.5px; color:var(--muted); }
+  .meta-line a { color:var(--text); border-bottom:1px dotted var(--muted); }
+  .meta-line a:hover { color:var(--primary-strong); border-color:var(--primary); }
+  .tag-new { display:inline-block; background:var(--primary); color:#0E2A31; font-family:"JetBrains Mono",monospace;
+    font-size:11px; font-weight:700; letter-spacing:.1em; padding:2px 8px; border-radius:4px; margin-right:8px; vertical-align:1px; }
+
+  /* status board (hero mock) */
+  .board { margin-top:54px; border:1px solid var(--border); border-radius:12px; background:var(--bg-elev); overflow:hidden;
+    box-shadow:0 24px 60px -30px rgba(0,0,0,.6); }
+  .board-bar { display:flex; align-items:center; gap:14px; padding:10px 16px; border-bottom:1px solid var(--border); font-family:"JetBrains Mono",monospace; font-size:12px; color:var(--muted); }
+  .board-bar .dots span { display:inline-block; width:9px; height:9px; border-radius:50%; background:var(--border-active); margin-right:5px; }
+  .board-bar .crumb b { color:var(--text); font-weight:500; }
+  .board-bar .rel { margin-left:auto; color:var(--done); }
+  .board-body { display:grid; grid-template-columns:250px 1fr; min-height:380px; }
+  .board-side { border-right:1px solid var(--border); padding:14px; font-family:"JetBrains Mono",monospace; font-size:12.5px; }
+  .grp { margin:12px 0 6px; font-size:10.5px; letter-spacing:.18em; color:var(--muted); text-transform:uppercase; }
+  .row { display:flex; align-items:center; gap:8px; padding:5px 8px; border-radius:6px; color:var(--text); }
+  .row.active { background:var(--bg-inset); }
+  .row .nm { font-weight:500; }
+  .row .st { margin-left:auto; font-size:11px; color:var(--muted); }
+  .dot { width:8px; height:8px; border-radius:50%; flex:none; }
+  .dot.working { background:var(--working); }
+  .dot.question { background:var(--question); animation:pulse 2s infinite; }
+  .dot.blocked { background:var(--blocked); }
+  .dot.done { background:var(--done); }
+  .dot.idle { background:var(--idle); }
+  @keyframes pulse { 0%,100% { box-shadow:0 0 0 0 rgba(232,180,90,.55); } 50% { box-shadow:0 0 0 6px rgba(232,180,90,0); } }
+  @media (prefers-reduced-motion:reduce){ .dot.question{ animation:none; } }
+  .board-main { padding:18px 20px; }
+  .chips { display:flex; flex-wrap:wrap; gap:8px; }
+  .chip { font-family:"JetBrains Mono",monospace; font-size:11.5px; padding:5px 10px; border-radius:6px;
+    border:1px solid var(--border); background:var(--bg-inset); color:var(--muted); display:flex; gap:7px; align-items:center; }
+  .chip .dot { width:6px; height:6px; }
+  .chip b { color:var(--text); font-weight:500; }
+  .qcard { margin-top:20px; border:1px solid var(--question); border-radius:10px; background:var(--bg-inset); padding:16px 18px; max-width:520px; }
+  .qcard .qhead { display:flex; align-items:center; gap:9px; font-family:"JetBrains Mono",monospace; font-size:12px; color:var(--question); letter-spacing:.06em; }
+  .qcard .qtext { font-size:15px; margin:10px 0 14px; color:var(--text); }
+  .qcard code { font-family:"JetBrains Mono",monospace; font-size:13px; color:var(--sand); background:var(--bg-elev); padding:2px 6px; border-radius:4px; }
+  .qactions { display:flex; gap:8px; }
+  .qbtn { font-family:"JetBrains Mono",monospace; font-size:12px; padding:7px 16px; border-radius:6px; cursor:pointer;
+    border:1px solid var(--border-active); background:var(--bg-elev); color:var(--text); }
+  .qbtn.yes { background:var(--done); border-color:var(--done); color:#12301C; font-weight:700; }
+  .qbtn:hover { filter:brightness(1.1); }
+  .rambar { height:4px; border-radius:2px; background:var(--border); margin-top:6px; width:120px; }
+  .rambar i { display:block; height:100%; border-radius:2px; background:var(--working); }
+
+  /* stats */
+  .stats { border-top:1px solid var(--border); border-bottom:1px solid var(--border); margin-top:64px; display:grid; grid-template-columns:repeat(4,1fr); }
+  .stat { padding:26px 26px 22px; border-left:1px solid var(--border); }
+  .stat:first-child { border-left:none; }
+  .stat .n { font-family:"Archivo",sans-serif; font-variation-settings:"wdth" 110; font-weight:800; font-size:34px; letter-spacing:-.01em; }
+  .stat .l { font-family:"JetBrains Mono",monospace; font-size:11px; letter-spacing:.16em; text-transform:uppercase; color:var(--muted); margin-top:4px; }
+  .stat .l b { color:var(--sand); font-weight:500; }
+
+  /* sections */
+  section.block { padding:96px 0; border-bottom:1px solid var(--border); }
+  section.block h2 { font-family:"Archivo","Inter",sans-serif; font-variation-settings:"wdth" 112; font-weight:800;
+    font-size:clamp(30px,4.4vw,44px); line-height:1.05; letter-spacing:-.015em; margin:14px 0 18px; max-width:22ch; }
+  section.block h2 em { font-style:normal; color:var(--primary-strong); }
+  section.block p.sub { color:var(--muted); max-width:60ch; margin-bottom:30px; font-size:17px; }
+  .statechip { display:inline-flex; align-items:center; gap:8px; font-family:"JetBrains Mono",monospace; font-size:11px;
+    letter-spacing:.14em; text-transform:uppercase; padding:4px 12px; border-radius:999px; border:1px solid var(--border); }
+  .statechip .dot { width:7px; height:7px; }
+  .two { display:grid; grid-template-columns:1fr 1fr; gap:48px; align-items:center; }
+  .shot { border:1px solid var(--border); border-radius:12px; background:var(--bg-inset); padding:20px; font-family:"JetBrains Mono",monospace; font-size:12.5px; color:var(--muted); }
+  .shot .l { padding:3px 0; white-space:pre; }
+  .c-primary { color:var(--primary); } .c-question { color:var(--question); } .c-done { color:var(--done); }
+  .c-blocked { color:var(--blocked); } .c-sand { color:var(--sand); } .c-dim { color:var(--idle); }
+  .pushcard { border:1px solid var(--border-active); border-radius:16px; background:var(--bg-elev); padding:16px; width:330px; }
+  .pushcard .app { display:flex; gap:8px; align-items:center; font-size:12px; color:var(--muted); }
+  .pushcard .title { font-size:13.5px; font-weight:600; margin:10px 0 4px; }
+  .pushcard .body { font-size:13.5px; color:var(--muted); margin-bottom:12px; }
+  .pushcard .body b { color:var(--text); font-weight:500; }
+  .pushcard .acts { display:flex; gap:8px; }
+  .featgrid { display:grid; grid-template-columns:repeat(3,1fr); gap:1px; background:var(--border); border:1px solid var(--border); border-radius:12px; overflow:hidden; margin-top:40px; }
+  .feat { background:var(--bg-elev); padding:26px 24px; }
+  .feat h3 { font-size:16px; font-weight:600; margin:10px 0 8px; }
+  .feat p { color:var(--muted); font-size:14px; }
+  .feat .k { font-family:"JetBrains Mono",monospace; font-size:11px; letter-spacing:.16em; text-transform:uppercase; color:var(--sand); }
+
+  /* comparison */
+  table.cmp { width:100%; border-collapse:collapse; margin-top:36px; font-size:14.5px; }
+  table.cmp th, table.cmp td { border:1px solid var(--border); padding:11px 14px; text-align:left; }
+  table.cmp th { font-family:"JetBrains Mono",monospace; font-size:11.5px; letter-spacing:.12em; text-transform:uppercase; color:var(--muted); background:var(--bg-elev); }
+  table.cmp td:first-child { color:var(--muted); }
+  table.cmp .yes { color:var(--done); font-weight:500; }
+  table.cmp .no { color:var(--idle); }
+
+  /* pricing */
+  .prices { display:grid; grid-template-columns:repeat(4,1fr); gap:1px; background:var(--border); border:1px solid var(--border); border-radius:12px; overflow:hidden; margin-top:40px; }
+  .price { background:var(--bg-elev); padding:24px 22px; }
+  .price .t { font-size:15px; font-weight:600; }
+  .price .p { font-family:"Archivo",sans-serif; font-variation-settings:"wdth" 110; font-weight:800; font-size:30px; margin:10px 0 8px; }
+  .price .p span { font-size:13px; color:var(--muted); font-family:"Inter",sans-serif; font-weight:400; }
+  .price ul { list-style:none; color:var(--muted); font-size:13px; }
+  .price li { padding:3px 0; }
+  .price.hl { background:var(--bg-inset); box-shadow:inset 0 0 0 1px var(--primary); }
+  .price .hl-tag { font-family:"JetBrains Mono",monospace; font-size:10.5px; letter-spacing:.14em; color:var(--primary); text-transform:uppercase; }
+
+  /* cta + footer */
+  .cta { padding:110px 0; text-align:center; }
+  .cta h2 { font-family:"Archivo","Inter",sans-serif; font-variation-settings:"wdth" 125; font-weight:800; font-size:clamp(34px,5.5vw,60px); letter-spacing:-.02em; }
+  .cta h2 em { font-style:normal; color:var(--primary-strong); }
+  footer { padding:44px 0 60px; color:var(--muted); font-size:13.5px; }
+  .foot-in { display:flex; gap:28px; align-items:center; flex-wrap:wrap; }
+  .foot-in a { color:var(--muted); border-bottom:1px solid transparent; }
+  .foot-in a:hover { color:var(--text); border-color:var(--border-active); }
+  .foot-in .right { margin-left:auto; color:var(--idle); font-family:"JetBrains Mono",monospace; font-size:12px; }
+
+  /* theme picker */
+  .themepick { position:fixed; right:20px; bottom:20px; z-index:20; display:flex; gap:6px; background:var(--bg-elev); border:1px solid var(--border-active); padding:7px; border-radius:999px; }
+  .themepick button { width:22px; height:22px; border-radius:50%; border:1px solid var(--border-active); cursor:pointer; }
+  .themepick button.sel { outline:2px solid var(--text); outline-offset:2px; }
+
+  @media (max-width:900px){ .two,.featgrid,.prices { grid-template-columns:1fr; } .stats{ grid-template-columns:repeat(2,1fr);} .stat:nth-child(odd){border-left:none;} .board-body{grid-template-columns:1fr;} .board-side{display:none;} }
+</style>
+</head>
+<body>
+
+<nav><div class="wrap nav-in">
+  <a class="logo" href="#">
+    <svg class="braid" viewBox="0 0 24 24" aria-hidden="true"><path d="M3 15c3-6 6-6 9 0s6 6 9 0"/><path d="M3 9c3 6 6 6 9 0s6-6 9 0"/></svg>
+    arreo
+  </a>
+  <div class="nav-links">
+    <a href="#moment">Docs</a><a href="#themes">Plugins</a><a href="#compare">Blog</a><a href="#pricing">Pricing</a>
+  </div>
+  <a class="btn" href="#install">Install</a>
+</div></nav>
+
+<header class="hero"><div class="wrap">
+  <div class="kicker">The agent runtime · Windows · Linux · macOS</div>
+  <h1>Run 30 agents.<br>Answer them <em>from anywhere.</em></h1>
+  <p class="lead">Arreo is where your coding agents live — a tiny Rust daemon that owns their
+  terminals on your server, with your phone watching every state. When one is blocked on a
+  question, you get it as a push. Answer from the lock screen. Nothing stops, nothing breaks,
+  and nobody — not even us — can read the traffic.</p>
+
+  <div class="install" id="install">
+    <span class="cmd"><span class="dollar">$ </span>curl -fsSL https://arreo.dev/install.sh <span class="pipe">|</span> sh</span>
+    <button>Copy</button>
+  </div>
+  <p class="meta-line">macOS · Linux · Windows · Apache-2.0 &nbsp;—&nbsp; <a href="#">homebrew, nix and manual install →</a><br>
+  <span style="margin-top:8px; display:inline-block;"><span class="tag-new">New</span> Self-host the whole relay, free — <a href="#">how the mesh works →</a></span></p>
+
+  <!-- status board mock -->
+  <div class="board" role="img" aria-label="Arreo status board with agents grouped by state">
+    <div class="board-bar">
+      <span class="dots"><span></span><span></span><span></span></span>
+      <span class="crumb">arreo · <b>all machines</b> · 30 agents</span>
+      <span class="rel">● relay eu-west · 12 ms</span>
+    </div>
+    <div class="board-body">
+      <div class="board-side">
+        <div class="grp">workbox · vps</div>
+        <div class="row"><span class="dot working"></span><span class="nm">pi-auth</span><span class="st">working</span></div>
+        <div class="row active"><span class="dot question"></span><span class="nm">codex-ci</span><span class="st" style="color:var(--question)">question</span></div>
+        <div class="row"><span class="dot blocked"></span><span class="nm">grok-refactor</span><span class="st">blocked</span></div>
+        <div class="row"><span class="dot done"></span><span class="nm">pi-docs</span><span class="st">done</span></div>
+        <div class="grp">raspberry · 5</div>
+        <div class="row"><span class="dot working"></span><span class="nm">omp-backfill</span><span class="st">working</span></div>
+        <div class="row"><span class="dot idle"></span><span class="nm">shell · logs</span><span class="st">idle</span></div>
+        <div class="grp" style="margin-top:22px;">harness RAM</div>
+        <div class="row" style="display:block;"><span class="st">arreo 118 MB / budget 120</span><div class="rambar"><i style="width:96%"></i></div></div>
+      </div>
+      <div class="board-main">
+        <div class="chips">
+          <span class="chip"><span class="dot working"></span><b>pi-auth</b> refactor auth · 342 MB</span>
+          <span class="chip"><span class="dot working"></span><b>omp-bench</b> running e2e · 214 MB</span>
+          <span class="chip"><span class="dot working"></span><b>codex-mesh</b> 512 MB</span>
+          <span class="chip"><span class="dot blocked"></span><b>grok-refactor</b> no prompt · 480 MB</span>
+          <span class="chip"><span class="dot done"></span><b>pi-docs</b> PR #118 open</span>
+          <span class="chip"><span class="dot idle"></span><b>shell · ci</b> watching</span>
+        </div>
+        <div class="qcard">
+          <div class="qhead"><span class="dot question" style="position:static"></span> workbox · codex-ci — question · 14 s</div>
+          <div class="qtext">May I run <code>sudo apt install libsqlite3-dev</code>? <span style="color:var(--muted)">(needs your answer)</span></div>
+          <div class="qactions"><button class="qbtn yes">Allow</button><button class="qbtn">Deny</button><button class="qbtn">Type an answer…</button></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- stats -->
+  <div class="stats">
+    <div class="stat"><div class="n">30</div><div class="l">agents per server <b>· tested</b></div></div>
+    <div class="stat"><div class="n">120 MB</div><div class="l">daemon RSS <b>· budgeted in CI</b></div></div>
+    <div class="stat"><div class="n">1</div><div class="l">pairing code <b>· 30 seconds, zero SSH</b></div></div>
+    <div class="stat"><div class="n">0</div><div class="l">agents lost to updates <b>· live handoff</b></div></div>
+  </div>
+</div></header>
+
+<section class="block" id="moment"><div class="wrap">
+  <div class="kicker">The moment</div>
+  <h2>It knows when an agent is <em>asking you.</em></h2>
+  <p class="sub" style="color:var(--muted); max-width:60ch;">Every harness blocks on questions — that's where your day goes. Arreo detects it natively
+  for Claude Code, Codex, opencode, Pi, OMP, Gemini and Grok, and by prompt-shape for
+  everything else. One state, pushed to every surface you own:</p>
+  <div class="two" style="margin-top:36px;">
+    <div class="pushcard">
+      <div class="app"><svg width="12" height="12" viewBox="0 0 16 16"><circle cx="8" cy="8" r="7" fill="#6FD3E8"/></svg> Arreo · workbox</div>
+      <div class="title"><span class="dot question" style="display:inline-block; position:static; margin-right:6px;"></span>codex-ci is asking</div>
+      <div class="body">May I run <code style="font-family:'JetBrains Mono',monospace; background:var(--bg-inset); padding:2px 6px; border-radius:4px;">sudo apt install</code>?</div>
+      <div class="acts"><button class="qbtn yes">Allow</button><button class="qbtn">Deny</button></div>
+    </div>
+    <div class="shot">
+      <div class="l"><span class="c-sand">▸</span> <span class="c-question">codex-ci · question</span> awaiting 14s</div>
+      <div class="l"><span class="c-dim">  may I run:</span> sudo apt install libsqlite3-dev</div>
+      <div class="l"> </div>
+      <div class="l"><span class="c-sand">▸</span> reply from phone · web · tui · another agent</div>
+      <div class="l"><span class="c-primary">›</span> allowed via push · audit #48210</div>
+      <div class="l"><span class="c-done">●</span> codex-ci → <span class="c-primary">working</span> · installing…</div>
+    </div>
+  </div>
+</div></section>
+
+<section class="block" id="mesh"><div class="wrap">
+  <div class="kicker">Machines</div>
+  <h2>Your VPS and your Raspberry Pi, <em>one herd.</em></h2>
+  <p class="sub" style="color:var(--muted); max-width:60ch;">Run a server on each machine and they appear as one fleet. Attach to any of them from any of them — or from the phone, or the web. Pair with a code; no SSH, no ports.</p>
+  <div class="shot" style="margin-top:34px;">
+    <div class="l"><span class="c-sand">$</span> arreo machines</div>
+    <div class="l"><span class="c-primary">●</span> workbox     VPS          · online · 12 agents · 2 asking</div>
+    <div class="l"><span class="c-primary">●</span> raspberry   RPi 5        · online · 8 agents · 0 asking</div>
+    <div class="l"><span class="c-dim">○</span> laptop      MacBook Pro  · offline · last seen 3 h ago</div>
+    <div class="l"><span class="c-sand">$</span> arreo attach raspberry      <span class="c-dim"># from the VPS, E2E, zero config</span></div>
+  </div>
+</div></section>
+
+<section class="block"><div class="wrap">
+  <div class="kicker">Fleet ops</div>
+  <h2>Things you shouldn't have to think about, <em>handled.</em></h2>
+  <div class="featgrid">
+    <div class="feat"><div class="k">config sync</div><h3>Edit a provider once</h3><p>Add a provider to <span class="mono">opencode.jsonc</span> on the VPS and it replicates to every machine — version vectors, conflict copies, secrets never leave the keychain.</p></div>
+    <div class="feat"><div class="k">updates</div><h3>Updated without a cut</h3><p>The new daemon inherits every PTY from the old one, live. If the handoff fails, the old daemon keeps serving. Agents never die; clients reattach in seconds.</p></div>
+    <div class="feat"><div class="k">resilience</div><h3>Two weeks offline, fine</h3><p>The relay queues everything — encrypted, 30 days — and device certs don't expire by age. Power it back on and the herd resumes like nothing happened.</p></div>
+    <div class="feat"><div class="k">security</div><h3>Zero inbound ports</h3><p>The daemon binds localhost only. All remote access is outbound QUIC with Noise-KK device certs. The relay stores ciphertext it cannot read.</p></div>
+    <div class="feat"><div class="k">resources</div><h3>RAM, per agent, enforced</h3><p>Live meters everywhere; hard caps via cgroups / Job Objects. A hungry agent gets throttled — and you get told.</p></div>
+    <div class="feat"><div class="k">plugins</div><h3>Sandboxed UI extensions</h3><p>WASM components with capability manifests: sidebar widgets, badges, custom panes, commands. Hot-loaded, throttled if misbehaving, never trusted with the render loop.</p></div>
+  </div>
+</div></section>
+
+<section class="block" id="themes"><div class="wrap">
+  <div class="kicker">Themes</div>
+  <h2>Try it right now — <em>this page themes.</em></h2>
+  <p class="sub" style="color:var(--muted); max-width:60ch;">One theme JSON drives the TUI, the phone and the web. Truecolor first, terminal-independent, graceful fallback. Switch palettes below — the same mechanism ships inside Arreo.</p>
+</div></section>
+
+<section class="block" id="compare"><div class="wrap">
+  <div class="kicker">Compare</div>
+  <h2>What nobody else combines.</h2>
+  <table class="cmp">
+    <tr><th></th><th>Arreo</th><th>tmux · zellij</th><th>desktop ADEs</th><th>dashboards</th></tr>
+    <tr><td>Work survives its UI closing</td><td class="yes">daemon owns the PTYs</td><td>detach</td><td>while the app runs</td><td>—</td></tr>
+    <tr><td>State: working · question · blocked · done</td><td class="yes">semantic, 3-tier detection</td><td class="no">—</td><td>partial</td><td>process status</td></tr>
+    <tr><td>Question pushes with quick actions</td><td class="yes">from any harness</td><td class="no">—</td><td>partial</td><td class="no">—</td></tr>
+    <tr><td>Multi-machine mesh, code pairing</td><td class="yes">no SSH, no ports</td><td class="no">—</td><td class="no">SSH only</td><td class="no">—</td></tr>
+    <tr><td>Per-agent RAM meters + hard caps</td><td class="yes">cgroups / Job Objects</td><td class="no">—</td><td class="no">—</td><td class="no">—</td></tr>
+    <tr><td>Updates that never kill an agent</td><td class="yes">live handoff</td><td class="no">no</td><td class="no">no</td><td class="no">—</td></tr>
+    <tr><td>Agents drive it (socket API + skill)</td><td class="yes">read · send · wait · spawn · metrics</td><td>scripting</td><td>app APIs</td><td>workflow APIs</td></tr>
+  </table>
+</div></section>
+
+<section class="block" id="pricing"><div class="wrap">
+  <div class="kicker">Pricing</div>
+  <h2>Free to self-host. <em>Free to try managed.</em></h2>
+  <div class="prices">
+    <div class="price"><div class="t">Self-host</div><div class="p">$0<span> forever</span></div>
+      <ul><li>Everything, unlimited agents</li><li>AGPL relay included</li><li>All features</li></ul></div>
+    <div class="price"><div class="t">Relay Free</div><div class="p">$0<span> no card</span></div>
+      <ul><li>Managed relay</li><li>2 machines · 7-day inbox</li><li>Push notifications</li></ul></div>
+    <div class="price hl"><div class="t">Personal</div><div class="p">$9<span> /mo</span></div>
+      <ul><li>Unlimited machines</li><li>30-day retention</li><li>Config sync</li><li>Devices UI</li></ul></div>
+    <div class="price"><div class="t">Pro</div><div class="p">$19<span> /mo</span></div>
+      <ul><li>Web dashboard</li><li>1-year metrics</li><li>Approval gates</li></ul></div>
+  </div>
+</div></section>
+
+<section class="cta"><div class="wrap">
+  <h2>Run 30 agents. <em>Herd them from your phone.</em></h2>
+  <p style="color:var(--muted); margin:18px 0 30px;">Windows · Linux · macOS · iOS · Android · Web — Apache-2.0</p>
+  <div class="install" style="display:inline-flex;">
+    <span class="cmd"><span class="dollar">$ </span>curl -fsSL https://arreo.dev/install.sh <span class="pipe">|</span> sh</span>
+    <button>Copy</button>
+  </div>
+</div></section>
+
+<footer><div class="wrap foot-in">
+  <a class="logo" style="font-size:15px" href="#"><svg class="braid" style="width:16px;height:16px" viewBox="0 0 24 24" aria-hidden="true"><path d="M3 15c3-6 6-6 9 0s6 6 9 0" fill="none" stroke="#6FD3E8" stroke-width="2.4" stroke-linecap="round"/><path d="M3 9c3 6 6 6 9 0s6-6 9 0" fill="none" stroke="#6FD3E8" stroke-width="2.4" stroke-linecap="round"/></svg> arreo</a>
+  <a href="#">Docs</a><a href="#">Security</a><a href="#">Threat model</a><a href="#">Source</a><a href="#">Pricing</a><a href="#">Discord</a>
+  <span class="right">© 2026 Arreo · Apache-2.0 (core) · AGPL-3.0 (relay)</span>
+</div></footer>
+
+<div class="themepick" role="group" aria-label="Theme">
+  <button title="arreo (default)" style="background:#121110" class="sel" onclick="setTheme('arreo',this)"></button>
+  <button title="tokyonight" style="background:#1A1B26" onclick="setTheme('tokyonight',this)"></button>
+  <button title="paper (light)" style="background:#F5F1E8" onclick="setTheme('paper',this)"></button>
+</div>
+
+<script>
+  function setTheme(name, btn){
+    if(name==='paper'){
+      document.documentElement.setAttribute('data-theme','arreo');
+      document.documentElement.style.setProperty('--bg','#FAF8F4'); document.documentElement.style.setProperty('--bg-elev','#FFFFFF');
+      document.documentElement.style.setProperty('--bg-inset','#F0ECE3'); document.documentElement.style.setProperty('--border','#E2DCD0');
+      document.documentElement.style.setProperty('--border-active','#CFC7B8'); document.documentElement.style.setProperty('--text','#26221C');
+      document.documentElement.style.setProperty('--muted','#7A7266'); document.documentElement.style.setProperty('--sand','#8A6F3C');
+      document.documentElement.style.setProperty('--primary','#0E7C97'); document.documentElement.style.setProperty('--primary-strong','#07607A');
+    } else {
+      document.documentElement.removeAttribute('style');
+      document.documentElement.setAttribute('data-theme', name);
+    }
+    document.querySelectorAll('.themepick button').forEach(b=>b.classList.remove('sel'));
+    btn.classList.add('sel');
+  }
+</script>
+</body>
+</html>
