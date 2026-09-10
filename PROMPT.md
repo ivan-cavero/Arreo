@@ -85,16 +85,26 @@ Rules:
   fails, what's left) resumable by a stranger with zero context.
 - If it isn't in the ledger, it didn't happen.
 
-## 3. Task protocol
+## 3. Task protocol — you own the backlog, with judgment
 
 - Pick from `tasks/` — highest priority with met dependencies and written acceptance
   criteria. Missing/ambiguous criteria is a **finding**: propose criteria in the ledger,
   mark `needs-criteria`, pick something else. Never invent requirements silently.
+- **You don't just consume the queue — you garden it** (the queue is a garden, not a wall):
+  - **Create** tasks when you find gaps, broken assumptions, or next steps nobody wrote —
+    criteria first, then the file (`T-0NNN-slug.md`, next free number, `proposed`), then
+    work. A task without written criteria doesn't start.
+  - **Split** oversized tasks (one worker-session each) and **merge** trivial ones — with
+    a ledger note explaining the judgment call.
+  - **Re-scope** when reality disagrees with the original scope — reason written into the
+    task file, never silently.
+  - **Retire** stale ones (`obsolete`, one-line why). Working a stale task out of respect
+    for the plan is worse than admitting the plan moved.
+  - When *decomposing a phase*, aim for breadth with **concrete numbers** — "generate
+    20–100 tasks", per the Cursor research; vague goals produce timid queues.
 - Each task file: goal, scope fence (files/crates), acceptance criteria, verification
   commands. Outside the fence = bug, even if it looks like an improvement.
-- When *planning* (decomposing a big task): **use concrete numbers** — "generate 20–100
-  tasks", not "many tasks"; vagueness produces timid default output. State intent, limits,
-  and priorities explicitly; don't rely on what's "obvious".
+- Update the tasks file's status as you go (`in-progress` → `done` with evidence links).
 - If `tasks/` is empty: consult ROADMAP phase exit criteria and write proposed tasks
   (flagged `proposed`) — 10–30 of them, sized for one worker session each.
 
@@ -157,8 +167,13 @@ research. Rules learned the hard way there apply here:
    `cargo xtask e2e --slice <s>`, `cargo clippy --workspace --all-targets` (zero warnings),
    `cargo xtask bench` on hot paths. Never write "done" without having *run* these against
    the final state of the code, this turn.
-3. **Three-OS humility.** You are on one OS. Portable code always; commit messages say what
-   was verified locally and what CI must confirm.
+3. **Three-OS reality (dev runs on Linux):** portability is proven in layers — (a)
+   `cargo xtask check-targets` (T-0010): build + clippy for windows-msvc (cargo-xwin) and
+   darwin targets (osxcross) on every commit; (b) real behavior verified on GitHub-hosted
+   runners (ubuntu/macos/windows) — free and unlimited on public repos, and the only
+   sanctioned way to *execute* macOS; Wine = quick checks only, never a shipping claim;
+   macOS-on-non-Apple VMs violate Apple's EULA — don't, and don't fake macOS results.
+   Commit messages state what was verified locally and what CI must confirm.
 4. **Work-unit commits.** One deliverable per commit, tests with code, `git commit -s`,
    outcome-focused messages. Small commits are crash recovery and review currency.
 5. **Perf budgets are executable law** (`perf-budget.toml`): regressions are fixed or parked
