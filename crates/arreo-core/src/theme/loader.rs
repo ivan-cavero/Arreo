@@ -33,8 +33,6 @@ pub enum LoadError {
         path: PathBuf,
         source: Box<SchemaError>,
     },
-    #[error("cannot read {path}: {detail}")]
-    Io { path: PathBuf, detail: String },
 }
 
 /// The themes available to this process, in load order.
@@ -45,9 +43,20 @@ pub struct Catalog {
 
 #[derive(Debug, Clone)]
 struct Entry {
-    raw: RawTheme,
+    /// `Err` when the file exists but could not be parsed — the theme stays in
+    /// the catalog so the picker can offer it and report *why* it is broken,
+    /// instead of vanishing without explanation.
+    raw: Result<RawTheme, Box<SchemaError>>,
     /// `None` for built-ins; the file path for anything on disk.
     path: Option<PathBuf>,
+}
+
+impl Entry {
+    fn describe_path(&self) -> PathBuf {
+        self.path
+            .clone()
+            .unwrap_or_else(|| PathBuf::from("<builtin>"))
+    }
 }
 
 impl Catalog {
@@ -58,16 +67,25 @@ impl Catalog {
         for (name, json) in BUILTINS {
             let raw: RawTheme = serde_json::from_str(json)
                 .unwrap_or_else(|e| panic!("built-in theme {name} is not valid JSON: {e}"));
-            catalog
-                .entries
-                .insert((*name).to_string(), Entry { raw, path: None });
+            catalog.entries.insert(
+                (*name).to_string(),
+                Entry {
+                    raw: Ok(raw),
+                    path: None,
+                },
+            );
         }
         catalog
     }
 
     /// Built-ins plus every `*.json` in the given directories, later wins.
-    /// A missing directory is not an error (most users have neither).
-    pub fn discover(dirs: &[PathBuf]) -> Result<Self, LoadError> {
+    ///
+    /// A missing directory is not an error (most users have neither), and a
+    /// single broken file does not invalidate the others: the unreadable file
+    /// is kept as a broken entry so selecting it says what is wrong, while
+    /// every valid theme still loads.
+    #[must_use]
+    pub fn discover(dirs: &[PathBuf]) -> Self {
         let mut catalog = Self::builtin();
         for dir in dirs {
             let Ok(read) = std::fs::read_dir(dir) else {
@@ -86,19 +104,28 @@ impl Catalog {
                     .file_stem()
                     .map(|stem| stem.to_string_lossy().to_string())
                     .unwrap_or_default();
-                let text = std::fs::read_to_string(&path).map_err(|e| LoadError::Io {
-                    path: path.clone(),
-                    detail: e.to_string(),
-                })?;
-                let raw: RawTheme =
-                    serde_json::from_str(&text).map_err(|e| LoadError::Invalid {
+                let text = match std::fs::read_to_string(&path) {
+                    Ok(text) => text,
+                    Err(e) => {
+                        catalog.entries.insert(
+                            name.clone(),
+                            Entry {
+                                raw: Err(Box::new(SchemaError::Unreadable {
+                                    theme: name,
+                                    detail: e.to_string(),
+                                })),
+                                path: Some(path),
+                            },
+                        );
+                        continue;
+                    }
+                };
+                let raw = serde_json::from_str(&text).map_err(|e| {
+                    Box::new(SchemaError::Json {
                         theme: name.clone(),
-                        path: path.clone(),
-                        source: Box::new(SchemaError::Json {
-                            theme: name.clone(),
-                            detail: e.to_string(),
-                        }),
-                    })?;
+                        detail: e.to_string(),
+                    })
+                });
                 catalog.entries.insert(
                     name,
                     Entry {
@@ -108,7 +135,20 @@ impl Catalog {
                 );
             }
         }
-        Ok(catalog)
+        catalog
+    }
+
+    /// Every theme file that failed to load, with its reason (the TUI shows
+    /// these; `None` means everything in the catalog parsed).
+    #[must_use]
+    pub fn broken(&self) -> Vec<(String, String)> {
+        self.entries
+            .iter()
+            .filter_map(|(name, entry)| match &entry.raw {
+                Err(error) => Some((name.clone(), error.to_string())),
+                Ok(_) => None,
+            })
+            .collect()
     }
 
     /// Search path: user config, the project root, then the working
@@ -168,24 +208,23 @@ impl Catalog {
             name: name.to_string(),
             available: Catalog::builtin_names().join(", "),
         })?;
-        let path = entry
-            .path
-            .clone()
-            .unwrap_or_else(|| PathBuf::from("<builtin>"));
-        let mut colors = validate(name, &path, &entry.raw, variant)?;
+        let path = entry.describe_path();
+        let raw = entry.raw.as_ref().map_err(|source| LoadError::Invalid {
+            theme: name.to_string(),
+            path: path.clone(),
+            source: source.clone(),
+        })?;
+        let mut colors = validate(name, &path, raw, variant)?;
         // Partial themes inherit the rest of the base look, so a theme file
         // with three tokens is a valid theme, not a broken window.
         if name != BASE_THEME {
-            if let Some(base) = self.entries.get(BASE_THEME) {
-                let base_colors = validate(
-                    BASE_THEME,
-                    &base
-                        .path
-                        .clone()
-                        .unwrap_or_else(|| PathBuf::from("<builtin>")),
-                    &base.raw,
-                    variant,
-                )?;
+            if let Some(Ok(base)) = self.entries.get(BASE_THEME).map(|entry| &entry.raw) {
+                let base_path = self
+                    .entries
+                    .get(BASE_THEME)
+                    .map(Entry::describe_path)
+                    .unwrap_or_else(|| PathBuf::from("<builtin>"));
+                let base_colors = validate(BASE_THEME, &base_path, base, variant)?;
                 for (token, color) in base_colors {
                     colors.entry(token).or_insert(color);
                 }
@@ -300,7 +339,7 @@ mod tests {
             r##"{ "theme": { "primary": "#ff0000" } }"##,
         )
         .expect("write");
-        let catalog = Catalog::discover(std::slice::from_ref(&dir)).expect("discover");
+        let catalog = Catalog::discover(std::slice::from_ref(&dir));
         let theme = catalog
             .theme_with_depth("mine", Variant::Dark, Depth::Truecolor)
             .expect("loads");
@@ -327,7 +366,7 @@ mod tests {
             r##"{ "theme": { "primary": "#222222" } }"##,
         )
         .expect("write");
-        let catalog = Catalog::discover(&[user.clone(), project.clone()]).expect("discover");
+        let catalog = Catalog::discover(&[user.clone(), project.clone()]);
         assert_eq!(
             catalog.source("brand"),
             Some(project.join("brand.json").as_path())
@@ -348,7 +387,7 @@ mod tests {
             r##"{ "theme": { "primry": "#fff" } }"##,
         )
         .expect("write");
-        let catalog = Catalog::discover(std::slice::from_ref(&dir)).expect("discover is lazy");
+        let catalog = Catalog::discover(std::slice::from_ref(&dir));
         match catalog.theme_with_depth("bad", Variant::Dark, Depth::Truecolor) {
             Err(LoadError::Invalid { source, path, .. }) => {
                 assert!(path.ends_with("bad.json"));
@@ -392,5 +431,71 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("tempdir");
         dir
+    }
+}
+
+#[cfg(test)]
+mod resilience_tests {
+    use super::*;
+
+    #[test]
+    fn one_broken_file_does_not_hide_the_others() {
+        let dir = std::env::temp_dir().join(format!("arreo-theme-mixed-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("tempdir");
+        std::fs::write(
+            dir.join("good.json"),
+            r##"{ "theme": { "primary": "#123456" } }"##,
+        )
+        .expect("write");
+        std::fs::write(dir.join("bad.json"), "{ not json").expect("write");
+        std::fs::write(
+            dir.join("typo.json"),
+            r##"{ "theme": { "primry": "#fff" } }"##,
+        )
+        .expect("write");
+
+        let catalog = Catalog::discover(std::slice::from_ref(&dir));
+        // The valid theme still loads...
+        let good = catalog
+            .theme_with_depth("good", Variant::Dark, Depth::Truecolor)
+            .expect("good theme loads despite its broken neighbours");
+        assert_eq!(good.color("primary"), Color::Rgb(0x12, 0x34, 0x56));
+        // ...and the unparseable one is named, not hidden.
+        let broken: Vec<String> = catalog.broken().into_iter().map(|(name, _)| name).collect();
+        assert_eq!(broken, vec!["bad".to_string()], "{broken:?}");
+        // A file that parses but names an unknown token is a *selection* error
+        // (the picker shows it); it must not be silent either.
+        let err = catalog
+            .theme_with_depth("typo", Variant::Dark, Depth::Truecolor)
+            .expect_err("typo must fail");
+        assert!(err.to_string().contains("primry"), "{err}");
+        // Broken themes still appear in the picker (so a user can see them).
+        let names = catalog.names();
+        assert!(names.contains(&"typo".to_string()) && names.contains(&"good".to_string()));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn an_unreadable_file_is_reported_as_such() {
+        let dir = std::env::temp_dir().join(format!("arreo-theme-perm-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("tempdir");
+        let path = dir.join("locked.json");
+        std::fs::write(&path, r##"{ "theme": { "primary": "#fff" } }"##).expect("write");
+        // A directory named like a theme file is unreadable as a file and is
+        // the portable way to force the read error.
+        let weird = dir.join("isdir.json");
+        std::fs::create_dir_all(&weird).expect("mkdir");
+        let catalog = Catalog::discover(std::slice::from_ref(&dir));
+        let broken = catalog.broken();
+        assert!(
+            broken
+                .iter()
+                .any(|(name, reason)| name == "isdir" && reason.contains("could not be read")),
+            "{broken:?}"
+        );
+        assert!(catalog.contains("locked"), "the readable theme disappeared");
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

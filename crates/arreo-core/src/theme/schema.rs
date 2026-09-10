@@ -142,6 +142,8 @@ pub struct RawTheme {
 pub enum SchemaError {
     #[error("theme {theme:?} is not valid JSON: {detail}")]
     Json { theme: String, detail: String },
+    #[error("theme {theme:?} could not be read: {detail}")]
+    Unreadable { theme: String, detail: String },
     #[error("theme {theme:?} defines unknown token {token:?} (known: {hint})")]
     UnknownToken {
         theme: String,

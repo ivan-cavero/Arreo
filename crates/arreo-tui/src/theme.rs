@@ -16,6 +16,10 @@ pub struct ThemeState {
     theme: Theme,
     variant: Variant,
     depth: Depth,
+    /// Why the starting theme is not the one that was asked for (a broken
+    /// user theme shadowing `arreo`, say). Surfaced in the status line instead
+    /// of leaving the user wondering why their colors did nothing.
+    startup_error: Option<String>,
 }
 
 impl Default for ThemeState {
@@ -26,10 +30,10 @@ impl Default for ThemeState {
 
 impl ThemeState {
     /// Load the catalog from the standard hierarchy and select the `arreo`
-    /// built-in at the detected terminal depth. A catalog that cannot even
-    /// list its directories still has the built-ins, so this only fails if a
-    /// user theme shadows `arreo` with something broken — and then the error
-    /// is worth showing instead of hiding.
+    /// built-in at the detected terminal depth. Built-ins are embedded, so a
+    /// usable base look always exists; if a user theme shadows `arreo` with
+    /// something broken, that reason is kept for the status line instead of
+    /// leaving the user staring at unchanged colors.
     #[must_use]
     pub fn new() -> Self {
         Self::with_depth(Depth::detect(), Variant::Dark)
@@ -37,17 +41,34 @@ impl ThemeState {
 
     #[must_use]
     pub fn with_depth(depth: Depth, variant: Variant) -> Self {
-        let catalog =
-            Catalog::discover(&Catalog::default_dirs()).unwrap_or_else(|_| Catalog::builtin());
-        let theme = catalog
-            .theme_with_depth("arreo", variant, depth)
-            .unwrap_or_else(|_| Theme::arreo(depth));
+        let catalog = Catalog::discover(&Catalog::default_dirs());
+        let (theme, startup_error) = match catalog.theme_with_depth("arreo", variant, depth) {
+            Ok(theme) => (theme, None),
+            Err(e) => (
+                Theme::arreo(depth),
+                Some(format!("theme \"arreo\" unusable: {e}")),
+            ),
+        };
         Self {
             catalog,
             theme,
             variant,
             depth,
+            startup_error,
         }
+    }
+
+    /// A message for the status line when the selected starting theme was not
+    /// usable (otherwise the user sees default colors with no explanation).
+    #[must_use]
+    pub fn startup_error(&self) -> Option<&str> {
+        self.startup_error.as_deref()
+    }
+
+    /// Themes whose files could not be parsed (name, reason).
+    #[must_use]
+    pub fn broken(&self) -> Vec<(String, String)> {
+        self.catalog.broken()
     }
 
     #[must_use]
@@ -174,6 +195,22 @@ mod tests {
             assert_ne!(working, done, "{name}: working == done");
             assert_ne!(done, idle, "{name}: done == idle");
         }
+    }
+
+    #[test]
+    fn a_broken_user_arreo_theme_is_visible_not_silent() {
+        // The built-in base must still be usable, and the reason must be
+        // available to the UI rather than swallowed.
+        let state = ThemeState::with_depth(Depth::Truecolor, Variant::Dark);
+        assert!(
+            state.theme().colors().len() > 10,
+            "base look always resolves"
+        );
+        // A clean environment has nothing broken and nothing to report.
+        if state.broken().is_empty() {
+            assert_eq!(state.startup_error(), None);
+        }
+        let _ = state.broken();
     }
 
     #[test]

@@ -129,6 +129,9 @@ async fn run(
             // A bad --theme is worth saying out loud, not silently ignoring.
             app.status = format!("theme {name:?}: {e}");
         }
+    } else if let Some(problem) = app.theme.startup_error() {
+        // Same rule for a broken user theme shadowing the default.
+        app.status = problem.to_string();
     }
     // Daemon traffic lives in its own task: a slow socket must never delay
     // input. The UI loop only drains events and applies finished snapshots.
