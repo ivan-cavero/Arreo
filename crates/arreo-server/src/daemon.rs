@@ -87,20 +87,66 @@ pub type Registry = Arc<RwLock<HashMap<String, Arc<PaneEntry>>>>;
 pub struct Daemon {
     registry: Registry,
     socket: PathBuf,
+    db: PathBuf,
 }
 
 impl Daemon {
     #[must_use]
     pub fn new(socket: &Path) -> Self {
+        let db = super::persist::db_path_for(socket);
         Self {
             registry: Arc::new(RwLock::new(HashMap::new())),
             socket: socket.to_path_buf(),
+            db,
         }
     }
 
     #[must_use]
     pub fn registry(&self) -> Registry {
         Arc::clone(&self.registry)
+    }
+
+    /// Restore persisted panes into the registry (called at boot, before
+    /// serving). Failures restore partially (bad records skipped loudly) —
+    /// a corrupt DB never blocks the daemon.
+    async fn restore_boot(&self) {
+        match super::persist::restore(&self.db) {
+            Ok(pairs) => {
+                if pairs.is_empty() {
+                    return;
+                }
+                let mut registry = self.registry.write().await;
+                for (id, pane) in pairs {
+                    if registry.contains_key(&id) {
+                        continue;
+                    }
+                    registry.insert(id, Arc::new(PaneEntry::new(pane)));
+                }
+                eprintln!(
+                    "daemon: restored {} pane(s) from {}",
+                    registry.len(),
+                    self.db.display()
+                );
+            }
+            Err(e) => {
+                eprintln!("daemon: restore failed (starting empty): {e}");
+            }
+        }
+    }
+
+    /// Snapshot the registry to disk (spawn/kill/shutdown callers). Errors
+    /// are logged, never fatal — persistence is best-effort per op.
+    pub async fn snapshot(&self) {
+        let panes: Vec<(String, Arc<Pane>)> = self
+            .registry
+            .read()
+            .await
+            .iter()
+            .map(|(id, entry)| (id.clone(), Arc::clone(&entry.pane)))
+            .collect();
+        if let Err(e) = super::persist::snapshot(&panes, &self.db) {
+            eprintln!("daemon: snapshot failed: {e}");
+        }
     }
 
     /// Serve forever (until the listener errors fatally). Removes a stale
@@ -115,11 +161,14 @@ impl Daemon {
         }
         let _ = std::fs::remove_file(&self.socket);
         let listener = UnixListener::bind(&self.socket)?;
+        // Boot restore BEFORE serving: crash survivors reappear with history.
+        self.restore_boot().await;
         loop {
             let (stream, _) = listener.accept().await?;
             let registry = Arc::clone(&self.registry);
+            let db = self.db.clone();
             tokio::spawn(async move {
-                if let Err(e) = handle(stream, registry).await {
+                if let Err(e) = handle(stream, registry, db).await {
                     eprintln!("daemon: connection error: {e}");
                 }
             });
@@ -188,7 +237,7 @@ async fn read_message(
 
 /// Connection handler: Hello→Welcome handshake, then verbs. Attach/Resume
 /// own the connection while streaming (v0 semantics, T-0009 F4).
-async fn handle(stream: UnixStream, registry: Registry) -> Result<(), DaemonError> {
+async fn handle(stream: UnixStream, registry: Registry, db: PathBuf) -> Result<(), DaemonError> {
     let (mut reader, mut writer) = stream.into_split();
     let mut buf = Vec::new();
 
@@ -275,7 +324,29 @@ async fn handle(stream: UnixStream, registry: Registry) -> Result<(), DaemonErro
             }
             _ => {}
         }
-        if let Some(reply) = dispatch(&message, &registry).await {
+        let reply = dispatch(&message, &registry, &db).await;
+        // Persistence: spawn/kill/split mutate the registry — snapshot after
+        // them so the DB always reflects the current topology. Async task
+        // (never blocks the connection); failures logged, never fatal.
+        if matches!(message, Message::Spawn { .. })
+            || matches!(message, Message::Kill { .. })
+            || matches!(message, Message::Split { .. })
+        {
+            let registry = Arc::clone(&registry);
+            let db = db.clone();
+            tokio::spawn(async move {
+                let panes: Vec<(String, Arc<Pane>)> = registry
+                    .read()
+                    .await
+                    .iter()
+                    .map(|(id, entry)| (id.clone(), Arc::clone(&entry.pane)))
+                    .collect();
+                if let Err(e) = super::persist::snapshot(&panes, &db) {
+                    eprintln!("daemon: snapshot failed: {e}");
+                }
+            });
+        }
+        if let Some(reply) = reply {
             write_message(&mut writer, &reply).await?;
         }
     }
@@ -324,9 +395,22 @@ fn not_found(id: &str) -> Message {
     }
 }
 
+/// Append one audit row for a sent prompt (best-effort: failures logged).
+fn audit_send(db: &Path, id: &str, data: &str) {
+    if let Ok(store) = arreo_core::store::SessionStore::open(db) {
+        let now = now_ms();
+        let _ = store.audit(arreo_core::store::AuditEvent {
+            ts_ms: now,
+            device: "cli".to_string(),
+            agent: id.to_string(),
+            prompt: data.to_string(),
+        });
+    }
+}
+
 /// One-shot verbs. Returns `None` when the verb streams instead (handled by
 /// the caller). Every arm checks the version first — loud, never silent.
-async fn dispatch(message: &Message, registry: &Registry) -> Option<Message> {
+async fn dispatch(message: &Message, registry: &Registry, db: &Path) -> Option<Message> {
     match message {
         Message::Spawn {
             v,
@@ -397,6 +481,10 @@ async fn dispatch(message: &Message, registry: &Registry) -> Option<Message> {
                 Some(entry) => match entry.pane.send(data.as_bytes()) {
                     Ok(()) => {
                         entry.pump(now_ms());
+                        // Audit every prompt (device="cli" pre-auth; device
+                        // certs land with pairing). Redaction happens inside
+                        // `audit()` — key material never touches disk.
+                        audit_send(db, id, data);
                         Some(Message::Ok { v: VERSION })
                     }
                     Err(e) => Some(Message::Error {

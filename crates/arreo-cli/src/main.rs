@@ -25,6 +25,7 @@ fn usage() -> ExitCode {
     eprintln!("  arreo metrics <id> [--socket PATH]   (pane query; --pid <PID> samples locally)");
     eprintln!("  arreo service install|uninstall|status [--socket PATH]");
     eprintln!("  arreo server stop [--socket PATH]   (graceful: drain + exit 0)");
+    eprintln!("  arreo audit [--limit N] [--socket PATH]   (append-only log, secrets redacted)");
     ExitCode::from(2)
 }
 
@@ -57,6 +58,7 @@ fn main() -> ExitCode {
         Some("send") => rt::block_on(cmd_send(&args[2..])),
         Some("service") => cmd_service(&args[2..]),
         Some("server") => rt::block_on(cmd_server(&args[2..])),
+        Some("audit") => cmd_audit(&args[2..]),
         _ => usage(),
     }
 }
@@ -995,6 +997,60 @@ async fn cmd_pane_metrics(rest: &[String]) -> ExitCode {
         }
         Err(e) => {
             eprintln!("metrics: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// `arreo audit [--limit N]`: print the append-only audit log (newest last).
+/// Reads the sidecar DB directly (no daemon round-trip — the log outlives
+/// the daemon by design). Secrets are already redacted at write time.
+fn cmd_audit(rest: &[String]) -> ExitCode {
+    let (socket, kept) = take_socket(rest);
+    let mut limit = 50usize;
+    let mut i = 0;
+    while i < kept.len() {
+        match kept[i].as_str() {
+            "--limit" if i + 1 < kept.len() => {
+                limit = kept[i + 1].parse().unwrap_or(50).max(1);
+                i += 2;
+            }
+            _ => {
+                eprintln!("usage: arreo audit [--limit N] [--socket PATH]");
+                return ExitCode::from(2);
+            }
+        }
+    }
+    let mut db = socket.into_os_string();
+    db.push(".db");
+    let db = PathBuf::from(db);
+    if !db.exists() {
+        eprintln!("audit: no log yet (no prompts sent through this daemon)");
+        return ExitCode::SUCCESS;
+    }
+    let store = match arreo_core::store::SessionStore::open(&db) {
+        Ok(store) => store,
+        Err(e) => {
+            eprintln!("audit: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    match store.audit_recent(limit) {
+        Ok(events) => {
+            for event in events.iter().rev() {
+                println!(
+                    "{} {} {} {}{}",
+                    event.ts_ms,
+                    event.device,
+                    event.agent,
+                    if event.redacted { "[redacted] " } else { "" },
+                    event.prompt.lines().next().unwrap_or("")
+                );
+            }
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("audit: {e}");
             ExitCode::FAILURE
         }
     }

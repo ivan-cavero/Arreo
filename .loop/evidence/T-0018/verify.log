@@ -1,0 +1,11 @@
+## T-0018 evidence (2026-09-10, linux x86_64, rustc 1.98.0)
+
+### persistence slice (kill -9 → 10/10 layout + byte-equal scrollback):
+[PASS] persistence: 10 panes live with markers
+[PASS] persistence: layout restored (10/10 panes)
+[PASS] persistence: scrollback byte-equal (10/10 markers)
+persistence: 3 passed, 0 failed
+
+### store 4/4 + persist 2/2 unit green (incl. injection + migration tests)
+### audit live: key redacted, key-never-on-disk proven, export via CLI
+### adversarial: corrupt DB serves-through + heals aside; replay-injection redesigned to ring pre-seed

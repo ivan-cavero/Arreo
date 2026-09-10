@@ -35,5 +35,7 @@ jobs:
         run: cargo run -p xtask -- e2e --slice lifecycle
       - name: adapters (T-0017 — registry lint + fixture replays)
         run: cargo run -p xtask -- adapters --check
+      - name: persistence (T-0018 — kill -9 restore + audit)
+        run: cargo run -p xtask -- e2e --slice persistence
       - name: xtask stubs
         run: cargo xtask e2e

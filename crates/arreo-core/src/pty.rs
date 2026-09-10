@@ -110,6 +110,19 @@ impl RingBuffer {
         self.lines.push_back(line);
     }
 
+    /// Pre-seed restored history (T-0018): push lines directly into the ring
+    /// WITHOUT touching the PTY. This is the ONLY safe restore mechanism —
+    /// typing history as keystrokes would EXECUTE metachar lines in the fresh
+    /// shell (proven hazard, T-0018 adversarial pass). Restored lines read
+    /// back through `drain()` ahead of live output, byte-identical.
+    pub fn prepend_history(&mut self, history: &[String]) {
+        // Oldest first, through the same bounded path (capacity respected,
+        // oldest restored lines evict first if history exceeds capacity).
+        for line in history {
+            self.push_line(line.clone());
+        }
+    }
+
     /// Flush an unterminated trailing partial line (e.g. a shell prompt).
     pub fn flush_partial(&mut self) {
         if !self.pending.is_empty() {
@@ -315,6 +328,15 @@ impl Pane {
             .lock()
             .map(|b| (b.raw_bytes(), b.raw_truncated()))
             .unwrap_or_default()
+    }
+
+    /// Restore pre-crash history into the ring (T-0018). Safe: bypasses the
+    /// PTY entirely (see `prepend_history` — keystroke replay would execute
+    /// metachar lines). Call immediately after spawn, before live output.
+    pub fn restore_history(&self, history: &[String]) {
+        if let Ok(mut buf) = self.buffer.lock() {
+            buf.prepend_history(history);
+        }
     }
 
     #[must_use]

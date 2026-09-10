@@ -46,9 +46,21 @@ async fn main() {
         signal = shutdown_signal() => {
             eprintln!("arreo-server: {signal} received, draining...");
             let drained = drain(&registry).await;
+            // Persist the final topology (post-T-0018: restart restores it).
+            let panes: Vec<(String, std::sync::Arc<arreo_core::pty::Pane>)> = registry
+                .read()
+                .await
+                .iter()
+                .map(|(id, entry)| (id.clone(), std::sync::Arc::clone(&entry.pane)))
+                .collect();
+            let db = arreo_server::db_path_for(&socket_path);
+            if let Err(e) = arreo_server::snapshot(&panes, &db) {
+                eprintln!("arreo-server: final snapshot failed: {e}");
+            }
             eprintln!(
                 "arreo-server: drained {drained} pane(s), exiting cleanly \
-                 (children keep running; T-0018 re-attaches on restart)"
+                 (children keep running; restart restores from {})",
+                db.display()
             );
             let _ = std::fs::remove_file(&socket_path);
             std::process::exit(0);

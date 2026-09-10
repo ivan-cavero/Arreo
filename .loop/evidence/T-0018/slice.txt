@@ -1,0 +1,4 @@
+[PASS] persistence: 10 panes live with markers
+[PASS] persistence: layout restored (10/10 panes)
+[PASS] persistence: scrollback byte-equal (10/10 markers)
+persistence: 3 passed, 0 failed

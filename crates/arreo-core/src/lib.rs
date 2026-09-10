@@ -10,4 +10,6 @@ pub mod metrics;
 pub mod proto;
 pub mod pty;
 pub mod state;
+#[cfg(feature = "sqlite")]
+pub mod store;
 pub mod vt;
