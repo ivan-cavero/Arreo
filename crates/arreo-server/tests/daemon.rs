@@ -299,3 +299,21 @@ async fn kill_terminates_and_reaps_the_child() {
         .await;
     assert!(matches!(client.recv().await, Response::Error { .. }));
 }
+
+/// Regression for the T-0009 chaos find: `Pane::spawn` (fork) hung when
+/// called on a multi-threaded tokio worker. The daemon now spawns via
+/// `spawn_blocking` — this test runs the whole serve+spawn cycle on a
+/// multi-thread runtime, where the old code deadlocked.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn spawn_answers_on_multithread_runtime() {
+    let socket = temp_socket("mt");
+    let _server = spawn_daemon(socket.clone()).await;
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    let mut client = Client::connect(&socket).await;
+    client.send(&spawn_req("mt-pane")).await;
+    let reply = tokio::time::timeout(std::time::Duration::from_secs(10), client.recv())
+        .await
+        .expect("spawn answers (no fork deadlock)");
+    assert!(matches!(reply, Response::Ok { .. }), "got {reply:?}");
+}

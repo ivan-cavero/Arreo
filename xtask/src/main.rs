@@ -9,6 +9,7 @@ use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
 mod bench;
+mod chaos;
 mod check_targets;
 
 fn main() -> ExitCode {
@@ -21,7 +22,7 @@ fn main() -> ExitCode {
         }
     };
     match cmd {
-        "e2e" => stub(cmd, rest),
+        "e2e" => e2e(rest),
         "bench" => bench::bench(rest),
         "conpty-smoke" => conpty_smoke(rest),
         "check-targets" => check_targets::check_targets(rest),
@@ -30,6 +31,21 @@ fn main() -> ExitCode {
             eprintln!("usage: xtask <e2e|bench|conpty-smoke|check-targets> [options]");
             ExitCode::from(2)
         }
+    }
+}
+
+fn e2e(rest: &[String]) -> ExitCode {
+    let slice = rest
+        .windows(2)
+        .find(|w| w[0] == "--slice")
+        .map(|w| w[1].as_str());
+    match slice {
+        Some("chaos") => chaos::run(rest),
+        Some(other) => {
+            eprintln!("xtask e2e: unknown slice {other:?} (have: chaos)");
+            ExitCode::from(2)
+        }
+        None => stub("e2e", rest),
     }
 }
 

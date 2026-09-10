@@ -1,0 +1,8 @@
+[PASS] mid-write-kill (741.975932ms): mid-write kill: journal intact (1892 bytes, 200 lines)
+[PASS] resize-spam (349.142776ms): resize spam: 10000 ok, final 119x43, output intact
+[PASS] giant-line (1.637560706s): giant line: ring 1114112B + vt 11776B, drops counted
+[PASS] binary-garbage (63.545684ms): binary garbage: 8 cases, no panic, history intact
+[PASS] racing-senders (562.215888ms): racing senders: 8x25 ok, 400 lines, bounded
+[PASS] attach-disconnect (665.61645ms): attach disconnect: reattach intact, daemon healthy
+[PASS] fuzz-corpus (9.647392s): deterministic fuzz: 4000 iters, 131671 bytes, seed 0x5eedc0de, no panic, bounded
+chaos: 7 passed, 0 failed

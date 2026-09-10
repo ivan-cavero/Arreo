@@ -121,7 +121,12 @@ impl Engine {
             let visible = strip_ansi(bytes);
             self.text.push_str(&visible);
             if self.text.len() > TEXT_CAP {
-                let drop = self.text.len() - TEXT_CAP;
+                // Floor to a char boundary: byte truncation can split a
+                // multibyte char (chaos-found panic: is_char_boundary).
+                let mut drop = self.text.len() - TEXT_CAP;
+                while drop > 0 && !self.text.is_char_boundary(drop) {
+                    drop -= 1;
+                }
                 self.text.drain(..drop);
             }
             if self.adapter.match_error(&visible) {

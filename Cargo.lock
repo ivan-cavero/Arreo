@@ -1036,6 +1036,8 @@ name = "xtask"
 version = "0.1.0"
 dependencies = [
  "arreo-core",
+ "arreo-server",
+ "tokio",
 ]
 
 [[package]]

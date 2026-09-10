@@ -162,13 +162,29 @@ async fn dispatch(request: &Request, registry: &Registry) -> Response {
             if let Err(response) = check_version(*v) {
                 return response;
             }
-            let args_ref: Vec<&str> = args.iter().map(String::as_str).collect();
-            let pane = match Pane::spawn(program, &args_ref, *cols, *rows) {
-                Ok(pane) => Arc::new(pane),
-                Err(e) => {
+            // Fork off the async worker: posix_openpt+fork inside a
+            // multi-threaded tokio worker can hang (chaos-found, T-0009).
+            // spawn_blocking runs it on a dedicated thread instead.
+            let program = program.clone();
+            let args_owned = args.clone();
+            let (cols, rows) = (*cols, *rows);
+            let spawned = tokio::task::spawn_blocking(move || {
+                let args_ref: Vec<&str> = args_owned.iter().map(String::as_str).collect();
+                Pane::spawn(&program, &args_ref, cols, rows)
+            })
+            .await;
+            let pane = match spawned {
+                Ok(Ok(pane)) => Arc::new(pane),
+                Ok(Err(e)) => {
                     return Response::Error {
                         v: VERSION,
                         message: format!("spawn failed: {e}"),
+                    };
+                }
+                Err(e) => {
+                    return Response::Error {
+                        v: VERSION,
+                        message: format!("spawn task failed: {e}"),
                     };
                 }
             };

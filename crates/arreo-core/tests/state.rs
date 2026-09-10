@@ -216,3 +216,14 @@ fn done_is_terminal_and_unknown_never_emits() {
     assert!(fresh.tick(999_999).is_empty());
     assert_eq!(*fresh.state(), State::Unknown);
 }
+
+#[test]
+fn multibyte_truncation_never_panics() {
+    // Chaos-found (T-0009): TEXT_CAP drain split a multibyte char.
+    let mut engine = Engine::new(Adapter::default(), 0);
+    let chunk = "日本語✓".repeat(20000).into_bytes();
+    for (i, piece) in chunk.chunks(1024).enumerate() {
+        engine.feed(piece, i as u64 * 10);
+    }
+    let _ = engine.tick(999_999);
+}

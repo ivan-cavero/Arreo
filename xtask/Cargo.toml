@@ -12,3 +12,5 @@ rust-version.workspace = true
 # from re-enabling `sqlite` via feature unification. Normal builds still get
 # the store through arreo-core's own default.
 arreo-core = { path = "../crates/arreo-core", default-features = false }
+arreo-server = { path = "../crates/arreo-server" }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "time", "io-util", "net"] }
