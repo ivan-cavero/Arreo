@@ -8,6 +8,7 @@
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
+mod api_slice;
 mod bench;
 mod chaos;
 mod check_targets;
@@ -44,6 +45,7 @@ fn e2e(rest: &[String]) -> ExitCode {
         .map(|w| w[1].as_str());
     match slice {
         Some("chaos") => chaos::run(rest),
+        Some("api") => api_slice::run(rest),
         Some("lifecycle") => lifecycle_slice::run(rest),
         Some(other) => {
             eprintln!("xtask e2e: unknown slice {other:?} (have: chaos)");

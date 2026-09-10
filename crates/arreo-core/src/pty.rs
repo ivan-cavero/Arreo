@@ -189,6 +189,15 @@ pub struct Pane {
     child: Arc<Mutex<Box<dyn portable_pty::Child + Send + Sync>>>,
     killer: Mutex<Box<dyn portable_pty::ChildKiller + Send + Sync>>,
     closed: Arc<std::sync::atomic::AtomicBool>,
+    /// Spawn record for `split` (daemon re-spawns the same program).
+    spawn: SpawnSpec,
+}
+
+/// How a pane was spawned (remembered for `split`).
+#[derive(Debug, Clone)]
+pub struct SpawnSpec {
+    pub program: String,
+    pub args: Vec<String>,
 }
 
 impl Pane {
@@ -239,7 +248,17 @@ impl Pane {
             child: Arc::new(Mutex::new(child)),
             killer,
             closed,
+            spawn: SpawnSpec {
+                program: program.to_string(),
+                args: args.iter().map(|s| s.to_string()).collect(),
+            },
         })
+    }
+
+    /// How this pane was spawned (for `split`).
+    #[must_use]
+    pub fn spawn_spec(&self) -> SpawnSpec {
+        self.spawn.clone()
     }
 
     /// Write input bytes to the child (e.g. `b"ls\r"`).

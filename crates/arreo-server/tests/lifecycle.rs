@@ -27,20 +27,54 @@ fn spawn_server_daemon(socket: std::path::PathBuf) -> std::process::Child {
         .expect("arreo-server binary exists (cargo test builds bins)")
 }
 
-fn raw_request(socket: &std::path::Path, line: &str) -> String {
-    use std::io::{BufRead, BufReader, Write};
+fn raw_request(
+    socket: &std::path::Path,
+    message: &arreo_core::proto::Message,
+) -> arreo_core::proto::Message {
+    use arreo_core::proto::codec;
+    use std::io::{Read, Write};
     use std::os::unix::net::UnixStream;
     let mut stream = UnixStream::connect(socket).expect("connect");
     stream
         .set_read_timeout(Some(Duration::from_secs(5)))
         .expect("timeout");
-    stream.write_all(line.as_bytes()).expect("write");
-    stream.write_all(b"\n").expect("nl");
+    // Hello→Welcome handshake, then the request, then one reply.
+    let hello = arreo_core::proto::Message::Hello {
+        v: arreo_core::proto::VERSION,
+        client: "lifecycle-test".to_string(),
+        wants: vec![arreo_core::proto::VERSION],
+    };
+    stream
+        .write_all(&codec::encode_frame(&hello).expect("hello"))
+        .expect("write");
     stream.flush().expect("flush");
-    let mut reader = BufReader::new(stream);
-    let mut out = String::new();
-    reader.read_line(&mut out).expect("read");
-    out
+    let mut acc = Vec::new();
+    let mut chunk = [0u8; 8192];
+    let welcome = loop {
+        let n: usize = stream.read(&mut chunk).expect("read");
+        assert!(n > 0, "handshake closed");
+        acc.extend_from_slice(&chunk[..n]);
+        if let Ok((message, consumed)) = codec::decode_frame(&acc) {
+            acc.drain(..consumed);
+            break message;
+        }
+    };
+    assert!(
+        matches!(welcome, arreo_core::proto::Message::Welcome { .. }),
+        "handshake: {welcome:?}"
+    );
+    stream
+        .write_all(&codec::encode_frame(message).expect("encode"))
+        .expect("write");
+    stream.flush().expect("flush");
+    loop {
+        let n: usize = stream.read(&mut chunk).expect("read");
+        assert!(n > 0, "reply closed");
+        acc.extend_from_slice(&chunk[..n]);
+        if let Ok((message, _)) = codec::decode_frame(&acc) {
+            return message;
+        }
+    }
 }
 
 #[test]
@@ -57,9 +91,22 @@ fn sigterm_drains_committed_output_and_exits() {
     // Spawn a chatterbox and let output commit.
     let reply = raw_request(
         &socket,
-        r#"{"op":"spawn","v":0,"id":"chat","program":"/bin/sh","args":["-c","for i in $(seq 1 50); do echo tick-$i; sleep 0.05; done; sleep 30"],"cols":80,"rows":24}"#,
+        &arreo_core::proto::Message::Spawn {
+            v: arreo_core::proto::VERSION,
+            id: "chat".to_string(),
+            program: "/bin/sh".to_string(),
+            args: vec![
+                "-c".to_string(),
+                "for i in $(seq 1 50); do echo tick-$i; sleep 0.05; done; sleep 30".to_string(),
+            ],
+            cols: 80,
+            rows: 24,
+        },
     );
-    assert!(reply.contains("\"ok\""), "spawn: {reply}");
+    assert!(
+        matches!(reply, arreo_core::proto::Message::Ok { .. }),
+        "spawn: {reply:?}"
+    );
     std::thread::sleep(Duration::from_millis(800));
 
     // SIGTERM mid-traffic.

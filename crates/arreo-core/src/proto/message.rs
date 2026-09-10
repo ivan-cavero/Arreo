@@ -127,6 +127,37 @@ pub enum Message {
         id: String,
         code: Option<u32>,
     },
+    /// Client → server: one-shot read — current text from `from_line`
+    /// (no stream; exactly one `Snapshot` or `Delta` answers, then silence).
+    Read {
+        v: u32,
+        id: String,
+        #[serde(default)]
+        from_line: usize,
+    },
+    /// Client → server: watch a pane until it reaches `state` or
+    /// `timeout_ms` elapses. Answers exactly once: `StateEvent` on match,
+    /// `Error` ("timeout") on expiry. The agent orchestration primitive.
+    Wait {
+        v: u32,
+        id: String,
+        state: AgentState,
+        timeout_ms: u64,
+    },
+    /// Client → server: split a pane — spawn a sibling running the same
+    /// program in `cols`×`rows` (cwd/shape inheritance is T-0015's TUI job;
+    /// v1 split = same program, fresh shell, new id).
+    Split {
+        v: u32,
+        id: String,
+        new_id: String,
+        #[serde(default = "default_cols")]
+        cols: u16,
+        #[serde(default = "default_rows")]
+        rows: u16,
+    },
+    /// Client → server: resource truth for one pane's tree.
+    MetricsReq { v: u32, id: String },
 }
 
 fn default_cols() -> u16 {

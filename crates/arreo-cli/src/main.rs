@@ -2,7 +2,8 @@
 //! daemon verbs `serve`-side client: `panes`, `spawn`, `attach`, `send` (T-0005),
 //! lifecycle: `service`, `server` (T-0012).
 
-use arreo_core::proto::{Request, Response};
+use arreo_core::proto::codec;
+use arreo_core::proto::{AgentState, Message, VERSION};
 use std::future::Future;
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -18,6 +19,10 @@ fn usage() -> ExitCode {
     eprintln!("  arreo spawn <id> <program> [args...] [--socket PATH]");
     eprintln!("  arreo attach <id> [--socket PATH]   (stream output; Ctrl-C detaches, pane keeps running)");
     eprintln!("  arreo send <id> <text...> [--socket PATH]");
+    eprintln!("  arreo read <id> [--from N] [--socket PATH]   (one-shot snapshot)");
+    eprintln!("  arreo wait <id> --state <state> [--timeout 5m] [--socket PATH]");
+    eprintln!("  arreo split <id> <new-id> [--socket PATH]");
+    eprintln!("  arreo metrics <id> [--socket PATH]   (pane query; --pid <PID> samples locally)");
     eprintln!("  arreo service install|uninstall|status [--socket PATH]");
     eprintln!("  arreo server stop [--socket PATH]   (graceful: drain + exit 0)");
     ExitCode::from(2)
@@ -33,7 +38,16 @@ fn main() -> ExitCode {
     match verb {
         Some("record") => cmd_record(&args[2..]),
         Some("replay") => cmd_replay(&args[2..]),
-        Some("metrics") => cmd_metrics(&args[2..]),
+        Some("metrics") => {
+            if args[2..].iter().any(|a| a == "--pid") {
+                cmd_metrics(&args[2..])
+            } else {
+                rt::block_on(cmd_pane_metrics(&args[2..]))
+            }
+        }
+        Some("read") => rt::block_on(cmd_read(&args[2..])),
+        Some("wait") => rt::block_on(cmd_wait(&args[2..])),
+        Some("split") => rt::block_on(cmd_split(&args[2..])),
         Some("panes") => rt::block_on(cmd_panes(&args[2..])),
         Some("spawn") => rt::block_on(cmd_spawn(&args[2..])),
         Some("attach") => rt::block_on(cmd_attach(&args[2..])),
@@ -292,15 +306,15 @@ fn cmd_metrics(rest: &[String]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-async fn open_connection(
-    socket: &PathBuf,
-) -> Result<
-    (
-        tokio::io::BufReader<tokio::net::unix::OwnedReadHalf>,
-        tokio::net::unix::OwnedWriteHalf,
-    ),
-    String,
-> {
+/// Framed MessagePack connection with Hello→Welcome handshake.
+struct Connection {
+    reader: tokio::io::BufReader<tokio::net::unix::OwnedReadHalf>,
+    writer: tokio::net::unix::OwnedWriteHalf,
+    buf: Vec<u8>,
+}
+
+async fn open_connection(socket: &PathBuf) -> Result<Connection, String> {
+    use tokio::io::AsyncWriteExt;
     let stream = tokio::net::UnixStream::connect(socket).await.map_err(|e| {
         format!(
             "cannot connect to {}: {e} (is arreo-server running?)",
@@ -308,25 +322,69 @@ async fn open_connection(
         )
     })?;
     let (reader, writer) = stream.into_split();
-    Ok((tokio::io::BufReader::new(reader), writer))
-}
-
-async fn request(socket: &PathBuf, req: &Request) -> Result<Response, String> {
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
-    let (mut reader, mut writer) = open_connection(socket).await?;
-    let mut line = serde_json::to_string(req).map_err(|e| format!("encode: {e}"))?;
-    line.push('\n');
-    writer
-        .write_all(line.as_bytes())
+    let mut conn = Connection {
+        reader: tokio::io::BufReader::new(reader),
+        writer,
+        buf: Vec::new(),
+    };
+    // Handshake: Hello → Welcome (or loud Error on version mismatch).
+    let hello = Message::Hello {
+        v: VERSION,
+        client: "arreo-cli".to_string(),
+        wants: vec![VERSION],
+    };
+    let frame = codec::encode_frame(&hello).map_err(|e| format!("encode: {e}"))?;
+    conn.writer
+        .write_all(&frame)
         .await
         .map_err(|e| format!("write: {e}"))?;
-    writer.flush().await.map_err(|e| format!("flush: {e}"))?;
-    let mut out = String::new();
-    reader
-        .read_line(&mut out)
+    conn.writer
+        .flush()
         .await
-        .map_err(|e| format!("read: {e}"))?;
-    serde_json::from_str(&out).map_err(|e| format!("decode: {e}"))
+        .map_err(|e| format!("flush: {e}"))?;
+    match conn.recv().await? {
+        Message::Welcome { .. } => Ok(conn),
+        Message::Error { message, .. } => Err(format!("handshake: {message}")),
+        other => Err(format!("handshake: unexpected {other:?}")),
+    }
+}
+
+impl Connection {
+    async fn send(&mut self, message: &Message) -> Result<(), String> {
+        use tokio::io::AsyncWriteExt;
+        let frame = codec::encode_frame(message).map_err(|e| format!("encode: {e}"))?;
+        self.writer
+            .write_all(&frame)
+            .await
+            .map_err(|e| format!("write: {e}"))?;
+        self.writer.flush().await.map_err(|e| format!("flush: {e}"))
+    }
+
+    async fn recv(&mut self) -> Result<Message, String> {
+        use tokio::io::AsyncReadExt;
+        loop {
+            if let Ok((message, consumed)) = codec::decode_frame(&self.buf) {
+                self.buf.drain(..consumed);
+                return Ok(message);
+            }
+            let mut chunk = [0u8; 8192];
+            let n = self
+                .reader
+                .read(&mut chunk)
+                .await
+                .map_err(|e| format!("read: {e}"))?;
+            if n == 0 {
+                return Err("server closed connection".to_string());
+            }
+            self.buf.extend_from_slice(&chunk[..n]);
+        }
+    }
+}
+
+async fn request(socket: &PathBuf, req: &Message) -> Result<Message, String> {
+    let mut conn = open_connection(socket).await?;
+    conn.send(req).await?;
+    conn.recv().await
 }
 
 async fn cmd_panes(rest: &[String]) -> ExitCode {
@@ -335,8 +393,16 @@ async fn cmd_panes(rest: &[String]) -> ExitCode {
         eprintln!("panes: unexpected args {kept:?}");
         return ExitCode::from(2);
     }
-    match request(&socket, &Request::List { v: 0 }).await {
-        Ok(Response::Panes { panes, .. }) => {
+    match request(
+        &socket,
+        &Message::Panes {
+            v: VERSION,
+            panes: vec![],
+        },
+    )
+    .await
+    {
+        Ok(Message::Panes { panes, .. }) => {
             println!("{:>16}  STATE", "ID");
             for pane in panes {
                 println!(
@@ -347,7 +413,7 @@ async fn cmd_panes(rest: &[String]) -> ExitCode {
             }
             ExitCode::SUCCESS
         }
-        Ok(Response::Error { message, .. }) => {
+        Ok(Message::Error { message, .. }) => {
             eprintln!("panes: {message}");
             ExitCode::FAILURE
         }
@@ -368,8 +434,8 @@ async fn cmd_spawn(rest: &[String]) -> ExitCode {
         eprintln!("usage: arreo spawn <id> <program> [args...] [--socket PATH]");
         return ExitCode::from(2);
     }
-    let req = Request::Spawn {
-        v: 0,
+    let req = Message::Spawn {
+        v: VERSION,
         id: kept[0].clone(),
         program: kept[1].clone(),
         args: kept[2..].to_vec(),
@@ -377,11 +443,11 @@ async fn cmd_spawn(rest: &[String]) -> ExitCode {
         rows: 24,
     };
     match request(&socket, &req).await {
-        Ok(Response::Ok { .. }) => {
+        Ok(Message::Ok { .. }) => {
             println!("spawned {}", kept[0]);
             ExitCode::SUCCESS
         }
-        Ok(Response::Error { message, .. }) => {
+        Ok(Message::Error { message, .. }) => {
             eprintln!("spawn: {message}");
             ExitCode::FAILURE
         }
@@ -402,14 +468,14 @@ async fn cmd_send(rest: &[String]) -> ExitCode {
         eprintln!("usage: arreo send <id> <text...> [--socket PATH]");
         return ExitCode::from(2);
     }
-    let req = Request::Send {
-        v: 0,
+    let req = Message::Send {
+        v: VERSION,
         id: kept[0].clone(),
         data: kept[1..].join(" "),
     };
     match request(&socket, &req).await {
-        Ok(Response::Ok { .. }) => ExitCode::SUCCESS,
-        Ok(Response::Error { message, .. }) => {
+        Ok(Message::Ok { .. }) => ExitCode::SUCCESS,
+        Ok(Message::Error { message, .. }) => {
             eprintln!("send: {message}");
             ExitCode::FAILURE
         }
@@ -428,64 +494,53 @@ async fn cmd_send(rest: &[String]) -> ExitCode {
 /// or the connection breaks. Ctrl-C detaches (exit 0) — the pane keeps
 /// running on the daemon. No full repaints: only NEW lines print (v0 delta).
 async fn cmd_attach(rest: &[String]) -> ExitCode {
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
     let (socket, kept) = take_socket(rest);
     if kept.len() != 1 {
         eprintln!("usage: arreo attach <id> [--socket PATH]");
         return ExitCode::from(2);
     }
     let id = kept[0].clone();
-    let (mut reader, mut writer) = match open_connection(&socket).await {
-        Ok(pair) => pair,
+    let mut conn = match open_connection(&socket).await {
+        Ok(conn) => conn,
         Err(e) => {
             eprintln!("attach: {e}");
             return ExitCode::FAILURE;
         }
     };
-    let req = Request::Attach {
-        v: 0,
-        id: id.clone(),
-        from_line: 0,
-    };
-    let mut line = serde_json::to_string(&req).unwrap();
-    line.push('\n');
-    if let Err(e) = writer.write_all(line.as_bytes()).await {
+    if let Err(e) = conn
+        .send(&Message::Attach {
+            v: VERSION,
+            id: id.clone(),
+            from_line: 0,
+        })
+        .await
+    {
         eprintln!("attach: {e}");
         return ExitCode::FAILURE;
     }
-    let _ = writer.flush().await;
     loop {
-        let mut out = String::new();
-        match reader.read_line(&mut out).await {
-            Ok(0) => return ExitCode::SUCCESS,
-            Ok(_) => {}
-            Err(e) => {
-                eprintln!("attach: connection lost: {e}");
-                return ExitCode::FAILURE;
-            }
-        }
-        let response: Response = match serde_json::from_str(&out) {
-            Ok(response) => response,
-            Err(e) => {
-                eprintln!("attach: bad frame: {e}");
-                return ExitCode::FAILURE;
-            }
-        };
-        match response {
-            Response::Output { lines, .. } => {
+        match conn.recv().await {
+            Ok(Message::Delta { lines, .. }) | Ok(Message::Snapshot { lines, .. }) => {
                 for text in lines {
                     println!("{text}");
                 }
             }
-            Response::Exited { code, .. } => {
+            Ok(Message::Exited { code, .. }) => {
                 eprintln!("attach: pane exited (code {code:?})");
                 return ExitCode::SUCCESS;
             }
-            Response::Error { message, .. } => {
+            Ok(Message::Error { message, .. }) => {
                 eprintln!("attach: {message}");
                 return ExitCode::FAILURE;
             }
-            Response::Ok { .. } | Response::Panes { .. } => {}
+            Ok(other) => {
+                eprintln!("attach: unexpected {other:?}");
+                return ExitCode::FAILURE;
+            }
+            Err(e) => {
+                eprintln!("attach: connection lost: {e}");
+                return ExitCode::FAILURE;
+            }
         }
     }
 }
@@ -692,4 +747,252 @@ async fn find_daemon_pid(socket: &PathBuf) -> Option<u32> {
         }
     }
     None
+}
+
+/// `arreo read <id> [--from N]`: one-shot snapshot of current pane text.
+async fn cmd_read(rest: &[String]) -> ExitCode {
+    let (socket, kept) = take_socket(rest);
+    let mut from_line = 0usize;
+    let mut id: Option<String> = None;
+    let mut i = 0;
+    while i < kept.len() {
+        if kept[i] == "--from" && i + 1 < kept.len() {
+            from_line = kept[i + 1].parse().unwrap_or(0);
+            i += 2;
+        } else if id.is_none() {
+            id = Some(kept[i].clone());
+            i += 1;
+        } else {
+            eprintln!("usage: arreo read <id> [--from N] [--socket PATH]");
+            return ExitCode::from(2);
+        }
+    }
+    let Some(id) = id else {
+        eprintln!("usage: arreo read <id> [--from N] [--socket PATH]");
+        return ExitCode::from(2);
+    };
+    match request(
+        &socket,
+        &Message::Read {
+            v: VERSION,
+            id,
+            from_line,
+        },
+    )
+    .await
+    {
+        Ok(Message::Delta { lines, .. }) | Ok(Message::Snapshot { lines, .. }) => {
+            for text in lines {
+                println!("{text}");
+            }
+            ExitCode::SUCCESS
+        }
+        Ok(Message::Error { message, .. }) => {
+            eprintln!("read: {message}");
+            ExitCode::FAILURE
+        }
+        Ok(other) => {
+            eprintln!("read: unexpected {other:?}");
+            ExitCode::FAILURE
+        }
+        Err(e) => {
+            eprintln!("read: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// `arreo wait <id> --state <state> [--timeout <dur>]`: block until the pane
+/// reaches a state. Duration syntax: `500ms`, `30s`, `5m` (default `5m`).
+/// Exit 0 on match (prints the StateEvent), 1 on timeout/error.
+async fn cmd_wait(rest: &[String]) -> ExitCode {
+    let (socket, kept) = take_socket(rest);
+    let mut id: Option<String> = None;
+    let mut state: Option<String> = None;
+    let mut timeout_ms = 5 * 60 * 1000u64;
+    let mut i = 0;
+    while i < kept.len() {
+        match kept[i].as_str() {
+            "--state" if i + 1 < kept.len() => {
+                state = Some(kept[i + 1].clone());
+                i += 2;
+            }
+            "--timeout" if i + 1 < kept.len() => {
+                timeout_ms = match parse_duration_ms(&kept[i + 1]) {
+                    Some(ms) => ms,
+                    None => {
+                        eprintln!(
+                            "wait: bad --timeout {:?} (want 500ms, 30s, 5m)",
+                            kept[i + 1]
+                        );
+                        return ExitCode::from(2);
+                    }
+                };
+                i += 2;
+            }
+            other if id.is_none() => {
+                id = Some(other.to_string());
+                i += 1;
+            }
+            _ => {
+                eprintln!("usage: arreo wait <id> --state <state> [--timeout 5m] [--socket PATH]");
+                return ExitCode::from(2);
+            }
+        }
+    }
+    let (Some(id), Some(state)) = (id, state) else {
+        eprintln!("usage: arreo wait <id> --state <state> [--timeout 5m] [--socket PATH]");
+        return ExitCode::from(2);
+    };
+    let want = match state.to_lowercase().as_str() {
+        "working" => AgentState::Working,
+        "idle" => AgentState::Idle,
+        "question" => AgentState::Question,
+        "blocked" => AgentState::Blocked,
+        "done" => AgentState::Done,
+        "unknown" => AgentState::Unknown,
+        _ => {
+            eprintln!(
+                "wait: bad state {state:?} (want working|idle|question|blocked|done|unknown)"
+            );
+            return ExitCode::from(2);
+        }
+    };
+    match request(
+        &socket,
+        &Message::Wait {
+            v: VERSION,
+            id,
+            state: want,
+            timeout_ms,
+        },
+    )
+    .await
+    {
+        Ok(Message::StateEvent {
+            state,
+            confidence,
+            matched_pattern,
+            ..
+        }) => {
+            println!("state={state:?} confidence={confidence} pattern={matched_pattern:?}");
+            ExitCode::SUCCESS
+        }
+        Ok(Message::Error { message, .. }) => {
+            eprintln!("wait: {message}");
+            ExitCode::FAILURE
+        }
+        Ok(other) => {
+            eprintln!("wait: unexpected {other:?}");
+            ExitCode::FAILURE
+        }
+        Err(e) => {
+            eprintln!("wait: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn parse_duration_ms(text: &str) -> Option<u64> {
+    if let Some(ms) = text.strip_suffix("ms") {
+        return ms.parse().ok();
+    }
+    if let Some(s) = text.strip_suffix('s') {
+        return s.parse::<u64>().ok().map(|s| s * 1000);
+    }
+    if let Some(m) = text.strip_suffix('m') {
+        return m.parse::<u64>().ok().map(|m| m * 60 * 1000);
+    }
+    None
+}
+
+/// `arreo split <id> <new-id>`: spawn a sibling pane with the same program.
+async fn cmd_split(rest: &[String]) -> ExitCode {
+    let (socket, kept) = take_socket(rest);
+    if kept.len() != 2 {
+        eprintln!("usage: arreo split <id> <new-id> [--socket PATH]");
+        return ExitCode::from(2);
+    }
+    match request(
+        &socket,
+        &Message::Split {
+            v: VERSION,
+            id: kept[0].clone(),
+            new_id: kept[1].clone(),
+            cols: 80,
+            rows: 24,
+        },
+    )
+    .await
+    {
+        Ok(Message::Ok { .. }) => {
+            println!("split {} -> {}", kept[0], kept[1]);
+            ExitCode::SUCCESS
+        }
+        Ok(Message::Error { message, .. }) => {
+            eprintln!("split: {message}");
+            ExitCode::FAILURE
+        }
+        Ok(other) => {
+            eprintln!("split: unexpected {other:?}");
+            ExitCode::FAILURE
+        }
+        Err(e) => {
+            eprintln!("split: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// `arreo metrics <id>`: resource truth for one pane's tree (daemon query;
+/// the local `--pid` sampler from T-0006 stays for pid-level inspection).
+async fn cmd_pane_metrics(rest: &[String]) -> ExitCode {
+    let (socket, kept) = take_socket(rest);
+    if kept.len() != 1 {
+        eprintln!("usage: arreo metrics <id> [--socket PATH]  (pane query; use --pid <PID> for local sampling)");
+        return ExitCode::from(2);
+    }
+    // `--pid` still routes to the local sampler (T-0006 verb preserved).
+    if kept[0] == "--pid" {
+        eprintln!("usage: arreo metrics --pid <PID> [--samples N]  (local sampler)");
+        return ExitCode::from(2);
+    }
+    match request(
+        &socket,
+        &Message::MetricsReq {
+            v: VERSION,
+            id: kept[0].clone(),
+        },
+    )
+    .await
+    {
+        Ok(Message::Metrics {
+            rss_bytes,
+            cpu_percent,
+            pids,
+            ..
+        }) => {
+            println!(
+                "rss={}KiB cpu={} pids={}",
+                rss_bytes / 1024,
+                cpu_percent
+                    .map(|c| format!("{c:.1}%"))
+                    .unwrap_or_else(|| "—".to_string()),
+                pids
+            );
+            ExitCode::SUCCESS
+        }
+        Ok(Message::Error { message, .. }) => {
+            eprintln!("metrics: {message}");
+            ExitCode::FAILURE
+        }
+        Ok(other) => {
+            eprintln!("metrics: unexpected {other:?}");
+            ExitCode::FAILURE
+        }
+        Err(e) => {
+            eprintln!("metrics: {e}");
+            ExitCode::FAILURE
+        }
+    }
 }

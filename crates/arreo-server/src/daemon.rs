@@ -1,23 +1,28 @@
-//! Daemon: owns `Arc<Pane>` per id, serves the v0 protocol concurrently.
+//! Daemon: owns one `PaneEntry` per id, serves framed MessagePack (API v1).
 //!
 //! One sentence: the daemon is a pane registry behind a UnixListener; every
-//! connection is an independent tokio task, and attach streams deltas until
-//! the child exits or the client goes away.
+//! connection opens with Hello→Welcome, then speaks `Message` verbs; attach
+//! streams deltas until the child exits or the client goes away.
 //!
-//! Concurrency: `Arc<RwLock<HashMap<id, Arc<Pane>>>>`. Pane is Sync (T-0002),
-//! so readers never block writers. Slow clients: bounded 100 ms poll loop per
-//! attach — a stuck client delays only its own task, never the daemon.
+//! Cutover note (T-0014): the T-0005 JSONL framing is GONE — one framing, not
+//! two. The compat types remain in `arreo_core::proto` for tests only.
+//!
+//! Concurrency: `Arc<RwLock<HashMap<id, Arc<PaneEntry>>>>`. Pane is Sync
+//! (T-0002), engines/samplers sit behind Mutexes; slow clients block only
+//! their own task (100 ms attach polls, bounded wait polls).
 
+use arreo_core::metrics::Sampler;
+use arreo_core::proto::codec::{self, CodecError};
+use arreo_core::proto::{AgentState, Message, PaneInfo, VERSION};
 use arreo_core::pty::{ExitState, Pane};
+use arreo_core::state::{Adapter, Confidence, Engine, State};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use thiserror::Error;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::RwLock;
-
-use super::protocol::{PaneInfo, Request, Response, VERSION};
 
 #[derive(Debug, Error)]
 pub enum DaemonError {
@@ -31,8 +36,53 @@ pub enum DaemonError {
     Pty(String),
 }
 
+/// Per-pane daemon state: the PTY plus its state engine + metrics sampler.
+/// Engines are fed from the raw journal on every poll (bytes since `fed`).
+pub struct PaneEntry {
+    pub pane: Arc<Pane>,
+    pub engine: Mutex<Engine>,
+    pub fed: Mutex<usize>,
+    pub sampler: Mutex<Sampler>,
+}
+
+impl PaneEntry {
+    fn new(pane: Arc<Pane>) -> Self {
+        Self {
+            pane,
+            engine: Mutex::new(Engine::new(Adapter::default(), 0)),
+            fed: Mutex::new(0),
+            sampler: Mutex::new(Sampler::new()),
+        }
+    }
+
+    /// Feed unfed journal bytes through the engine at `now_ms`. Returns new events.
+    fn pump(&self, now_ms: u64) -> Vec<arreo_core::state::Event> {
+        let (raw, _) = self.pane.raw_snapshot();
+        let mut fed = self.fed.lock().unwrap_or_else(|e| e.into_inner());
+        let fresh = if raw.len() > *fed {
+            &raw[*fed..]
+        } else {
+            &[][..]
+        };
+        *fed = raw.len();
+        drop(fed);
+        self.engine
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .feed(fresh, now_ms)
+    }
+
+    fn engine_state(&self) -> State {
+        *self
+            .engine
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .state()
+    }
+}
+
 /// Shared pane registry.
-pub type Registry = Arc<RwLock<HashMap<String, Arc<Pane>>>>;
+pub type Registry = Arc<RwLock<HashMap<String, Arc<PaneEntry>>>>;
 
 pub struct Daemon {
     registry: Registry,
@@ -85,73 +135,200 @@ impl Daemon {
     }
 }
 
-async fn write_line(
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+async fn write_message(
     writer: &mut (impl AsyncWriteExt + Unpin),
-    value: &Response,
+    message: &Message,
 ) -> std::io::Result<()> {
-    let mut line = serde_json::to_string(value).unwrap_or_else(|_| {
-        serde_json::to_string(&Response::Error {
-            v: VERSION,
-            message: "encode error".to_string(),
-        })
-        .unwrap_or_else(|_| r#"{"op":"error","v":0,"message":"encode error"}"#.to_string())
-    });
-    line.push('\n');
-    writer.write_all(line.as_bytes()).await?;
+    let frame = codec::encode_frame(message).map_err(|e| {
+        std::io::Error::new(std::io::ErrorKind::InvalidData, format!("encode: {e}"))
+    })?;
+    writer.write_all(&frame).await?;
     writer.flush().await
 }
 
-fn check_version(v: u32) -> Result<(), Response> {
+fn engine_state_to_wire(state: State) -> AgentState {
+    match state {
+        State::Unknown => AgentState::Unknown,
+        State::Working => AgentState::Working,
+        State::Idle => AgentState::Idle,
+        State::Question => AgentState::Question,
+        State::Blocked => AgentState::Blocked,
+        State::Done => AgentState::Done,
+    }
+}
+
+/// Read exactly one framed message (buffering partial reads).
+async fn read_message(
+    reader: &mut (impl AsyncReadExt + Unpin),
+    buf: &mut Vec<u8>,
+) -> Result<Message, DaemonError> {
+    loop {
+        if let Ok((message, consumed)) = codec::decode_frame(buf) {
+            buf.drain(..consumed);
+            return Ok(message);
+        }
+        let mut chunk = [0u8; 8192];
+        let n = reader.await_reader(&mut chunk).await?;
+        if n == 0 {
+            return Err(DaemonError::Io(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "client closed",
+            )));
+        }
+        buf.extend_from_slice(&chunk[..n]);
+    }
+}
+
+/// Connection handler: Hello→Welcome handshake, then verbs. Attach/Resume
+/// own the connection while streaming (v0 semantics, T-0009 F4).
+async fn handle(stream: UnixStream, registry: Registry) -> Result<(), DaemonError> {
+    let (mut reader, mut writer) = stream.into_split();
+    let mut buf = Vec::new();
+
+    // Handshake first: exactly one Hello, answered by Welcome or Error.
+    // Bounded by timeout: pre-v1 JSONL clients (`{...}\n`) would otherwise
+    // hang forever (their first bytes parse as a ~2 GB frame length).
+    // A timeout turns the migration hazard into a loud close.
+    let hello = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        read_message(&mut reader, &mut buf),
+    )
+    .await;
+    let hello = match hello {
+        Ok(hello) => hello,
+        Err(_) => return Ok(()),
+    };
+    match hello {
+        Ok(Message::Hello { wants, .. }) => match codec::negotiate(VERSION, &wants) {
+            Ok(v) => {
+                write_message(
+                    &mut writer,
+                    &Message::Welcome {
+                        v,
+                        server: "arreo-server".to_string(),
+                    },
+                )
+                .await?;
+            }
+            Err(e @ CodecError::Version { .. }) => {
+                write_message(
+                    &mut writer,
+                    &Message::Error {
+                        v: VERSION,
+                        message: e.to_string(),
+                    },
+                )
+                .await?;
+                return Ok(());
+            }
+            Err(e) => {
+                write_message(
+                    &mut writer,
+                    &Message::Error {
+                        v: VERSION,
+                        message: e.to_string(),
+                    },
+                )
+                .await?;
+                return Ok(());
+            }
+        },
+        Ok(other) => {
+            write_message(
+                &mut writer,
+                &Message::Error {
+                    v: VERSION,
+                    message: format!("first frame must be Hello, got {}", op_name(&other)),
+                },
+            )
+            .await?;
+            return Ok(());
+        }
+        Err(_) => return Ok(()),
+    }
+
+    loop {
+        let message = match read_message(&mut reader, &mut buf).await {
+            Ok(message) => message,
+            Err(_) => return Ok(()),
+        };
+        // Streaming verbs own the connection until done.
+        match &message {
+            Message::Attach { id, from_line, .. } => {
+                stream_attach(&mut writer, &registry, id, *from_line).await?;
+                continue;
+            }
+            Message::Resume { id, from_line, .. } => {
+                stream_attach(&mut writer, &registry, id, *from_line).await?;
+                continue;
+            }
+            Message::Wait { .. } => {
+                watch_state(&mut writer, &registry, &message).await?;
+                continue;
+            }
+            _ => {}
+        }
+        if let Some(reply) = dispatch(&message, &registry).await {
+            write_message(&mut writer, &reply).await?;
+        }
+    }
+}
+
+fn op_name(message: &Message) -> &'static str {
+    match message {
+        Message::Hello { .. } => "hello",
+        Message::Welcome { .. } => "welcome",
+        Message::Snapshot { .. } => "snapshot",
+        Message::Delta { .. } => "delta",
+        Message::Resume { .. } => "resume",
+        Message::Error { .. } => "error",
+        Message::StateEvent { .. } => "state-event",
+        Message::Metrics { .. } => "metrics",
+        Message::Spawn { .. } => "spawn",
+        Message::Panes { .. } => "panes",
+        Message::Attach { .. } => "attach",
+        Message::Send { .. } => "send",
+        Message::Resize { .. } => "resize",
+        Message::Kill { .. } => "kill",
+        Message::Ok { .. } => "ok",
+        Message::Exited { .. } => "exited",
+        Message::Read { .. } => "read",
+        Message::Wait { .. } => "wait",
+        Message::Split { .. } => "split",
+        Message::MetricsReq { .. } => "metrics-req",
+    }
+}
+
+fn check_version(v: u32) -> Result<(), Message> {
     if v == VERSION {
         Ok(())
     } else {
-        Err(Response::Error {
+        Err(Message::Error {
             v: VERSION,
             message: format!("unsupported version {v} (server speaks {VERSION})"),
         })
     }
 }
 
-async fn handle(stream: UnixStream, registry: Registry) -> Result<(), DaemonError> {
-    let (reader, mut writer) = stream.into_split();
-    let mut lines = BufReader::new(reader).lines();
-    while let Some(line) = lines.next_line().await? {
-        if line.trim().is_empty() {
-            continue;
-        }
-        let request: Request = match serde_json::from_str(&line) {
-            Ok(request) => request,
-            Err(e) => {
-                write_line(
-                    &mut writer,
-                    &Response::Error {
-                        v: VERSION,
-                        message: format!("bad request: {e}"),
-                    },
-                )
-                .await?;
-                continue;
-            }
-        };
-        // Attach streams until exit/close: handle inline, then continue
-        // serving further requests on the same connection afterwards.
-        if let Request::Attach { v, id, from_line } = &request {
-            if let Err(response) = check_version(*v) {
-                write_line(&mut writer, &response).await?;
-                continue;
-            }
-            stream_attach(&mut writer, &registry, id, *from_line).await?;
-            continue;
-        }
-        let response = dispatch(&request, &registry).await;
-        write_line(&mut writer, &response).await?;
+fn not_found(id: &str) -> Message {
+    Message::Error {
+        v: VERSION,
+        message: format!("pane {id:?} not found"),
     }
-    Ok(())
 }
 
-async fn dispatch(request: &Request, registry: &Registry) -> Response {
-    match request {
-        Request::Spawn {
+/// One-shot verbs. Returns `None` when the verb streams instead (handled by
+/// the caller). Every arm checks the version first — loud, never silent.
+async fn dispatch(message: &Message, registry: &Registry) -> Option<Message> {
+    match message {
+        Message::Spawn {
             v,
             id,
             program,
@@ -159,12 +336,10 @@ async fn dispatch(request: &Request, registry: &Registry) -> Response {
             cols,
             rows,
         } => {
-            if let Err(response) = check_version(*v) {
-                return response;
+            if let Err(reply) = check_version(*v) {
+                return Some(reply);
             }
-            // Fork off the async worker: posix_openpt+fork inside a
-            // multi-threaded tokio worker can hang (chaos-found, T-0009).
-            // spawn_blocking runs it on a dedicated thread instead.
+            // Fork off the async worker (chaos-found, T-0009).
             let program = program.clone();
             let args_owned = args.clone();
             let (cols, rows) = (*cols, *rows);
@@ -176,114 +351,330 @@ async fn dispatch(request: &Request, registry: &Registry) -> Response {
             let pane = match spawned {
                 Ok(Ok(pane)) => Arc::new(pane),
                 Ok(Err(e)) => {
-                    return Response::Error {
+                    return Some(Message::Error {
                         v: VERSION,
                         message: format!("spawn failed: {e}"),
-                    };
+                    });
                 }
                 Err(e) => {
-                    return Response::Error {
+                    return Some(Message::Error {
                         v: VERSION,
                         message: format!("spawn task failed: {e}"),
-                    };
+                    });
                 }
             };
             let mut registry = registry.write().await;
             if registry.contains_key(id) {
-                return Response::Error {
+                return Some(Message::Error {
                     v: VERSION,
                     message: format!("pane {id:?} already exists"),
-                };
+                });
             }
-            registry.insert(id.clone(), pane);
-            Response::Ok { v: VERSION }
+            registry.insert(id.clone(), Arc::new(PaneEntry::new(pane)));
+            Some(Message::Ok { v: VERSION })
         }
-        Request::List { v } => {
-            if let Err(response) = check_version(*v) {
-                return response;
+        Message::Panes { v, .. } => {
+            if let Err(reply) = check_version(*v) {
+                return Some(reply);
             }
             let registry = registry.read().await;
             let mut panes: Vec<PaneInfo> = registry
                 .iter()
-                .map(|(id, pane)| PaneInfo {
+                .map(|(id, entry)| PaneInfo {
                     id: id.clone(),
-                    alive: matches!(pane.try_wait(), ExitState::Running),
+                    alive: matches!(entry.pane.try_wait(), ExitState::Running),
                 })
                 .collect();
             panes.sort_by(|a, b| a.id.cmp(&b.id));
-            Response::Panes { v: VERSION, panes }
+            Some(Message::Panes { v: VERSION, panes })
         }
-        Request::Send { v, id, data } => {
-            if let Err(response) = check_version(*v) {
-                return response;
+        Message::Send { v, id, data } => {
+            if let Err(reply) = check_version(*v) {
+                return Some(reply);
             }
             let registry = registry.read().await;
             match registry.get(id) {
-                Some(pane) => match pane.send(data.as_bytes()) {
-                    Ok(()) => Response::Ok { v: VERSION },
-                    Err(e) => Response::Error {
+                Some(entry) => match entry.pane.send(data.as_bytes()) {
+                    Ok(()) => {
+                        entry.pump(now_ms());
+                        Some(Message::Ok { v: VERSION })
+                    }
+                    Err(e) => Some(Message::Error {
                         v: VERSION,
                         message: format!("send failed: {e}"),
-                    },
+                    }),
                 },
-                None => Response::Error {
-                    v: VERSION,
-                    message: format!("pane {id:?} not found"),
-                },
+                None => Some(not_found(id)),
             }
         }
-        Request::Resize { v, id, cols, rows } => {
-            if let Err(response) = check_version(*v) {
-                return response;
+        Message::Resize { v, id, cols, rows } => {
+            if let Err(reply) = check_version(*v) {
+                return Some(reply);
             }
             let registry = registry.read().await;
             match registry.get(id) {
-                Some(pane) => match pane.resize(*cols, *rows) {
-                    Ok(()) => Response::Ok { v: VERSION },
-                    Err(e) => Response::Error {
+                Some(entry) => match entry.pane.resize(*cols, *rows) {
+                    Ok(()) => Some(Message::Ok { v: VERSION }),
+                    Err(e) => Some(Message::Error {
                         v: VERSION,
                         message: format!("resize failed: {e}"),
-                    },
+                    }),
                 },
-                None => Response::Error {
-                    v: VERSION,
-                    message: format!("pane {id:?} not found"),
-                },
+                None => Some(not_found(id)),
             }
         }
-        Request::Kill { v, id } => {
-            if let Err(response) = check_version(*v) {
-                return response;
+        Message::Kill { v, id } => {
+            if let Err(reply) = check_version(*v) {
+                return Some(reply);
             }
             let mut registry = registry.write().await;
             match registry.remove(id) {
-                Some(pane) => {
+                Some(entry) => {
                     drop(registry);
-                    // Actually terminate the child (not just forget the Pane —
-                    // otherwise it keeps running orphaned). Ignore AlreadyDead:
-                    // the pane is gone from the registry either way. Reap in
-                    // the background so the victim never lingers as a zombie.
-                    let _ = pane.kill_shared();
+                    let _ = entry.pane.kill_shared();
                     tokio::task::spawn_blocking(move || {
-                        let _ = pane.wait_timeout(std::time::Duration::from_secs(5));
+                        let _ = entry.pane.wait_timeout(std::time::Duration::from_secs(5));
                     });
-                    Response::Ok { v: VERSION }
+                    Some(Message::Ok { v: VERSION })
                 }
-                None => Response::Error {
-                    v: VERSION,
-                    message: format!("pane {id:?} not found"),
-                },
+                None => Some(not_found(id)),
             }
         }
-        Request::Attach { .. } => Response::Error {
+        Message::Read { v, id, from_line } => {
+            if let Err(reply) = check_version(*v) {
+                return Some(reply);
+            }
+            let registry = registry.read().await;
+            match registry.get(id) {
+                Some(entry) => {
+                    entry.pump(now_ms());
+                    let lines = entry.pane.drain();
+                    let from = (*from_line).min(lines.len());
+                    Some(Message::Delta {
+                        v: VERSION,
+                        id: id.clone(),
+                        from_line: from,
+                        lines: lines[from..].to_vec(),
+                    })
+                }
+                None => Some(not_found(id)),
+            }
+        }
+        Message::Split {
+            v,
+            id,
+            new_id,
+            cols,
+            rows,
+        } => {
+            if let Err(reply) = check_version(*v) {
+                return Some(reply);
+            }
+            let spec = {
+                let registry = registry.read().await;
+                match registry.get(id) {
+                    Some(entry) => entry.pane.spawn_spec(),
+                    None => return Some(not_found(id)),
+                }
+            };
+            if registry.read().await.contains_key(new_id) {
+                return Some(Message::Error {
+                    v: VERSION,
+                    message: format!("pane {new_id:?} already exists"),
+                });
+            }
+            let program = spec.program.clone();
+            let args_owned = spec.args.clone();
+            let (cols, rows) = (*cols, *rows);
+            let spawned = tokio::task::spawn_blocking(move || {
+                let args_ref: Vec<&str> = args_owned.iter().map(String::as_str).collect();
+                Pane::spawn(&program, &args_ref, cols, rows)
+            })
+            .await;
+            match spawned {
+                Ok(Ok(pane)) => {
+                    registry
+                        .write()
+                        .await
+                        .insert(new_id.clone(), Arc::new(PaneEntry::new(Arc::new(pane))));
+                    Some(Message::Ok { v: VERSION })
+                }
+                Ok(Err(e)) => Some(Message::Error {
+                    v: VERSION,
+                    message: format!("split failed: {e}"),
+                }),
+                Err(e) => Some(Message::Error {
+                    v: VERSION,
+                    message: format!("split task failed: {e}"),
+                }),
+            }
+        }
+        Message::MetricsReq { v, id } => {
+            if let Err(reply) = check_version(*v) {
+                return Some(reply);
+            }
+            let registry = registry.read().await;
+            match registry.get(id) {
+                Some(entry) => match entry.pane.child_pid() {
+                    Some(pid) => {
+                        let mut sampler = entry.sampler.lock().unwrap_or_else(|e| e.into_inner());
+                        match sampler.sample_tree(pid) {
+                            Ok(sample) => Some(Message::Metrics {
+                                v: VERSION,
+                                id: id.clone(),
+                                rss_bytes: sample.rss_bytes,
+                                cpu_percent: sample.cpu_percent,
+                                pids: sample.pids.len(),
+                            }),
+                            Err(e) => Some(Message::Error {
+                                v: VERSION,
+                                message: format!("metrics failed: {e}"),
+                            }),
+                        }
+                    }
+                    None => Some(Message::Error {
+                        v: VERSION,
+                        message: format!("pane {id:?} has no live child"),
+                    }),
+                },
+                None => Some(not_found(id)),
+            }
+        }
+        // Streaming verbs + handshake replies never reach dispatch.
+        Message::Attach { .. }
+        | Message::Resume { .. }
+        | Message::Wait { .. }
+        | Message::Hello { .. }
+        | Message::Welcome { .. }
+        | Message::Snapshot { .. }
+        | Message::Delta { .. }
+        | Message::Error { .. }
+        | Message::StateEvent { .. }
+        | Message::Metrics { .. }
+        | Message::Ok { .. }
+        | Message::Exited { .. } => Some(Message::Error {
             v: VERSION,
-            message: "attach handled inline".to_string(),
-        },
+            message: format!("unexpected {} here", op_name(message)),
+        }),
     }
 }
 
-/// Stream append-deltas for `id` starting at `from_line` until the child
-/// exits (then send `Exited`) or the client disconnects (write fails → return).
+/// Watch a pane until it reaches `state` or the timeout elapses. Answers
+/// exactly once. Polls the engine at 50 ms (well under the 200 ms budget).
+async fn watch_state(
+    writer: &mut (impl AsyncWriteExt + Unpin),
+    registry: &Registry,
+    message: &Message,
+) -> std::io::Result<()> {
+    let (v, id, want, timeout_ms) = match message {
+        Message::Wait {
+            v,
+            id,
+            state,
+            timeout_ms,
+        } => (*v, id.clone(), *state, *timeout_ms),
+        _ => return Ok(()),
+    };
+    if let Err(reply) = check_version(v) {
+        return write_message(writer, &reply).await;
+    }
+    let entry = {
+        let registry = registry.read().await;
+        match registry.get(&id) {
+            Some(entry) => Arc::clone(entry),
+            None => {
+                return write_message(writer, &not_found(&id)).await;
+            }
+        }
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+    loop {
+        let now = now_ms();
+        let events = entry.pump(now);
+        // Direct match on fresh events, plus current-state check (the pane
+        // may already be in the wanted state before we started watching).
+        let matched = events
+            .iter()
+            .find(|e| engine_state_to_wire(e.state) == want);
+        if let Some(event) = matched {
+            return write_message(
+                writer,
+                &Message::StateEvent {
+                    v: VERSION,
+                    id: id.clone(),
+                    state: want,
+                    confidence: confidence_to_wire(&event.confidence),
+                    matched_pattern: event.matched_pattern.clone(),
+                },
+            )
+            .await;
+        }
+        if engine_state_to_wire(entry.engine_state()) == want {
+            return write_message(
+                writer,
+                &Message::StateEvent {
+                    v: VERSION,
+                    id: id.clone(),
+                    state: want,
+                    confidence: "direct:already".to_string(),
+                    matched_pattern: None,
+                },
+            )
+            .await;
+        }
+        // Child exit while waiting for anything but Done: answer what IS true.
+        if !matches!(entry.pane.try_wait(), ExitState::Running) && !matches!(want, AgentState::Done)
+        {
+            entry.pump(now);
+            if engine_state_to_wire(entry.engine_state()) == want {
+                continue;
+            }
+            return write_message(
+                writer,
+                &Message::Error {
+                    v: VERSION,
+                    message: format!("pane {id:?} exited while waiting"),
+                },
+            )
+            .await;
+        }
+        if matches!(entry.pane.try_wait(), ExitState::Exited(_)) && matches!(want, AgentState::Done)
+        {
+            return write_message(
+                writer,
+                &Message::StateEvent {
+                    v: VERSION,
+                    id: id.clone(),
+                    state: AgentState::Done,
+                    confidence: "direct:exit".to_string(),
+                    matched_pattern: None,
+                },
+            )
+            .await;
+        }
+        if std::time::Instant::now() >= deadline {
+            return write_message(
+                writer,
+                &Message::Error {
+                    v: VERSION,
+                    message: format!("timeout waiting for {want:?} after {timeout_ms} ms"),
+                },
+            )
+            .await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
+fn confidence_to_wire(confidence: &Confidence) -> String {
+    match confidence {
+        Confidence::Direct => "direct".to_string(),
+        Confidence::Inferred { rule } => format!("inferred:{rule}"),
+    }
+}
+
+/// Stream deltas for `id` from `from_line` until exit or disconnect.
+/// Also pumps the pane's state engine so `wait` sees fresh states.
 async fn stream_attach(
     writer: &mut (impl AsyncWriteExt + Unpin),
     registry: &Registry,
@@ -291,26 +682,19 @@ async fn stream_attach(
     mut from_line: usize,
 ) -> std::io::Result<()> {
     loop {
-        let pane = {
+        let entry = {
             let registry = registry.read().await;
             registry.get(id).cloned()
         };
-        let Some(pane) = pane else {
-            write_line(
-                writer,
-                &Response::Error {
-                    v: VERSION,
-                    message: format!("pane {id:?} not found"),
-                },
-            )
-            .await?;
-            return Ok(());
+        let Some(entry) = entry else {
+            return write_message(writer, &not_found(id)).await;
         };
-        let lines = pane.drain();
+        entry.pump(now_ms());
+        let lines = entry.pane.drain();
         if lines.len() > from_line {
-            write_line(
+            write_message(
                 writer,
-                &Response::Output {
+                &Message::Delta {
                     v: VERSION,
                     id: id.to_string(),
                     from_line,
@@ -321,20 +705,19 @@ async fn stream_attach(
             .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "client gone"))?;
             from_line = lines.len();
         }
-        match pane.try_wait() {
+        match entry.pane.try_wait() {
             ExitState::Exited(code) => {
-                // Final drain already sent above (drain includes everything);
-                // report the exit and close the stream.
-                write_line(
+                // Final drain already sent above; report exit (best-effort:
+                // a gone client just ends the stream).
+                let _ = write_message(
                     writer,
-                    &Response::Exited {
+                    &Message::Exited {
                         v: VERSION,
                         id: id.to_string(),
                         code: Some(code),
                     },
                 )
-                .await
-                .ok();
+                .await;
                 return Ok(());
             }
             ExitState::Running => {
@@ -343,3 +726,12 @@ async fn stream_attach(
         }
     }
 }
+
+/// Async-read helper that borrows the reader mutably across awaits.
+trait ReadHelper: AsyncReadExt + Unpin {
+    async fn await_reader(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.read(buf).await
+    }
+}
+
+impl<T: AsyncReadExt + Unpin> ReadHelper for T {}

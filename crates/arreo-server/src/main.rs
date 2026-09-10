@@ -91,7 +91,7 @@ async fn drain(registry: &arreo_server::daemon::Registry) -> usize {
         }
         // A drain flushes committed output; the lines themselves live in the
         // pane (and die with the daemon pre-T-0018 — documented, not hidden).
-        let _ = pane.drain();
+        let _ = pane.pane.drain();
         flushed += 1;
     }
     flushed

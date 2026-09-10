@@ -58,7 +58,6 @@ name = "arreo-cli"
 version = "0.1.0"
 dependencies = [
  "arreo-core",
- "serde_json",
  "tokio",
 ]
 

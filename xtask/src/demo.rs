@@ -350,17 +350,41 @@ fn live_states_check() -> bool {
 }
 
 fn raw_kill(socket: &PathBuf, id: &str) {
-    use std::io::Write;
+    use std::io::{Read, Write};
     use std::os::unix::net::UnixStream;
     let mut stream = match UnixStream::connect(socket) {
         Ok(stream) => stream,
         Err(_) => return,
     };
     let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
-    let _ = writeln!(stream, "{{\"op\":\"kill\",\"v\":0,\"id\":\"{id}\"}}");
-    let mut buf = [0u8; 256];
-    use std::io::Read;
     let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+    // Framed Hello handshake, then Kill (MessagePack v1 framing).
+    let hello = arreo_core::proto::Message::Hello {
+        v: arreo_core::proto::VERSION,
+        client: "demo-cleanup".to_string(),
+        wants: vec![arreo_core::proto::VERSION],
+    };
+    let kill = arreo_core::proto::Message::Kill {
+        v: arreo_core::proto::VERSION,
+        id: id.to_string(),
+    };
+    let _ = stream.write_all(&arreo_core::proto::codec::encode_frame(&hello).unwrap_or_default());
+    let mut buf = [0u8; 256];
+    // Read Welcome (ignore errors — best-effort cleanup).
+    let mut acc = Vec::new();
+    for _ in 0..4 {
+        match stream.read(&mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                acc.extend_from_slice(&buf[..n]);
+                if let Ok((_, consumed)) = arreo_core::proto::codec::decode_frame(&acc) {
+                    acc.drain(..consumed);
+                    break;
+                }
+            }
+        }
+    }
+    let _ = stream.write_all(&arreo_core::proto::codec::encode_frame(&kill).unwrap_or_default());
     let _ = stream.read(&mut buf);
 }
 

@@ -1,0 +1,13 @@
+## T-0014 evidence (2026-09-10, linux x86_64, rustc 1.98.0)
+
+### api tests (4) + slice green:
+test hello_handshake_and_version_rejection ... ok
+test metrics_reports_tree_truth ... ok
+test spawn_panes_read_send_split ... ok
+test wait_watches_state_with_timeout ... ok
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.45s
+
+### skill doc executed verbatim (all verbs incl. wait→Question 2.5s, timeout→exit 1)
+### adversarial: ghost verbs exit 1, bad state/duration exit 2, split-collision exit 1
+### slices: chaos 7/7, lifecycle 2/2, bench 6/6 all green post-cutover
+### full battery: workspace green, fmt/clippy clean

@@ -13,4 +13,3 @@ path = "src/main.rs"
 [dependencies]
 arreo-core = { path = "../arreo-core" }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "time", "io-util", "net"] }
-serde_json = "1"
