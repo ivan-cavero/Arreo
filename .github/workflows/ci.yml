@@ -33,5 +33,7 @@ jobs:
         run: cargo run -p xtask -- demo phase0
       - name: lifecycle (T-0012 — SIGTERM drain + crash restart)
         run: cargo run -p xtask -- e2e --slice lifecycle
+      - name: adapters (T-0017 — registry lint + fixture replays)
+        run: cargo run -p xtask -- adapters --check
       - name: xtask stubs
         run: cargo xtask e2e

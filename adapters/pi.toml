@@ -1,0 +1,51 @@
+# Pi adapter (T-0017) — universal tier, tuned from RECORDED pi runs.
+#
+# Observed shapes (fixtures/pi-*.pty, pi 0.84.4, --print text mode):
+# - Working: streamed answer text (any flow).
+# - Question: model asks back in TEXT ("Sure — which files...?", ends with
+#   "?" after an action verb). No permission gate in --print (auto-approved).
+# - Idle: static banner/help (no prompt tail → silence → idle).
+# - Stress: ?-heavy code (Spanish comments, `?` operator) must NOT ask.
+#
+# Native tier (documented, not yet wired): pi --mode json emits
+# session/agent_start/turn_start/message_*/turn_end/agent_end/agent_settled.
+# A hook mapping message_start(role=assistant, tool calls) → working and
+# permission-shaped assistant text → question is specified in
+# adapters/pi-native.md; the daemon hook lands with T-0014+ (socket API
+# already carries StateEvent with confidence payloads).
+
+idle_after_ms = 2000
+question_after_ms = 2000
+blocked_after_ms = 2500
+bell_means_attention = true
+done_on_exit = true
+
+question_patterns = [
+  "\\[y/n\\]",
+  "\\(y/n\\)",
+  "\\byes\\b.*\\bno\\b",
+  # pi asks back with action verbs + trailing ? (recorded: "which files
+  # do you want to delete? ... before touching anything.")
+  "which .*\\?.*$",
+  "should i .*\\?.*$",
+  "may i .*\\?.*$",
+  "want me to .*\\?.*$",
+  "confirm.*\\?.*$",
+  "proceed\\?",
+  "\\?\\s*$",
+  "❯\\s*$",
+  "›\\s*$",
+]
+
+error_patterns = [
+  "Traceback \\(most recent call last\\)",
+  "(?m)^(Error|FAILED|FATAL|panic)(:|\\b)",
+  "command not found",
+  "exit code \\d+",
+  "ValueError",
+  "TypeError",
+  "Segmentation fault",
+  # pi-specific: auth/provider failures (recorded error surface).
+  "Auth checks require",
+  "Unknown .* command",
+]

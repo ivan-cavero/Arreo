@@ -1,0 +1,18 @@
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 2.37s
+     Running `target/debug/xtask adapters --check`
+[PASS] default: schema valid (11 question + 7 error patterns)
+[PASS] default/question-permission.pty: flow Working, end Question
+[PASS] default/working-stream.pty: flow Working, end Idle
+[PASS] default/idle-shell.pty: flow Working, end Idle
+[PASS] default/vim-edit.pty: flow Working, end Idle
+[PASS] opencode: schema valid (12 question + 9 error patterns)
+[PASS] opencode/opencode-question.pty: flow Working, end Question
+[PASS] opencode/opencode-working.pty: flow Working, end Idle
+[PASS] opencode/opencode-idle.pty: flow Working, end Idle
+[PASS] opencode/opencode-stress.pty: flow Working, end Idle
+[PASS] pi: schema valid (12 question + 9 error patterns)
+[PASS] pi/pi-question.pty: flow Working, end Question
+[PASS] pi/pi-working.pty: flow Working, end Idle
+[PASS] pi/pi-idle.pty: flow Working, end Idle
+[PASS] pi/pi-stress.pty: flow Working, end Question
+adapters: 15 passed, 0 failed

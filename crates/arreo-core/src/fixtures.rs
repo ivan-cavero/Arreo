@@ -125,14 +125,29 @@ impl Fixture {
             }
             match pane.try_wait() {
                 ExitState::Exited(_) => {
-                    // Final drain: one more snapshot after exit (EOF race).
-                    std::thread::sleep(Duration::from_millis(50));
-                    let (raw, _) = pane.raw_snapshot();
-                    if raw.len() > last_len {
-                        events.push(Event {
-                            t_ms: start.elapsed().as_millis() as u64,
-                            bytes: raw[last_len..].to_vec(),
-                        });
+                    // Final drain: poll until the journal is STABLE (two
+                    // equal snapshots 100 ms apart, up to 2 s) — children
+                    // often flush on exit and the reader pump needs
+                    // scheduling on a loaded box (chaos-found: fixed 50 ms
+                    // missed pi's exit flush 4 runs straight).
+                    let mut stable = 0u32;
+                    let mut last = last_len;
+                    for _ in 0..20 {
+                        std::thread::sleep(Duration::from_millis(100));
+                        let (raw, _) = pane.raw_snapshot();
+                        if raw.len() > last {
+                            events.push(Event {
+                                t_ms: start.elapsed().as_millis() as u64,
+                                bytes: raw[last..].to_vec(),
+                            });
+                            last = raw.len();
+                            stable = 0;
+                        } else {
+                            stable += 1;
+                            if stable >= 2 {
+                                break;
+                            }
+                        }
                     }
                     break;
                 }

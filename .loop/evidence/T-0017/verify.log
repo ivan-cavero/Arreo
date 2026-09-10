@@ -1,0 +1,26 @@
+## T-0017 evidence (2026-09-10, linux x86_64, rustc 1.98.0)
+
+### adapters --check + e2e state slice: 15/15 PASS
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 2.37s
+     Running `target/debug/xtask adapters --check`
+[PASS] default: schema valid (11 question + 7 error patterns)
+[PASS] default/question-permission.pty: flow Working, end Question
+[PASS] default/working-stream.pty: flow Working, end Idle
+[PASS] default/idle-shell.pty: flow Working, end Idle
+[PASS] default/vim-edit.pty: flow Working, end Idle
+[PASS] opencode: schema valid (12 question + 9 error patterns)
+[PASS] opencode/opencode-question.pty: flow Working, end Question
+[PASS] opencode/opencode-working.pty: flow Working, end Idle
+[PASS] opencode/opencode-idle.pty: flow Working, end Idle
+[PASS] opencode/opencode-stress.pty: flow Working, end Idle
+[PASS] pi: schema valid (12 question + 9 error patterns)
+[PASS] pi/pi-question.pty: flow Working, end Question
+[PASS] pi/pi-working.pty: flow Working, end Idle
+[PASS] pi/pi-idle.pty: flow Working, end Idle
+[PASS] pi/pi-stress.pty: flow Working, end Question
+adapters: 15 passed, 0 failed
+
+### fixtures: 8 recorded (4 pi + 4 opencode, 36 KiB, secret-free, deterministic)
+### state tests 16/16 (incl. per-adapter mis-detection review + opencode pattern payload)
+### review finds fixed: exit-flush race (stability drain), --version shadow (argv[1]-only)
+### honest scope: codex/gemini/claude deferred (no CLIs on box — universal default covers them, no untested stubs)

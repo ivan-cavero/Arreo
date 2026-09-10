@@ -1,0 +1,53 @@
+# opencode adapter (T-0017) — universal + native tiers.
+#
+# Observed shapes (fixtures/opencode-*.pty, opencode 1.18.30):
+# - Working: step_start/text/tool_use event flow (--format json).
+# - Question (UNIVERSAL text, printed even in --format json runs):
+#   "! permission requested: <scope> (<path>); auto-rejecting"
+#   (recorded verbatim in opencode-question.pty).
+# - Question (NATIVE events, per herdr's live plugin on this box):
+#   permission.asked / question.asked → blocked-with-payload;
+#   permission.replied / question.replied / question.rejected → working;
+#   tool.execute.before/after → working; session.status map
+#   (idle/active/busy/pending/retry/running/streaming/working);
+#   session.idle → idle; session.error → blocked.
+# - Idle: static banner/help.
+# - Stress: ?-heavy code in text parts must NOT ask.
+#
+# Native hook spec: adapters/opencode-native.md (plugin subscribing to the
+# events above, reporting StateEvent with the permission payload).
+
+idle_after_ms = 2000
+question_after_ms = 2000
+blocked_after_ms = 2500
+bell_means_attention = true
+done_on_exit = true
+
+question_patterns = [
+  "\\[y/n\\]",
+  "\\(y/n\\)",
+  "\\byes\\b.*\\bno\\b",
+  # opencode terminal permission line (recorded verbatim).
+  "permission requested",
+  "permission.*\\?",
+  "may i (run|execute|install|delete|modify)",
+  "proceed\\?",
+  "confirm\\b.*\\?",
+  "allow\\?",
+  "\\?\\s*$",
+  "❯\\s*$",
+  "›\\s*$",
+]
+
+error_patterns = [
+  "Traceback \\(most recent call last\\)",
+  "(?m)^(Error|FAILED|FATAL|panic)(:|\\b)",
+  "command not found",
+  "exit code \\d+",
+  "ValueError",
+  "TypeError",
+  "Segmentation fault",
+  # opencode-specific: auto-rejected tool calls + error states.
+  "auto-rejecting",
+  "\"status\":\"error\"",
+]

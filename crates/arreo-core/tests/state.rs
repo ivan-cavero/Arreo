@@ -227,3 +227,59 @@ fn multibyte_truncation_never_panics() {
     }
     let _ = engine.tick(999_999);
 }
+
+/// T-0017 mis-detection review: adversarial shapes through EVERY adapter.
+/// A `?` in code, an open editor, or spinner output must never flip any
+/// adapter to Question — the honest `unknown`/non-question path.
+#[test]
+fn adversarial_shapes_fool_no_adapter() {
+    use arreo_core::state::{Adapter, Engine, State};
+    let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../adapters");
+    let adapters = ["default.toml", "pi.toml", "opencode.toml"];
+    // Shapes: ?-heavy code, vim alt-screen, spinner storm, bell-less noise.
+    let shapes: &[&[u8]] = &[
+        b"fn f() {\n  // what? why? huh?\n  let x = a ? b : c;\n  Ok(x?)\n}\n",
+        b"\x1b[?1049h\x1b[1;1H~   vim   \x1b[24;1H\"file\" 1L, 17B",
+        b"loading 1\rloading 2\rloading 3\rloading 4\r",
+        b"Some(Coffee { ml: 330 }) // no question here, just code\n",
+    ];
+    for name in adapters {
+        let adapter = Adapter::load(&root.join(name)).expect("adapter loads");
+        for (i, shape) in shapes.iter().enumerate() {
+            let mut engine = Engine::new(adapter.clone(), 0);
+            engine.feed(shape, 0);
+            let later = engine.feed(b"", 5_000);
+            assert!(
+                !later.iter().any(|e| e.state == State::Question),
+                "{name} shape {i}: false question: {later:?}"
+            );
+        }
+    }
+}
+
+/// Native-tier payload honesty: opencode's recorded permission line yields
+/// `question (inferred)` WITH the matched pattern naming the scope.
+#[test]
+fn opencode_permission_line_carries_its_pattern() {
+    use arreo_core::state::{Adapter, Engine, State};
+    let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../adapters");
+    let adapter = Adapter::load(&root.join("opencode.toml")).expect("opencode loads");
+    let mut engine = Engine::new(adapter, 0);
+    engine.feed(
+        b"! permission requested: external_directory (/tmp/x/*); auto-rejecting\n",
+        0,
+    );
+    let later = engine.feed(b"", 2_500);
+    let question = later
+        .iter()
+        .find(|e| e.state == State::Question)
+        .expect("asks: {later:?}");
+    assert!(
+        question
+            .matched_pattern
+            .as_deref()
+            .is_some_and(|p| p.contains("permission requested")),
+        "pattern names the scope: {:?}",
+        question.matched_pattern
+    );
+}

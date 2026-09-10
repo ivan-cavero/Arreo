@@ -30,7 +30,10 @@ fn usage() -> ExitCode {
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
-    if args.iter().any(|a| a == "--version" || a == "-V") {
+    // NOTE: only argv[1] counts (chaos-found, T-0017: a global `.any()`
+    // swallowed child args, so `arreo record X --version` printed OUR version
+    // instead of recording the child's `--version` run).
+    if args.get(1).is_some_and(|a| a == "--version" || a == "-V") {
         println!("arreo {}", env!("CARGO_PKG_VERSION"));
         return ExitCode::SUCCESS;
     }

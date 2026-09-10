@@ -8,6 +8,7 @@
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
+mod adapters_check;
 mod api_slice;
 mod bench;
 mod chaos;
@@ -30,6 +31,7 @@ fn main() -> ExitCode {
         "demo" => demo::demo(rest),
         "conpty-smoke" => conpty_smoke(rest),
         "check-targets" => check_targets::check_targets(rest),
+        "adapters" => adapters_check::run(rest),
         other => {
             eprintln!("unknown xtask command: {other}");
             eprintln!("usage: xtask <e2e|bench|conpty-smoke|check-targets> [options]");
@@ -46,6 +48,7 @@ fn e2e(rest: &[String]) -> ExitCode {
     match slice {
         Some("chaos") => chaos::run(rest),
         Some("api") => api_slice::run(rest),
+        Some("state") => adapters_check::run(rest),
         Some("lifecycle") => lifecycle_slice::run(rest),
         Some(other) => {
             eprintln!("xtask e2e: unknown slice {other:?} (have: chaos)");
