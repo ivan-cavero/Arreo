@@ -1,0 +1,23 @@
+## T-0005 evidence (2026-09-10, linux x86_64, rustc 1.98.0)
+
+### cargo test -p arreo-server → 5 passed
+test unknown_pane_and_version_are_loud_errors ... ok
+test detach_reattach_keeps_scrollback ... ok
+test kill_terminates_and_reaps_the_child ... ok
+test spawn_list_send_attach_same_truth ... ok
+test two_clients_see_same_truth ... ok
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.35s
+
+### interactive tmux frames (.loop/evidence/T-0005/frame-*.txt): spawn+panes, attach stream, exec output, reattach — all with real keystrokes
+total 28
+drwxrwxr-x  2 dev dev 4096 Sep 10 18:53 .
+drwxrwxr-x 12 dev dev 4096 Sep 10 18:39 ..
+-rw-rw-r--  1 dev dev  344 Sep 10 18:41 frame-attach-exec.txt
+-rw-rw-r--  1 dev dev  200 Sep 10 18:40 frame-attach.txt
+-rw-rw-r--  1 dev dev  278 Sep 10 18:40 frame-panes.txt
+-rw-rw-r--  1 dev dev  712 Sep 10 18:42 frame-reattach.txt
+-rw-rw-r--  1 dev dev  575 Sep 10 18:53 verify.log
+
+### adversarial: malformed JSON→loud error, dup spawn→exit 1, ghost attach→exit 1, second daemon→AddrInUse refusal
+### review finds fixed: Kill orphaned children (now kill_shared + background reap, proven: zombie→reaped); dep-gate violation (protocol moved to arreo-core::proto, gate green)
+### full battery: fmt clean, clippy -D warnings clean, workspace green incl. dep gate

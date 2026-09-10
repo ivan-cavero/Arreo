@@ -1,0 +1,15 @@
+dev@vmi3525064:~/dev/Arreo$ ./target/debug/arreo spawn shell /bin/sh --socket /tmp/arreo-ev.sock
+spawned shell
+dev@vmi3525064:~/dev/Arreo$ ./target/debug/arreo panes --socket /tmp/arreo-ev.sock
+              ID  STATE
+           shell  alive
+dev@vmi3525064:~/dev/Arreo$ ./target/debug/arreo send shell 'echo typed-via-send-77' --socket /tmp/arreo-ev.sock
+dev@vmi3525064:~/dev/Arreo$ ./target/debug/arreo send shell $'\r' --socket /tmp/arreo-ev.sock
+dev@vmi3525064:~/dev/Arreo$ timeout 3 ./target/debug/arreo attach shell --socket /tmp/arreo-ev.sock > /tmp/reattach.txt
+2>&1; echo REATTACH_EXIT=$?; cat /tmp/reattach.txt
+REATTACH_EXIT=124
+$ echo typed-via-send-77
+
+typed-via-send-77
+$
+dev@vmi3525064:~/dev/Arreo$

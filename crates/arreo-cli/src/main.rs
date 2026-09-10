@@ -1,5 +1,8 @@
-//! `arreo` CLI binary. Verbs land per task: `record` (T-0011), `metrics --pid` (T-0006), full suite (T-0005+).
+//! `arreo` CLI binary. Verbs: `record` (T-0011), `metrics --pid` (T-0006),
+//! daemon verbs `serve`-side client: `panes`, `spawn`, `attach`, `send` (T-0005).
 
+use arreo_core::proto::{Request, Response};
+use std::future::Future;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
@@ -9,7 +12,11 @@ fn usage() -> ExitCode {
     eprintln!("  arreo --version");
     eprintln!("  arreo record <command> [args...] -o <fixture.pty> [--timeout-secs N]");
     eprintln!("  arreo replay <fixture.pty> [--speed N]");
-    eprintln!("  arreo metrics --pid <PID> [--samples N]   (live table; daemon-backed `arreo metrics <pane>` lands with T-0005/T-0012)");
+    eprintln!("  arreo metrics --pid <PID> [--samples N]");
+    eprintln!("  arreo panes [--socket PATH]");
+    eprintln!("  arreo spawn <id> <program> [args...] [--socket PATH]");
+    eprintln!("  arreo attach <id> [--socket PATH]   (stream output; Ctrl-C detaches, pane keeps running)");
+    eprintln!("  arreo send <id> <text...> [--socket PATH]");
     ExitCode::from(2)
 }
 
@@ -24,8 +31,66 @@ fn main() -> ExitCode {
         Some("record") => cmd_record(&args[2..]),
         Some("replay") => cmd_replay(&args[2..]),
         Some("metrics") => cmd_metrics(&args[2..]),
+        Some("panes") => rt::block_on(cmd_panes(&args[2..])),
+        Some("spawn") => rt::block_on(cmd_spawn(&args[2..])),
+        Some("attach") => rt::block_on(cmd_attach(&args[2..])),
+        Some("send") => rt::block_on(cmd_send(&args[2..])),
         _ => usage(),
     }
+}
+
+/// Minimal block_on (current-thread runtime: no extra threads for a CLI).
+mod rt {
+    use super::Future;
+    use std::process::ExitCode;
+    pub fn block_on<F: Future<Output = ExitCode>>(future: F) -> ExitCode {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map(|rt| rt.block_on(future))
+            .unwrap_or_else(|e| {
+                eprintln!("arreo: runtime failed: {e}");
+                ExitCode::FAILURE
+            })
+    }
+}
+
+fn default_socket() -> PathBuf {
+    if let Ok(runtime) = std::env::var("XDG_RUNTIME_DIR") {
+        return PathBuf::from(runtime).join("arreo.sock");
+    }
+    std::env::temp_dir().join(format!("arreo-{}.sock", unix_uid()))
+}
+
+#[cfg(unix)]
+fn unix_uid() -> u32 {
+    unsafe {
+        extern "C" {
+            fn getuid() -> u32;
+        }
+        getuid()
+    }
+}
+
+#[cfg(not(unix))]
+fn unix_uid() -> u32 {
+    0
+}
+
+fn take_socket(rest: &[String]) -> (PathBuf, Vec<String>) {
+    let mut socket = default_socket();
+    let mut kept = Vec::new();
+    let mut i = 0;
+    while i < rest.len() {
+        if rest[i] == "--socket" && i + 1 < rest.len() {
+            socket = PathBuf::from(&rest[i + 1]);
+            i += 2;
+        } else {
+            kept.push(rest[i].clone());
+            i += 1;
+        }
+    }
+    (socket, kept)
 }
 
 fn cmd_record(rest: &[String]) -> ExitCode {
@@ -220,4 +285,202 @@ fn cmd_metrics(rest: &[String]) -> ExitCode {
         std::thread::sleep(Duration::from_secs(1));
     }
     ExitCode::SUCCESS
+}
+
+async fn open_connection(
+    socket: &PathBuf,
+) -> Result<
+    (
+        tokio::io::BufReader<tokio::net::unix::OwnedReadHalf>,
+        tokio::net::unix::OwnedWriteHalf,
+    ),
+    String,
+> {
+    let stream = tokio::net::UnixStream::connect(socket).await.map_err(|e| {
+        format!(
+            "cannot connect to {}: {e} (is arreo-server running?)",
+            socket.display()
+        )
+    })?;
+    let (reader, writer) = stream.into_split();
+    Ok((tokio::io::BufReader::new(reader), writer))
+}
+
+async fn request(socket: &PathBuf, req: &Request) -> Result<Response, String> {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+    let (mut reader, mut writer) = open_connection(socket).await?;
+    let mut line = serde_json::to_string(req).map_err(|e| format!("encode: {e}"))?;
+    line.push('\n');
+    writer
+        .write_all(line.as_bytes())
+        .await
+        .map_err(|e| format!("write: {e}"))?;
+    writer.flush().await.map_err(|e| format!("flush: {e}"))?;
+    let mut out = String::new();
+    reader
+        .read_line(&mut out)
+        .await
+        .map_err(|e| format!("read: {e}"))?;
+    serde_json::from_str(&out).map_err(|e| format!("decode: {e}"))
+}
+
+async fn cmd_panes(rest: &[String]) -> ExitCode {
+    let (socket, kept) = take_socket(rest);
+    if !kept.is_empty() {
+        eprintln!("panes: unexpected args {kept:?}");
+        return ExitCode::from(2);
+    }
+    match request(&socket, &Request::List { v: 0 }).await {
+        Ok(Response::Panes { panes, .. }) => {
+            println!("{:>16}  STATE", "ID");
+            for pane in panes {
+                println!(
+                    "{:>16}  {}",
+                    pane.id,
+                    if pane.alive { "alive" } else { "exited" }
+                );
+            }
+            ExitCode::SUCCESS
+        }
+        Ok(Response::Error { message, .. }) => {
+            eprintln!("panes: {message}");
+            ExitCode::FAILURE
+        }
+        Ok(other) => {
+            eprintln!("panes: unexpected {other:?}");
+            ExitCode::FAILURE
+        }
+        Err(e) => {
+            eprintln!("panes: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+async fn cmd_spawn(rest: &[String]) -> ExitCode {
+    let (socket, kept) = take_socket(rest);
+    if kept.len() < 2 {
+        eprintln!("usage: arreo spawn <id> <program> [args...] [--socket PATH]");
+        return ExitCode::from(2);
+    }
+    let req = Request::Spawn {
+        v: 0,
+        id: kept[0].clone(),
+        program: kept[1].clone(),
+        args: kept[2..].to_vec(),
+        cols: 80,
+        rows: 24,
+    };
+    match request(&socket, &req).await {
+        Ok(Response::Ok { .. }) => {
+            println!("spawned {}", kept[0]);
+            ExitCode::SUCCESS
+        }
+        Ok(Response::Error { message, .. }) => {
+            eprintln!("spawn: {message}");
+            ExitCode::FAILURE
+        }
+        Ok(other) => {
+            eprintln!("spawn: unexpected {other:?}");
+            ExitCode::FAILURE
+        }
+        Err(e) => {
+            eprintln!("spawn: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+async fn cmd_send(rest: &[String]) -> ExitCode {
+    let (socket, kept) = take_socket(rest);
+    if kept.len() < 2 {
+        eprintln!("usage: arreo send <id> <text...> [--socket PATH]");
+        return ExitCode::from(2);
+    }
+    let req = Request::Send {
+        v: 0,
+        id: kept[0].clone(),
+        data: kept[1..].join(" "),
+    };
+    match request(&socket, &req).await {
+        Ok(Response::Ok { .. }) => ExitCode::SUCCESS,
+        Ok(Response::Error { message, .. }) => {
+            eprintln!("send: {message}");
+            ExitCode::FAILURE
+        }
+        Ok(other) => {
+            eprintln!("send: unexpected {other:?}");
+            ExitCode::FAILURE
+        }
+        Err(e) => {
+            eprintln!("send: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Attach: stream append-deltas to stdout until the pane exits (then exit 0)
+/// or the connection breaks. Ctrl-C detaches (exit 0) — the pane keeps
+/// running on the daemon. No full repaints: only NEW lines print (v0 delta).
+async fn cmd_attach(rest: &[String]) -> ExitCode {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+    let (socket, kept) = take_socket(rest);
+    if kept.len() != 1 {
+        eprintln!("usage: arreo attach <id> [--socket PATH]");
+        return ExitCode::from(2);
+    }
+    let id = kept[0].clone();
+    let (mut reader, mut writer) = match open_connection(&socket).await {
+        Ok(pair) => pair,
+        Err(e) => {
+            eprintln!("attach: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let req = Request::Attach {
+        v: 0,
+        id: id.clone(),
+        from_line: 0,
+    };
+    let mut line = serde_json::to_string(&req).unwrap();
+    line.push('\n');
+    if let Err(e) = writer.write_all(line.as_bytes()).await {
+        eprintln!("attach: {e}");
+        return ExitCode::FAILURE;
+    }
+    let _ = writer.flush().await;
+    loop {
+        let mut out = String::new();
+        match reader.read_line(&mut out).await {
+            Ok(0) => return ExitCode::SUCCESS,
+            Ok(_) => {}
+            Err(e) => {
+                eprintln!("attach: connection lost: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+        let response: Response = match serde_json::from_str(&out) {
+            Ok(response) => response,
+            Err(e) => {
+                eprintln!("attach: bad frame: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+        match response {
+            Response::Output { lines, .. } => {
+                for text in lines {
+                    println!("{text}");
+                }
+            }
+            Response::Exited { code, .. } => {
+                eprintln!("attach: pane exited (code {code:?})");
+                return ExitCode::SUCCESS;
+            }
+            Response::Error { message, .. } => {
+                eprintln!("attach: {message}");
+                return ExitCode::FAILURE;
+            }
+            Response::Ok { .. } | Response::Panes { .. } => {}
+        }
+    }
 }

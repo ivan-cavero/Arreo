@@ -1,0 +1,6 @@
+timeout 4 ./target/debug/arreo attach shell --socket /tmp/arreo-ev.sock
+dev@vmi3525064:~/dev/Arreo$ timeout 4 ./target/debug/arreo attach shell --socket /tmp/arreo-ev.sock
+$ echo typed-via-send-77
+
+
+

@@ -1,0 +1,14 @@
+dev@vmi3525064:~/dev/Arreo$ ./target/debug/arreo spawn shell /bin/sh --socket /tmp/arreo-ev.sock
+spawned shell
+dev@vmi3525064:~/dev/Arreo$ ./target/debug/arreo panes --socket /tmp/arreo-ev.sock
+              ID  STATE
+           shell  alive
+dev@vmi3525064:~/dev/Arreo$
+
+
+
+
+
+
+
+

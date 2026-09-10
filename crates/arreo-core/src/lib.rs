@@ -6,6 +6,7 @@
 
 pub mod fixtures;
 pub mod metrics;
+pub mod proto;
 pub mod pty;
 pub mod state;
 pub mod vt;

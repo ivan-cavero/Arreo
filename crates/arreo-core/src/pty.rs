@@ -187,7 +187,7 @@ pub struct Pane {
     writer: Mutex<Box<dyn Write + Send>>,
     buffer: Arc<Mutex<RingBuffer>>,
     child: Arc<Mutex<Box<dyn portable_pty::Child + Send + Sync>>>,
-    killer: Box<dyn portable_pty::ChildKiller + Send + Sync>,
+    killer: Mutex<Box<dyn portable_pty::ChildKiller + Send + Sync>>,
     closed: Arc<std::sync::atomic::AtomicBool>,
 }
 
@@ -229,7 +229,7 @@ impl Pane {
             })
             .map_err(PtyError::Io)?;
 
-        let killer = child.clone_killer();
+        let killer = Mutex::new(child.clone_killer());
         let master = Mutex::new(pair.master);
         let writer = Mutex::new(master.lock().map_err(|_| PtyError::Closed)?.take_writer()?);
         Ok(Self {
@@ -346,9 +346,16 @@ impl Pane {
         }
     }
 
-    /// Kill the child process.
+    /// Kill the child process (exclusive handle).
     pub fn kill(&mut self) -> Result<(), PtyError> {
-        self.killer.kill()?;
+        self.killer.lock().map_err(|_| PtyError::Closed)?.kill()?;
+        Ok(())
+    }
+
+    /// Kill through a shared handle (daemon registry holds `Arc<Pane>`).
+    /// Same syscall as `kill`; interior mutability bridges `&self`.
+    pub fn kill_shared(&self) -> Result<(), PtyError> {
+        self.killer.lock().map_err(|_| PtyError::Closed)?.kill()?;
         Ok(())
     }
 }
