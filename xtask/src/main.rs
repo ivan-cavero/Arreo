@@ -16,6 +16,7 @@ mod check_targets;
 mod demo;
 mod enforcement_slice;
 mod lifecycle_slice;
+mod package;
 mod persistence_slice;
 
 fn main() -> ExitCode {
@@ -34,6 +35,7 @@ fn main() -> ExitCode {
         "conpty-smoke" => conpty_smoke(rest),
         "check-targets" => check_targets::check_targets(rest),
         "adapters" => adapters_check::run(rest),
+        "package" => package::package(rest),
         other => {
             eprintln!("unknown xtask command: {other}");
             eprintln!("usage: xtask <e2e|bench|conpty-smoke|check-targets> [options]");

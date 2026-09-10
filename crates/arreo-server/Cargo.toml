@@ -15,7 +15,7 @@ name = "arreo_server"
 path = "src/lib.rs"
 
 [dependencies]
-arreo-core = { path = "../arreo-core" }
+arreo-core = { version = "0.1.0", path = "../arreo-core" }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "time", "io-util", "net", "signal"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

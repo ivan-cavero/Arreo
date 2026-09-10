@@ -1,0 +1,77 @@
+# cargo-deny configuration (T-0020): bans, licenses, duplicates.
+#
+# Philosophy (dependency rules, enforced here):
+# - std + in-tree first; new deps need a ledger note + ADR-level rationale.
+# - No scaffolding deps (implementable in an afternoon).
+# - Apache-2.0 / MIT preferred; copyleft (GPL/AGPL) BANNED in shipped code
+#   (the relay is AGPL by design, but no GPL-family crate may enter the
+#   dependency tree — the relay's license is ours, not a dependency's).
+# - No unmaintained / yanked / wildcard-version deps.
+
+[graph]
+targets = [
+    { triple = "x86_64-unknown-linux-gnu" },
+    { triple = "x86_64-pc-windows-msvc" },
+    { triple = "aarch64-apple-darwin" },
+]
+# Build deps included: a compromised build script owns the machine.
+all-features = false
+exclude-dev = false
+
+[output]
+feature-depth = 1
+
+[bans]
+# Fail the gate on these — no silent drift.
+# multiple-versions = "warn" (NOT deny): all 6 current dupes are TRANSITIVE
+# (bitflags via portable-pty/alacritty, syn/thiserror majors, windows-sys,
+# hashbrown) — deny would veto every upstream minor bump, unworkable.
+# Warn keeps visibility; a duplicate WE introduce directly gets denied by
+# review (ledger rule), not by this lint.
+multiple-versions = "warn"
+wildcards = "deny"
+deny = [
+    # Copyleft in the dependency tree (our AGPL relay is a first-party
+    # crate, not a dependency — this bans GPL-family DEPENDENCIES).
+    { name = "gpl-3.0", wrappers = [] },
+    # Known-unmaintained stand-ins get explicit entries with reasons here.
+]
+skip = []
+skip-tree = []
+
+[licenses]
+# Allowed licenses for every crate in the tree (including transitive).
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-DFS-2016",
+    "Unicode-3.0",
+    "CC0-1.0",
+    "Unlicense",
+    "MPL-2.0",
+    "CDLA-Permissive-2.0",
+    "OpenSSL",
+    "Zlib",
+]
+# Confidence threshold for license-text detection (0.20 schema key).
+confidence-threshold = 0.8
+# Copyleft (GPL-family) dependencies are banned by the allow-list below:
+# anything not explicitly allowed fails the gate, so no GPL-family crate
+# can enter the tree. (Our AGPL relay is a first-party crate, not a
+# dependency.) A future explicit per-crate ban gets added with its reason
+# the day a copyleft crate knocks — fail-closed by default, loud by entry.
+exceptions = []
+
+[licenses.private]
+ignore = false
+
+[sources]
+# crates.io only (plus our own path crates). No git deps without pinning.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

@@ -25,6 +25,18 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: test (incl. dependency-direction gate)
         run: cargo test --workspace
+      - name: supply chain (T-0020 — vet + audit + deny, zero findings)
+        run: |
+          cargo install cargo-vet --locked --version 0.10.0
+          cargo install cargo-deny --locked --version 0.20.2
+          cargo install cargo-audit --locked --version 0.22.0
+          cargo vet --locked
+          cargo audit
+          cargo deny check
+      - name: package skeleton (T-0020 — dist plan mode)
+        run: cargo run -p xtask -- package --dry-run
+      - name: binary size (T-0020 — release daemon ≤ budget)
+        run: cargo run -p xtask -- bench --probe size
       - name: cgroup delegation (T-0019 — ubuntu only; macos/windows skip honestly)
         if: matrix.os == 'ubuntu-latest'
         run: |

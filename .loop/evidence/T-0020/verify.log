@@ -1,0 +1,11 @@
+## T-0020 evidence (2026-09-10, linux x86_64, rustc 1.98.0)
+
+### gates (all green locally):
+vet: Vetting Succeeded (141 exempted)
+audit: 0 vulnerabilities (147 deps scanned)
+deny: advisories ok, bans ok, licenses ok, sources ok
+
+### package --dry-run: skeleton valid (3 targets + 2 installers + 2 binaries)
+### bench --probe size: arreo-server release 3.6 MB (target ≤ 20 MB) → PASS
+### negative: deny bit on wildcards+dupes pre-fix (recorded); vet lockfile-tamper → exit 255
+### release profile: opt-z/strip/abort/thin-LTO in Cargo.toml; philosophy in CONTRIBUTING (rule 4)

@@ -15,4 +15,4 @@ name = "arreo_relay"
 path = "src/lib.rs"
 
 [dependencies]
-arreo-core = { path = "../arreo-core" }
+arreo-core = { version = "0.1.0", path = "../arreo-core" }

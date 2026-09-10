@@ -29,9 +29,10 @@ use std::time::{Duration, Instant};
 
 pub fn bench(rest: &[String]) -> ExitCode {
     if rest.iter().any(|a| a == "--help" || a == "-h") {
-        println!("usage: xtask bench [--panes N] [--json] [--probe proto]");
+        println!("usage: xtask bench [--panes N] [--json] [--probe proto|size]");
         println!("  spawns N real panes, replays fixtures, asserts perf-budget.toml phase-0 rows.");
         println!("  --probe proto: only the 1MB MessagePack codec check (T-0013).");
+        println!("  --probe size: only the release daemon binary size check (T-0020).");
         return ExitCode::SUCCESS;
     }
     if rest.iter().any(|a| a == "--probe") {
@@ -41,12 +42,18 @@ pub fn bench(rest: &[String]) -> ExitCode {
             .map(|w| w[1].as_str());
         match which {
             Some("proto") => return probe_proto(rest.iter().any(|a| a == "--json")),
+            Some("size") => {
+                let target = Budget::load(&workspace_root().join("perf-budget.toml"))
+                    .map(|b| b.daemon_binary_mb)
+                    .unwrap_or(20);
+                return super::package::probe_size(rest.iter().any(|a| a == "--json"), target);
+            }
             Some(other) => {
-                eprintln!("bench: unknown probe {other:?} (have: proto)");
+                eprintln!("bench: unknown probe {other:?} (have: proto, size)");
                 return ExitCode::from(2);
             }
             None => {
-                eprintln!("bench: --probe needs a name (have: proto)");
+                eprintln!("bench: --probe needs a name (have: proto, size)");
                 return ExitCode::from(2);
             }
         }
@@ -95,6 +102,7 @@ struct Budget {
     detection_latency_ms: u64,
     sampler_sweep_30panes_ms: u64,
     vt_feed_1byte_ms: u64,
+    daemon_binary_mb: u64,
 }
 
 impl Budget {
@@ -128,6 +136,7 @@ impl Budget {
             detection_latency_ms: get("detection_latency_ms")?,
             sampler_sweep_30panes_ms: get("sampler_sweep_30panes_ms")?,
             vt_feed_1byte_ms: get("vt_feed_1byte_ms")?,
+            daemon_binary_mb: get("daemon_binary_mb")?,
         })
     }
 }

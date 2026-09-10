@@ -62,11 +62,17 @@ cargo audit && cargo vet             # supply chain
    *and* Windows. A release is not a release if any OS is red — this applies to PRs too.
 3. **Perf budgets are executable.** If `xtask bench` says you regressed RSS or attach
    latency, fix it — no human judgment, no "but it's small".
-4. **No secrets, ever.** Config sync code includes secret-shape scanning; `cargo vet` and
+4. **Dependencies are reviewed, not added.** Std + in-tree first; a new crate needs a
+   ledger note with rationale (correctness/performance/security/simplicity/maintenance
+   — "it's popular" is not a rationale). No scaffolding dependencies (implementable in
+   an afternoon). Gates: `cargo vet` (reviews) + `cargo audit` (RUSTSEC) + `cargo deny`
+   (bans/duplicates/licenses) — zero unresolved findings or the merge fails. Vetting a
+   new dep means `cargo vet certify` (exemptions are the day-one floor, not the goal).
+5. **No secrets, ever.** Config sync code includes secret-shape scanning; `cargo vet` and
    CI secret scans back it up. Don't commit keys, even "test" ones.
-5. **Compat window.** Protocol/schema changes must keep N−1 client compatibility or be
+6. **Compat window.** Protocol/schema changes must keep N−1 client compatibility or be
    behind a feature flag. If the live handoff can't carry your change, mark it deferred-update.
-6. **Small PRs.** One concern per PR; target < ~400 changed lines. Larger work goes in
+7. **Small PRs.** One concern per PR; target < ~400 changed lines. Larger work goes in
    stacked PRs (the chained-prs skill documents the pattern).
 
 ## Pull requests

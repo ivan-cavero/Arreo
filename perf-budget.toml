@@ -30,6 +30,9 @@ sampler_sweep_30panes_ms = { phase0 = true, target = 300, unit = "ms" }
 vt_feed_1byte_ms = { phase0 = true, target = 50, unit = "ms" }
 # Fixture replay determinism: byte-exact, always (no threshold — boolean).
 replay_determinism = { phase0 = true, target = 0, unit = "mismatches" }
+# Release daemon binary ≤ 20 MB (T-0020 supply chain; enforced by
+# `bench --probe size`, which builds --release on demand and caches).
+daemon_binary_mb = { phase0 = true, target = 20, unit = "MB" }
 
 # Later phases (recorded, not yet enforced):
 phone_cold_attach_s = { phase0 = false, target = 1, unit = "s" }

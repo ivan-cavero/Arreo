@@ -11,6 +11,6 @@ rust-version.workspace = true
 # keeps `cargo check --workspace --no-default-features` (T-0010 lite pass)
 # from re-enabling `sqlite` via feature unification. Normal builds still get
 # the store through arreo-core's own default.
-arreo-core = { path = "../crates/arreo-core", default-features = false }
-arreo-server = { path = "../crates/arreo-server" }
+arreo-core = { version = "0.1.0", path = "../crates/arreo-core", default-features = false }
+arreo-server = { version = "0.1.0", path = "../crates/arreo-server" }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "time", "io-util", "net"] }

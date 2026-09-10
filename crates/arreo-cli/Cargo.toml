@@ -11,5 +11,5 @@ name = "arreo"
 path = "src/main.rs"
 
 [dependencies]
-arreo-core = { path = "../arreo-core" }
+arreo-core = { version = "0.1.0", path = "../arreo-core" }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "time", "io-util", "net"] }
