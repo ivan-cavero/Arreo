@@ -413,20 +413,67 @@ CI runs a nightly benchmark: 30 panes × [CC]-shaped traffic replay, asserting e
 - **E2E suite as the referee:** hermetic, fast (< 5 min full), deterministic fixtures (scripted PTY output replays), covering every release-gating behavior on all three OSes. Agents can run it freely; it is the definition of "works".
 - **Perf budgets are executable:** `perf-budget.toml` (from §5) enforced by `xtask bench` — a PR that regresses RSS or attach latency fails mechanically, no human judgment needed.
 
-### 10.2 The loop layout (how a task flows)
+### 10.2 The loop layout (validated by Cursor's autonomous-codebases research, Feb 2026)
 
-- **Planning:** a human + one planning agent maintain `tasks/` (acceptance criteria per task, dependency order). Nothing enters a loop without written criteria.
-- **Workers:** one agent per git worktree (OMP `/loop` with the task prompt), implementing with strict TDD; the worker's exit condition is: tests green + e2e slice green + self-review done.
-- **Verifier:** a separate agent runs the E2E battery + perf budget against the worktree diff — read-only, independent from the worker (never trust the writer's own green).
-- **Bug hunters:** scheduled red-team loops running chaos tests (kill the daemon mid-handoff, drop relay connections, OOM a pane, corrupt scrollback files) plus fuzzing on the protocol parser and state engine. Findings become tasks with repro steps.
-- **Review gate:** native review / dual-review skill before merge; humans approve merges and releases, agents do everything else.
-- **Memory:** session summaries + discoveries persist (Engram/OMP memory) so the next loop iteration starts smarter — key decisions land in `specs/`, not in chat scrollback.
+> Cursor ran this exact experiment at scale: recursive planners with single-threaded
+> accountability, workers that never talk to each other, one deliverable per worker,
+> **no integrator**, and a low-but-stable error rate converged by the fleet — ~1,000
+> commits/hour sustained for a week with zero human intervention. Their failed experiments
+> are as instructive as their wins: lock-based self-coordination collapsed (20 agents at
+> 1–3-agent throughput), a separate integrator became a bottleneck bureaucracy, and
+> 100%-correct-before-commit serialized everything.
+
+- **Planner-executor (the loop agent):** decomposes roadmap into focused tasks, delegates,
+  integrates deliverables, keeps the ledger. One hat at a time — never both.
+- **Subagent fleet (OMP ≥ v18 native):** `scout` (exploration, read-only) · `task`
+  (implementation workers, recursive to depth 3) · `sonic` (mechanical) · `librarian`
+  (external API research) · `reviewer` + `security-reviewer` (independent verification —
+  **never the writer grading itself**, which replaces the naive verifier from v1 of this
+  design). Workers run on their **own worktrees** (`omp worktree`) and deliver structured
+  results (`yield`); the planner integrates sequentially in the ledger.
+- **Concurrency discipline:** no shared coordination files, no agent-managed locks
+  (validated failure mode) — isolation by worktree, contention resolved by the planner,
+  convergence accepted where files collide.
+- **Correctness cadence:** full e2e battery + perf budgets green at **integration points**
+  (merge to main, phase exit); within worker worktrees, momentum over ceremony. The green
+  line is a cadence, not a constant.
+- **Prompt discipline (from the same research):** constraints over instructions, concrete
+  numbers over vague goals ("generate 20–100 tasks"), never checklist a high-level task,
+  and specify intent explicitly (dependencies philosophy, performance limits) — agents
+  follow bad instructions as faithfully as good ones.
+- **Planning:** a human + one planning agent maintain `tasks/` (acceptance criteria per
+  task, dependency order). Nothing enters a loop without written criteria.
+- **Bug hunters:** scheduled red-team loops running chaos tests (kill the daemon
+  mid-handoff, drop relay connections, OOM a pane, corrupt scrollback files) plus fuzzing
+  on the protocol parser and state engine. Findings become tasks with repro steps.
+- **Review gate:** native review / dual-review skill before merge; humans approve merges
+  and releases, agents do everything else.
+- **Empirical verification matrix (every artifact exercised, then attacked):** code →
+  failing test + suite + e2e slice; TUI → driven interactively via scripted PTY with real
+  key events + frame captures; web → real-browser click-through (CDP/Playwright-style)
+  with screenshots per claimed state; mobile → simulator run + screenshots; daemon →
+  socket-API exercise + chaos (kill mid-handoff, corrupt input, OOM); docs/themes →
+  examples executed. Evidence stored per task under `.loop/evidence/` and referenced from
+  the ledger — **claims without evidence don't merge**. After it works, agents run an
+  explicit adversarial pass (malformed input, zero-length, huge output, network loss,
+  concurrency) — found bugs become tasks or in-scope fixes; dogfooding on our own fleet
+  whenever the feature exists.
+- **Simplicity is a merge gate, not a taste:** simplest design that meets the criteria;
+  every abstraction pays rent (used in ≥ 2 real places); a change must be explainable in
+  one sentence; deleted complexity counts as progress. Current stable toolchain always —
+  stale dependencies are bugs.
+- **Memory:** ledger snapshot + event log (`.loop/PROGRESS.md`), session summaries, and
+  `specs/` updates persist learnings between iterations.
+- **Fleet infra:** run loops on the VPS (many-core, fast disk); the Pi5 is a *target*
+  machine, not a build farm — the research found concurrent-build disk I/O is the first
+  bottleneck at fleet scale.
 
 ### 10.3 Why this is viable for THIS project specifically
 
 - The product's own feedback loop is unusually machine-checkable: states, metrics, budgets, and protocol conformance are all assertable — ideal ground for agent-driven development.
+- The harness for the loops is OMP itself — which already has the subagent machinery the research validated (bundled task agents, model roles, worktrees, structured deliverables). We build Arreo with the same pattern Arreo is meant to serve; every lesson from the loop becomes product insight for Arreo's own state/notification design.
 - Rust's compiler + clippy + the e2e battery give agents the fast, unambiguous feedback they need to self-correct in-loop.
-- The risk this must NOT degenerate into: agents shipping plausible-but-broken systems code. Mitigations: capability-scoped crates, TDD discipline forwarded to workers, independent verification, and the CI OS matrix as the only merge authority.
+- The risks this must NOT degenerate into: agents shipping plausible-but-broken systems code (mitigations: capability-scoped crates, TDD on personal edits, reviewer/security-reviewer independence, CI OS matrix as merge authority), and the loop agent absorbing everything instead of delegating (mitigation: one-hat rule + role table in PROMPT.md).
 
 ---
 
