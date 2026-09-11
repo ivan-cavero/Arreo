@@ -3,7 +3,7 @@ id: T-0045
 title: Cross-server attach — attach to a pane on machine B from a client paired with A
 phase: 2
 priority: 3
-status: proposed
+status: in-progress
 depends_on: [T-0014, T-0043, T-0044]
 scope:
   - crates/arreo-cli/src/remote.rs
@@ -63,6 +63,53 @@ convenience (the bookmark model §3.7 rejects). Honest gaps: interactive attach 
 path is out of scope (loopback and LAN-direct only) and the phone-side UX is Phase 3; if the relay
 inbox lacks a drain API, `wait` on a reconnecting session degrades to attach-on-return with a clear
 message instead of fake queued results.
+
+## Progress and findings (2026-09-11)
+
+**Landed: the shared client (criterion 2, the "one code path" claim).** The daemon client that speaks
+the protocol over either transport moved from `arreo-tui` to `arreo-core/src/mesh/session.rs`
+(commit `4f79f4f`), because this task adds two callers — the CLI's `--machine` and a daemon attaching
+to another machine — and `arreo-cli` may not depend on `arreo-tui`. The TUI re-exports it; its 18
+tests pass untouched, which is what makes it a move rather than a rewrite.
+
+**Found, and it is the blocker for criterion 1: a machine name is not dialable yet.** The directory
+(keyed by `machine_id`, the machine's *root* key — T-0043) tells you *which machine* something is, not
+how to reach it. Reaching it needs two other things:
+
+1. **a device to route to** — the relay moves bytes between *device* ids, and a machine's daemon
+   authenticates as a device (the one pairing created for it), a different key entirely;
+2. **that device's public key** — the Noise handshake proves the peer holds the key we pinned
+   (ADR 0011), so a client needs more than an id: it needs the key itself.
+
+So a row has to carry the daemon's dial key, written by the relay from the certificate that
+authenticated the session asserting the row (never self-reported). A prototype of exactly that was
+built — `MachineRow.daemon_key`, a relay column written from `session.public_key`, and
+`arreo attach --machine <name>` resolving through it to the existing client — and **reverted**, for two
+reasons worth recording:
+
+- The relay's own `the_schema_holds_directory_metadata_and_nothing_else` test pins the machine table's
+  column list and forces the change to be a *decision*. Reading it showed the invariant is "no secrets,
+  no agent state, no grants" — the account table already holds a public root key by the same argument —
+  so a public dial key is admissible. Recorded here because the next attempt will meet that test too:
+  it wants the reasoning, not a widened list.
+- The end-to-end test then failed at the dial stage: the request reached the relay and the peer's id
+  was right, but **the daemon authenticated as a different device key than the test had installed**, so
+  nothing answered. That is a harness/plumbing question (which key does `arreo-server` load, versus
+  which one `devices issue` writes into whose identity directory), not a design one — and it is not
+  something to guess at, so the whole increment was reverted rather than committed unproven. An
+  attach that "looks implemented" and cannot connect is precisely the failure this project keeps
+  finding.
+
+**Next attempt should start there:** make a two-machine harness whose daemon keys are unambiguous
+(print what each process authenticated as, and assert it matches), then re-land the dial key, then the
+`--machine` verb. The reverted prototype is described above in enough detail to rebuild in one sitting;
+nothing was left in the tree.
+
+**Criteria 7 and 8 belong to T-0047, which depends on this task.** Criterion 7 ("covered as a chaos
+case driven by the mesh slice") and criterion 8 ("written by the T-0047 slice rather than asserted by
+hand") both name that slice, and it is the referee for the whole mesh phase. Moving them is a
+correction of the split, not a reduction: this task keeps resolution, semantics, observability and
+trust (criteria 1–6), and the slice owns isolation-at-scale and the recorded budget row.
 
 ## Verification
 

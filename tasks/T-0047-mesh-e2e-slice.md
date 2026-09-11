@@ -65,6 +65,20 @@ tasks) supply the queued-message assertion; until they land it is a named skip. 
 proves protocol and state semantics, not WAN/NAT behaviour; real Pi5 hardware and mobile clients are out
 of scope (Phase 3), and < 60 s is a dev-box number, not a CI SLA.
 
+## Absorbed from T-0045 (2026-09-11)
+
+Two of T-0045's criteria name this slice as their home, so they moved here — a correction of the split,
+not a reduction:
+
+- **Node isolation (was T-0045 criterion 7).** Killing B's link mid-attach leaves A's local session and
+  any C session untouched (per-machine independent reconnect, §3.7 isolation), covered as a chaos case
+  driven by this slice.
+- **The latency budget (was T-0045 criterion 8).** On loopback, ≥ 3 s to a live overview of a remote
+  machine fails; the measured value lands in `perf-budget.toml` as `cross_machine_attach_ms`, and this
+  slice is what writes it.
+
+Both need a slice that spawns two real daemons and a relay, which is what this task is.
+
 ## Verification
 
 ```console

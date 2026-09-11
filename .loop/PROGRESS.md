@@ -1,26 +1,26 @@
 ## State snapshot          ← REWRITTEN (not appended) at every checkpoint
-Task: T-0059 · `arreo machines trust` — DONE. With it **T-0046 is DONE** (all 8 criteria met; the
-mechanism landed in two earlier increments, the operator's surface here).
-Where you are: a machine's grant decides what a device may do on it, enforced per verb on every remote
-session; `machines trust <device>|--list` extends and lists it; `devices revoke <device> --machine X`
-cuts one machine's grant; every change and every first refusal leaves an audit row. 445 tests.
-Next step: **T-0045** (cross-server attach — `arreo attach --machine <name>` over the relay) is the
-next ready p3 task and the last piece of §3.7's scenario. T-0048 (OSS launch) is the other large one.
+Task: T-0045 · cross-server attach — IN PROGRESS. One commit landed (the shared client moved to core,
+`4f79f4f`); the dial-key increment was built, tested, and **reverted** (see Findings). T-0046 and
+T-0059 are DONE.
+Where you are: the shared daemon client lives in `arreo-core::mesh::session` (TUI + CLI + daemon can all
+use it, criterion 2 landed). A machine's *name* is not yet dialable — that gap is found, designed and
+documented, but not landed. 445 tests, all green.
+Next step: **T-0045's dial key.** Start with a two-machine harness whose daemon identity is unambiguous
+(assert what each process authenticated as), then re-land `MachineRow.daemon_key` + the relay column +
+`arreo attach --machine`. Exact design and the metadata-only test's argument are in the task file.
 Open workers: (none)
 Known broken: (none) · Parked: (none)
 Findings:
-- **Two gates, two reasons, two fixes.** A viewer refused `spawn` is stopped by the *certificate*
-  (re-pair/re-issue to fix); a device with no grant is stopped by *this machine's ledger*
-  (`machines trust` to fix). Filing both as one event would hide which command the operator needs.
-- **A refusal row is written once per session, not once per verb** — otherwise a retrying client fills
-  the log from outside, the cheapest DoS against an audit trail.
-- **The refusal message printed the certificate's word (`owner`)** where the roadmap says `operator`;
-  `Role::operator_term` now renders the operator's word everywhere user-facing, and a test asserts the
-  absence of the other one.
-- **Two writers need a busy timeout.** `SessionStore` had none, so a CLI write during a daemon write
-  would fail with SQLITE_BUSY — "randomly fails" to an operator. Five seconds now.
-- **A test-process store write is invisible to a daemon spawned afterwards** in the harness
-  (mechanism still unexplained; the shell transcript covers that case).
+- **A directory name is not a route.** The relay moves bytes between *device* ids; a machine's row is
+  keyed by its *root* key. Reaching a machine by name needs the daemon's device id **and its public
+  key** (the Noise handshake pins a key, not an id) — neither is in the row today. T-0045's criteria
+  never mention this; it is the actual blocker for criterion 1.
+- **The relay's metadata-only invariant admits public keys** (the account table already holds one), so
+  the column is a decision to record, not a wall. The test that says so is worth reading before
+  widening it.
+- **The reverted prototype's failure was harness plumbing**, not design: the daemon authenticated as a
+  different device key than the test installed. Diagnosis left in the task file.
+- **`check-targets` is worth its gate** (it caught a feature-gate break twice this phase).
 ## Event log               ← append-only; newest last; never rewrite
 - 2026-09-10 [turn 1] ledger created; repo at e489fac (docs only); T-0001 + T-0022 (AGENTS.md gardened) done
 - 2026-09-10 [turn 2] T-0002 PTY manager done+pushed (342606c; 9 tests); PROMPT.md v2 synced + ADR 0001 (ef6c595)
@@ -90,3 +90,5 @@ Findings:
 - 2026-09-11 [turn 46] T-0046 increment 2 landed (task still in-progress; three criteria → T-0059): the trust gate is wired into `SessionAuth::check` after authentication on every remote session (direct and relay), `arreo devices issue` and the server half of `arreo pair` **grant on issue** (a device pinned without a grant would authenticate and then be refused, which is how the first wiring attempt broke `tests/audit.rs`), and the boot **backfill** grants pre-existing pairings once behind a one-way marker. `TrustLedger` moved to `arreo-core` (the CLI writes grants and may not depend on `arreo-server`) and is gated on the `sqlite` feature, which check-targets caught. Found a real bug: **every early session exit delivered nothing** — T-0052's drain lived at the tail, so a refused handshake wrote its Error into the duplex and dropped it; the flush is now a wrapper covering all exit paths. Not landed: `arreo machines trust`, `arreo devices revoke --machine`, audit rows (T-0059, filed with criteria). Evidence `.loop/evidence/T-0046/` (model.txt + backfill.txt). 435 tests, clippy/fmt clean, vet/deny/audit green, check-targets PASS/SKIP, 8 slices green, bench 6/6
 
 - 2026-09-11 [turn 47] T-0059 `arreo machines trust` done, which completes T-0046. New: `machines trust <device> [--machine] [--role viewer|operator] [--yes]` (prints the fingerprint, confirms, refuses an unpinned device so a typo is caught), `machines trust --list [--json]` (its own schema-1 contract), `devices revoke <id> --machine <name>` (cuts one machine's grant; without `--machine` it revokes the device and reports the live local grant it leaves behind), and the audit rows `trust.grant`/`trust.revoke`/`trust.refuse` with the refusal **once per session**. Two design findings: a viewer's refused spawn comes from the *certificate* gate (different fact, different fix) so it is not a trust row; and the refusal printed the certificate's `owner` where the roadmap says `operator`, fixed by `Role::operator_term` (the test asserts `owner` is *absent*). Also a real robustness fix: `SessionStore` had no busy timeout, so two writers (CLI + daemon) could fail with SQLITE_BUSY. Evidence `.loop/evidence/T-0059/` (transcript + mutation proofs). 445 tests, clippy/fmt clean, vet/deny/audit green, check-targets PASS/SKIP, 8 slices green, bench 6/6
+
+- 2026-09-11 [turn 48] T-0045 started: the shared daemon client moved from `arreo-tui` to `arreo-core::mesh::session` (`4f79f4f`) so the CLI and a daemon can both use it — the TUI's 18 tests pass untouched, which is what makes it a move rather than a rewrite. Then the *dial key* increment was built (a machine's row carrying the key a peer dials, written by the relay from the authenticated certificate; `arreo attach --machine <name>` resolving through it), and **reverted**: the design is right and recorded, but the two-machine test failed at the dial stage because the daemon authenticated as a different device key than the harness installed — harness plumbing, not design, and not something to guess at, so nothing unproven was committed. Findings written into the task file (a directory name is not a route: the relay routes by *device* id and Noise pins a *key*; the relay's metadata-only test admits public keys, and wants the argument recorded). Criteria 7–8 reassigned to T-0047, which depends on this task and is its referee. 445 tests green
