@@ -1,0 +1,26 @@
+T-0043 machine directory — consistency evidence
+2026-09-11T07:42:37Z
+
+join: name=workbox conflict=false
+== add (Workbox -> canonical case) ==
+rows: 1
+7423a80cb6699119e9ea657ade7b6c3c	workbox	ok	online	1000	3	
+round-trip byte-identical: true
+
+== rename (identity preserved) ==
+rows: 1
+7423a80cb6699119e9ea657ade7b6c3c	workbox-prime	ok	online	1000	3	
+round-trip byte-identical: true
+
+== remove (tombstoned, name still held) ==
+rows: 1
+7423a80cb6699119e9ea657ade7b6c3c	workbox-prime	ok	online	1000	3	2592003000
+round-trip byte-identical: true
+
+re-add: name=workbox-prime tombstone_until=None
+== re-add (same machine keeps its name) ==
+rows: 1
+7423a80cb6699119e9ea657ade7b6c3c	workbox-prime	ok	online	4000	3	
+round-trip byte-identical: true
+
+orphaned tombstones: 0

@@ -8,6 +8,10 @@
 //! (T-0029..T-0031); they extend this crate, and they must not weaken the
 //! guarantees here (see the module docs for the exact rules).
 
+pub mod directory;
 pub mod pairing;
+pub mod store;
 
+pub use directory::{Directory, DirectoryFailure, JoinTicket};
 pub use pairing::{Mailbox, MAX_FRAME_BYTES, MAX_REMEMBERED_BURNS, READ_TIMEOUT};
+pub use store::{RelayStore, StoreError, SCHEMA_VERSION};

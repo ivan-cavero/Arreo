@@ -1,44 +1,41 @@
 ## State snapshot          ← REWRITTEN (not appended) at every checkpoint
-Task: T-0023 · Noise-QUIC remote transport (phase 2) — DONE, evidence recorded
-Where you are: transport implemented and wired; all gates green on the final code
-Next step: T-0027 — the transport/pairing e2e slice (turns T-0023/T-0024's
-negatives into one command over real sockets). Then T-0026 (revocation) or
-T-0029 (relay v0), whichever the queue ranks next.
+Task: T-0043 · machine directory (phase 2) — DONE, evidence recorded
+Where you are: directory landed (core rules + relay SQLite store + ADR 0012); all
+gates green on the final code
+Next step: T-0044 (`arreo machines` list/add/rename/remove/status) — it is the
+first *reader* of the directory and the first place the read-only server cache
+gets wired into a live path. T-0026 (device revocation, p3) also has its deps met
+and unblocks T-0027 and T-0033.
 Open workers: (none)
 Known broken: (none) · Parked: (none)
 Findings:
-- **The handshake's first flight is replayable in principle — and decryption
-  cannot catch it.** KK's first message depends only on the responder's *static*
-  key, so a recorded flight authenticates against a fresh responder, which
-  answers it and reports a session with a device that is not there. No keys are
-  derivable (that needs the initiator's ephemeral secret), so nothing is readable
-  or forgeable — but the server believing in a session is worth refusing. That is
-  what `FlightGuard` does. Any future KK-based path needs the same guard; this is
-  a property of the pattern, not of this implementation.
-- **A stream framing prefix cannot be authenticated by the seal it precedes.**
-  The `u16` length is outside the AEAD by construction, so a rewritten length is
-  invisible to decryption. A length no seal can produce must fail fast
-  (`MAX_FRAME_BYTES`); a plausible-but-longer one is indistinguishable from a
-  frame still in flight and is bounded only by the transport's idle timeout.
-  Worth remembering for the relay's framing (T-0029/T-0030).
-- **`ring` compiles C, and that silently killed the portability gate's C-free
-  fallback.** Adding rustls/ring to `arreo-core` made `check-targets` FAIL (no
-  `lib.exe`) instead of SKIP, because the fallback build (`--no-default-features`
-  drops `sqlite`) still pulled the crypto tree. The transport deps are now behind
-  a default `transport` feature; `check-targets` is back to PASS/SKIP. Any future
-  C dependency in core must keep a feature-gated pure-Rust surface, or the gate
-  loses its meaning.
-- **`cargo vet regenerate exemptions` is the repair path** for a new dependency
-  tree (336 exemptions now, was 279); the registry imports (`isrg`,
-  `bytecode-alliance`) carry no audits for this tree. `cargo audit` is clean.
-- **A passing test can pass for the wrong reason.** The first tamper test ignored
-  a `timeout` result and asserted only "no plaintext arrived" — also true when
-  the read *times out*. It hid a real stall. Assertions on absence need a
-  companion assertion that the thing actually finished.
-- Perf data point: release, loopback — QUIC connect 3.0 ms, QUIC+Noise 5.1 ms
-  (Noise adds one round trip), 1 MB through the transport 9.7 ms, RSS 22.7 MB
-  with a listener plus five live sessions. The §5 budget (30 panes + 5 clients)
-  is 120 MB; the transport's share is in the low tens of MB.
+- **A tombstone that keeps a row also keeps the UNIQUE index.** Holding a removed
+  name for its machine means the row stays, so `UNIQUE(account_id, name_key)`
+  kept holding it too — and an *expired* tombstone could never release the name
+  (the reclaim path hit a constraint violation). The fix is a three-state
+  `name_key` (live / unexpired tombstone / NULL = released) plus a release step
+  inside the claim transaction. Any "hold the row but free the key" policy needs
+  the same treatment.
+- **Boundary predicates must be asserted on both sides of the instant.** The
+  tombstone deadline is `until > now` (core) and `<= now` releases (relay); a test
+  that only checks "after expiry" would have passed with either convention. Pin
+  `until - 1` and `until` separately.
+- **A test can be self-contradictory and look like a code bug.** One draft test
+  had the owner reclaim its name *and* expected the name free after expiry — both
+  true statements, impossible in one directory. Splitting the scenario is what
+  made the real (tombstone) bug visible instead of hiding behind a rewrite.
+- **Rejecting is stronger than normalizing when the rule is ASCII.** NFC is the
+  identity over `[a-z0-9-]`, so validating the casefolded form needs no Unicode
+  crate — and refusing a confusable (`wоrkbox` with a Cyrillic `о`) is strictly
+  better than normalizing it, because it can never enter the directory at all.
+- **The task file's ADR number was already taken** (`0009` is device-identity).
+  Accepted ADRs are immutable, so the decision landed as 0012 and the task file
+  points there with the reason. Check the number before writing one.
+- Ready-queue note: **T-0036 (signed releases, p1) is human-gated** — it needs a
+  `MINISIGN_SECRET_KEY` CI secret and a committed public key, neither of which an
+  agent may provision (and no fake secrets). It stays `proposed` until a human
+  creates the key; T-0043 was the highest-priority task whose deps were met and
+  which had no human prerequisite.
 ## Event log               ← append-only; newest last; never rewrite
 - 2026-09-10 [turn 1] ledger created; repo at e489fac (docs only); T-0001 + T-0022 (AGENTS.md gardened) done
 - 2026-09-10 [turn 2] T-0002 PTY manager done+pushed (342606c; 9 tests); PROMPT.md v2 synced + ADR 0001 (ef6c595)
@@ -64,3 +61,4 @@ Findings:
 - 2026-09-11 [turn 21] T-0025 device identity done+pushed (978569a; ed25519 certs + roles + durable authority + `arreo devices`, store v3, ADR 0009, 173 tests, evidence) — also repaired the two supply-chain gates T-0015 had left red (ratatui 0.30 drops unmaintained `paste`; vet exemptions regenerated); remote == local
 - 2026-09-11 [turn 22] T-0024 pairing done+pushed (f275056; SPAKE2+HMAC flow in core, single-use write-once mailbox in arreo-relay served over unix+TCP, `arreo pair` both sides, `pairing_failed` audit kind, ADR 0010, 6 three-process scenarios + 28 unit tests, evidence); 4 real defects fixed en route (premature burn, expiry race, invisible audit kind, unguarded unix socket breaking the Windows gate); T-0049 filed (CLI broken-pipe panic); gates all green (211 tests, vet 279, deny 4/4, check-targets PASS/SKIP, bench 6/6); remote == local
 - 2026-09-11 [turn 23] T-0023 remote transport done+pushed: Noise-KK (snow) inside QUIC (quinn), one bidi stream carrying the T-0013 msgpack frames; Noise static derived from the pinned ed25519 identity (ADR 0011); per-verb gate (`DeviceAuthority::check_verb`) in front of the *same* `serve_session` loop the unix socket runs; zero inbound ports by default (loopback test seam only). 15 core + 5 daemon tests over real streams/sockets; 6 real defects fixed (resolver id spelling, replay guard, pump request/response deadlock, impossible frame length, quiet-peer accept starvation, swallowed failure reason); `transport` feature gate keeps `check-targets` at PASS/SKIP; vet exemptions regenerated 279->336; 236 workspace tests, clippy/fmt clean, deny/audit green, bench 6/6, all five e2e slices green; evidence in `.loop/evidence/T-0023/`; remote == local
+- 2026-09-11 [turn 24] T-0043 machine directory done+pushed: `arreo_core::mesh` (MachineId/Name rules with ASCII-only rejection, presence thresholds, canonical sorted export, read-only DirectoryCache) + `arreo-relay` SQLite (single RelayStore connection/migration owner, account/machine tables, UNIQUE(account_id,name_key), tombstones, BEGIN IMMEDIATE claims) + ADR 0012 (task file said 0009, already taken — corrected); 10 directory acceptance tests (schema denylist, explicit-join ticket, suffix conflicts, 8-thread concurrent claims, rename atomicity, tombstone hold + expiry boundary, stale prune idempotence, export round-trip) + 5 core rule tests; 1 real defect fixed (expired tombstone could never release its name); 252 workspace tests, clippy/fmt clean, vet/deny/audit green, check-targets PASS/SKIP; evidence in `.loop/evidence/T-0043/`; remote == local

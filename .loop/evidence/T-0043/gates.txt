@@ -1,0 +1,36 @@
+T-0043 gate battery — 2026-09-11T07:42:52Z
+
+== directory acceptance tests (real SQLite; file-backed for concurrency) ==
+test a_tombstone_holds_the_name_for_its_machine ... ok
+test rename_is_atomic_and_refuses_a_collision_without_partial_state ... ok
+test a_machine_enters_only_through_a_live_join_ticket ... ok
+test discovery_resolves_known_machines_and_cannot_create_them ... ok
+test add_rename_remove_readd_leaves_a_directory_that_round_trips ... ok
+test an_expired_tombstone_releases_the_name ... ok
+test a_name_conflict_suffixes_and_says_so ... ok
+test stale_is_pruned_from_the_one_presence_rule_and_is_idempotent ... ok
+test the_schema_holds_directory_metadata_and_nothing_else ... ok
+test concurrent_claims_serialize_into_one_plain_name_and_n_minus_one_suffixed ... ok
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s
+
+== core directory rules ==
+test mesh::directory::tests::presence_follows_the_stated_thresholds ... ok
+test mesh::directory::tests::a_name_at_the_length_limit_still_takes_a_suffix ... ok
+test mesh::directory::tests::names_are_validated_and_case_normalized ... ok
+test mesh::directory::tests::the_export_round_trips_and_is_order_independent ... ok
+test mesh::directory::tests::the_cache_only_ever_mirrors_what_the_relay_said ... ok
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 99 filtered out; finished in 0.00s
+
+== workspace suite ==
+passed=252 failed=0
+
+== clippy / fmt ==
+0
+(0 = clean)
+fmt clean
+
+== supply chain ==
+Vetting Succeeded (336 exempted)
+advisories ok, bans ok, licenses ok, sources ok
+0
+(0 = none)

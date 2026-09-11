@@ -8,6 +8,7 @@ pub mod enforce;
 pub mod fixtures;
 pub mod identity;
 pub mod lifecycle;
+pub mod mesh;
 pub mod metrics;
 pub mod pairing;
 pub mod proto;
