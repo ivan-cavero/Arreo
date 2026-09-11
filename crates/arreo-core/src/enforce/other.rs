@@ -6,7 +6,7 @@
 //! with real implementations when their platform work starts — until then
 //! every method says exactly where it belongs.
 
-use super::{Breach, Budget, EnforceError};
+use super::{Breach, Budget, EnforceError, Pressure};
 use std::path::Path;
 
 pub struct Guard;
@@ -22,6 +22,13 @@ impl Guard {
 
     pub fn breached(&self) -> Result<Option<Breach>, EnforceError> {
         Err(EnforceError::Unimplemented("T-0019 (resource enforcement)"))
+    }
+
+    /// No group exists on this OS, so there is no pressure to read: the honest
+    /// empty reading (a gap, never an error — T-0041).
+    #[must_use]
+    pub fn pressure(&self) -> Pressure {
+        Pressure::default()
     }
 
     pub fn path(&self) -> &Path {

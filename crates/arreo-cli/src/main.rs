@@ -466,12 +466,23 @@ async fn cmd_panes(rest: &[String]) -> ExitCode {
     .await
     {
         Ok(Message::Panes { panes, .. }) => {
-            println!("{:>16}  STATE", "ID");
+            // Attention first (T-0041): alerting panes sort ahead of merely
+            // working ones, so a script can page on the listing. The alert
+            // column is empty when no episode fired — absent, never a lie.
+            let mut panes = panes;
+            panes.sort_by(|a, b| {
+                a.alert
+                    .is_none()
+                    .cmp(&b.alert.is_none())
+                    .then(a.id.cmp(&b.id))
+            });
+            println!("{:>16}  {:<7}  ALERT", "ID", "STATE");
             for pane in panes {
                 println!(
-                    "{:>16}  {}",
+                    "{:>16}  {:<7}  {}",
                     pane.id,
-                    if pane.alive { "alive" } else { "exited" }
+                    if pane.alive { "alive" } else { "exited" },
+                    pane.alert.as_deref().unwrap_or(""),
                 );
             }
             ExitCode::SUCCESS

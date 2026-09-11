@@ -121,6 +121,10 @@ pub mod actions {
     pub const PRUNE: &str = "audit.prune";
     /// A resource budget was breached and the daemon acted on it (T-0019).
     pub const ENFORCE_BREACH: &str = "enforce.breach";
+    /// A graded cgroup alert fired (T-0041): `warn` at 80%, `critical` at 95%.
+    /// The level rides in `detail`, so one action name covers the ladder and an
+    /// operator greps one string for the whole episode.
+    pub const ENFORCE_ALERT: &str = "enforce.alert";
 }
 
 /// One audit row (prompt already redacted on write).

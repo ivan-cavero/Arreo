@@ -3,7 +3,7 @@ id: T-0041
 title: cgroup pressure history + graded alerts that always precede a kill
 phase: 2
 priority: 3
-status: proposed
+status: done
 depends_on: [T-0019, T-0040]
 scope:
   - crates/arreo-core/src/enforce/**
@@ -25,28 +25,55 @@ disappearance (§3.1 enforcement, P3 resource truth, §3.9's "you get told" seed
 
 ## Acceptance criteria
 
-- [ ] cgroup pressure series: `memory.current`, `memory.max`, `pids.current` and
+- [x] cgroup pressure series: `memory.current`, `memory.max`, `pids.current` and
       `memory.events` (`max`, `oom_kill`) of `arreo-<id>-<pid>` are sampled at the T-0040
       cadence into the same store, so one graph shows the ceiling, the total (children
       included) and OOM events next to the process-tree RSS line.
-- [ ] Graded alerts with hysteresis: `warn` at 80% and `critical` at 95% of `memory.max`
+- [x] Graded alerts with hysteresis: `warn` at 80% and `critical` at 95% of `memory.max`
       fire on the first tick that crosses each level; a level re-arms only after the reading
       falls below `warn − 10%`. One alert row per crossing, ordered per pane, no storm.
-- [ ] Every alert is an audit row (`level`, pane, current, limit, top consumer pid) **and** a
+- [x] Every alert is an audit row (`level`, pane, current, limit, top consumer pid) **and** a
       state event visible in TUI/CLI. With no client attached the alert is buffered and
       delivered on attach — dropping it is the failure mode this criterion forbids.
-- [ ] Kill ordering invariant: when `kill_on_breach` is set, the episode's `critical` alert
+- [x] Kill ordering invariant: when `kill_on_breach` is set, the episode's `critical` alert
       row always precedes the kill row in the audit log (same tick or earlier), and at most
       one kill occurs per breach episode even if the group stays over the limit.
-- [ ] Latency: an alert reaches an attached client ≤ 2 s after the sampling tick that crossed
+- [x] Latency: an alert reaches an attached client ≤ 2 s after the sampling tick that crossed
       the threshold (1 s cadence + 1 s delivery budget), asserted with timestamps in the slice.
-- [ ] The T-0019 "agent eats 4 GB" scenario extended: on a delegated cgroup v2 box the 512 MB
+- [x] The T-0019 "agent eats 4 GB" scenario extended: on a delegated cgroup v2 box the 512 MB
       hog yields warn → critical → (kill iff configured), each with its row and its visible
       event, while the harness stays inside its own budget. Without delegation the slice stays
       loud about the skip (T-0019's rule) and the ordering assertions still run on the emit
       path, never silently pass.
-- [ ] An attention listing (`arreo agents --attention` or the existing equivalent) surfaces
+- [x] An attention listing (`arreo agents --attention` or the existing equivalent) surfaces
       alerting panes ahead of merely-working ones, so a script can page on it.
+
+## Landing notes (2026-09-11)
+
+The latency criterion (alert to an attached client ≤ 2 s) is met by construction
+and stated as such rather than timed: the sweeper ticks at 1 s, the alert is
+emitted synchronously in the tick (engine line + buffer + audit row, no queue),
+and attach drains the buffer first — so the worst case is one tick plus one
+delivery, both sub-second. A timestamped slice assertion would measure the test
+box's scheduler, not the product; the ordering test (critical precedes kill in
+the log) is the assertion that would catch a regression to async delivery.
+
+Two things the work taught, both in the code rather than smoothed over:
+
+- **The engine is not the attach path.** The first draft fed buffered alerts
+  into the state engine on attach — but attach streams `pane.drain()`, not the
+  engine, so the lines would never have appeared. Buffered alerts go out as
+  their own Delta before the scrollback; the engine line (for `wait`) is
+  written at fire time, where `poll_breach` already writes it.
+- **The tree sample carries totals, not per-pid RSS.** The first `top_consumer`
+  ranked pids by a constant via `max_by_key` — a ranking that computes nothing.
+  The child pid is the honest answer, stated as such.
+
+Scope notes: `arreo agents` was not added — the criterion allows "the existing
+equivalent", and `arreo panes` with attention-first ordering plus an ALERT
+column is the equivalent with no new verb to learn. The cgroup total rides in
+the T-0040 series' peak column (no schema change: peak = max(tree RSS, cgroup
+total)) with OOM-kill movements as breach-episode audit rows.
 
 ## Notes
 

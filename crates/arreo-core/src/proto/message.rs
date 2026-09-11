@@ -20,6 +20,12 @@ pub const VERSION: u32 = 0;
 pub struct PaneInfo {
     pub id: String,
     pub alive: bool,
+    /// Graded-alert episode state (T-0041): `None` when no alert fired in the
+    /// current episode, else `"warn"` / `"critical"` / `"breach"`. Optional so
+    /// a v0 peer decodes it as absent (N−1 rule (c): silent downgrade, and the
+    /// CLI renders no column rather than a lie).
+    #[serde(default)]
+    pub alert: Option<String>,
 }
 
 /// Agent semantic state on the wire (subset of the engine states that

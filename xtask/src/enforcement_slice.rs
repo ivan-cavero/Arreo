@@ -123,6 +123,50 @@ pub fn run(_rest: &[String]) -> ExitCode {
                 return ExitCode::FAILURE;
             }
             println!("[PASS] enforcement: breach notified (you got told): {out}");
+            // Graded alerts (T-0041): the hog blew past 80% and 95% on its way
+            // to the ceiling, so warn and critical rows precede the breach row
+            // — same tick or earlier, never after. The audit trail proves the
+            // ordering without interpretation.
+            let (_, audit) = cli(&cli_bin, &socket, &["audit", "--limit", "50"]);
+            let warn_at = audit.find("enforce.alert");
+            let breach_at = audit.find("enforce.breach");
+            match (warn_at, breach_at) {
+                (Some(w), Some(b)) if w < b => {
+                    println!("[PASS] enforcement: alert precedes breach in the audit log");
+                }
+                (None, Some(_)) => {
+                    println!("[FAIL] enforcement: breach with no preceding alert row: {audit}");
+                    return ExitCode::FAILURE;
+                }
+                (Some(_), None) => {
+                    println!("[FAIL] enforcement: alert with no breach row: {audit}");
+                    return ExitCode::FAILURE;
+                }
+                _ => {
+                    println!("[FAIL] enforcement: no alert or breach rows: {audit}");
+                    return ExitCode::FAILURE;
+                }
+            }
+            // Attention listing: the hog sorts ahead of merely-working panes.
+            let (_, panes) = cli(&cli_bin, &socket, &["panes"]);
+            let hog_line = panes.lines().find(|l| l.contains("hog"));
+            match hog_line {
+                Some(line)
+                    if line.contains("critical")
+                        || line.contains("breach")
+                        || line.contains("warn") =>
+                {
+                    println!("[PASS] enforcement: attention listing surfaces the hog: {line}");
+                }
+                Some(line) => {
+                    println!("[FAIL] enforcement: hog listed without its alert level: {line}");
+                    return ExitCode::FAILURE;
+                }
+                None => {
+                    println!("[FAIL] enforcement: hog missing from panes: {panes}");
+                    return ExitCode::FAILURE;
+                }
+            }
             // Kill-switch policy was on: the pane should be dead or dying.
             std::thread::sleep(Duration::from_secs(2));
             let (_, out) = cli(&cli_bin, &socket, &["panes"]);

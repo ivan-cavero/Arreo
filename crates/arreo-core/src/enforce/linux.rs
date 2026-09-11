@@ -12,7 +12,7 @@
 //! HIT (throttle/reclaim), not only on OOM-kill — exactly the "tell me
 //! before it dies" signal the criterion wants.
 
-use super::{Breach, Budget, EnforceError};
+use super::{Breach, Budget, EnforceError, Pressure};
 use std::path::PathBuf;
 
 pub struct Guard {
@@ -99,6 +99,37 @@ impl Guard {
         self.read("memory.current").ok()?.trim().parse().ok()
     }
 
+    /// Cgroup pressure snapshot: the ceiling, the total (children included),
+    /// and the kernel's OOM counters (T-0041).
+    ///
+    /// `memory.current` includes descendants (that is what makes it the
+    /// kernel's own answer where a process-tree RSS misses grandchildren that
+    /// moved trees); `memory.events` carries `max` (ceiling hits) and
+    /// `oom_kill` (members the kernel killed). `pids.current` rides along so
+    /// one graph shows all three lines. Every field is `Option` because a
+    /// group can vanish mid-read (member reaped, guard dropped) — a missing
+    /// counter is a gap in the series, never an error.
+    #[must_use]
+    pub fn pressure(&self) -> Pressure {
+        let max = self.memory_max().ok().flatten();
+        Pressure {
+            current: self.memory_current(),
+            max,
+            pids_current: self
+                .read("pids.current")
+                .ok()
+                .and_then(|text| text.trim().parse().ok()),
+            oom_kill: self
+                .read("memory.events")
+                .ok()
+                .and_then(|text| parse_events_counter(&text, "oom_kill")),
+            max_events: self
+                .read("memory.events")
+                .ok()
+                .and_then(|text| parse_events_counter(&text, "max")),
+        }
+    }
+
     /// Live member count (from `cgroup.procs` lines).
     pub fn member_count(&self) -> Result<usize, EnforceError> {
         Ok(self
@@ -115,6 +146,16 @@ impl Guard {
         let pids = self.read("pids.events").ok();
         Ok(parse_breach(memory.as_deref(), pids.as_deref()))
     }
+}
+
+/// Parse one `name value` counter out of a `memory.events`-shaped text.
+/// `None` when the line is absent or unparsable — a missing counter is a gap,
+/// never a zero that would claim "no OOMs" about a file never read.
+fn parse_events_counter(text: &str, name: &str) -> Option<u64> {
+    text.lines().find_map(|line| {
+        let (key, value) = line.split_once(' ')?;
+        (key == name).then(|| value.trim().parse::<u64>().ok())?
+    })
 }
 
 /// Pure breach parser (unit-tested everywhere, no cgroupfs needed):

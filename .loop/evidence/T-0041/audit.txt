@@ -1,0 +1,35 @@
+# T-0041 evidence — cgroup pressure history + graded alerts
+
+## 1. The thresholds and the emit path (no cgroup needed)
+
+$ cargo test -p arreo-core --test enforce_alerts
+$ cargo test -p arreo-server --lib alert_tests
+
+test no_ratio_fires_nothing_and_keeps_episode_memory ... ok
+test rearm_needs_below_seventy_percent ... ok
+test pressure_ratio_needs_both_sides ... ok
+test levels_fire_once_each_going_up ... ok
+test thresholds_are_the_stated_numbers ... ok
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+test daemon::alert_tests::emit_alert_writes_all_three_doors ... ok
+test daemon::alert_tests::critical_always_precedes_kill_in_the_log ... ok
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 5 filtered out; finished in 0.14s
+
+## 2. The live episode (delegated box runs the hog; this box has no delegation)
+
+$ cargo xtask e2e --slice enforcement
+[PASS] enforcement: no delegation here — daemon loud, not silent: Error { v: 0, message: "enforce failed: cgroup unavailable: /sys/fs/cgroup/user.slice/user-1001.slice/user@1001.service/app.slice/app-orca-1341966.scope/arreo-hog-2372820/memory.max: Permission denied (os error 13)" }
+enforcement: mechanism proven by unit/parser tests; CI ubuntu runs the hog
+enforcement: passed
+
+## 3. The full battery (final code)
+
+cargo test --workspace: 375 passed, 0 failed across 50 targets
+cargo clippy --workspace --all-targets -- -D warnings: 0 diagnostics
+cargo fmt --all -- --check: clean
+cargo vet --locked: Vetting Succeeded (336 exempted)
+cargo deny check: advisories ok, bans ok, licenses ok, sources ok
+cargo audit: 343 crate dependencies, no advisories
+cargo xtask check-targets: x86_64-unknown-linux-gnu PASS; x86_64-pc-windows-msvc SKIP (pure-Rust no-sqlite PASS)
+e2e slices: api green, compat green, lifecycle 2/2, persistence 3/3, enforcement passed (loud skip), tui 18/18, theme 27/27, relay 14/14
+cargo xtask bench: 6/6 PASS

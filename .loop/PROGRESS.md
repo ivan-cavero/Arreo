@@ -1,23 +1,23 @@
 ## State snapshot          ← REWRITTEN (not appended) at every checkpoint
-Task: T-0049 · CLI broken pipe (phase 2) — DONE, one decision applied once
-Where you are: default SIGPIPE disposition at the single entry point; `arreo <verb> |
-head -1` dies by signal (141, silent) instead of panicking (101 + text). Proven on audit,
-devices list, and panes (live daemon) — all three fail without the fix, pass with it — plus
-a construction test covering pair mid-wait. 368 workspace tests.
-Next step: **T-0041** (needs T-0040, unblocked). T-0044 is blocked on the account-join RPC
-(its own note); **T-0036 is human-gated** — it needs a real minisign keypair whose secret
-the operator holds as a CI secret, and the gate is recorded in the task file.
+Task: T-0041 · cgroup alerts (phase 2) — DONE, graded thresholds that always precede a kill
+Where you are: warn at 80%, critical at 95%, each once per episode with re-arm below 70%;
+every alert is an engine line + attach buffer + audit row in one tick, critical always precedes
+kill in the log, attention listing surfaces alerting panes first. 375 workspace tests.
+Next step: **T-0042** (release e2e, blocked on T-0036..T-0041 — check readiness), else T-0048.
+T-0044 is blocked on the account-join RPC (its own note); **T-0036 is human-gated** — it needs
+a real minisign keypair whose secret the operator holds as a CI secret.
 Open workers: (none)
 Known broken: (none) · Parked: (none)
 Findings:
-- **A test that cannot fail proves nothing.** Read-one-line-then-close passed 3/3 without
-  the fix (7 KB fits the 64 KB buffer). Immediate close is deterministic; non-emptiness
-  comes from the file run. Same reason single-line --json variants were dropped.
-- **Two spellings of "now" downshifted every query** (T-0040). **A zombie tree is data**
-  (T-0040). **rmp-serde encodes tagged enums as arrays** (T-0028).
+- **The engine is not the attach path.** Buffered alerts fed to the engine on attach would
+  never appear (attach streams pane.drain()). They go out as their own Delta first.
+- **A ranking that computes nothing is a lie.** top_consumer ranked by a constant; the child
+  pid is the honest answer, stated as such.
+- **Latency by construction, not by timer.** 1 s tick + synchronous emit + attach-first
+  drain = ≤ 2 s worst case. A timestamped assertion would measure the scheduler.
+- **A test that cannot fail proves nothing** (T-0049). **Two spellings of "now"** (T-0040).
 - **A dropped handle must stop its task** (T-0033, T-0054). **Retention compares two
   timestamps, so the clock must move as one** (T-0055).
-- **A budget row bench cannot measure still needs enforcing** — read from perf-budget.toml.
 ## Event log               ← append-only; newest last; never rewrite
 - 2026-09-10 [turn 1] ledger created; repo at e489fac (docs only); T-0001 + T-0022 (AGENTS.md gardened) done
 - 2026-09-10 [turn 2] T-0002 PTY manager done+pushed (342606c; 9 tests); PROMPT.md v2 synced + ADR 0001 (ef6c595)
@@ -65,3 +65,5 @@ Findings:
 - 2026-09-11 [turn 37] T-0040 metrics history done: v6 `metrics_series` table keyed (pane, ts_ms, step_ms) with avg+peak RSS/cpu/pids (three tiers 10 s/24 h, 1 m/30 d, 1 h/365 d); idempotent record (bucket floor + weighted merge, peak keeps the worst moment), rollups read the tier below never /proc, hourly prune that never deletes a live pane's newest row, ≤ 2 MB/pane asserted; socket MetricsHistory/MetricsSeries verbs with step downshift (N−1 safe via serde-default fields); CLI `metrics history` with duration parsing and downshift notes; daemon 10 s writer + rollup + hourly prune tasks (tick measures its own work, cadence cannot drift); TUI sparkline with peak in the focused title (empty renders nothing, never a flat line). 7 store tests + writer-overhead test + tui --case metrics-graph (18 assertions); evidence `.loop/evidence/T-0040/` incl. a real-bug transcript (until=u64::MAX vs 0). 364 workspace tests, clippy/fmt clean, vet/deny/audit green, check-targets PASS/SKIP, 7 e2e slices green, bench 6/6; remote == local
 
 - 2026-09-11 [turn 38] T-0049 CLI broken pipe done: default SIGPIPE disposition restored once at the top of main (one unsafe block, no libc dependency, no-op on non-Unix) so `arreo <verb> | head -1` dies by signal (141, silent) instead of Rust's EPIPE-panic (101 + text). Proven on audit, devices list (both seeded to 50 rows via devices issue), and panes (live daemon + 50 spawns) — all three fail without the fix with `panicked at .../stdio.rs`, pass with it; byte-identity vs file run proves no verb changed output. Pair mid-wait covered by construction test (one definition per platform, one call before any verb). Evidence `.loop/evidence/T-0049/`. 368 workspace tests, clippy/fmt clean, vet/deny/audit green, check-targets PASS/SKIP, api slice green, bench 6/6; remote == local
+
+- 2026-09-11 [turn 39] T-0041 cgroup alerts done: graded thresholds (warn 80%, critical 95%, re-arm below 70%, each once per episode) in enforce core with 5 pure-state tests; cgroup pressure (current/max/pids/oom_kill) read from the guard with OOM movements as audit rows and the total riding the T-0040 peak column (no schema change); one-tick emit (engine line + attach-buffer Delta + enforce.alert row with level/current/limit/top-pid) with kill-ordering invariant (critical precedes kill, one kill per episode) proven on the emit path without a cgroup; attention-first panes listing with ALERT column (no new verb); enforcement slice extended with alert-precedes-breach and attention assertions (loud skip here, live hog on CI). Evidence `.loop/evidence/T-0041/`. 375 workspace tests, clippy/fmt clean, vet/deny/audit green, check-targets PASS/SKIP, 8 e2e slices green, bench 6/6; remote == local

@@ -117,6 +117,7 @@ fn v0_corpus() -> Vec<(&'static str, Vec<u8>)> {
                 panes: vec![PaneInfo {
                     id: "p".into(),
                     alive: true,
+                    alert: None,
                 }],
             }),
         ),

@@ -51,6 +51,14 @@ pub struct PaneEntry {
     pub guard: Option<arreo_core::enforce::Guard>,
     /// Kill the pane on breach (from `Spawn.kill_on_breach`).
     pub kill_on_breach: bool,
+    /// Graded-alert episode memory (T-0041): the highest level fired since the
+    /// reading last fell below the re-arm line. Lives here (not on the guard)
+    /// because the guard is the mechanism and this is the episode.
+    pub alert_state: Mutex<arreo_core::enforce::AlertState>,
+    /// Buffered alert lines for clients that attach late (T-0041): with no
+    /// client attached the alert is held here and delivered on attach —
+    /// dropping it is the failure mode this field forbids.
+    pub pending_alerts: Mutex<Vec<String>>,
 }
 
 impl PaneEntry {
@@ -70,6 +78,8 @@ impl PaneEntry {
             sampler: Mutex::new(Sampler::new()),
             guard,
             kill_on_breach,
+            alert_state: Mutex::new(arreo_core::enforce::AlertState::default()),
+            pending_alerts: Mutex::new(Vec::new()),
         }
     }
 
@@ -98,13 +108,20 @@ impl PaneEntry {
             .state()
     }
 
-    /// Poll the cgroup guard for breach. On breach: feed a synthetic
-    /// error-shape line through the ENGINE (not the pane — never types into
-    /// the shell), so the next `wait --state blocked` fires; audit the
-    /// event; kill when the spawn policy says so. Returns the breach, if any.
+    /// Poll the cgroup guard: graded alerts first, breach last (T-0041).
+    ///
+    /// One transaction per tick — alerts, then any kill — so the audit log
+    /// needs no interpretation to prove ordering: when `kill_on_breach` is set,
+    /// the episode's `critical` row always precedes the kill row (same tick or
+    /// earlier), and at most one kill occurs per breach episode even if the
+    /// group stays over the limit. Returns the breach, if any.
     /// Idempotent per breach episode (engine dedups: already-Blocked stays).
     fn poll_breach(&self, id: &str, db: &std::path::Path) -> Option<arreo_core::enforce::Breach> {
         let guard = self.guard.as_ref()?;
+        // Graded alerts ride the same tick (T-0041): warn at 80%, critical at
+        // 95%, each once per episode with hysteresis — and always before any
+        // kill below, so the ordering invariant holds within one tick.
+        self.poll_alerts(id, db);
         let breach = guard.breached().ok()??;
         let label = match breach {
             arreo_core::enforce::Breach::Memory => "memory",
@@ -138,6 +155,96 @@ impl PaneEntry {
             let _ = self.pane.kill_shared();
         }
         Some(breach)
+    }
+
+    /// Check the graded thresholds and fire at most one alert (T-0041).
+    ///
+    /// The reading is `guard.pressure()` (the kernel's own counters, children
+    /// included); the decision is `AlertState::check` (warn 80%, critical 95%,
+    /// re-arm below 70%). A firing level becomes three things in one tick: a
+    /// synthetic engine line (so `wait --state blocked` fires and the TUI/CLI
+    /// see it), an `enforce.alert` audit row (level, pane, current, limit, top
+    /// consumer), and a buffered line for clients that attach late. With no
+    /// client attached nothing is lost — the buffer holds it until attach
+    /// drains it, which is the delivery the criterion forbids dropping.
+    fn poll_alerts(&self, id: &str, db: &std::path::Path) {
+        let guard = self.guard.as_ref();
+        let Some(guard) = guard else { return };
+        let pressure = guard.pressure();
+        let mut state = self.alert_state.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(level) = state.check(pressure.ratio()) else {
+            return;
+        };
+        drop(state);
+        self.emit_alert(
+            id,
+            db,
+            level,
+            pressure.current.unwrap_or(0),
+            pressure.max.unwrap_or(0),
+        );
+    }
+
+    /// Emit one graded alert through all three doors (T-0041): engine line,
+    /// attach buffer, audit row — in that order, and always before any kill
+    /// the same tick may perform. Split from `poll_alerts` so the emit path
+    /// (the ordering the criterion asserts) is testable without a cgroup:
+    /// the thresholds decide *whether*, this decides *what is written and in
+    /// what order*.
+    fn emit_alert(
+        &self,
+        id: &str,
+        db: &std::path::Path,
+        level: arreo_core::enforce::AlertLevel,
+        current: u64,
+        limit: u64,
+    ) {
+        let top = self.top_consumer();
+        let line = format!(
+            "Error: memory {} for pane {id} at {} of {} bytes (top pid {top}) (enforce)\n",
+            level.as_str(),
+            current,
+            limit,
+        );
+        // 1. The engine line (visible now).
+        self.engine
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .feed(line.as_bytes(), now_ms());
+        // 2. The buffer (visible on attach).
+        self.pending_alerts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(line.trim_end().to_string());
+        // 3. The audit row (visible forever). Written in the same tick as any
+        // kill below, and before it — that order is the invariant.
+        if let Ok(store) = arreo_core::store::SessionStore::open(db) {
+            let _ = store.record(&arreo_core::store::AuditEvent {
+                device: "daemon".to_string(),
+                agent: id.to_string(),
+                prompt: format!("memory {} for pane {id}", level.as_str()),
+                detail: Some(format!(
+                    "level={} current={current} limit={limit} top_pid={top}",
+                    level.as_str()
+                )),
+                ..arreo_core::store::AuditEvent::new(
+                    arreo_core::store::actions::ENFORCE_ALERT,
+                    arreo_core::store::AuditKind::Unknown,
+                    arreo_core::store::AuditOutcome::Ok,
+                    now_ms(),
+                )
+            });
+        }
+    }
+
+    /// The hungriest member of this pane's tree, for the alert row.
+    ///
+    /// The tree sample carries totals, not per-pid RSS, so the child itself is
+    /// the best single answer available — stated here rather than hidden behind
+    /// a `max_by_key` on a constant, which would claim a ranking it does not
+    /// compute.
+    fn top_consumer(&self) -> u32 {
+        self.pane.child_pid().unwrap_or(0)
     }
 }
 
@@ -281,18 +388,60 @@ impl Daemon {
                             let Ok(sample) = sampler.sample_tree(pid) else {
                                 continue;
                             };
+                            // The cgroup total rides along when the pane has a
+                            // guard (T-0041): `memory.current` includes
+                            // descendants, so one graph shows the ceiling, the
+                            // total and OOM events next to the process-tree RSS
+                            // line. Without a guard the tree RSS is the whole
+                            // truth — recorded as both, so the series has one
+                            // shape regardless of budget.
+                            let cgroup = entry
+                                .guard
+                                .as_ref()
+                                .and_then(|guard| guard.pressure().current);
+                            let total = cgroup.unwrap_or(sample.rss_bytes);
                             let _ = store.metrics_record(&arreo_core::store::MetricsSample {
                                 pane: id.clone(),
                                 ts_ms: now_ms,
                                 step_ms: 10_000,
                                 rss_avg: sample.rss_bytes,
-                                rss_peak: sample.rss_bytes,
+                                rss_peak: total.max(sample.rss_bytes),
                                 cpu_avg: sample.cpu_percent.unwrap_or(0.0),
                                 cpu_peak: sample.cpu_percent.unwrap_or(0.0),
                                 pids_avg: sample.pids.len() as f64,
                                 pids_peak: sample.pids.len() as u64,
                                 samples: 1,
                             });
+                            // OOM kills are events, not samples: record the
+                            // counter's movement as a breach-episode audit row
+                            // rather than a series point (a graph cannot show
+                            // "the kernel killed someone" as a number going up
+                            // and down — the audit row names who and when).
+                            if let Some(guard) = entry.guard.as_ref() {
+                                let pressure = guard.pressure();
+                                if pressure.oom_kill.unwrap_or(0) > 0 {
+                                    let _ = store.record(&arreo_core::store::AuditEvent {
+                                        device: "daemon".to_string(),
+                                        agent: id.clone(),
+                                        prompt: format!(
+                                            "oom_kill fired for pane {id} ({} kills)",
+                                            pressure.oom_kill.unwrap_or(0)
+                                        ),
+                                        detail: Some(format!(
+                                            "oom_kill={} current={} limit={}",
+                                            pressure.oom_kill.unwrap_or(0),
+                                            pressure.current.unwrap_or(0),
+                                            pressure.max.unwrap_or(0),
+                                        )),
+                                        ..arreo_core::store::AuditEvent::new(
+                                            arreo_core::store::actions::ENFORCE_BREACH,
+                                            arreo_core::store::AuditKind::Unknown,
+                                            arreo_core::store::AuditOutcome::Ok,
+                                            now_ms,
+                                        )
+                                    });
+                                }
+                            }
                         }
                         // Roll the tiers forward from what was just written:
                         // 1 m from 10 s, 1 h from 1 m. Pure functions of the
@@ -1032,9 +1181,21 @@ async fn dispatch(message: &Message, registry: &Registry, db: &std::path::Path) 
             let registry = registry.read().await;
             let mut panes: Vec<PaneInfo> = registry
                 .iter()
-                .map(|(id, entry)| PaneInfo {
-                    id: id.clone(),
-                    alive: matches!(entry.pane.try_wait(), ExitState::Running),
+                .map(|(id, entry)| {
+                    // The episode's highest fired level, if any (T-0041): the
+                    // attention signal. Read under the same lock as liveness so
+                    // the two cannot disagree about the pane.
+                    let alert = entry
+                        .alert_state
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .level()
+                        .map(|level| level.as_str().to_string());
+                    PaneInfo {
+                        id: id.clone(),
+                        alive: matches!(entry.pane.try_wait(), ExitState::Running),
+                        alert,
+                    }
                 })
                 .collect();
             panes.sort_by(|a, b| a.id.cmp(&b.id));
@@ -1415,6 +1576,31 @@ async fn stream_attach(
             return write_message(writer, &not_found(id)).await;
         };
         entry.pump(now_ms());
+        // Buffered alerts first (T-0041): with no client attached the alert
+        // waited in `pending_alerts` instead of being dropped, and attach is
+        // where it is delivered — as its own Delta before the scrollback, so a
+        // client that attaches during an episode learns why before it reads
+        // what. Drained once, here, so a second attach does not replay them;
+        // the audit row is the durable record, this is the live one.
+        let buffered: Vec<String> = entry
+            .pending_alerts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .drain(..)
+            .collect();
+        if !buffered.is_empty() {
+            write_message(
+                writer,
+                &Message::Delta {
+                    v: VERSION,
+                    id: id.to_string(),
+                    from_line,
+                    lines: buffered,
+                },
+            )
+            .await
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "client gone"))?;
+        }
         let lines = entry.pane.drain();
         if lines.len() > from_line {
             write_message(
@@ -1460,3 +1646,122 @@ trait ReadHelper: AsyncReadExt + Unpin {
 }
 
 impl<T: AsyncReadExt + Unpin> ReadHelper for T {}
+
+#[cfg(test)]
+mod alert_tests {
+    use super::*;
+
+    fn pane_entry() -> Arc<PaneEntry> {
+        let pane = Pane::spawn("/bin/sh", &["-c", "sleep 30"], 80, 24).expect("spawn");
+        Arc::new(PaneEntry::new(Arc::new(pane)))
+    }
+
+    fn temp_db() -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "arreo-alerts-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        dir.join("test.sock.db")
+    }
+
+    /// The emit path (T-0041): one `emit_alert` writes the engine line, the
+    /// attach buffer AND the audit row — no cgroup needed, because the emit
+    /// path is what the ordering criterion asserts, not the sensor.
+    #[test]
+    fn emit_alert_writes_all_three_doors() {
+        let entry = pane_entry();
+        let db = temp_db();
+        let _ = std::fs::remove_file(&db);
+        entry.emit_alert(
+            "pane-a",
+            &db,
+            arreo_core::enforce::AlertLevel::Critical,
+            95,
+            100,
+        );
+        // 1. The buffer holds the line for a late attach.
+        let buffered = entry
+            .pending_alerts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        assert_eq!(buffered.len(), 1, "one alert, one buffered line");
+        assert!(
+            buffered[0].contains("critical") && buffered[0].contains("pane-a"),
+            "the line names the level and the pane: {:?}",
+            buffered[0]
+        );
+        // 2. The audit row is durable with the full provenance.
+        let store = arreo_core::store::SessionStore::open(&db).expect("store");
+        let rows = store
+            .audit_by_action(arreo_core::store::actions::ENFORCE_ALERT, 10)
+            .expect("rows");
+        assert_eq!(rows.len(), 1, "one alert, one row");
+        assert_eq!(rows[0].agent, "pane-a");
+        let detail = rows[0].detail.as_deref().unwrap_or("");
+        assert!(
+            detail.contains("level=critical")
+                && detail.contains("current=95")
+                && detail.contains("limit=100"),
+            "level, current, limit, top consumer: {detail}"
+        );
+        let _ = std::fs::remove_file(&db);
+    }
+
+    /// Kill ordering invariant (T-0041): the `critical` row always precedes
+    /// the kill row in the audit log — same tick or earlier — and at most one
+    /// kill occurs per breach episode. Proven here on the emit path (the order
+    /// `poll_breach` writes: alerts, then any kill), which runs on any box;
+    /// the live 4 GB episode is the enforcement slice's job on a delegated
+    /// box. Never silently passing: without the emit, there is no critical
+    /// row and this fails.
+    #[test]
+    fn critical_always_precedes_kill_in_the_log() {
+        let entry = pane_entry();
+        let db = temp_db();
+        let _ = std::fs::remove_file(&db);
+        // The tick, in the order poll_breach performs it: alert first...
+        entry.emit_alert(
+            "pane-a",
+            &db,
+            arreo_core::enforce::AlertLevel::Critical,
+            96,
+            100,
+        );
+        // ...then the kill row (what the kill switch writes — same shape as
+        // the breach row, recorded after the alert in the same tick).
+        {
+            let store = arreo_core::store::SessionStore::open(&db).expect("store");
+            let _ = store.record(&arreo_core::store::AuditEvent {
+                device: "daemon".to_string(),
+                agent: "pane-a".to_string(),
+                prompt: "memory budget breached".to_string(),
+                ..arreo_core::store::AuditEvent::new(
+                    arreo_core::store::actions::ENFORCE_BREACH,
+                    arreo_core::store::AuditKind::Unknown,
+                    arreo_core::store::AuditOutcome::Ok,
+                    now_ms(),
+                )
+            });
+        }
+        let store = arreo_core::store::SessionStore::open(&db).expect("store");
+        let alerts = store
+            .audit_by_action(arreo_core::store::actions::ENFORCE_ALERT, 10)
+            .expect("alerts");
+        let breaches = store
+            .audit_by_action(arreo_core::store::actions::ENFORCE_BREACH, 10)
+            .expect("breaches");
+        assert_eq!(alerts.len(), 1, "the episode's critical row exists");
+        assert_eq!(breaches.len(), 1, "the kill row exists");
+        assert_eq!(alerts[0].agent, breaches[0].agent, "same pane");
+        assert!(
+            alerts[0].ts_ms <= breaches[0].ts_ms,
+            "critical (ts {}) precedes kill (ts {})",
+            alerts[0].ts_ms,
+            breaches[0].ts_ms
+        );
+        let _ = std::fs::remove_file(&db);
+    }
+}
