@@ -28,7 +28,8 @@ use arreo_core::relay::{
     decode_message, decode_payload, encode_message, encode_payload, fresh_nonce, read_envelope,
     read_frame, verify_auth, write_frame, Ack, Auth, AuthReply, DirectoryReply, DrainReport,
     DrainRequest, Hello, HelloReply, JoinRequest, MachinesRequest, Outcome, RelayEnvelope,
-    RelayError, RelayHeader, RelayKind, MAX_HANDSHAKE_BYTES, RELAY_SENDER, RELAY_VERSION,
+    RelayError, RelayHeader, RelayKind, RemoveRequest, RenameRequest, StaleRequest,
+    MAX_HANDSHAKE_BYTES, RELAY_SENDER, RELAY_VERSION,
 };
 use arreo_core::transport::{accept_connection, Connection, Endpoint, HandshakeLimiter, QuicError};
 use std::collections::HashMap;
@@ -319,6 +320,115 @@ impl Router {
                 refused: None,
             },
             Err(e) => refuse(format!("the relay would not admit this machine: {e}")),
+        }
+    }
+
+    /// Does this session's account list that machine?
+    ///
+    /// The authorization check for the write verbs: the directory is the
+    /// account's, and the session authenticated as a device of one account. One
+    /// extra read per write — writes are operator actions, not a hot path.
+    fn owns(&self, session: &Session, machine: &MachineId) -> bool {
+        Directory::new(self.store.clone())
+            .list(&session.account_id, crate::directory::now_ms())
+            .is_ok_and(|rows| rows.iter().any(|row| &row.machine_id == machine))
+    }
+
+    /// Rename a machine (T-0057).
+    ///
+    /// The directory's own rule decides — this function decodes, calls, and
+    /// maps the outcome to a refusal string, so a client cannot hold a different
+    /// opinion about whether a name was free.
+    fn rename(&self, session: &Session, request: &RenameRequest, seq: u64) -> DirectoryReply {
+        if request.v != RELAY_VERSION {
+            return refuse(seq, format!("rename speaks version {}", request.v));
+        }
+        let Ok(machine) = MachineId::parse(&request.machine_id) else {
+            return refuse(seq, format!("{:?} is not a machine id", request.machine_id));
+        };
+        let Ok(name) = Name::parse(&request.new_name) else {
+            return refuse(seq, format!("{:?} is not a machine name", request.new_name));
+        };
+        // The machine must belong to *this* session's account. The directory's
+        // rows are keyed by `machine_id`, which is unique across accounts, so
+        // without this check any account's device could rename or tombstone
+        // another account's machine by guessing an id — and the refusal is the
+        // same one an unknown id gets, so it does not become an oracle for
+        // "this machine exists somewhere else".
+        if !self.owns(session, &machine) {
+            return refuse(
+                seq,
+                format!("no machine {} in this account", request.machine_id),
+            );
+        }
+        let directory = Directory::new(self.store.clone());
+        match directory.rename(&machine, &name, crate::directory::now_ms()) {
+            Ok(row) => DirectoryReply {
+                v: RELAY_VERSION,
+                seq,
+                granted: Some(row),
+                machines: Vec::new(),
+                refused: None,
+            },
+            Err(e) => refuse(seq, format!("the rename was refused: {e}")),
+        }
+    }
+
+    /// Tombstone a machine's name (T-0057).
+    fn remove(&self, session: &Session, request: &RemoveRequest, seq: u64) -> DirectoryReply {
+        if request.v != RELAY_VERSION {
+            return refuse(seq, format!("remove speaks version {}", request.v));
+        }
+        let Ok(machine) = MachineId::parse(&request.machine_id) else {
+            return refuse(seq, format!("{:?} is not a machine id", request.machine_id));
+        };
+        if !self.owns(session, &machine) {
+            return refuse(
+                seq,
+                format!("no machine {} in this account", request.machine_id),
+            );
+        }
+        let directory = Directory::new(self.store.clone());
+        match directory.remove(&machine, crate::directory::now_ms()) {
+            Ok(row) => DirectoryReply {
+                v: RELAY_VERSION,
+                seq,
+                granted: Some(row),
+                machines: Vec::new(),
+                refused: None,
+            },
+            Err(e) => refuse(seq, format!("the removal was refused: {e}")),
+        }
+    }
+
+    /// Prune exactly the stale machines (T-0057): T-0043's rule, applied by the
+    /// relay, with the pruned rows in the reply so the caller can say what it
+    /// reclaimed without a second read.
+    fn prune_stale(&self, session: &Session, request: StaleRequest, seq: u64) -> DirectoryReply {
+        if request.v != RELAY_VERSION {
+            return refuse(seq, format!("stale speaks version {}", request.v));
+        }
+        let directory = Directory::new(self.store.clone());
+        let now = crate::directory::now_ms();
+        let pruned = match directory.remove_stale(&session.account_id, now) {
+            Ok(pruned) => pruned,
+            Err(e) => return refuse(seq, format!("the prune was refused: {e}")),
+        };
+        // The rows are read back *tombstoned*: a pruned machine keeps its name
+        // for the tombstone window, which is exactly what "what it reclaimed"
+        // should report.
+        let rows = directory
+            .list(&session.account_id, now)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|row| pruned.contains(&row.machine_id))
+            .collect();
+        DirectoryReply {
+            v: RELAY_VERSION,
+            seq,
+            granted: None,
+            machines: rows,
+            refused: None,
         }
     }
 
@@ -688,6 +798,26 @@ where
                 let _ = outbound.try_send(Outbound::Directory(reply));
                 continue;
             }
+            // The directory's write side (T-0057). The relay applies the rules
+            // the directory owns — never the client's idea of them.
+            RelayKind::Rename => {
+                let request: RenameRequest = decode_payload(&envelope.payload)?;
+                let reply = router.rename(session, &request, seq);
+                let _ = outbound.try_send(Outbound::Directory(reply));
+                continue;
+            }
+            RelayKind::Remove => {
+                let request: RemoveRequest = decode_payload(&envelope.payload)?;
+                let reply = router.remove(session, &request, seq);
+                let _ = outbound.try_send(Outbound::Directory(reply));
+                continue;
+            }
+            RelayKind::Stale => {
+                let request: StaleRequest = decode_payload(&envelope.payload)?;
+                let reply = router.prune_stale(session, request, seq);
+                let _ = outbound.try_send(Outbound::Directory(reply));
+                continue;
+            }
             RelayKind::Frame => {}
             // A device may not originate the relay's own kinds: a forged
             // departure notice would let any device in an account make another
@@ -897,6 +1027,17 @@ fn peer_gone_envelope(session: &Session, departed: &DeviceId) -> Result<RelayEnv
         },
         payload: Vec::new(),
     })
+}
+
+/// A directory refusal: the answer to a request the relay would not perform.
+fn refuse(seq: u64, reason: String) -> DirectoryReply {
+    DirectoryReply {
+        v: RELAY_VERSION,
+        seq,
+        granted: None,
+        machines: Vec::new(),
+        refused: Some(reason),
+    }
 }
 
 /// The always-present framing of the relay's own answers: the relay as sender,

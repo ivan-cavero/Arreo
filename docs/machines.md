@@ -7,6 +7,8 @@ script consumes it.
 ```console
 arreo machines list   [--json] [--all] [--offline] [--config PATH]
 arreo machines status [<name>] [--json] [--offline] [--config PATH]
+arreo machines rename <old> <new> [--config PATH]
+arreo machines remove <name> [--stale] [--force] [--config PATH]
 ```
 
 Both verbs read the relay **directly** with this machine's paired device
@@ -43,9 +45,10 @@ same `machines` request the daemon does (T-0056).
   the relay's rule (T-0043) has three outcomes, and a fourth would be a claim
   nobody made.
 - `flags` is the only open-ended field: `name-suffixed` (the relay's collision
-  rule gave this machine a suffix — not a mistake), `name-reclaimable` (the
-  machine is stale, so its name can be taken), `unverified` (the row came from
-  the cache, see below).
+  rule gave this machine a suffix — not a mistake), `name-tombstoned` (the
+  machine was removed and its name is held for the tombstone window),
+  `name-reclaimable` (the machine is stale, so its name can be taken),
+  `unverified` (the row came from the cache, see below).
 - **Schema 1 is additive-only.** A checked-in contract test fails on a removed
   or renamed key and on an out-of-enum presence, so breaking a script is a red
   build rather than a surprise.
@@ -108,10 +111,35 @@ account = "acct-1"
 | 4 | the relay is unreachable, or this machine has no paired identity |
 | 5 | the relay refused (name conflict, trust refusal) |
 
+## Writing: rename and remove
+
+Both write through the relay, which applies the directory's rules — the client is
+never trusted to decide whether a name is free or a machine is stale.
+
+`rename <old> <new>` renames a machine. A name that is live for another machine is
+**refused with nothing changed** (exit 5), and the result printed is the row the
+directory now holds. Renames are not suffixed: the deterministic suffix is the rule
+for *claims*, where a machine joins and asks for a name it may not get; an operator
+who renames a machine means that name.
+
+`remove <name>` tombstones the name for 30 days: the row stays (so the machine
+keeps its name if it comes back), and no *other* key can take the name until the
+tombstone expires. The output says until when. Two things make it deliberate:
+
+- a machine that is **online right now** needs `--force`, because tombstoning a
+  machine that is answering is almost always a mistake;
+- `--stale` is the bulk form: it removes every machine the presence rule calls
+  stale, prints each reclaimed name, and is idempotent (a second run finds
+  nothing).
+
+`--json` and `--offline` are for the read verbs and are **refused** here rather
+than accepted and ignored: the write verbs print one line, which is not a
+contract, and a write cannot answer from memory.
+
 ## Not implemented yet
 
-`add`, `rename` and `remove` need the directory's **write** side over the wire,
-which does not exist yet (tracked as T-0057; T-0056 deliberately landed only the
-machine's own row assertion and the account read). They refuse with exit 2 and
-name the reason — a verb that looked implemented and silently did nothing would
-be worse.
+`add <pairing-code>` — the join handoff. A row is claimed by a signature the
+machine makes over its own key, and a four-word pairing code authenticates a
+pairing *session*, not a machine: it carries neither the key nor the account's
+coordinates. Deciding how the invite carries those is T-0058. `machines add`
+refuses with exit 2 and names the reason.

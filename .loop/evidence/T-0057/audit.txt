@@ -1,0 +1,51 @@
+# T-0057 evidence — the directory's write verbs over the wire
+
+## 1. The rules, applied by the relay (real relay binary, real QUIC)
+
+$ cargo test -p arreo-relay --test router
+
+test a_write_for_another_accounts_machine_is_refused ... ok
+test the_directory_write_verbs_apply_the_relays_rules ... ok
+test result: ok. 21 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.40s
+
+## 2. The verbs through the real CLI (rename, refused rename, tombstone, prune)
+
+$ cargo test -p arreo-cli --test machines
+test an_unpaired_client_is_told_what_is_missing ... ok
+test the_test_config_is_one_the_shared_loader_accepts ... ok
+test a_missing_relay_configuration_is_exit_4 ... ok
+test list_and_status_read_the_accounts_directory ... ok
+test rename_and_remove_write_the_directory_and_never_leave_partial_state ... ok
+test an_unreachable_relay_answers_from_the_cache_and_says_so ... ok
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 20.56s
+
+## 3. Unit coverage (the flag rules, the exit codes, the contract)
+
+test machines::tests::a_cached_envelope_is_labelled ... ok
+test machines::tests::a_cached_row_is_never_online ... ok
+test machines::tests::ages_are_human ... ok
+test machines::tests::usage_errors_are_exit_2 ... ok
+test machines::tests::an_age_is_never_negative ... ok
+test machines::tests::the_json_envelope_is_schema_1_with_closed_presence_values ... ok
+test machines::tests::only_add_is_still_missing_and_json_is_refused_where_it_is_not_a_contract ... ok
+test machines::tests::the_exit_codes_are_distinct ... ok
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+## 4. Both new behaviours proved to fail when their code is removed
+
+Removing the account-ownership check in the relay makes both cross-account
+writes succeed, and a_write_for_another_accounts_machine_is_refused goes red.
+Removing the tombstone flag (deriving it from presence instead of the row)
+makes the CLI test report name-reclaimable for a row that is name-tombstoned.
+
+## 5. The full battery (final code)
+
+cargo test --workspace: 411 passed, 0 failed across 52 targets
+cargo clippy --workspace --all-targets -- -D warnings: 0 diagnostics
+cargo fmt --all -- --check: clean
+cargo vet --locked: Vetting Succeeded (336 exempted)
+cargo deny check: advisories ok, bans ok, licenses ok, sources ok
+cargo audit: no advisories
+cargo xtask check-targets: x86_64-unknown-linux-gnu PASS; x86_64-pc-windows-msvc SKIP (pure-Rust no-sqlite PASS)
+e2e slices: api green, compat green, lifecycle 2/2, persistence 3/3, enforcement passed, tui 18/18, theme 27/27, relay 14/14
+cargo xtask bench: 6/6 PASS

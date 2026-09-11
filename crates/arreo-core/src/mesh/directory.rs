@@ -330,6 +330,11 @@ pub struct CachedMachine {
     pub proto_version: u32,
     #[serde(default)]
     pub name_conflict: bool,
+    /// When the name's tombstone expires, as the relay said it (T-0057): a
+    /// removed machine keeps its name for that window, and a renderer that
+    /// cannot say so would show a tombstoned machine as an ordinary one.
+    #[serde(default)]
+    pub tombstone_until_ms: Option<i64>,
 }
 
 /// A server's read-only mirror of the directory.
@@ -370,6 +375,7 @@ impl DirectoryCache {
                     last_seen_ms: row.last_seen_ms,
                     proto_version: row.proto_version,
                     name_conflict: row.name_conflict,
+                    tombstone_until_ms: row.tombstone_until_ms,
                 },
             );
         }

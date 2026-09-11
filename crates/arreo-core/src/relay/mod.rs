@@ -142,8 +142,17 @@ pub enum RelayKind {
     /// MessagePack encoding of [`MachinesRequest`]; the relay answers with a
     /// [`RelayKind::Directory`] carrying the rows.
     Machines,
-    /// Relay → device: the answer to [`RelayKind::Join`] or
-    /// [`RelayKind::Machines`]. The payload is the MessagePack encoding of
+    /// Device → relay: rename a machine in the account's directory. The payload
+    /// is the MessagePack encoding of [`RenameRequest`] (T-0057).
+    Rename,
+    /// Device → relay: tombstone a machine's name. The payload is the
+    /// MessagePack encoding of [`RemoveRequest`] (T-0057).
+    Remove,
+    /// Device → relay: prune exactly the stale machines (T-0043's rule). The
+    /// payload is the MessagePack encoding of [`StaleRequest`] (T-0057).
+    Stale,
+    /// Relay → device: the answer to [`RelayKind::Join`], [`RelayKind::Machines`]
+    /// or one of the write kinds. The payload is the MessagePack encoding of
     /// [`DirectoryReply`], and the reply's **kind** is what identifies it — the
     /// drain report's guess-by-shape is a wart this does not repeat.
     Directory,
@@ -160,6 +169,9 @@ impl RelayKind {
             Self::PeerGone => "peergone",
             Self::Join => "join",
             Self::Machines => "machines",
+            Self::Rename => "rename",
+            Self::Remove => "remove",
+            Self::Stale => "stale",
             Self::Directory => "directory",
         }
     }
@@ -430,6 +442,36 @@ pub struct MachinesRequest {
     pub v: u32,
     /// Include tombstoned (removed) names rather than only live machines.
     pub all: bool,
+}
+
+/// Device → relay: rename a machine (T-0057).
+///
+/// The directory's rule decides: a name that is live for another machine is
+/// refused (a *claim* gets a suffix — a rename is an explicit request for one
+/// name, so a conflict is an answer, not something to paper over).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RenameRequest {
+    pub v: u32,
+    /// The machine to rename, bare 32 hex characters.
+    pub machine_id: String,
+    /// The name it should have.
+    pub new_name: String,
+}
+
+/// Device → relay: tombstone a machine's name for [`crate::mesh::TOMBSTONE_SECS`]
+/// (T-0057). The row stays, so a returning machine keeps its name; a *different*
+/// key cannot take it until the tombstone expires.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoveRequest {
+    pub v: u32,
+    pub machine_id: String,
+}
+
+/// Device → relay: prune the stale machines — exactly the set T-0043's presence
+/// rule calls stale, idempotent (T-0057).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StaleRequest {
+    pub v: u32,
 }
 
 /// Relay → device: the answer to a [`RelayKind::Join`] or

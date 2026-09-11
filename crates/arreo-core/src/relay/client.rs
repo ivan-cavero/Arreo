@@ -12,7 +12,8 @@ use super::{
     decode_message, decode_payload, encode_message, encode_payload, proof_payload, read_envelope,
     read_frame, write_frame, Ack, Auth, AuthReply, ClientError, DirectoryReply, DrainReport,
     DrainRequest, Hello, HelloReply, JoinRequest, MachinesRequest, Outcome, RelayEnvelope,
-    RelayError, RelayHeader, RelayKind, MAX_HANDSHAKE_BYTES, RELAY_VERSION,
+    RelayError, RelayHeader, RelayKind, RemoveRequest, RenameRequest, StaleRequest,
+    MAX_HANDSHAKE_BYTES, RELAY_VERSION,
 };
 use crate::identity::{DeviceCert, DeviceId, DeviceKey};
 use crate::transport::{client_endpoint, SERVER_NAME};
@@ -119,12 +120,16 @@ where
         }
         // The relay never originates these, and a device reading them would
         // mean the relay echoed a request back.
-        RelayKind::Drain | RelayKind::Ack | RelayKind::Join | RelayKind::Machines => {
-            Err(ClientError::Protocol(RelayError::Frame(format!(
-                "the relay sent a {:?} envelope",
-                envelope.header.kind
-            ))))
-        }
+        RelayKind::Drain
+        | RelayKind::Ack
+        | RelayKind::Join
+        | RelayKind::Machines
+        | RelayKind::Rename
+        | RelayKind::Remove
+        | RelayKind::Stale => Err(ClientError::Protocol(RelayError::Frame(format!(
+            "the relay sent a {:?} envelope",
+            envelope.header.kind
+        )))),
     }
 }
 
@@ -246,6 +251,21 @@ impl RelayWriter {
     ) -> Result<(), ClientError> {
         self.control_with_seq(seq, RelayKind::Machines, request)
             .await
+    }
+
+    /// Rename a machine, on a reserved sequence number (T-0057).
+    pub async fn rename(&mut self, seq: u64, request: &RenameRequest) -> Result<(), ClientError> {
+        self.control_with_seq(seq, RelayKind::Rename, request).await
+    }
+
+    /// Tombstone a machine's name, on a reserved sequence number.
+    pub async fn remove(&mut self, seq: u64, request: &RemoveRequest) -> Result<(), ClientError> {
+        self.control_with_seq(seq, RelayKind::Remove, request).await
+    }
+
+    /// Prune the stale machines, on a reserved sequence number.
+    pub async fn stale(&mut self, seq: u64, request: &StaleRequest) -> Result<(), ClientError> {
+        self.control_with_seq(seq, RelayKind::Stale, request).await
     }
 
     #[must_use]

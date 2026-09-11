@@ -40,7 +40,7 @@
 use crate::identity::{DeviceCert, DeviceId, DeviceKey};
 use crate::relay::{
     ClientError, DirectoryReply, Incoming, JoinRequest, MachinesRequest, Outcome, RelayClient,
-    RelayReader, RelayWriter, RELAY_VERSION,
+    RelayReader, RelayWriter, RemoveRequest, RenameRequest, StaleRequest, RELAY_VERSION,
 };
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -162,6 +162,12 @@ enum Outbound {
     /// Read the account's machine directory (T-0056), with the slot its reply
     /// goes to.
     Machines(MachinesRequest, oneshot::Sender<DirectoryReply>),
+    /// Rename a machine (T-0057), with the slot its reply goes to.
+    Rename(RenameRequest, oneshot::Sender<DirectoryReply>),
+    /// Tombstone a machine's name (T-0057), with the slot its reply goes to.
+    Remove(RemoveRequest, oneshot::Sender<DirectoryReply>),
+    /// Prune the stale machines (T-0057), with the slot its reply goes to.
+    Stale(StaleRequest, oneshot::Sender<DirectoryReply>),
 }
 
 /// One peer's stream state.
@@ -455,6 +461,45 @@ impl RelaySession {
         self.directory_request(Outbound::Join, request).await
     }
 
+    /// Rename a machine and return the relay's answer (T-0057).
+    ///
+    /// The answer's `refused` is where the directory's rule lands: a name live
+    /// for another machine comes back as a refusal with nothing changed, never as
+    /// a suffix (that rule is for claims).
+    pub async fn rename_machine(
+        &self,
+        machine_id: &str,
+        new_name: &str,
+    ) -> Result<DirectoryReply, SessionError> {
+        self.directory_request(
+            Outbound::Rename,
+            RenameRequest {
+                v: RELAY_VERSION,
+                machine_id: machine_id.to_string(),
+                new_name: new_name.to_string(),
+            },
+        )
+        .await
+    }
+
+    /// Tombstone a machine's name and return the relay's answer (T-0057).
+    pub async fn remove_machine(&self, machine_id: &str) -> Result<DirectoryReply, SessionError> {
+        self.directory_request(
+            Outbound::Remove,
+            RemoveRequest {
+                v: RELAY_VERSION,
+                machine_id: machine_id.to_string(),
+            },
+        )
+        .await
+    }
+
+    /// Prune exactly the stale machines and return the rows pruned (T-0057).
+    pub async fn prune_stale(&self) -> Result<DirectoryReply, SessionError> {
+        self.directory_request(Outbound::Stale, StaleRequest { v: RELAY_VERSION })
+            .await
+    }
+
     /// Read the account's machine directory.
     pub async fn machines(&self, all: bool) -> Result<DirectoryReply, SessionError> {
         self.directory_request(
@@ -689,6 +734,23 @@ async fn write_pump(
                 let seq = writer.reserve_seq();
                 park_reply(&pending_replies, seq, waiter);
                 writer.machines(seq, &request).await.map(|()| None)
+            }
+            // The same reserve-park-then-send order as every other request: a
+            // write's reply can be as fast as a read's (T-0057).
+            Outbound::Rename(request, waiter) => {
+                let seq = writer.reserve_seq();
+                park_reply(&pending_replies, seq, waiter);
+                writer.rename(seq, &request).await.map(|()| None)
+            }
+            Outbound::Remove(request, waiter) => {
+                let seq = writer.reserve_seq();
+                park_reply(&pending_replies, seq, waiter);
+                writer.remove(seq, &request).await.map(|()| None)
+            }
+            Outbound::Stale(request, waiter) => {
+                let seq = writer.reserve_seq();
+                park_reply(&pending_replies, seq, waiter);
+                writer.stale(seq, &request).await.map(|()| None)
             }
         };
         match result {

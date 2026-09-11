@@ -478,6 +478,171 @@ async fn a_fire_and_forget_assertion_writes_the_row() {
     );
 }
 
+/// The write side (T-0057): rename, tombstone, and the stale prune, with the
+/// directory's rules applied by the relay.
+#[tokio::test]
+async fn the_directory_write_verbs_apply_the_relays_rules() {
+    let relay = Relay::start("directory-write");
+    let root = RootKey::generate().expect("entropy");
+    relay.register_account("acct-1", &root.public());
+    let (alice_key, alice_cert) = device(&root, "alice", 1);
+    let session = RelaySession::dial(relay.addr, "acct-1", &alice_key, &alice_cert)
+        .await
+        .expect("alice registers");
+
+    // Two machines, so a collision has something to collide with.
+    let first = RootKey::generate().expect("entropy");
+    let second = RootKey::generate().expect("entropy");
+    let workbox = session
+        .join_machine(signed_join(&first, session.nonce(), "acct-1", "workbox"))
+        .await
+        .expect("the relay answers")
+        .granted
+        .expect("a row");
+    session
+        .join_machine(signed_join(&second, session.nonce(), "acct-1", "pi"))
+        .await
+        .expect("the relay answers");
+
+    // Rename to a free name: the row comes back with the new name.
+    let renamed = session
+        .rename_machine(workbox.machine_id.as_str(), "workbox-2")
+        .await
+        .expect("the relay answers");
+    assert_eq!(renamed.refused, None, "{renamed:?}");
+    assert_eq!(renamed.granted.expect("a row").name.as_str(), "workbox-2");
+
+    // Rename onto the other machine's live name: refused, and *nothing*
+    // changes — a rename is an explicit request for one name, so a conflict is
+    // an answer, not a suffix (that rule belongs to claims).
+    let refused = session
+        .rename_machine(workbox.machine_id.as_str(), "pi")
+        .await
+        .expect("the relay answers");
+    assert!(refused.refused.is_some(), "{refused:?}");
+    let listed = session.machines(false).await.expect("the relay answers");
+    let names: Vec<&str> = listed.machines.iter().map(|r| r.name.as_str()).collect();
+    assert_eq!(
+        names,
+        vec!["pi", "workbox-2"],
+        "a refused rename must leave both names untouched"
+    );
+
+    // A name that is not a name is refused with the rule's reason, not stored.
+    let bad = session
+        .rename_machine(workbox.machine_id.as_str(), "not a name")
+        .await
+        .expect("the relay answers");
+    assert!(bad.refused.is_some(), "{bad:?}");
+
+    // An unknown machine is refused with the same sentence a foreign account's
+    // machine gets — one answer for "not yours or not there", so the refusal is
+    // not an oracle (the CLI maps it to exit 3).
+    let ghost = session
+        .rename_machine("33333333333333333333333333333333", "wherever")
+        .await
+        .expect("the relay answers");
+    let reason = ghost.refused.expect("a refusal");
+    assert!(reason.contains("no machine"), "{reason}");
+
+    // Remove: the name is held for the tombstone window, and a returning
+    // machine under a *different* key cannot take it.
+    let removed = session
+        .remove_machine(workbox.machine_id.as_str())
+        .await
+        .expect("the relay answers");
+    let row = removed.granted.expect("a row");
+    assert!(
+        row.tombstone_until_ms.is_some_and(|until| until > 0),
+        "a removal is a tombstone, not a deletion: {row:?}"
+    );
+    let stranger = RootKey::generate().expect("entropy");
+    let taken = session
+        .join_machine(signed_join(
+            &stranger,
+            session.nonce(),
+            "acct-1",
+            "workbox-2",
+        ))
+        .await
+        .expect("the relay answers")
+        .granted
+        .expect("a row");
+    assert_ne!(
+        taken.name.as_str(),
+        "workbox-2",
+        "the tombstone holds the name for its whole window"
+    );
+
+    // The prune is T-0043's rule: a fresh machine is not stale, so it removes
+    // nothing and says so (idempotent by construction — the second run finds an
+    // empty set too).
+    for _ in 0..2 {
+        let pruned = session.prune_stale().await.expect("the relay answers");
+        assert_eq!(pruned.refused, None, "{pruned:?}");
+        assert!(
+            pruned.machines.is_empty(),
+            "nothing here is stale: {:?}",
+            pruned.machines
+        );
+    }
+}
+
+/// A machine id belonging to *another* account is not writable: the directory is
+/// the account's, and the id is unique across accounts, so without the check any
+/// account's device could rename or tombstone another account's machine.
+#[tokio::test]
+async fn a_write_for_another_accounts_machine_is_refused() {
+    let relay = Relay::start("directory-cross");
+    let root = RootKey::generate().expect("entropy");
+    relay.register_account("acct-1", &root.public());
+    let other_root = RootKey::generate().expect("entropy");
+    relay.register_account("acct-2", &other_root.public());
+
+    let (alice_key, alice_cert) = device(&root, "alice", 1);
+    let alice = RelaySession::dial(relay.addr, "acct-1", &alice_key, &alice_cert)
+        .await
+        .expect("alice registers");
+    // A machine of the *other* account: `acct-2`'s device joins it.
+    let (bob_key, bob_cert) = device(&other_root, "bob", 2);
+    let bob = RelaySession::dial(relay.addr, "acct-2", &bob_key, &bob_cert)
+        .await
+        .expect("bob registers");
+    let machine = RootKey::generate().expect("entropy");
+    let theirs = bob
+        .join_machine(signed_join(&machine, bob.nonce(), "acct-2", "workbox"))
+        .await
+        .expect("the relay answers")
+        .granted
+        .expect("a row");
+
+    for reply in [
+        alice
+            .rename_machine(theirs.machine_id.as_str(), "stolen")
+            .await
+            .expect("the relay answers"),
+        alice
+            .remove_machine(theirs.machine_id.as_str())
+            .await
+            .expect("the relay answers"),
+    ] {
+        let reason = reply.refused.expect("a refusal");
+        assert!(
+            reason.contains("no machine"),
+            "the refusal must not reveal that the machine exists elsewhere: {reason}"
+        );
+    }
+    // And the other account's directory is untouched.
+    let theirs_after = bob.machines(false).await.expect("the relay answers");
+    assert_eq!(theirs_after.machines.len(), 1);
+    assert_eq!(theirs_after.machines[0].name.as_str(), "workbox");
+    assert!(
+        !theirs_after.machines[0].tombstone_active(i64::MAX),
+        "the other account's name is not tombstoned: {:?}",
+        theirs_after.machines[0]
+    );
+}
+
 /// A request the relay cannot read is a refusal, not a session-ending error.
 #[tokio::test]
 async fn a_malformed_join_is_refused() {

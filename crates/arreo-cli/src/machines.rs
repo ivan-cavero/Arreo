@@ -50,25 +50,18 @@ pub fn run(rest: &[String]) -> ExitCode {
     match verb {
         "list" => crate::rt::block_on(list(args)),
         "status" => crate::rt::block_on(status(args)),
+        "rename" => crate::rt::block_on(rename(args)),
+        "remove" => crate::rt::block_on(remove(args)),
         // Named with the reason rather than answered with a stub: a verb that
         // looks implemented and silently does nothing is worse than one that
-        // says what is missing. The write side of the directory (rename, remove)
-        // needs relay verbs that do not exist yet (T-0057), and `add` needs the
-        // account handoff the pairing protocol does not carry (T-0057's notes).
-        "rename" | "remove" => fail(
-            USAGE,
-            &format!(
-                "`machines {verb}` is not implemented yet: it needs the directory's write side \
-                 over the wire, which is tracked as T-0057. `machines list` and `machines status` \
-                 read the directory today"
-            ),
-        ),
+        // says what is missing. `add` needs the account handoff the pairing
+        // protocol does not carry yet (T-0058).
         "add" => fail(
             USAGE,
             "`machines add` is not implemented yet: a row is claimed by a signature the machine \
              makes over its own key, and the pairing code carries neither that key nor the \
-             account's coordinates — deciding the handoff is T-0058. `machines list` and \
-             `machines status` read the directory today",
+             account's coordinates — deciding the handoff is T-0058. Run `machines add` on the \
+             joining machine once T-0058 lands",
         ),
         other => {
             eprintln!("machines: unknown verb {other:?}");
@@ -78,8 +71,10 @@ pub fn run(rest: &[String]) -> ExitCode {
 }
 
 fn usage() -> ExitCode {
-    eprintln!("usage: arreo machines list [--json] [--all] [--offline] [--config PATH]");
+    eprintln!("usage: arreo machines list   [--json] [--all] [--offline] [--config PATH]");
     eprintln!("       arreo machines status [<name>] [--json] [--offline] [--config PATH]");
+    eprintln!("       arreo machines rename <old> <new> [--config PATH]");
+    eprintln!("       arreo machines remove <name> [--stale] [--force] [--config PATH]");
     eprintln!();
     eprintln!(
         "  --json     the script contract (schema {SCHEMA}); the human table is NOT one and may"
@@ -88,10 +83,10 @@ fn usage() -> ExitCode {
     eprintln!("  --all      include names whose machines are gone (tombstoned)");
     eprintln!("  --offline  never contact the relay; answer from the last known rows (exit 0)");
     eprintln!("  --config   the file with the [relay] section (also $ARREO_CONFIG)");
+    eprintln!("  --stale    remove every machine the presence rule calls stale (T-0043's rule)");
+    eprintln!("  --force    tombstone a machine that is answering right now (asks once otherwise)");
     eprintln!();
-    eprintln!();
-    eprintln!("not yet implemented (the directory's write side over the wire is T-0057):");
-    eprintln!("  add <pairing-code> [--name N] · rename <old> <new> · remove <name> [--force]");
+    eprintln!("not yet implemented: add <pairing-code> [--name N]   (the join handoff, T-0058)");
     eprintln!();
     eprintln!(
         "exit codes: {OK} ok · {USAGE} usage · {UNKNOWN_MACHINE} unknown machine · \
@@ -105,8 +100,13 @@ struct Options {
     json: bool,
     all: bool,
     offline: bool,
+    stale: bool,
+    force: bool,
     config: Option<PathBuf>,
+    /// The positional argument, when the verb takes one — or, for `rename`,
+    /// the first of the two.
     name: Option<String>,
+    second: Option<String>,
 }
 
 fn parse(verb: &str, args: &[String], allow_name: bool) -> Result<Options, ExitCode> {
@@ -114,8 +114,11 @@ fn parse(verb: &str, args: &[String], allow_name: bool) -> Result<Options, ExitC
         json: false,
         all: false,
         offline: false,
+        stale: false,
+        force: false,
         config: None,
         name: None,
+        second: None,
     };
     let mut i = 0;
     while i < args.len() {
@@ -123,13 +126,22 @@ fn parse(verb: &str, args: &[String], allow_name: bool) -> Result<Options, ExitC
             "--json" => options.json = true,
             "--all" => options.all = true,
             "--offline" => options.offline = true,
+            "--stale" => options.stale = true,
+            "--force" => options.force = true,
             "--config" if i + 1 < args.len() => {
                 options.config = Some(PathBuf::from(&args[i + 1]));
                 i += 2;
                 continue;
             }
-            other if !other.starts_with('-') && allow_name && options.name.is_none() => {
-                options.name = Some(other.to_string());
+            other if !other.starts_with('-') && allow_name => {
+                if options.name.is_none() {
+                    options.name = Some(other.to_string());
+                } else if options.second.is_none() {
+                    options.second = Some(other.to_string());
+                } else {
+                    eprintln!("machines {verb}: unexpected argument {other:?}");
+                    return Err(usage());
+                }
             }
             other => {
                 eprintln!("machines {verb}: unexpected argument {other:?}");
@@ -155,6 +167,8 @@ struct Row {
     last_seen_ms: i64,
     proto_version: u32,
     name_conflict: bool,
+    /// When the name's tombstone expires, when the relay said there is one.
+    tombstone_until_ms: Option<i64>,
     /// Whether this row came from the cache rather than the relay: the flag that
     /// says "unverified" travels with it, so a script sees the same distinction
     /// the `source` field makes for the whole answer.
@@ -172,6 +186,7 @@ impl Row {
             last_seen_ms: row.last_seen_ms,
             proto_version: row.proto_version,
             name_conflict: row.name_conflict,
+            tombstone_until_ms: row.tombstone_until_ms,
             from_cache: false,
         }
     }
@@ -197,6 +212,7 @@ impl Row {
             last_seen_ms: cached.last_seen_ms,
             proto_version: cached.proto_version,
             name_conflict: cached.name_conflict,
+            tombstone_until_ms: cached.tombstone_until_ms,
             from_cache: true,
         }
     }
@@ -208,18 +224,31 @@ impl Row {
         now_ms.saturating_sub(self.last_seen_ms).max(0) / 1000
     }
 
-    fn flags(&self) -> Vec<&'static str> {
+    /// What an operator needs to know about this row beyond its name.
+    ///
+    /// `name-tombstoned` comes from the *row's* tombstone, not from its
+    /// presence: a machine removed a minute ago is not stale, and a renderer that
+    /// showed it as an ordinary online machine would hide the fact that its name
+    /// is reserved. `name-reclaimable` is the stale case, where the name can be
+    /// taken by anyone.
+    fn flags(&self, now_ms: i64) -> Vec<&'static str> {
         let mut flags = Vec::new();
         if self.name_conflict {
             flags.push("name-suffixed");
         }
-        if self.presence == Presence::Stale {
+        if self.tombstone_active(now_ms) {
+            flags.push("name-tombstoned");
+        } else if self.presence == Presence::Stale {
             flags.push("name-reclaimable");
         }
         if self.from_cache {
             flags.push("unverified");
         }
         flags
+    }
+
+    fn tombstone_active(&self, now_ms: i64) -> bool {
+        self.tombstone_until_ms.is_some_and(|until| until > now_ms)
     }
 
     fn presence_str(&self) -> &'static str {
@@ -506,6 +535,258 @@ async fn status(args: &[String]) -> ExitCode {
     ExitCode::from(OK)
 }
 
+/// A flag that only makes sense for the read verbs, if the caller passed one.
+///
+/// `--json` is the read verbs' contract (the write verbs print one line, which is
+/// not a contract), and `--offline` means "answer from memory", which a write
+/// cannot do. Refusing them is the honest answer: accepting a flag and ignoring
+/// it looks like it worked.
+fn read_only_flag(options: &Options) -> Option<&'static str> {
+    if options.json {
+        Some("--json")
+    } else if options.offline {
+        Some("--offline")
+    } else {
+        None
+    }
+}
+
+/// Dial the relay with this machine's identity, for a verb that writes.
+///
+/// The read path folds "no config" and "no identity" into its cache fallback; a
+/// write cannot fall back to anything, so it stops with the reason.
+async fn session(options: &Options) -> Result<arreo_core::relay::session::RelaySession, ExitCode> {
+    let path = config_path(options)?;
+    let settings = match arreo_core::relay::config::load_config(&path) {
+        Ok(Some(settings)) => settings,
+        Ok(None) => {
+            eprintln!(
+                "machines: no relay is configured ({}), so the directory cannot be written",
+                path.display()
+            );
+            return Err(ExitCode::from(UNREACHABLE));
+        }
+        Err(e) => {
+            eprintln!("machines: {e}");
+            return Err(ExitCode::from(USAGE));
+        }
+    };
+    let (key, cert) = match paired_identity() {
+        Ok(pair) => pair,
+        Err(message) => {
+            eprintln!("machines: {message}");
+            return Err(ExitCode::from(UNREACHABLE));
+        }
+    };
+    arreo_core::relay::session::RelaySession::dial(settings.addr, &settings.account, &key, &cert)
+        .await
+        .map_err(|e| {
+            eprintln!("machines: cannot reach the relay at {}: {e}", settings.addr);
+            ExitCode::from(UNREACHABLE)
+        })
+}
+
+/// Resolve a name to the row the directory holds, or the exit code for "no such
+/// machine" (3).
+async fn row_named(
+    session: &arreo_core::relay::session::RelaySession,
+    wanted: &str,
+    all: bool,
+) -> Result<Row, ExitCode> {
+    if let Err(e) = Name::parse(wanted) {
+        eprintln!("machines: {wanted:?} is not a machine name: {e}");
+        return Err(ExitCode::from(UNKNOWN_MACHINE));
+    }
+    match session.machines(all).await {
+        Ok(reply) if reply.refused.is_none() => match reply
+            .machines
+            .iter()
+            .find(|row| row.name.as_str() == wanted)
+        {
+            Some(row) => Ok(Row::from_relay(row)),
+            None => {
+                eprintln!("machines: no machine named {wanted:?} in this account");
+                Err(ExitCode::from(UNKNOWN_MACHINE))
+            }
+        },
+        Ok(reply) => {
+            eprintln!(
+                "machines: the relay refused to read the directory: {}",
+                reply.refused.unwrap_or_default()
+            );
+            Err(ExitCode::from(CONFLICT))
+        }
+        Err(e) => {
+            eprintln!("machines: the relay did not answer: {e}");
+            Err(ExitCode::from(UNREACHABLE))
+        }
+    }
+}
+
+/// Turn a directory refusal into the contract's exit code.
+///
+/// The relay's reply is a sentence, not a code, so the mapping is by what the
+/// refusal says: a taken name or a name that is not a name is a conflict (5), an
+/// unknown machine is 3 — the same codes the read verbs use for the same
+/// situations, so a script that switches on them does not need a second table.
+fn refusal_code(reason: &str) -> ExitCode {
+    if reason.contains("NoSuchMachine") || reason.contains("no machine") {
+        ExitCode::from(UNKNOWN_MACHINE)
+    } else {
+        ExitCode::from(CONFLICT)
+    }
+}
+
+async fn rename(args: &[String]) -> ExitCode {
+    let options = match parse("rename", args, true) {
+        Ok(options) => options,
+        Err(code) => return code,
+    };
+    let (Some(old), Some(new)) = (options.name.clone(), options.second.clone()) else {
+        eprintln!("machines rename: needs the current name and the new one");
+        return usage();
+    };
+    if let Some(flag) = read_only_flag(&options) {
+        // Said rather than ignored: a flag that is accepted and does nothing is
+        // worse than one that is refused, because the caller believes it worked.
+        eprintln!(
+            "machines rename: {flag} belongs to the read verbs; a write must reach the relay"
+        );
+        return ExitCode::from(USAGE);
+    }
+    let session = match session(&options).await {
+        Ok(session) => session,
+        Err(code) => return code,
+    };
+    // The row first: the verb takes names, the wire takes ids, and this is also
+    // what makes "no such machine" exit 3 before anything is written.
+    let row = match row_named(&session, &old, true).await {
+        Ok(row) => row,
+        Err(code) => return code,
+    };
+    if let Err(e) = Name::parse(&new) {
+        eprintln!("machines: {new:?} is not a machine name: {e}");
+        return ExitCode::from(CONFLICT);
+    }
+    match session.rename_machine(&row.machine_id, &new).await {
+        Ok(reply) => match (reply.refused, reply.granted) {
+            (Some(reason), _) => {
+                eprintln!("machines: {reason}");
+                refusal_code(&reason)
+            }
+            (None, Some(updated)) => {
+                // The relay's row is what is printed: the caller sees what the
+                // directory now holds, not what it asked for.
+                println!("renamed {old} → {}", updated.name.as_str());
+                ExitCode::from(OK)
+            }
+            (None, None) => {
+                eprintln!("machines: the relay answered a rename without a row");
+                ExitCode::from(CONFLICT)
+            }
+        },
+        Err(e) => {
+            eprintln!("machines: the relay did not answer: {e}");
+            ExitCode::from(UNREACHABLE)
+        }
+    }
+}
+
+async fn remove(args: &[String]) -> ExitCode {
+    let options = match parse("remove", args, true) {
+        Ok(options) => options,
+        Err(code) => return code,
+    };
+    if let Some(flag) = read_only_flag(&options) {
+        eprintln!(
+            "machines remove: {flag} belongs to the read verbs; a write must reach the relay"
+        );
+        return ExitCode::from(USAGE);
+    }
+    let session = match session(&options).await {
+        Ok(session) => session,
+        Err(code) => return code,
+    };
+
+    // `--stale` is T-0043's bulk rule: the relay decides the set, and the reply
+    // carries the rows it pruned, so "what it reclaimed" needs no second read.
+    if options.stale {
+        return match session.prune_stale().await {
+            Ok(reply) => match reply.refused {
+                Some(reason) => {
+                    eprintln!("machines: {reason}");
+                    refusal_code(&reason)
+                }
+                None => {
+                    if reply.machines.is_empty() {
+                        println!("nothing was stale; the directory is unchanged");
+                    } else {
+                        for row in &reply.machines {
+                            println!("removed {} (name held for the tombstone window)", row.name);
+                        }
+                    }
+                    ExitCode::from(OK)
+                }
+            },
+            Err(e) => {
+                eprintln!("machines: the relay did not answer: {e}");
+                ExitCode::from(UNREACHABLE)
+            }
+        };
+    }
+
+    let Some(name) = options.name.clone() else {
+        eprintln!("machines remove: needs a machine name, or --stale for the bulk prune");
+        return usage();
+    };
+    let row = match row_named(&session, &name, true).await {
+        Ok(row) => row,
+        Err(code) => return code,
+    };
+    // An online machine is answering right now: tombstoning it is almost always
+    // a mistake, so it takes the explicit word. The check is here rather than in
+    // the directory because the directory's rule is about names, and this is
+    // about the operator's intent.
+    if row.presence == Presence::Online && !options.force {
+        eprintln!(
+            "machines: {name} is online right now (seen {} ago); pass --force to tombstone it              anyway",
+            human_age(row.age_secs(now_ms()))
+        );
+        return ExitCode::from(CONFLICT);
+    }
+    match session.remove_machine(&row.machine_id).await {
+        Ok(reply) => match (reply.refused, reply.granted) {
+            (Some(reason), _) => {
+                eprintln!("machines: {reason}");
+                refusal_code(&reason)
+            }
+            (None, Some(removed)) => {
+                match removed.tombstone_until_ms {
+                    Some(until) => println!(
+                        "removed {} — the name is held until {} ({}), then it is free",
+                        removed.name,
+                        rfc3339(until),
+                        human_age((until - now_ms()).max(0) / 1000)
+                    ),
+                    None => println!(
+                        "removed {} — the relay reported no tombstone, which means it is gone",
+                        removed.name
+                    ),
+                }
+                ExitCode::from(OK)
+            }
+            (None, None) => {
+                eprintln!("machines: the relay answered a removal without a row");
+                ExitCode::from(CONFLICT)
+            }
+        },
+        Err(e) => {
+            eprintln!("machines: the relay did not answer: {e}");
+            ExitCode::from(UNREACHABLE)
+        }
+    }
+}
+
 /// The `--json` envelope: the script contract, schema 1.
 ///
 /// `source` is the honest field: `cache` means these rows are remembered, and
@@ -521,7 +802,7 @@ fn envelope(rows: &[Row], now_ms: i64, from_cache: bool) -> serde_json::Value {
                 "last_seen": rfc3339(row.last_seen_ms),
                 "age_secs": row.age_secs(now_ms),
                 "proto_version": row.proto_version,
-                "flags": row.flags(),
+                "flags": row.flags(now_ms),
             })
         })
         .collect();
@@ -553,7 +834,7 @@ fn print_table(rows: &[Row], now_ms: i64, from_cache: bool) {
             row.presence_str(),
             human_age(row.age_secs(now_ms)),
             row.proto_version,
-            row.flags().join(",")
+            row.flags(now_ms).join(",")
         );
     }
 }
@@ -576,8 +857,8 @@ fn print_status(row: &Row, now_ms: i64, from_cache: bool) {
     // `unknown` rather than a fabricated 0 — a 0 would read as "no device is
     // trusted", which is a claim, and the criteria say `null` until it is real.
     println!("  trusted devices unknown (per-machine trust lands with T-0046)");
-    if !row.flags().is_empty() {
-        println!("  flags          {}", row.flags().join(","));
+    if !row.flags(now_ms).is_empty() {
+        println!("  flags          {}", row.flags(now_ms).join(","));
     }
 }
 
@@ -606,6 +887,7 @@ mod tests {
             last_seen_ms,
             proto_version: 1,
             name_conflict: conflict,
+            tombstone_until_ms: None,
             from_cache: false,
         }
     }
@@ -675,6 +957,7 @@ mod tests {
             last_seen_ms: 1_000,
             proto_version: 1,
             name_conflict: false,
+            tombstone_until_ms: None,
         };
         let rows = vec![Row::from_cache("beta", &cached)];
         let envelope = envelope(&rows, 10_000, true);
@@ -702,6 +985,7 @@ mod tests {
             last_seen_ms: 9_999,
             proto_version: 1,
             name_conflict: false,
+            tombstone_until_ms: None,
         };
         let row = Row::from_cache("alpha", &cached);
         assert_eq!(
@@ -709,7 +993,7 @@ mod tests {
             "offline",
             "a remembered row is not live"
         );
-        assert!(row.flags().contains(&"unverified"));
+        assert!(row.flags(10_000).contains(&"unverified"));
         assert_eq!(
             row.age_secs(10_000),
             0,
@@ -733,26 +1017,31 @@ mod tests {
         assert_eq!(row.age_secs(25_000), 5);
     }
 
-    /// The verbs whose transports do not exist yet say so and exit 2 — a stub
-    /// that looked implemented would be the dishonest answer. Each names its own
-    /// missing task, so the refusal is actionable rather than a shrug.
+    /// The verb whose transport does not exist yet says so and exits 2 — a stub
+    /// that looked implemented would be the dishonest answer — and the two verbs
+    /// that *are* implemented refuse `--json` rather than accepting a flag that
+    /// would do nothing.
     #[test]
-    fn the_write_verbs_report_the_missing_transport() {
-        for (verb, task) in [
-            ("rename", "T-0057"),
-            ("remove", "T-0057"),
-            ("add", "T-0058"),
-        ] {
-            let code = run(&[verb.to_string()]);
+    fn only_add_is_still_missing_and_json_is_refused_where_it_is_not_a_contract() {
+        assert_eq!(
+            run(&["add".to_string()]),
+            ExitCode::from(USAGE),
+            "`machines add` must refuse rather than pretend"
+        );
+        for verb in ["rename", "remove"] {
+            let code = run(&[verb.to_string(), "--json".to_string()]);
             assert_eq!(
                 code,
                 ExitCode::from(USAGE),
-                "`machines {verb}` must refuse rather than pretend"
+                "`machines {verb} --json` claims a contract this verb does not have"
             );
-            // The message itself is on stderr, which this test cannot capture;
-            // the integration test asserts the text end to end.
-            assert!(!task.is_empty());
         }
+        // `rename` with one name is a usage error, and it does not reach the
+        // network (a unit test has no relay, so reaching it would hang).
+        assert_eq!(
+            run(&["rename".to_string(), "one".to_string()]),
+            ExitCode::from(USAGE)
+        );
     }
 
     /// Usage errors are exit 2, whether the verb is unknown or an argument is.

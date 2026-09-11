@@ -280,7 +280,7 @@ in it to put pane text, agent state or a key.
 | `src_device` | string | the sender. The relay requires it to equal the session's own device id (parsed and compared, so `dev_<hex>` and `<hex>` are the same device) |
 | `dst` | string | the destination device id, in either spelling |
 | `seq` | u64 | the sender's own sequence number. The relay does not check or rewrite it; it echoes it on the status it answers with |
-| `kind` | `"frame"`, `"status"`, `"drain"`, `"ack"`, `"peergone"`, `"join"`, `"machines"` or `"directory"` | what the envelope is for (§4.2) |
+| `kind` | `"frame"`, `"status"`, `"drain"`, `"ack"`, `"peergone"`, `"join"`, `"machines"`, `"rename"`, `"remove"`, `"stale"` or `"directory"` | what the envelope is for (§4.2) |
 
 The relay does **not** enforce monotonic `seq` and does not de-duplicate: a
 receiver that cares about ordering or replays must do that itself, on the
@@ -297,13 +297,16 @@ sender's sequence numbers.
 | `peergone` | relay → device only | no payload: a device in your account went offline. `src_device` is the device that left; `dst` is you. The whole message is the header, so a receiver with no stream for that peer ignores it (§4.6) |
 | `join` | device → relay only | MessagePack of one `JoinRequest` (§4.7): assert *this machine's* row in the account's machine directory |
 | `machines` | device → relay only | MessagePack of one `MachinesRequest` (§4.7): read the account's machine directory |
-| `directory` | relay → device only | MessagePack of one `DirectoryReply` (§4.7), answering a `join` or a `machines` on the same `seq`. The reply's **kind** identifies it; a client must never guess at a payload's shape |
+| `rename` | device → relay only | MessagePack of one `RenameRequest` (§4.8): give this machine a different name |
+| `remove` | device → relay only | MessagePack of one `RemoveRequest` (§4.8): tombstone this machine's name |
+| `stale` | device → relay only | MessagePack of one `StaleRequest` (§4.8): prune exactly the stale machines |
+| `directory` | relay → device only | MessagePack of one `DirectoryReply` (§4.7), answering a `join`, `machines`, `rename`, `remove` or `stale` on the same `seq`. The reply's **kind** identifies it; a client must never guess at a payload's shape |
 
 A device that sends `kind = "status"`, `"peergone"` **or `"directory"`** is refused per-envelope:
 statuses, departure notices and directory replies are the relay's to originate — a forged departure
 would let any device in an account make another device's peers drop their streams, and a forged
-reply would let one device tell another what the directory says. `drain`, `ack`, `join` and
-`machines` are the mirror image — the device's to originate, and the relay never sends them, so a
+reply would let one device tell another what the directory says. `drain`, `ack`, `join`, `machines`, `rename`,
+`remove` and `stale` are the mirror image — the device's to originate, and the relay never sends them, so a
 client that reads one is reading its own request echoed back and should treat it as a protocol
 error. None of them is a *frame*: a control message carries nothing for another device, and it never
 reaches the routing decision of §4.3.
@@ -701,6 +704,41 @@ guessed at.**
   or forge an envelope, because the trust decision happens above it.
 - **The handshake budget is per address, not global** (§5.4).
 
+### 4.8 Writing the directory (`rename`, `remove`, `stale`)
+
+The directory belongs to the account, and the relay owns the only copy: the rules
+(§ROADMAP 3.7, implemented in `arreo-core::mesh`) are applied **there**, never by
+the client. A write is authorized by the session's certificate — a device the
+account's owner paired — and it may only touch a machine that session's account
+lists. An id from another account gets the same refusal an unknown id gets, so the
+refusal is not an oracle for "this machine exists elsewhere".
+
+```text
+RenameRequest { v: 1, machine_id: "<32 hex>", new_name: "workbox-2" }
+RemoveRequest { v: 1, machine_id: "<32 hex>" }
+StaleRequest  { v: 1 }
+```
+
+Each is answered by one `directory` envelope on the request's `seq`:
+
+- `rename` → `granted` is the row with its new name. **A colliding rename is
+  refused**, with the directory's own reason in `refused` and nothing changed:
+  the suffix rule (`workbox` → `workbox-2`) belongs to *claims*, where the
+  machine asked for a name it may not get; an operator who renames a machine
+  means that name, so a conflict is an answer rather than a name to invent.
+- `remove` → `granted` is the row with `tombstone_until_ms` set. A removal is a
+  **tombstone, not a deletion**: the name stays reserved for
+  `TOMBSTONE_SECS` (30 days) so a returning machine keeps it, and a *different*
+  key cannot take it until the tombstone expires.
+- `stale` → `machines` lists the rows pruned (each now tombstoned, so the caller
+  can report what it reclaimed without a second read). The set is exactly what
+  the presence rule calls stale, and the call is idempotent: a second run finds
+  nothing.
+
+`refused` is where every "no" lives, and its wording is the directory's own.
+An unknown machine, a name that is not a name, and a name that is taken are all
+`refused`, never a silent success.
+
 ### 8.4 What a third-party client must do
 
 1. Speak QUIC with ALPN `arreo/transport/1`, without verifying the relay's
@@ -734,7 +772,11 @@ guessed at.**
     Sign the join proof over the session's nonce: a proof bound to another session is
     refused by design. The answer arrives as one `directory` envelope on the request's
     `seq`, and its `refused` field is where a "no" lives.
-11. Expect `kind = "peergone"` (§4.6): when a device in your account goes
+11. Rename, remove and prune with `kind = "rename"`, `"remove"` and `"stale"`
+    (§4.8). Never decide for yourself whether a name is free: send the request and
+    read `refused`. A colliding rename is refused (not suffixed), a removal is a
+    tombstone, and `stale` prunes exactly the presence rule's stale set.
+12. Expect `kind = "peergone"` (§4.6): when a device in your account goes
     offline the relay sends you one, with no payload and `src_device` naming the
     device that left. If you hold a stream to that peer, end it — its next
     connection will be a fresh one, and yours should be too. If you hold none,

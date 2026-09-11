@@ -1,27 +1,22 @@
 ## State snapshot          ← REWRITTEN (not appended) at every checkpoint
-Task: T-0044 · `arreo machines` — read side DONE (list/status, JSON contract, cache, exit codes);
-`add` moved to T-0058 and `rename`/`remove` to T-0057, both filed with reasons in the task file
-Where you are: `arreo machines list|status` read the account's directory from the relay with the
-CLI's own paired identity (no daemon, no socket verb), print a versioned JSON contract or a
-non-contract table, and answer from a labelled cache when the relay is unreachable. 408 tests.
-Next step: **T-0057** (directory writes over the wire: rename/remove) then **T-0058** (`machines add`
-and the join handoff); both unblock the rest of T-0044. Then T-0046 (per-machine trust).
+Task: T-0057 · directory writes over the wire (rename/remove/stale) — DONE; T-0044's rename+remove
+criteria landed with it. Only `add` (T-0058) is left of T-0044.
+Where you are: the relay applies the directory's rules for rename, tombstone and the stale prune;
+`arreo machines rename|remove [--stale] [--force]` go through the real CLI, and a write for another
+account's machine is refused with the same sentence an unknown id gets. 411 tests.
+Next step: **T-0058** (`machines add` and the join handoff — it needs an ADR choosing how the invite
+carries the account and the machine). Then T-0046 (per-machine trust).
 Open workers: (none)
 Known broken: (none) · Parked: (none)
 Findings:
-- **An insertion between a `#[cfg]` attribute and the item it gates moves the gate.** `pub mod
-  config;` added before `pub mod session;` silently ungated the session (Windows check-targets went
-  red). Attribute-adjacent inserts need the attribute moved with the item.
-- **Don't invent a default the other side does not have.** The CLI's `$XDG_CONFIG_HOME/arreo/arreo.toml`
-  fallback was a second source for "which config is this machine's relay config" (the daemon reads
-  `--config`/`$ARREO_CONFIG` only). Removed; no path named is exit 2, a path with no `[relay]` is 4.
-- **A cached row is never `online`**: liveness is the one claim a cache cannot substantiate, so it is
-  downgraded and flagged `unverified` rather than hoped to be old.
-- **The contract test is the schema.** Renaming a key or widening the presence enum turns the build
-  red — proved by doing it.
-- **`rfc3339` by hand (Hinnant), not `chrono`**: twenty lines against a dependency for one field.
-- **A test that fails 1 in 6 fails in CI at the worst moment** (T-0056). **The tick IS the latency
-  budget** (T-0052).
+- **A rename conflict is refused, not suffixed** — the suffix rule belongs to claims; the task's first
+  draft was wrong and `Directory::rename` was right.
+- **An id unique across accounts needs an ownership check**, and the refusal must be the same one an
+  unknown id gets, or it becomes an oracle.
+- **A row's tombstone is a fact about the row, not about liveness**: deriving the flag from presence
+  hid every fresh tombstone.
+- **Refusing a flag beats ignoring it** (`--json`/`--offline` on writes). **Don't invent a default the
+  other side does not have** (T-0044).
 ## Event log               ← append-only; newest last; never rewrite
 - 2026-09-10 [turn 1] ledger created; repo at e489fac (docs only); T-0001 + T-0022 (AGENTS.md gardened) done
 - 2026-09-10 [turn 2] T-0002 PTY manager done+pushed (342606c; 9 tests); PROMPT.md v2 synced + ADR 0001 (ef6c595)
@@ -79,3 +74,5 @@ Findings:
 - 2026-09-11 [turn 42] T-0044 `arreo machines` read side done (list/status, `--json` schema 1 with a contract test that fails on a renamed key or an out-of-enum value, an honest cache with `source:"cache"` + `unverified` + exit 4 off `--offline`, stable exit codes 0/2/3/4/5, docs/machines.md, hermetic test through the real CLI and a real relay). The CLI dials the relay with its own paired identity — no daemon, no socket verb. `[relay]` config moved to `arreo_core::relay::config` (the CLI must not depend on arreo-server; one parser). `add` → T-0058 and `rename`/`remove` → T-0057, each filed with its reason and named in `--help`; `--watch` waits for presence push. Found: inserting a module between a `#[cfg]` attribute and the item it gated moved the gate (Windows check-targets caught it). Evidence `.loop/evidence/T-0044/`. 408 workspace tests, clippy/fmt clean, vet/deny/audit green, check-targets PASS/SKIP, 8 e2e slices green, bench 6/6
 
 - 2026-09-11 [turn 42, follow-up] T-0044 correction: the CLI no longer invents a configuration default (`$XDG_CONFIG_HOME/arreo/arreo.toml`) that the daemon does not have — one fact ("this machine's relay config") with two sources is the defect class this project keeps finding. No path named is exit 2 naming `--config`/`ARREO_CONFIG`; a path with no `[relay]` section is exit 4 naming the file. Battery re-run on the final code: 408 workspace tests / 0 failed (52 targets), clippy/fmt clean, vet 336 exempted, deny 4/4, audit 0, check-targets PASS/SKIP, 8 slices green, bench 6/6
+
+- 2026-09-11 [turn 43] T-0057 directory writes over the wire done: `rename`/`remove`/`stale` kinds, the session's three write requests on the same reserve-park-then-send path, the relay applying T-0043's rules itself (a colliding rename refused with both names untouched; a removal a tombstone that holds the name; the prune exactly the stale set, idempotent), an account-ownership check so a foreign `machine_id` is refused with the same sentence an unknown id gets, and the CLI verbs `machines rename|remove [--stale] [--force]` (an online machine needs `--force`; `--json`/`--offline` are refused rather than ignored). T-0044's rename/remove criteria landed here; only `add` (T-0058) is left. Found: the tombstone flag was derived from presence and hid every fresh tombstone — it comes from the row's `tombstone_until_ms` now, and the cache mirrors that field. Evidence `.loop/evidence/T-0057/`. 411 workspace tests, clippy/fmt clean, vet/deny/audit green, check-targets PASS/SKIP, 8 e2e slices green, bench 6/6

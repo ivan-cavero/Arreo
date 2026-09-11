@@ -357,19 +357,11 @@ fn list_and_status_read_the_accounts_directory() {
 
     // The verbs whose transports do not exist yet refuse rather than pretend,
     // and each names its own missing task.
-    for (verb, task) in [
-        ("rename", "T-0057"),
-        ("remove", "T-0057"),
-        ("add", "T-0058"),
-    ] {
-        let out = client.run(&["machines", verb]);
-        assert_eq!(out.code, 2, "`machines {verb}`: {}", out.all());
-        assert!(
-            out.stderr.contains(task),
-            "the refusal must name {task}: {}",
-            out.all()
-        );
-    }
+    // `add`'s transport does not exist yet: it refuses rather than pretending,
+    // and names the task that will bring it.
+    let out = client.run(&["machines", "add"]);
+    assert_eq!(out.code, 2, "`machines add`: {}", out.all());
+    assert!(out.stderr.contains("T-0058"), "{}", out.all());
 }
 
 /// The offline path: rows are still printed, labelled, and never silently
@@ -463,6 +455,138 @@ fn an_unreachable_relay_answers_from_the_cache_and_says_so() {
     );
 }
 
+/// The write verbs through the real CLI: rename live and refused, remove with
+/// the tombstone holding the name, and the stale prune.
+#[test]
+fn rename_and_remove_write_the_directory_and_never_leave_partial_state() {
+    let mut relay = Relay::start("write");
+    let root = RootKey::generate().expect("entropy");
+    relay.register_account("acct-1", &root.public());
+    let client = Client::new("write", &relay, "acct-1");
+    let key = DeviceKey::generate().expect("entropy");
+    client.identify(&root, &key, "laptop", 1);
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    runtime.block_on(async {
+        let session = RelaySession::dial(relay.addr, "acct-1", &key, &client_cert(&client))
+            .await
+            .expect("the client registers");
+        join_machine(
+            &session,
+            &RootKey::generate().expect("entropy"),
+            "acct-1",
+            "workbox",
+        )
+        .await;
+        join_machine(
+            &session,
+            &RootKey::generate().expect("entropy"),
+            "acct-1",
+            "pi",
+        )
+        .await;
+    });
+
+    // A rename to a free name is reported with the name the directory now holds.
+    let out = client.run(&["machines", "rename", "pi", "pi-2"]);
+    assert_eq!(out.code, 0, "{}", out.all());
+    assert!(out.stdout.contains("pi-2"), "{}", out.all());
+
+    // A rename onto a live name is exit 5, and *nothing* changes.
+    let out = client.run(&["machines", "rename", "pi-2", "workbox"]);
+    assert_eq!(out.code, 5, "{}", out.all());
+    let listed = client.run_with_config(&["machines", "list", "--json"]);
+    let names: Vec<String> = listed.json()["machines"]
+        .as_array()
+        .expect("array")
+        .iter()
+        .map(|m| m["name"].as_str().expect("name").to_string())
+        .collect();
+    assert_eq!(
+        names,
+        vec!["pi-2", "workbox"],
+        "a refused rename leaves both names untouched: {}",
+        listed.all()
+    );
+
+    // An unknown name is exit 3, and does not reach the relay's rules.
+    let out = client.run(&["machines", "rename", "ghost", "whatever"]);
+    assert_eq!(out.code, 3, "{}", out.all());
+    let out = client.run(&["machines", "rename", "pi-2", "NOT A NAME"]);
+    assert_eq!(out.code, 5, "{}", out.all());
+    assert!(out.stderr.contains("not a machine name"), "{}", out.all());
+
+    // Removing an online machine takes the deliberate word: without it, exit 5
+    // and nothing written.
+    let out = client.run(&["machines", "remove", "workbox"]);
+    assert_eq!(out.code, 5, "{}", out.all());
+    assert!(out.stderr.contains("--force"), "{}", out.all());
+    let listed = client.run_with_config(&["machines", "list", "--json"]);
+    assert_eq!(
+        listed.json()["machines"].as_array().expect("array").len(),
+        2,
+        "a refused removal changes nothing: {}",
+        listed.all()
+    );
+
+    // With --force it is tombstoned, and the name is held.
+    let out = client.run(&["machines", "remove", "workbox", "--force"]);
+    assert_eq!(out.code, 0, "{}", out.all());
+    assert!(out.stdout.contains("removed workbox"), "{}", out.all());
+    assert!(
+        out.stdout.contains("held until"),
+        "the operator is told what the tombstone does: {}",
+        out.all()
+    );
+    // The tombstoned row is visible with --all, and its name is still taken.
+    let listed = client.run_with_config(&["machines", "list", "--json", "--all"]);
+    let rows = listed.json()["machines"].as_array().expect("array").clone();
+    let workbox = rows
+        .iter()
+        .find(|row| row["name"] == serde_json::json!("workbox"))
+        .expect("the tombstoned row is listed with --all");
+    assert_eq!(
+        workbox["flags"],
+        serde_json::json!(["name-tombstoned"]),
+        "the row says the name is reserved: {}",
+        listed.all()
+    );
+    // Without --all it is not listed: a name whose machine is gone is not a
+    // machine you can attach to.
+    let listed = client.run_with_config(&["machines", "list", "--json"]);
+    assert_eq!(
+        listed.json()["machines"].as_array().expect("array").len(),
+        1,
+        "the tombstoned row is hidden without --all: {}",
+        listed.all()
+    );
+
+    // The prune is idempotent and reclaims nothing here: every machine was seen
+    // seconds ago, so none is stale.
+    for _ in 0..2 {
+        let out = client.run(&["machines", "remove", "--stale"]);
+        assert_eq!(out.code, 0, "{}", out.all());
+        assert!(out.stdout.contains("nothing was stale"), "{}", out.all());
+    }
+
+    // `--offline` is a read-side idea: a write cannot fall back to memory, and
+    // saying so beats accepting a flag that would do nothing.
+    let out = client.run(&["machines", "remove", "--stale", "--offline"]);
+    assert_eq!(out.code, 2, "{}", out.all());
+    assert!(out.stderr.contains("--offline"), "{}", out.all());
+    relay.stop();
+    let out = client.run(&["machines", "rename", "pi-2", "pi-3"]);
+    assert_eq!(
+        out.code,
+        4,
+        "an unreachable relay means the write did not happen: {}",
+        out.all()
+    );
+}
+
 /// A relay that is not configured at all is exit 4 with a message that says
 /// which file was read — an operator is never left guessing why there is no
 /// directory.
@@ -495,10 +619,15 @@ fn a_missing_relay_configuration_is_exit_4() {
         out.all()
     );
 
-    // The write verbs still refuse, before any of that.
+    // With a configuration that names no relay there is nothing to write to
+    // either, and the write path says so rather than falling back to a cache.
     let out = client.run(&["machines", "rename", "pi", "pi-2"]);
-    assert_eq!(out.code, 2, "{}", out.all());
-    assert!(out.stderr.contains("T-0057"), "{}", out.all());
+    assert_eq!(out.code, 4, "{}", out.all());
+    assert!(
+        out.stderr.contains("no relay is configured"),
+        "{}",
+        out.all()
+    );
 
     // And with no configuration named at all, the CLI asks for one instead of
     // guessing a path: exit 2 (usage), naming both ways to supply it.

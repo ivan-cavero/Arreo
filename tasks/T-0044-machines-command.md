@@ -44,7 +44,7 @@ citizens, not SSH bookmarks".
       5 min), takes the name from `--name` or the joining side, and prints the granted name (plain or
       the T-0043 suffix) plus the machine fingerprint; it never accepts an arbitrary host/port and
       never silently renames an existing machine.
-- [ ] **(moved to T-0057)** `rename`/`remove` never leave partial state: renaming onto a live name exits 5 with both names
+- [x] **(landed in T-0057)** `rename`/`remove` never leave partial state: renaming onto a live name exits 5 with both names
       untouched; removing an unknown name exits 3; `remove --force` performs the T-0043 tombstone
       bypass and prints what it reclaimed; both re-read the directory and print the resulting row.
 - [x] `status <name>` reports the stable subset — presence, last-seen age, negotiated protocol version,
