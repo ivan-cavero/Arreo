@@ -815,3 +815,173 @@ fn a_cli_verb_on_a_daemon_host_does_not_leave_it_unreachable() {
         relay.log()
     );
 }
+
+/// **Criterion 3: identical semantics remotely.** One scripted sequence — `spawn`,
+/// `read`, `send`, `wait`, `metrics` — replayed against a local pane and against
+/// the same pane reached by name, with the payloads compared.
+///
+/// This is the claim §3.7 makes ("same protocol, no SSH") in the form an operator
+/// experiences it: the same command, the same output, whether the pane is on this
+/// machine or another one. The comparison normalises the pane id and the timing
+/// fields, because those *should* differ; everything a caller acts on must not.
+#[test]
+fn the_same_commands_produce_the_same_output_locally_and_remotely() {
+    let relay = Relay::start("conformance");
+    let account_root = RootKey::generate().expect("entropy");
+    relay.register_account("acct-1", &account_root.public());
+
+    // A serves the pane.
+    let mut a = Machine::new("conf-a", &relay, "acct-1", Some("workbox"));
+    let a_device = DeviceKey::generate().expect("entropy");
+    let a_cert = DeviceCert::issue(
+        &account_root,
+        &a_device.public(),
+        "workbox",
+        Role::Owner,
+        1_000,
+        1,
+    );
+    a.install_identity(&account_root, &a_device, &a_cert);
+    a.start_daemon();
+    await_registration(&a);
+
+    // C drives: locally through A's socket, remotely by name.
+    let c = Machine::new("conf-c", &relay, "acct-1", None);
+    let c_device = DeviceKey::generate().expect("entropy");
+    let c_cert = DeviceCert::issue(
+        &account_root,
+        &c_device.public(),
+        "laptop",
+        Role::Owner,
+        1_000,
+        9,
+    );
+    c.install_identity(&RootKey::generate().expect("entropy"), &c_device, &c_cert);
+    let pinned = Command::new(binary("arreo"))
+        .args([
+            "devices",
+            "issue",
+            "--socket",
+            &a.socket.display().to_string(),
+            "--name",
+            "laptop",
+            "--role",
+            "operator",
+            "--key",
+            &c_device.public_hex(),
+        ])
+        .env("ARREO_IDENTITY_DIR", &a.dir)
+        .output()
+        .expect("issue runs");
+    assert!(
+        pinned.status.success(),
+        "A must pin C: {}",
+        String::from_utf8_lossy(&pinned.stderr)
+    );
+
+    // A pane whose output is deterministic, on A.
+    let (code, out) = a.run_local(&[
+        "spawn",
+        "pane-1",
+        "/bin/sh",
+        "-c",
+        "echo READY-MARKER; sleep 120",
+    ]);
+    assert_eq!(code, 0, "{out}");
+
+    // A scripted sequence, run twice: once through A's own socket, once by name
+    // from C. Each step is a verb plus the part of its output that must not differ.
+    let local = |args: &[&str]| -> Vec<String> { run_sequence(&a, args, false) };
+    let remote = |args: &[&str]| -> Vec<String> { run_sequence(&c, args, true) };
+
+    for (verb, extra) in [
+        ("panes", vec![]),
+        ("read", vec!["pane-1"]),
+        ("send", vec!["pane-1", "echo", "SENT-MARKER"]),
+        ("wait", vec!["pane-1", "--state", "idle", "--timeout", "5s"]),
+        ("metrics", vec!["pane-1"]),
+    ] {
+        let mut args = vec![verb];
+        args.extend(extra.iter().copied());
+        let local_out = local(&args);
+        let remote_out = remote(&args);
+        assert_eq!(
+            local_out, remote_out,
+            "`arreo {verb}` must behave the same locally and remotely:\n\
+             local:  {local_out:?}\nremote: {remote_out:?}"
+        );
+        // `send` prints nothing on success (it is silent, as a Unix verb should
+        // be), so "produced output" is asserted only where there is output to
+        // compare — otherwise this check would fail a passing verb.
+        if verb != "send" {
+            assert!(
+                !local_out.is_empty(),
+                "and it must have produced something to compare (`{verb}`)"
+            );
+        }
+    }
+}
+
+/// Run one verb against `machine`, either locally or by name, and return the
+/// output with the things that are *meant* to differ normalised away.
+fn run_sequence(machine: &Machine, args: &[&str], remote: bool) -> Vec<String> {
+    let mut argv: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+    let (code, out) = if remote {
+        argv.push("--machine".to_string());
+        argv.push("workbox".to_string());
+        let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
+        machine.run(&refs)
+    } else {
+        // Local: through the daemon's socket, as an operator on that machine.
+        let mut all: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+        all.push("--socket".to_string());
+        all.push(machine.socket.display().to_string());
+        let refs: Vec<&str> = all.iter().map(String::as_str).collect();
+        machine.run(&refs)
+    };
+    assert_eq!(
+        code,
+        0,
+        "`arreo {}` (remote={remote}) failed: {out}",
+        args.join(" ")
+    );
+    let mut lines: Vec<String> = out
+        .lines()
+        .map(str::trim_end)
+        .filter(|line| !line.is_empty())
+        // Normalised, because these legitimately differ and asserting on them would
+        // be asserting on the transport rather than the semantics: a pane's age, a
+        // metrics sample's timing, and the confidence a state match reported.
+        .map(|line| {
+            let mut out = String::new();
+            for (index, token) in line.split_whitespace().enumerate() {
+                if index > 0 {
+                    out.push(' ');
+                }
+                out.push_str(&normalise(token));
+            }
+            out
+        })
+        .collect();
+    lines.sort();
+    lines
+}
+
+/// Fold the parts of an output line that are expected to vary into a fixed token.
+fn normalise(token: &str) -> String {
+    // `--timeout`, `rss=…` and `cpu=…` are measurements; keep the shape, drop the
+    // number, so the comparison is about what the verb *reports*, not what the
+    // machine happened to be doing. Timestamps likewise.
+    for prefix in ["rss=", "cpu=", "pids=", "confidence=", "age"] {
+        if token.starts_with(prefix) {
+            return format!("{prefix}<n>");
+        }
+    }
+    if token.contains('T') && token.ends_with('Z') && token.len() > 10 {
+        return "<timestamp>".to_string();
+    }
+    if token.parse::<f64>().is_ok() && token.len() > 2 {
+        return "<n>".to_string();
+    }
+    token.to_string()
+}

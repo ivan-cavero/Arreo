@@ -63,7 +63,9 @@ fn usage() -> ExitCode {
     eprintln!("  arreo audit prune --before MS   (never automatic; says how many rows went)");
     eprintln!("  arreo attach --machine <name> [<pane>] [--link auto|relay] [--config PATH]");
     eprintln!("      reach another machine's pane by name, through the account's directory —");
-    eprintln!("      no IP, no port, no SSH target, and nothing dialed from argv");
+    eprintln!("      no IP, no port, no SSH target, and nothing dialed from argv.");
+    eprintln!("      The same `--machine <name> [--config PATH]` works on panes, read, send,");
+    eprintln!("      wait, split and metrics: one set of verbs, whichever machine holds the pane");
     eprintln!("  arreo devices <id|list|issue|rotate|revoke|authorize> [--json] [--socket PATH]");
     eprintln!("      list --revoked|--all   (live devices by default; tombstones with --revoked)");
     eprintln!("      revoke <name|id> [--machine <name>]");
@@ -470,26 +472,113 @@ impl Connection {
     }
 }
 
-async fn request(socket: &PathBuf, req: &Message) -> Result<Message, String> {
-    let mut conn = open_connection(socket).await?;
-    conn.send(req).await?;
-    conn.recv().await
+/// Where a verb's connection goes: this machine's socket, or another machine by
+/// name (T-0045).
+///
+/// One type for both so a verb reads the same whichever it got — which is the
+/// "identical semantics remotely" claim in the form a caller experiences it. The
+/// local arm is this file's own [`Connection`] (a Unix socket, one connection per
+/// call) and the remote arm is the shared client over the relay
+/// (`arreo_core::mesh::session::Client`), because that is the one implementation
+/// with the reconnect and handshake policy in it.
+enum Session {
+    Local(Connection),
+    Remote(Box<arreo_core::mesh::session::Client>),
+}
+
+impl Session {
+    async fn send(&mut self, message: &Message) -> Result<(), String> {
+        match self {
+            Self::Local(conn) => conn.send(message).await,
+            Self::Remote(client) => client.send(message).await.map_err(|e| e.to_string()),
+        }
+    }
+
+    async fn recv(&mut self) -> Result<Message, String> {
+        match self {
+            Self::Local(conn) => conn.recv().await,
+            Self::Remote(client) => client.recv().await.map_err(|e| e.to_string()),
+        }
+    }
+
+    /// One verb and its answer — the shape every one-shot verb uses.
+    async fn call(&mut self, message: &Message) -> Result<Message, String> {
+        self.send(message).await?;
+        self.recv().await
+    }
+}
+
+/// Strip `--machine`/`--config` from a verb's arguments and connect accordingly.
+///
+/// Returns the rest of the arguments untouched, so a verb's own flags parse the
+/// same whether the connection is local or remote — the point of doing this here
+/// rather than in each verb: four verbs parsing `--machine` four ways is four
+/// chances to disagree about what it means.
+async fn connect(
+    socket: &PathBuf,
+    kept: &[String],
+) -> Result<(Session, Vec<String>), (u8, String)> {
+    let mut machine: Option<String> = None;
+    let mut config: Option<std::path::PathBuf> = None;
+    let mut rest: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < kept.len() {
+        match kept[i].as_str() {
+            "--machine" => match kept.get(i + 1) {
+                Some(value) if !value.starts_with('-') => {
+                    machine = Some(value.clone());
+                    i += 2;
+                    continue;
+                }
+                _ => {
+                    return Err((
+                        2,
+                        "--machine needs a machine name (see `arreo machines list`)".to_string(),
+                    ))
+                }
+            },
+            "--config" => match kept.get(i + 1) {
+                Some(value) => {
+                    config = Some(std::path::PathBuf::from(value));
+                    i += 2;
+                    continue;
+                }
+                None => return Err((2, "--config needs a path".to_string())),
+            },
+            other => rest.push(other.to_string()),
+        }
+        i += 1;
+    }
+    let Some(name) = machine else {
+        let conn = open_connection(socket).await.map_err(|e| (4u8, e))?;
+        return Ok((Session::Local(conn), rest));
+    };
+    let resolved = remote::resolve(&name, config.as_deref()).await?;
+    let client = arreo_core::mesh::session::Client::connect_to(&resolved.target)
+        .await
+        .map_err(|e| (4u8, format!("{}: {e}", resolved.name)))?;
+    Ok((Session::Remote(Box::new(client)), rest))
 }
 
 async fn cmd_panes(rest: &[String]) -> ExitCode {
     let (socket, kept) = take_socket(rest);
+    let (mut session, kept) = match connect(&socket, &kept).await {
+        Ok(pair) => pair,
+        Err((code, message)) => {
+            eprintln!("panes: {message}");
+            return ExitCode::from(code);
+        }
+    };
     if !kept.is_empty() {
         eprintln!("panes: unexpected args {kept:?}");
         return ExitCode::from(2);
     }
-    match request(
-        &socket,
-        &Message::Panes {
+    match session
+        .call(&Message::Panes {
             v: VERSION,
             panes: vec![],
-        },
-    )
-    .await
+        })
+        .await
     {
         Ok(Message::Panes { panes, .. }) => {
             // Attention first (T-0041): alerting panes sort ahead of merely
@@ -530,6 +619,13 @@ async fn cmd_panes(rest: &[String]) -> ExitCode {
 
 async fn cmd_spawn(rest: &[String]) -> ExitCode {
     let (socket, kept) = take_socket(rest);
+    let (mut session, kept) = match connect(&socket, &kept).await {
+        Ok(pair) => pair,
+        Err((code, message)) => {
+            eprintln!("spawn: {message}");
+            return ExitCode::from(code);
+        }
+    };
     if kept.len() < 2 {
         eprintln!("usage: arreo spawn <id> <program> [args...] [--socket PATH]");
         return ExitCode::from(2);
@@ -545,7 +641,7 @@ async fn cmd_spawn(rest: &[String]) -> ExitCode {
         pids_max: None,
         kill_on_breach: false,
     };
-    match request(&socket, &req).await {
+    match session.call(&req).await {
         Ok(Message::Ok { .. }) => {
             println!("spawned {}", kept[0]);
             ExitCode::SUCCESS
@@ -567,8 +663,15 @@ async fn cmd_spawn(rest: &[String]) -> ExitCode {
 
 async fn cmd_send(rest: &[String]) -> ExitCode {
     let (socket, kept) = take_socket(rest);
+    let (mut session, kept) = match connect(&socket, &kept).await {
+        Ok(pair) => pair,
+        Err((code, message)) => {
+            eprintln!("send: {message}");
+            return ExitCode::from(code);
+        }
+    };
     if kept.len() < 2 {
-        eprintln!("usage: arreo send <id> <text...> [--socket PATH]");
+        eprintln!("usage: arreo send <id> <text...> [--socket PATH | --machine NAME]");
         return ExitCode::from(2);
     }
     let req = Message::Send {
@@ -576,7 +679,7 @@ async fn cmd_send(rest: &[String]) -> ExitCode {
         id: kept[0].clone(),
         data: kept[1..].join(" "),
     };
-    match request(&socket, &req).await {
+    match session.call(&req).await {
         Ok(Message::Ok { .. }) => ExitCode::SUCCESS,
         Ok(Message::Error { message, .. }) => {
             eprintln!("send: {message}");
@@ -864,6 +967,13 @@ async fn find_daemon_pid(socket: &PathBuf) -> Option<u32> {
 /// `arreo read <id> [--from N]`: one-shot snapshot of current pane text.
 async fn cmd_read(rest: &[String]) -> ExitCode {
     let (socket, kept) = take_socket(rest);
+    let (mut session, kept) = match connect(&socket, &kept).await {
+        Ok(pair) => pair,
+        Err((code, message)) => {
+            eprintln!("read: {message}");
+            return ExitCode::from(code);
+        }
+    };
     let mut from_line = 0usize;
     let mut id: Option<String> = None;
     let mut i = 0;
@@ -883,15 +993,13 @@ async fn cmd_read(rest: &[String]) -> ExitCode {
         eprintln!("usage: arreo read <id> [--from N] [--socket PATH]");
         return ExitCode::from(2);
     };
-    match request(
-        &socket,
-        &Message::Read {
+    match session
+        .call(&Message::Read {
             v: VERSION,
             id,
             from_line,
-        },
-    )
-    .await
+        })
+        .await
     {
         Ok(Message::Delta { lines, .. }) | Ok(Message::Snapshot { lines, .. }) => {
             for text in lines {
@@ -919,6 +1027,13 @@ async fn cmd_read(rest: &[String]) -> ExitCode {
 /// Exit 0 on match (prints the StateEvent), 1 on timeout/error.
 async fn cmd_wait(rest: &[String]) -> ExitCode {
     let (socket, kept) = take_socket(rest);
+    let (mut session, kept) = match connect(&socket, &kept).await {
+        Ok(pair) => pair,
+        Err((code, message)) => {
+            eprintln!("wait: {message}");
+            return ExitCode::from(code);
+        }
+    };
     let mut id: Option<String> = None;
     let mut state: Option<String> = None;
     let mut timeout_ms = 5 * 60 * 1000u64;
@@ -970,16 +1085,14 @@ async fn cmd_wait(rest: &[String]) -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    match request(
-        &socket,
-        &Message::Wait {
+    match session
+        .call(&Message::Wait {
             v: VERSION,
             id,
             state: want,
             timeout_ms,
-        },
-    )
-    .await
+        })
+        .await
     {
         Ok(Message::StateEvent {
             state,
@@ -1021,21 +1134,26 @@ fn parse_duration_ms(text: &str) -> Option<u64> {
 /// `arreo split <id> <new-id>`: spawn a sibling pane with the same program.
 async fn cmd_split(rest: &[String]) -> ExitCode {
     let (socket, kept) = take_socket(rest);
+    let (mut session, kept) = match connect(&socket, &kept).await {
+        Ok(pair) => pair,
+        Err((code, message)) => {
+            eprintln!("split: {message}");
+            return ExitCode::from(code);
+        }
+    };
     if kept.len() != 2 {
-        eprintln!("usage: arreo split <id> <new-id> [--socket PATH]");
+        eprintln!("usage: arreo split <id> <new-id> [--socket PATH | --machine NAME]");
         return ExitCode::from(2);
     }
-    match request(
-        &socket,
-        &Message::Split {
+    match session
+        .call(&Message::Split {
             v: VERSION,
             id: kept[0].clone(),
             new_id: kept[1].clone(),
             cols: 80,
             rows: 24,
-        },
-    )
-    .await
+        })
+        .await
     {
         Ok(Message::Ok { .. }) => {
             println!("split {} -> {}", kept[0], kept[1]);
@@ -1066,6 +1184,13 @@ async fn cmd_split(rest: &[String]) -> ExitCode {
 /// unknown pane gives an empty series plus a clear message, not an error.
 async fn cmd_metrics_history(rest: &[String]) -> ExitCode {
     let (socket, kept) = take_socket(rest);
+    let (mut session, kept) = match connect(&socket, &kept).await {
+        Ok(pair) => pair,
+        Err((code, message)) => {
+            eprintln!("metrics history: {message}");
+            return ExitCode::from(code);
+        }
+    };
     let mut pane: Option<String> = None;
     let mut since_ms: Option<u64> = None;
     let mut step_ms: u64 = 0;
@@ -1119,17 +1244,15 @@ async fn cmd_metrics_history(rest: &[String]) -> ExitCode {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
-    match request(
-        &socket,
-        &Message::MetricsHistory {
+    match session
+        .call(&Message::MetricsHistory {
             v: VERSION,
             id: pane.clone(),
             since_ms: now_ms.saturating_sub(since),
             until_ms: u64::MAX,
             step_ms,
-        },
-    )
-    .await
+        })
+        .await
     {
         Ok(Message::MetricsSeries {
             step_ms: got,
@@ -1242,8 +1365,15 @@ fn render_duration(step_ms: u64) -> String {
 /// the local `--pid` sampler from T-0006 stays for pid-level inspection).
 async fn cmd_pane_metrics(rest: &[String]) -> ExitCode {
     let (socket, kept) = take_socket(rest);
+    let (mut session, kept) = match connect(&socket, &kept).await {
+        Ok(pair) => pair,
+        Err((code, message)) => {
+            eprintln!("metrics: {message}");
+            return ExitCode::from(code);
+        }
+    };
     if kept.len() != 1 {
-        eprintln!("usage: arreo metrics <id> [--socket PATH]  (pane query; use --pid <PID> for local sampling)");
+        eprintln!("usage: arreo metrics <id> [--socket PATH | --machine NAME]  (pane query; use --pid <PID> for local sampling)");
         return ExitCode::from(2);
     }
     // `--pid` still routes to the local sampler (T-0006 verb preserved).
@@ -1251,14 +1381,12 @@ async fn cmd_pane_metrics(rest: &[String]) -> ExitCode {
         eprintln!("usage: arreo metrics --pid <PID> [--samples N]  (local sampler)");
         return ExitCode::from(2);
     }
-    match request(
-        &socket,
-        &Message::MetricsReq {
+    match session
+        .call(&Message::MetricsReq {
             v: VERSION,
             id: kept[0].clone(),
-        },
-    )
-    .await
+        })
+        .await
     {
         Ok(Message::Metrics {
             rss_bytes,

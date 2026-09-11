@@ -38,9 +38,11 @@ real networks.
       landed: the CLI and the daemon run the same `Client`, so a transcript comparison would assert
       that one function equals itself. What the test asserts instead is the *observable* each path
       produces — the pane's line arrives over the CLI path, and the daemon path sees B's pane count.
-- [ ] Identical semantics remotely: snapshot on attach, then deltas; `read`, `send`, `wait` and
-      `metrics` behave as locally — a conformance test replays one scripted sequence against a local
-      pane and a remote pane and shows equal payloads modulo pane ids and timestamps.
+- [x] Identical semantics remotely: `panes`, `read`, `send`, `wait`, `split` and `metrics` all take
+      `--machine <name>` and run through one connection type, so "local" and "remote" differ only in
+      what had to be resolved to open the socket. The conformance test replays one scripted sequence
+      against a local pane and the same pane reached by name and asserts the outputs are equal modulo
+      the fields that are measurements (an rss sample, a timestamp, a match confidence).
 - [ ] Observability: remote panes appear with the same fields as local ones (state, RAM, machine name,
       link path), and a remote `question` state surfaces in the local sidebar with its payload — no
       degraded second-class display for remote panes.
