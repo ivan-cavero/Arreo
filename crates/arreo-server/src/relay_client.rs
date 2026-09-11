@@ -153,6 +153,7 @@ pub fn own_identity() -> Result<(DeviceKey, DeviceCert), ConfigError> {
 pub struct RelayContext {
     pub authority: Arc<Mutex<crate::devices::DeviceAuthority>>,
     pub registry: crate::daemon::Registry,
+    pub sessions: crate::daemon::Sessions,
     pub db: std::path::PathBuf,
     /// Behind an `Arc` because the context is cloned per peer task, and a
     /// secret-bearing key type is deliberately not `Clone`: sharing one copy is
@@ -166,6 +167,7 @@ impl Clone for RelayContext {
         Self {
             authority: Arc::clone(&self.authority),
             registry: Arc::clone(&self.registry),
+            sessions: Arc::clone(&self.sessions),
             db: self.db.clone(),
             device: Arc::clone(&self.device),
             cert: Arc::clone(&self.cert),
@@ -352,6 +354,7 @@ async fn serve_peer(stream: RelayStream, context: &RelayContext, announced: Devi
         reader,
         writer,
         Arc::clone(&context.registry),
+        Arc::clone(&context.sessions),
         context.db.clone(),
         Some(auth),
     )

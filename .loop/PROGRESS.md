@@ -1,23 +1,21 @@
 ## State snapshot          ← REWRITTEN (not appended) at every checkpoint
-Task: T-0041 · cgroup alerts (phase 2) — DONE, graded thresholds that always precede a kill
-Where you are: warn at 80%, critical at 95%, each once per episode with re-arm below 70%;
-every alert is an engine line + attach buffer + audit row in one tick, critical always precedes
-kill in the log, attention listing surfaces alerting panes first. 375 workspace tests.
-Next step: **T-0042** (release e2e, blocked on T-0036..T-0041 — check readiness), else T-0048.
-T-0044 is blocked on the account-join RPC (its own note); **T-0036 is human-gated** — it needs
-a real minisign keypair whose secret the operator holds as a CI secret.
+Task: T-0052 · revocation live cutoff (phase 2) — DONE for the daemon side; the relay-router half re-scoped
+Where you are: a live session ends ~0.5 s after `arreo devices revoke`, with a typed revocation
+error (not a silent drop), on every transport the daemon serves — including relay peers. The
+registry holds one entry per device with a count and leaks nothing over 1000 rounds. 380 tests.
+Next step: **T-0046 (per-machine device trust)** now looks like the unblocker for the relay half
+plus T-0044/45/47; T-0035/31/40/41/49 are done, T-0036 human-gated. Read T-0046 first, then T-0048.
 Open workers: (none)
 Known broken: (none) · Parked: (none)
 Findings:
-- **The engine is not the attach path.** Buffered alerts fed to the engine on attach would
-  never appear (attach streams pane.drain()). They go out as their own Delta first.
-- **A ranking that computes nothing is a lie.** top_consumer ranked by a constant; the child
-  pid is the honest answer, stated as such.
-- **Latency by construction, not by timer.** 1 s tick + synchronous emit + attach-first
-  drain = ≤ 2 s worst case. A timestamped assertion would measure the scheduler.
+- **A session's last frame was written and discarded.** Dropping the channel aborts the pump
+  (T-0033), so the typed revocation error never reached the client. `serve_session` now shuts
+  its write half down and pauses 300 ms so the pump drains — a fix for every session end.
+- **The tick IS the latency budget.** A 1 s tick measured 1.004 s; 500 ms measures ~0.5 s.
+- **The registry is observability, not the mechanism.** Each session re-validates itself, so a
+  CLI revoke in another process needs no cross-process signaling at all.
 - **A test that cannot fail proves nothing** (T-0049). **Two spellings of "now"** (T-0040).
-- **A dropped handle must stop its task** (T-0033, T-0054). **Retention compares two
-  timestamps, so the clock must move as one** (T-0055).
+- **A dropped handle must stop its task** (T-0033, T-0054 — recurrence #3, now in the ledger).
 ## Event log               ← append-only; newest last; never rewrite
 - 2026-09-10 [turn 1] ledger created; repo at e489fac (docs only); T-0001 + T-0022 (AGENTS.md gardened) done
 - 2026-09-10 [turn 2] T-0002 PTY manager done+pushed (342606c; 9 tests); PROMPT.md v2 synced + ADR 0001 (ef6c595)
@@ -67,3 +65,5 @@ Findings:
 - 2026-09-11 [turn 38] T-0049 CLI broken pipe done: default SIGPIPE disposition restored once at the top of main (one unsafe block, no libc dependency, no-op on non-Unix) so `arreo <verb> | head -1` dies by signal (141, silent) instead of Rust's EPIPE-panic (101 + text). Proven on audit, devices list (both seeded to 50 rows via devices issue), and panes (live daemon + 50 spawns) — all three fail without the fix with `panicked at .../stdio.rs`, pass with it; byte-identity vs file run proves no verb changed output. Pair mid-wait covered by construction test (one definition per platform, one call before any verb). Evidence `.loop/evidence/T-0049/`. 368 workspace tests, clippy/fmt clean, vet/deny/audit green, check-targets PASS/SKIP, api slice green, bench 6/6; remote == local
 
 - 2026-09-11 [turn 39] T-0041 cgroup alerts done: graded thresholds (warn 80%, critical 95%, re-arm below 70%, each once per episode) in enforce core with 5 pure-state tests; cgroup pressure (current/max/pids/oom_kill) read from the guard with OOM movements as audit rows and the total riding the T-0040 peak column (no schema change); one-tick emit (engine line + attach-buffer Delta + enforce.alert row with level/current/limit/top-pid) with kill-ordering invariant (critical precedes kill, one kill per episode) proven on the emit path without a cgroup; attention-first panes listing with ALERT column (no new verb); enforcement slice extended with alert-precedes-breach and attention assertions (loud skip here, live hog on CI). Evidence `.loop/evidence/T-0041/`. 375 workspace tests, clippy/fmt clean, vet/deny/audit green, check-targets PASS/SKIP, 8 e2e slices green, bench 6/6; remote == local
+
+- 2026-09-11 [turn 40] T-0052 revocation live cutoff done (daemon side; the relay-router half re-scoped to T-0046's propagation work): per-session self-re-validation on a 500 ms tick (no central sweeper, no cross-process signaling — a CLI revoke in another process is observed on the next tick), typed revocation error delivered before close, `LiveSessions` registry (one entry per device with a count, leak-tested over 1000 rounds), unchanged transcripts for unrevoked sessions. Two real bugs fixed en route: a session's final frame was written then discarded because dropping the channel aborts the pump (`serve_session` now shuts its write half down and pauses 300 ms, so every session end flushes), and the tick's interval is the whole latency budget (1 s tick measured 1.004 s; 500 ms measures ~0.5 s). Evidence `.loop/evidence/T-0052/`. 380 workspace tests, clippy/fmt clean, vet/deny/audit green, check-targets PASS/SKIP, 8 e2e slices green, bench 6/6; remote == local

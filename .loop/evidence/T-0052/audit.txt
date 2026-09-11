@@ -1,0 +1,29 @@
+# T-0052 evidence — revocation cuts live sessions
+
+## 1. The cutoff, timed (real daemon, real CLI, real transport)
+
+$ cargo test -p arreo-server --test revocation_cutoff -- --nocapture
+
+test revoking_with_no_live_session_succeeds_quietly ... ok
+cutoff: live session ended 503.490496ms after revoke
+test a_revoked_devices_live_session_ends_within_a_second ... ok
+test an_unrevoked_session_is_unaffected_and_the_registry_does_not_leak ... ok
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.88s
+
+## 2. The registry leak check (1000 connect/close rounds)
+
+test daemon::session_registry_tests::one_device_with_many_sessions_is_one_entry ... ok
+test daemon::session_registry_tests::registering_and_releasing_leaves_nothing_behind ... ok
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 7 filtered out; finished in 0.01s
+
+## 3. The full battery (final code)
+
+cargo test --workspace: 380 passed, 0 failed across 51 targets
+cargo clippy --workspace --all-targets -- -D warnings: 0 diagnostics
+cargo fmt --all -- --check: clean
+cargo vet --locked: Vetting Succeeded (336 exempted)
+cargo deny check: advisories ok, bans ok, licenses ok, sources ok
+cargo audit: 343 crate dependencies, no advisories
+cargo xtask check-targets: x86_64-unknown-linux-gnu PASS; x86_64-pc-windows-msvc SKIP (pure-Rust no-sqlite PASS)
+e2e slices: api green, compat green, lifecycle 2/2, persistence 3/3, enforcement passed, tui 18/18, theme 27/27, relay 14/14
+cargo xtask bench: 6/6 PASS

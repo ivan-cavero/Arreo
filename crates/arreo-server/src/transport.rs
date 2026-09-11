@@ -22,7 +22,7 @@
 //!   replay cannot be re-established and one peer cannot make the daemon do
 //!   unbounded handshake work.
 
-use crate::daemon::{serve_session, Registry, SessionAuth};
+use crate::daemon::{serve_session, Registry, SessionAuth, Sessions};
 use crate::devices::DeviceAuthority;
 use arreo_core::identity::keys::{NoiseStatic, RootKey};
 use arreo_core::identity::{DeviceId, VerifyingKey};
@@ -80,6 +80,7 @@ pub async fn serve(
     local: NoiseStatic,
     authority: Arc<Mutex<DeviceAuthority>>,
     registry: Registry,
+    sessions: Sessions,
     db: PathBuf,
 ) -> Result<(), QuicError> {
     // Shared across connections: the limiter is the per-peer handshake budget,
@@ -101,6 +102,7 @@ pub async fn serve(
         let guard = Arc::clone(&guard);
         let authority = Arc::clone(&authority);
         let registry = Arc::clone(&registry);
+        let sessions = Arc::clone(&sessions);
         let db = db.clone();
         tokio::spawn(async move {
             let resolution = Arc::clone(&authority);
@@ -138,7 +140,8 @@ pub async fn serve(
             eprintln!("arreo-server: remote session from {}", session.device);
 
             let (reader, writer) = tokio::io::split(session.channel);
-            if let Err(e) = serve_session(reader, writer, registry, db, Some(auth)).await {
+            if let Err(e) = serve_session(reader, writer, registry, sessions, db, Some(auth)).await
+            {
                 eprintln!("daemon: remote connection error: {e}");
             }
         });
@@ -203,12 +206,13 @@ pub async fn listen_on(
     local: NoiseStatic,
     authority: Arc<Mutex<DeviceAuthority>>,
     registry: Registry,
+    sessions: Sessions,
     db: PathBuf,
 ) -> Result<SocketAddr, QuicError> {
     let endpoint = server_endpoint(addr)?;
     let bound = endpoint.local_addr().map_err(QuicError::Io)?;
     tokio::spawn(async move {
-        if let Err(e) = serve(endpoint, local, authority, registry, db).await {
+        if let Err(e) = serve(endpoint, local, authority, registry, sessions, db).await {
             eprintln!("arreo-server: remote transport stopped: {e}");
         }
     });
@@ -307,11 +311,13 @@ mod tests {
         // Same root key the authority bootstrapped, so the pins verify.
         let root = RootKey::load_or_generate(&scratch.layout.root_key).expect("root key");
         let registry: Registry = Arc::new(RwLock::new(HashMap::<String, Arc<PaneEntry>>::new()));
+        let sessions: Sessions = Arc::new(crate::daemon::LiveSessions::default());
         let addr = listen_on(
             "127.0.0.1:0".parse().expect("loopback"),
             root.noise_static(),
             Arc::clone(&authority),
             registry,
+            sessions,
             scratch.layout.store.clone(),
         )
         .await

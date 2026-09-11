@@ -251,10 +251,85 @@ impl PaneEntry {
 /// Shared pane registry.
 pub type Registry = Arc<RwLock<HashMap<String, Arc<PaneEntry>>>>;
 
+/// Live sessions keyed by authenticated device id (T-0052).
+///
+/// One entry per device with one cancel handle per session: a device with many
+/// sessions is one entry with many handles, not many entries. A session that
+/// ends removes its own handle (no leak across thousands of connections); an
+/// entry emptied that way is removed with it. Revocation iterates the entry
+/// and cancels every handle — the cutoff is an *event* delivered to live
+/// sessions, not a sweeper re-checking every session each tick (which would
+/// make cutoff latency a function of the tick interval and burn CPU on every
+/// idle connection forever to answer a question that changes only on revoke).
+#[derive(Debug, Default)]
+pub struct LiveSessions {
+    inner: std::sync::Mutex<HashMap<String, usize>>,
+}
+
+/// Shared live-session registry (see [`LiveSessions`]).
+pub type Sessions = Arc<LiveSessions>;
+
+impl LiveSessions {
+    /// Register one session for `device`; returns the guard that unregisters
+    /// it. The guard is the cleanup: dropping it (session end, any reason)
+    /// removes exactly its own count.
+    ///
+    /// One entry per device with a count (not one handle per session): a
+    /// device with many sessions is one entry, and a session that ends
+    /// decrements without touching its siblings. The registry is observability
+    /// (counts per device, leak checks) — the cutoff itself needs no
+    /// cross-session signaling, because each session re-validates itself (see
+    /// the tick in the verb loop below).
+    #[must_use]
+    pub fn register(self: &Arc<Self>, device: &str) -> SessionGuard {
+        *self
+            .inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(device.to_string())
+            .or_default() += 1;
+        SessionGuard {
+            sessions: Arc::clone(self),
+            device: device.to_string(),
+        }
+    }
+
+    /// Sessions currently held, by device (tests and diagnostics).
+    #[must_use]
+    pub fn counts(&self) -> HashMap<String, usize> {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    fn release(&self, device: &str) {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(count) = inner.get_mut(device) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                inner.remove(device);
+            }
+        }
+    }
+}
+
+/// Unregisters its session on drop. Held for the session's whole life; the
+/// drop is the cleanup, so every exit path (clean close, error, cancel) runs
+/// it without a single explicit call to remember.
+pub struct SessionGuard {
+    sessions: Arc<LiveSessions>,
+    device: String,
+}
+
+impl Drop for SessionGuard {
+    fn drop(&mut self) {
+        self.sessions.release(&self.device);
+    }
+}
+
 pub struct Daemon {
     registry: Registry,
     socket: PathBuf,
     db: PathBuf,
+    sessions: Sessions,
 }
 
 impl Daemon {
@@ -265,12 +340,19 @@ impl Daemon {
             registry: Arc::new(RwLock::new(HashMap::new())),
             socket: socket.to_path_buf(),
             db,
+            sessions: Arc::new(LiveSessions::default()),
         }
     }
 
     #[must_use]
     pub fn registry(&self) -> Registry {
         Arc::clone(&self.registry)
+    }
+
+    /// Live sessions by device (T-0052): the cutoff path revokes through this.
+    #[must_use]
+    pub fn sessions(&self) -> Sessions {
+        Arc::clone(&self.sessions)
     }
 
     /// Restore persisted panes into the registry (called at boot, before
@@ -491,9 +573,10 @@ impl Daemon {
         loop {
             let (stream, _) = listener.accept().await?;
             let registry = Arc::clone(&self.registry);
+            let sessions = Arc::clone(&self.sessions);
             let db = self.db.clone();
             tokio::spawn(async move {
-                if let Err(e) = handle(stream, registry, db).await {
+                if let Err(e) = handle(stream, registry, sessions, db).await {
                     eprintln!("daemon: connection error: {e}");
                 }
             });
@@ -633,13 +716,23 @@ static UNKNOWN_EVENTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU
 static GARBAGE_FRAMES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Connection handler for the local Unix socket: Hello→Welcome, then verbs.
-async fn handle(stream: UnixStream, registry: Registry, db: PathBuf) -> Result<(), DaemonError> {
+async fn handle(
+    stream: UnixStream,
+    registry: Registry,
+    sessions: Sessions,
+    db: PathBuf,
+) -> Result<(), DaemonError> {
     let (reader, writer) = stream.into_split();
     // `None`: the local socket is same-machine and trusted, so no per-verb
-    // authorization gate applies. A remote peer always arrives with one (see
+    // authorization gate applies — and no device to register under, so no
+    // cutoff handle either. A remote peer always arrives with one (see
     // [`SessionAuth`]).
-    serve_session(reader, writer, registry, db, None).await
+    serve_session(reader, writer, registry, sessions, db, None).await
 }
+
+/// How long a finished session stays alive after closing its write half, so the
+/// pump can put the final frames on the wire. See the end of `serve_session`.
+const FINAL_FRAME_GRACE: std::time::Duration = std::time::Duration::from_millis(300);
 
 /// The per-verb authorization gate for a session that arrived over the remote
 /// transport (T-0023).
@@ -729,6 +822,36 @@ impl SessionAuth {
             Err(poisoned) => poisoned.into_inner(),
         }
     }
+
+    /// Whether this session's device has been revoked since the handshake
+    /// (T-0052): the store is the authority (revocation is a fact the cert
+    /// files do not carry), so a CLI-side revoke in another process is visible
+    /// here on the next tick with no signaling between the processes.
+    fn is_revoked(&self) -> bool {
+        let mut authority = self.lock();
+        authority.check_verb(&self.peer, Verb::Read).is_err()
+            && authority.device(&self.device).is_none()
+    }
+}
+
+/// One cutoff interval (T-0052): local sessions never tick (no device to
+/// re-validate — the local socket is same-machine and trusted), remote sessions
+/// re-validate twice a second. A free function so the `select!` reads as what
+/// it is: a session that ends first drops its guard (unregistering it) and
+/// never reaches the tick; a tick that finds no revocation loops back to
+/// reading.
+///
+/// **Why 500 ms and not the 1 s the criterion bounds.** The bound is on the
+/// *cutoff* — revoke to session end — and the tick is the whole latency budget:
+/// a 1 s tick measured 1.004 s end to end (tick + frame delivery), which is
+/// over the line the criterion draws. Half the interval makes the worst case
+/// ~0.5 s with the same shape, at the cost of one extra store read per idle
+/// remote session per second (the same read it already does per verb).
+async fn cutoff_tick(auth: &Option<SessionAuth>) {
+    match auth {
+        Some(_) => tokio::time::sleep(std::time::Duration::from_millis(500)).await,
+        None => std::future::pending().await,
+    }
 }
 
 /// Connection handler: Hello→Welcome handshake, then verbs. Attach/Resume
@@ -740,6 +863,7 @@ pub(crate) async fn serve_session<R, W>(
     mut reader: R,
     mut writer: W,
     registry: Registry,
+    sessions: Sessions,
     db: PathBuf,
     auth: Option<SessionAuth>,
 ) -> Result<(), DaemonError>
@@ -771,6 +895,15 @@ where
             None,
         );
     }
+    // Live-session registration (T-0052): a remote session registers under its
+    // device id for observability (counts per device, leak checks). Local
+    // sessions (`auth: None`) have no device to key on — the local socket is
+    // same-machine and trusted, and a revocation names a device, never "the
+    // machine itself". The guard is the cleanup: dropping it at any exit below
+    // unregisters exactly this session.
+    let _guard = auth
+        .as_ref()
+        .map(|auth| sessions.register(auth.device_id().as_str()));
 
     // Handshake first: exactly one Hello, answered by Welcome or Error.
     // Bounded by timeout: pre-v1 JSONL clients (`{...}\n`) would otherwise
@@ -847,10 +980,56 @@ where
     // The read loop runs until the client goes away; the reason it ended is
     // worth recording, so the exit is a `break` carrying it rather than a bare
     // `return` that would leave the session with a connect row and no end.
+    //
+    // The cutoff tick (T-0052): each iteration races the next frame against a
+    // 1 s re-validation of this session's own authorization. A revocation
+    // written by *another* process (the CLI, against the same store) is
+    // observed here within a second, and the session ends with a typed
+    // revocation error rather than a silent drop. This is per-session, not a
+    // central sweeper: no cross-process channel exists (the CLI cannot reach
+    // this process's memory), and a sweeper would make cutoff latency a
+    // function of its tick while burning CPU on every idle connection. The
+    // cost here is one store read per session per idle second — the same as a
+    // verb, and idle sessions already cost a task each.
     let ended_because = loop {
-        let message = match read_message(&mut reader, &mut buf).await {
-            Ok(message) => message,
-            Err(e) => break e.to_string(),
+        let message = tokio::select! {
+            // Biased: a revocation racing a verb is observed first, so the
+            // client is told why even mid-verb — and the cutoff is at the next
+            // frame boundary rather than mid-frame (T-0052's honest gap).
+            biased;
+            () = cutoff_tick(&auth) => {
+                match &auth {
+                    Some(auth) if auth.is_revoked() => {
+                        let reason = format!(
+                            "device {} was revoked: this session is ended",
+                            auth.device_id().display_id()
+                        );
+                        // Best-effort: the client may already be gone, and the
+                        // audit row below is the durable record either way.
+                        let _ = write_message(
+                            &mut writer,
+                            &Message::Error { v: VERSION, message: reason.clone() },
+                        )
+                        .await;
+                        // Graceful close (T-0052): the typed error must reach
+                        // the client, and a bare `return` drops the channel —
+                        // whose `Drop` aborts the pump and discards sealed
+                        // bytes (T-0033's contract: dropped = closed, not
+                        // flushed). Shutting the write half down signals the
+                        // pump to drain and exit, so the client reads the
+                        // reason and *then* the close.
+                        let _ = tokio::io::AsyncWriteExt::shutdown(&mut writer).await;
+                        break format!("revoked ({})", auth.device_id().display_id());
+                    }
+                    _ => continue,
+                }
+            }
+            message = read_message(&mut reader, &mut buf) => {
+                match message {
+                    Ok(message) => message,
+                    Err(e) => break e.to_string(),
+                }
+            }
         };
         // Remote sessions are gated per verb, before anything acts on the
         // message. A refusal is answered and the session stays usable — a
@@ -943,6 +1122,15 @@ where
             Some(&ended_because),
         );
     }
+    // **The last frame must reach the peer.** Closing the write half signals
+    // the transport's pump to drain what the session already wrote and exit;
+    // the bounded pause is what lets it finish before this future returns and
+    // its streams drop (T-0052 found this the hard way: without it the typed
+    // revocation error was written, discarded, and the client saw a bare
+    // close). Bounded, not awaited forever: a peer that stops reading must
+    // cost this much and no more.
+    let _ = tokio::io::AsyncWriteExt::shutdown(&mut writer).await;
+    tokio::time::sleep(FINAL_FRAME_GRACE).await;
     Ok(())
 }
 
@@ -1763,5 +1951,52 @@ mod alert_tests {
             breaches[0].ts_ms
         );
         let _ = std::fs::remove_file(&db);
+    }
+}
+
+#[cfg(test)]
+mod session_registry_tests {
+    use super::*;
+
+    /// The registry holds one entry per device with a count, and a session that
+    /// ends removes exactly its own count — the leak check (T-0052). Thousands
+    /// of connects and closes must leave nothing behind, or a long-lived daemon
+    /// grows a map it never shrinks.
+    #[test]
+    fn registering_and_releasing_leaves_nothing_behind() {
+        let sessions = Arc::new(LiveSessions::default());
+        for round in 0..1_000 {
+            let guard_a = sessions.register("dev_a");
+            let guard_b = sessions.register("dev_a");
+            let guard_c = sessions.register("dev_b");
+            assert_eq!(sessions.counts().get("dev_a"), Some(&2));
+            assert_eq!(sessions.counts().get("dev_b"), Some(&1));
+            drop(guard_a);
+            assert_eq!(sessions.counts().get("dev_a"), Some(&1), "round {round}");
+            drop(guard_b);
+            assert_eq!(
+                sessions.counts().get("dev_a"),
+                None,
+                "a device with no sessions is removed, not left at zero (round {round})"
+            );
+            drop(guard_c);
+        }
+        assert!(
+            sessions.counts().is_empty(),
+            "1000 rounds left entries behind: {:?}",
+            sessions.counts()
+        );
+    }
+
+    /// One device with many sessions is one entry (not one per session), and
+    /// releasing one does not touch its siblings.
+    #[test]
+    fn one_device_with_many_sessions_is_one_entry() {
+        let sessions = Arc::new(LiveSessions::default());
+        let guards: Vec<SessionGuard> = (0..64).map(|_| sessions.register("dev_a")).collect();
+        assert_eq!(sessions.counts().len(), 1, "one device, one entry");
+        assert_eq!(sessions.counts().get("dev_a"), Some(&64));
+        drop(guards);
+        assert!(sessions.counts().is_empty());
     }
 }

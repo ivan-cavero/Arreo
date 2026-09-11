@@ -69,6 +69,7 @@ async fn main() {
     );
     let daemon = arreo_server::Daemon::new(&socket);
     let registry = daemon.registry();
+    let sessions = daemon.sessions();
     let socket_path = socket.clone();
     let authority = std::sync::Arc::new(std::sync::Mutex::new(authority));
 
@@ -83,6 +84,7 @@ async fn main() {
                     let context = arreo_server::RelayContext {
                         authority: std::sync::Arc::clone(&authority),
                         registry: std::sync::Arc::clone(&registry),
+                        sessions: std::sync::Arc::clone(&sessions),
                         db: arreo_server::db_path_for(&socket_path),
                         device: std::sync::Arc::new(device),
                         cert: std::sync::Arc::new(cert),
@@ -122,7 +124,15 @@ async fn main() {
         // local socket either way.
         match arreo_server::transport::server_identity() {
             Ok(local) => {
-                match arreo_server::transport::listen_on(addr, local, authority, registry, db).await
+                match arreo_server::transport::listen_on(
+                    addr,
+                    local,
+                    authority,
+                    registry,
+                    std::sync::Arc::clone(&sessions),
+                    db,
+                )
+                .await
                 {
                     Ok(bound) => eprintln!(
                         "arreo-server: remote transport listening on {bound} (test seam {})",
