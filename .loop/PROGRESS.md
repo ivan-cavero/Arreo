@@ -5,10 +5,12 @@ machine-local ledger + one-time backfill, 15 tests, NO behaviour change yet). T-
 Where you are: the trust rule, its durable table and this machine's ledger exist and are tested; the
 ledger is **not yet wired** into `SessionAuth::check`, so a remote session is still gated only by the
 certificate. 431 tests.
-Next step: **finish T-0046** — wire the ledger into `SessionAuth::check` (both gates: certificate,
-then this machine's grant) **and call the boot backfill before any session is served** (wiring without
-the backfill locks out every already-paired device); then the socket verbs + `arreo machines trust`;
-then `arreo-server/tests/trust.rs`.
+Next step: **finish T-0046.** The wiring was attempted and reverted because it exposed a real gap:
+a device pinned *after* boot (`arreo devices issue`) has no grant, so the gate broke the normal device
+flow (`tests/audit.rs` caught it). Grant-on-issue is therefore a prerequisite, and it is architectural:
+the CLI issues certificates but may not depend on `arreo-server` where `TrustLedger` lives, so the
+ledger's type most likely moves to `arreo-core` (its store layer already is). Full reasoning in the
+task file; then the socket verbs + `arreo machines trust`.
 Open workers: (none)
 Known broken: (none) · Parked: (none)
 Findings:
@@ -87,3 +89,5 @@ Findings:
 - 2026-09-11 [turn 44] T-0058 machine join handoff done, and with it T-0044 (`arreo machines` complete across T-0044+T-0057+T-0058). `arreo machines add <code> --uri <invite>` runs on the machine being admitted: the invite (extended additively with `a=`/`r=`, absent = an ordinary pairing) carries the account and the relay because the joining machine has no configuration to read; the SPAKE2 exchange is the same one `arreo pair --join` runs (`join_pairing`, extracted so the persist-only-on-success rule lives once); the machine then asserts its OWN directory row under its own root key. ADR 0018 records the decision and four rejected alternatives. The design came from reading `Router::handle_connection` — the relay verifies a device certificate against the ACCOUNT ROOT, so only a machine holding it can admit, which is why the handoff is two acts by two machines. Evidence `.loop/evidence/T-0058/`. 416 workspace tests, clippy/fmt clean, vet/deny/audit green, check-targets PASS/SKIP, 8 e2e slices green, bench 6/6 (one contended reading re-run clean). Corrected T-0044's stale T-0056 note (it predicted a socket verb the reads did not need)
 
 - 2026-09-11 [turn 45] T-0046 increment 1 landed (task in-progress): the per-machine trust model, tested and not yet wired. `arreo-core/src/mesh/trust.rs` (TrustRecord keyed (machine_id, device_id), the pure role x verb rule, one denial builder that always names the machine, the role needed and the exact command); `arreo_core::store` schema v7 `machine_trust` with the machine in the PRIMARY KEY, so "a grant on A is not a grant on B" is a key constraint (test: A's grant leaves B with exactly zero rows) plus a one-way `trust_initialized` marker; `arreo-server/src/mesh/trust.rs` (this machine's ledger, identity from its root key = the same MachineId::from_key the directory row uses, `check` returning Refused-vs-Store, and `backfill_once` so an upgrade cannot lock out already-paired devices and a "revoke everything" cannot heal itself). ADR 0019 written; T-0046's fence corrected from a taken ADR number (0010 is pairing-spake2). 431 tests, clippy/fmt clean, vet/deny/audit green, check-targets PASS/SKIP, 8 slices green. Remaining: wire into SessionAuth::check + the boot backfill, the socket/CLI verbs, and arreo-server/tests/trust.rs
+
+- 2026-09-11 [turn 45, follow-up] The T-0046 enforcement wiring was written and **reverted**: it broke the normal device flow. A device pinned after boot (`arreo devices issue --socket …`) has no grant, so the new `SessionAuth` gate refused it — the boot backfill only covers devices that existed at startup, and `crates/arreo-server/tests/audit.rs` caught it. The gate therefore cannot ship without **grant-on-issue**, which is architectural: `arreo devices issue` and the server half of `arreo pair` run in the CLI process (pairing may run with no daemon) but the CLI may not depend on `arreo-server` where `TrustLedger` lives — so the ledger's type most likely moves to `arreo-core`, whose store layer `SessionStore::record_trust` is already there. Reasoning recorded in the task file; nothing from the attempt committed; tree green at 431 tests

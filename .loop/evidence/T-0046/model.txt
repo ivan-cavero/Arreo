@@ -51,3 +51,19 @@ e2e slices: api green, compat green, lifecycle 2/2, persistence 3/3, enforcement
 - the boot backfill is not called yet, which is why wiring must come with it;
 - no socket verbs and no 'arreo machines trust' CLI verb;
 - no arreo-server/tests/trust.rs acceptance tests.
+
+## 6. The wiring attempt that was reverted, and why
+
+Wiring SessionAuth::check to the ledger was written and REVERTED (nothing
+committed). It broke the normal device flow: a device pinned after boot
+(`arreo devices issue --socket ...`, how every operator and every test adds one)
+has no grant row, so the new gate refused it — the boot backfill only covers
+devices that existed at startup. `crates/arreo-server/tests/audit.rs` caught it.
+
+The gate cannot ship without grant-on-issue, and that is architectural: `arreo
+devices issue` and the server half of `arreo pair` run in the CLI process against
+the authority directly (pairing may run with no daemon), but the CLI may not
+depend on `arreo-server`, where `TrustLedger` lives. So the ledger's type most
+likely moves to `arreo-core` — its store layer (`SessionStore::record_trust`) is
+already there, and the CLI already writes device records directly. Recorded in
+the task file; the tree is back to increment 1, 431 tests.

@@ -94,6 +94,32 @@ this machine's grant) and run the backfill at boot before any session is served;
 `arreo machines trust <device> [--machine] [--role] [--yes]`; `arreo devices revoke --machine`; the
 `arreo-server/tests/trust.rs` acceptance tests; and the ADR.
 
+### The wiring step was attempted and reverted, because it found a real gap
+
+Wiring `SessionAuth::check` to the ledger was written, and it **broke the normal device flow**: a
+device pinned *after* the daemon booted (`arreo devices issue --socket …`, which is how every test and
+every operator adds one) has no grant row, so the new gate refused it. The boot backfill only covers
+devices that existed when the daemon started. `crates/arreo-server/tests/audit.rs`'s remote test
+failed on exactly this, which is the test doing its job.
+
+So the gate cannot ship without **grant-on-issue**, and that turns out to be an architectural question
+rather than a patch:
+
+- `arreo devices issue` and the server half of `arreo pair` run in the **CLI process** against the
+  authority directly (no daemon, and pairing may run with none). They are where a certificate is
+  created, so they are where the default grant belongs.
+- But the CLI **may not depend on `arreo-server`** (AGENTS.md's enforced rule: only `xtask` may), and
+  `TrustLedger` lives there. So either the ledger's type moves to `arreo-core` (its store layer,
+  `SessionStore::record_trust`, is already there), or the default grant is written through the daemon
+  by socket verb — which fails when there is no daemon, exactly the case pairing runs in.
+
+The first option is the one that fits the existing shape (the store layer is already in core, and the
+CLI already writes device records directly). **That decision belongs in this task's remaining work,
+not in a rushed patch**, and the ADR must record it: the ledger is a *store* concern with a policy
+skin, and the policy skin is what the daemon owns.
+
+Nothing was committed from the attempt; the tree is back to increment 1.
+
 **Decisions made while landing the model, for the ADR to record:** the grant reuses `Role` (accepting
 the roadmap's `operator` as a spelling of `Owner`, one value, no translation table) rather than
 inventing a trust-specific role enum; a *colliding* rename is refused while a *claim* gets the

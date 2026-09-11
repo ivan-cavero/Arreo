@@ -222,14 +222,17 @@ impl TrustLedger {
     /// later revokes every device, the ledger is legitimately empty, and a backfill
     /// that ran again would silently restore the access that was just taken away.
     /// So this runs once, ever, and says what it did.
+    /// It reads the clock itself rather than taking a timestamp: a migration
+    /// clock is not something a caller has an opinion about, and a parameter
+    /// would invite each call site to source it differently.
     pub fn backfill_once(
         &self,
         existing: &[DeviceId],
-        now_ms: i64,
     ) -> Result<Vec<DeviceId>, Box<dyn std::error::Error + Send + Sync>> {
         if self.store.trust_initialized()? {
             return Ok(Vec::new());
         }
+        let now_ms = now_ms();
         let mut granted = Vec::new();
         for device in existing {
             // A device granting itself is exactly what the pairing default is:
@@ -241,6 +244,15 @@ impl TrustLedger {
         self.store.mark_trust_initialized()?;
         Ok(granted)
     }
+}
+
+/// The current time, in epoch milliseconds. The ledger's own clock, for the one
+/// operation (the migration) where the caller has no opinion about the time.
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 /// What can go wrong when this machine is asked whether a device may do something.
@@ -438,7 +450,7 @@ mod tests {
         let b = device('b');
 
         let granted = pi
-            .backfill_once(&[a.clone(), b.clone()], 1_000)
+            .backfill_once(&[a.clone(), b.clone()])
             .expect("backfill");
         assert_eq!(granted.len(), 2);
         for device in [&a, &b] {
@@ -447,14 +459,14 @@ mod tests {
 
         // A second call does nothing, and crucially does not resurrect rows.
         assert!(pi
-            .backfill_once(&[a.clone(), b.clone()], 2_000)
+            .backfill_once(&[a.clone(), b.clone()])
             .expect("second")
             .is_empty());
 
         pi.revoke(&a, 3_000).expect("revoke");
         assert!(pi.check(&a, Verb::Read).is_err());
         assert!(pi
-            .backfill_once(&[a.clone(), b.clone()], 4_000)
+            .backfill_once(&[a.clone(), b.clone()])
             .expect("third")
             .is_empty());
         assert!(
