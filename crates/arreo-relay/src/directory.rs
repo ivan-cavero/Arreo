@@ -29,6 +29,36 @@ use arreo_core::mesh::directory::{
 };
 use rusqlite::{params, OptionalExtension, TransactionBehavior};
 
+/// The environment variable a test sets to move the relay's clock.
+///
+/// Named here so the test and the reader use one spelling. Unset in production,
+/// where it costs one `OnceLock` read and nothing else.
+pub const CLOCK_OFFSET_ENV: &str = "ARREO_CLOCK_OFFSET_MS";
+
+/// Milliseconds the relay's clock is offset by, from [`CLOCK_OFFSET_ENV`].
+///
+/// Read **once**, so every clock read in the process shifts together: retention
+/// is a comparison between two timestamps, and a clock that moved between a write
+/// and a sweep would make "expired" a function of scheduling rather than of time.
+/// That is also why this is a startup offset and not a per-call hook — a relay
+/// whose clock moves underneath it is a relay whose retention cannot be reasoned
+/// about.
+///
+/// Why the seam exists at all (T-0055): §3.14's promise is about a machine that
+/// was away for *weeks*, and the only honest way to test a retention window is to
+/// move the clock rather than to wait. A short TTL with a real sleep is the
+/// tempting middle and is worse than either: slow, and still not the window it
+/// claims to exercise.
+fn clock_offset_ms() -> i64 {
+    static OFFSET: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
+    *OFFSET.get_or_init(|| {
+        std::env::var(CLOCK_OFFSET_ENV)
+            .ok()
+            .and_then(|value| value.trim().parse::<i64>().ok())
+            .unwrap_or(0)
+    })
+}
+
 /// Milliseconds since the Unix epoch — the clock every row is stamped with.
 #[must_use]
 pub fn now_ms() -> i64 {
@@ -36,6 +66,7 @@ pub fn now_ms() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
+        .saturating_add(clock_offset_ms())
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -543,4 +574,31 @@ fn hex32(bytes: &[u8; 32]) -> String {
 #[must_use]
 pub fn stale_after_ms() -> i64 {
     (STALE_AFTER_SECS as i64) * 1000
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The seam changes nothing when it is not set: production reads the wall
+    /// clock, and this is the assertion that keeps a test-only offset from
+    /// becoming a production clock.
+    #[test]
+    fn the_clock_is_the_wall_clock_when_the_seam_is_unset() {
+        assert!(
+            std::env::var(CLOCK_OFFSET_ENV).is_err(),
+            "{} is set in this process, so this test cannot tell the seam from the \\
+             clock — the harness must not set it globally",
+            CLOCK_OFFSET_ENV
+        );
+        let wall = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        let read = now_ms();
+        assert!(
+            (read - wall).abs() < 1_000,
+            "now_ms() is {read}, a second or more from the wall clock at {wall}"
+        );
+    }
 }

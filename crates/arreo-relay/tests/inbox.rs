@@ -20,7 +20,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// A store on a real file, so the WAL and the transaction behavior are real.
 fn scratch(tag: &str) -> (PathBuf, RelayStore) {
@@ -271,6 +271,10 @@ struct Relay {
     addr: SocketAddr,
     state_dir: PathBuf,
     extra: Vec<String>,
+    /// The clock offset this relay was started with, in milliseconds. Part of the
+    /// harness because "time passed" is a fact about the relay's view (T-0055),
+    /// and a restart is how a test changes it.
+    clock_offset_ms: i64,
 }
 
 impl Drop for Relay {
@@ -291,16 +295,17 @@ impl Relay {
         let _ = std::fs::remove_dir_all(&state_dir);
         std::fs::create_dir_all(&state_dir).expect("scratch");
         let mut relay = Self {
-            child: Self::spawn(&state_dir, extra),
+            child: Self::spawn(&state_dir, extra, 0),
             addr: "0.0.0.0:0".parse().expect("placeholder"),
             state_dir,
             extra: extra.iter().map(|s| s.to_string()).collect(),
+            clock_offset_ms: 0,
         };
         relay.addr = Self::await_addr(&mut relay.child);
         relay
     }
 
-    fn spawn(state_dir: &std::path::Path, extra: &[&str]) -> Child {
+    fn spawn(state_dir: &std::path::Path, extra: &[&str], clock_offset_ms: i64) -> Child {
         let mut args = vec![
             "serve".to_string(),
             "--listen".to_string(),
@@ -311,6 +316,7 @@ impl Relay {
         args.extend(extra.iter().map(|s| s.to_string()));
         Command::new(env!("CARGO_BIN_EXE_arreo-relay"))
             .args(&args)
+            .env(arreo_relay::CLOCK_OFFSET_ENV, clock_offset_ms.to_string())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
@@ -344,10 +350,23 @@ impl Relay {
 
     /// `kill -9` and restart against the same state directory.
     fn crash_and_restart(&mut self) {
+        self.restart_with_clock(self.clock_offset_ms);
+    }
+
+    /// Restart with the relay's clock moved by `offset_ms` from the wall clock.
+    ///
+    /// A restart is the honest way to move a process's clock: the offset is read
+    /// once, so every clock read in a run shifts together, and a *running* relay
+    /// whose clock could jump would be one whose retention cannot be reasoned
+    /// about (see `arreo_relay::directory::now_ms`). The store is untouched, so
+    /// what changes is only how old the relay believes its rows are — which is
+    /// exactly what a long absence is, from the inbox's point of view.
+    fn restart_with_clock(&mut self, offset_ms: i64) {
         let _ = self.child.kill();
         let _ = self.child.wait();
         let extra: Vec<&str> = self.extra.iter().map(String::as_str).collect();
-        self.child = Self::spawn(&self.state_dir, &extra);
+        self.child = Self::spawn(&self.state_dir, &extra, offset_ms);
+        self.clock_offset_ms = offset_ms;
         self.addr = Self::await_addr(&mut self.child);
     }
 
@@ -547,4 +566,177 @@ fn the_inbox_migration_leaves_the_directory_intact() {
         .expect("columns")
         .contains(&"bytes".to_string()));
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// One day, in the units the inbox measures in.
+const DAY_MS: i64 = 24 * 60 * 60 * 1000;
+
+/// The `reattach_after_absence_s` budget, read from `perf-budget.toml`.
+///
+/// Read rather than copied, because a test with its own constant is a second
+/// source of truth for one fact — and the file is the law (`bench` reads it the
+/// same way, with the same no-TOML-dependency parse).
+fn reattach_budget_ms() -> i64 {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join("perf-budget.toml");
+    let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+    let line = text
+        .lines()
+        .find(|line| line.trim_start().starts_with("reattach_after_absence_s"))
+        .expect("perf-budget.toml has a reattach_after_absence_s row");
+    let seconds: i64 = line
+        .split("target")
+        .nth(1)
+        .and_then(|rest| rest.split('=').nth(1))
+        .and_then(|value| value.trim().split(|c: char| !c.is_ascii_digit()).next())
+        .and_then(|value| value.parse().ok())
+        .expect("the row has a numeric target");
+    seconds * 1000
+}
+
+/// §3.14 in one test: a machine that was away for weeks comes back, is usable
+/// again in seconds, drains what accumulated in order and exactly once, and is
+/// *told* about what the retention window dropped.
+///
+/// The absence is simulated by moving the relay's clock across a restart rather
+/// than by sleeping (T-0055): a real fifteen-day wait is not a test, and a short
+/// TTL with a real sleep is worse than either — slow, and still not the window it
+/// claims to exercise.
+#[tokio::test]
+async fn a_machine_that_was_away_for_weeks_reattaches_and_drains_once() {
+    // A ten-day window, so the two halves are distinguishable: a five-day
+    // absence is inside it, a twenty-five-day one is past it.
+    let mut relay = Relay::start("absence", &["--inbox-ttl-days", "10"]);
+    let root = RootKey::generate().expect("entropy");
+    relay.register_account("acct-1", &root.public());
+
+    let (alice_key, alice_cert) = device(&root, "alice", 1);
+    let (bob_key, bob_cert) = device(&root, "bob", 2);
+    let alice_id = alice_cert.device().clone();
+
+    // Alice connects once so the relay knows her — the queue is for a device that
+    // is *known* and offline, not for a stranger — then leaves for five days.
+    {
+        let alice = RelayClient::connect(relay.addr, "acct-1", &alice_key, &alice_cert)
+            .await
+            .expect("alice authenticates");
+        drop(alice);
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Bob sends three messages while she is away.
+    let mut bob = RelayClient::connect(relay.addr, "acct-1", &bob_key, &bob_cert)
+        .await
+        .expect("bob authenticates");
+    for index in 0..3u8 {
+        let seq = bob
+            .send(&alice_id, format!("while-away-{index}").as_bytes())
+            .await
+            .expect("send");
+        match bob.next().await.expect("answered") {
+            Incoming::Status {
+                seq: reported,
+                outcome,
+            } => {
+                assert_eq!(reported, seq);
+                assert!(
+                    matches!(outcome, Outcome::Queued { .. }),
+                    "an absent machine's mail must be queued, got {outcome:?}"
+                );
+            }
+            other => panic!("expected a status, got {other:?}"),
+        }
+    }
+
+    // Five days pass (the relay's clock moves; nothing else does).
+    relay.restart_with_clock(5 * DAY_MS);
+
+    // Alice returns. The reattach is the dial, the authentication and the drain,
+    // timed against the budget the file states.
+    let started = Instant::now();
+    let mut alice = RelayClient::connect(relay.addr, "acct-1", &alice_key, &alice_cert)
+        .await
+        .expect("alice reattaches after five days away");
+    let (messages, report) = alice.drain_all(1).await.expect("drain");
+    let reattach_ms = started.elapsed().as_millis() as i64;
+
+    let payloads: Vec<String> = messages
+        .iter()
+        .map(|envelope| String::from_utf8_lossy(&envelope.payload).to_string())
+        .collect();
+    assert_eq!(
+        payloads,
+        vec!["while-away-0", "while-away-1", "while-away-2"],
+        "what accumulated is delivered in seq order"
+    );
+    assert_eq!(report.delivered, 3);
+    assert_eq!(report.dropped, 0, "inside the window nothing was dropped");
+    assert_eq!(report.expired, 0);
+    assert_eq!(report.next_seq, 4);
+
+    let budget_ms = reattach_budget_ms();
+    assert!(
+        reattach_ms < budget_ms,
+        "the reattach took {reattach_ms} ms, over the {budget_ms} ms budget"
+    );
+    println!("absence: reattached after 5 days in {reattach_ms} ms (budget {budget_ms} ms)");
+
+    // Re-running the drained batch re-executes nothing: without an ack the same
+    // messages come back (at-least-once), and the ack is what makes it once.
+    let (again, _) = alice.drain_all(1).await.expect("drain again");
+    assert_eq!(
+        again.len(),
+        3,
+        "an unacked drain redelivers — the contract is at-least-once plus a cursor"
+    );
+    alice.ack(3).await.expect("ack");
+    let (after_ack, report) = alice.drain_all(4).await.expect("drain after ack");
+    assert!(
+        after_ack.is_empty(),
+        "acked messages are not redelivered: {after_ack:?}"
+    );
+    assert_eq!(report.delivered, 0);
+
+    // Now the window: twenty more days pass with two more messages waiting.
+    // Bob reconnects too — the restart that moved the clock ended his session,
+    // and a test that assumed otherwise would be testing a socket, not retention.
+    drop(alice);
+    drop(bob);
+    let mut bob = RelayClient::connect(relay.addr, "acct-1", &bob_key, &bob_cert)
+        .await
+        .expect("bob reconnects after the restart");
+    for index in 0..2u8 {
+        let seq = bob
+            .send(&alice_id, format!("too-late-{index}").as_bytes())
+            .await
+            .expect("send");
+        match bob.next().await.expect("answered") {
+            Incoming::Status {
+                seq: reported,
+                outcome,
+            } => {
+                assert_eq!(reported, seq);
+                assert!(matches!(outcome, Outcome::Queued { .. }), "{outcome:?}");
+            }
+            other => panic!("expected a status, got {other:?}"),
+        }
+    }
+    relay.restart_with_clock(25 * DAY_MS);
+
+    // Alice returns to nothing but an honest count: the window took the messages,
+    // and the relay says so rather than reporting an empty queue.
+    let mut alice = RelayClient::connect(relay.addr, "acct-1", &alice_key, &alice_cert)
+        .await
+        .expect("alice reattaches after a month away");
+    let (late, report) = alice.drain_all(4).await.expect("drain after the window");
+    assert!(
+        late.is_empty(),
+        "messages past the retention window are not delivered: {late:?}"
+    );
+    assert_eq!(
+        report.expired, 2,
+        "the two that expired are counted, not silently lost: {report:?}"
+    );
+    assert_eq!(report.queued, 0);
 }

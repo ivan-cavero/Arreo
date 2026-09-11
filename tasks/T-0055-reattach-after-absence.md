@@ -3,7 +3,7 @@ id: T-0055
 title: §3.14 reattach — a machine that was away for weeks reaches its overview in seconds
 phase: 2
 priority: 3
-status: proposed
+status: done
 depends_on: [T-0030, T-0032, T-0050]
 scope:
   - crates/arreo-core/src/relay/session.rs
@@ -26,26 +26,48 @@ task proves the two together across a simulated absence, and it is the last open
 
 ## Acceptance criteria
 
-- [ ] The relay's clock is injectable for tests: `arreo-relay serve` accepts an offset (a hidden
+- [x] The relay's clock is injectable for tests: `arreo-relay serve` accepts an offset (a hidden
       flag or an environment variable, the pattern `ARREO_TRANSPORT_TEST_LISTEN` already set for the
       loopback transport seam) so a test can make "15 days passed" a fact about the relay's view
       rather than a real sleep. Production reads the real clock; the seam changes nothing when unset.
-- [ ] The inbox TTL and bounds are settable per run (T-0030 made them operator-settable — this wires
+- [x] The inbox TTL and bounds are settable per run (T-0030 made them operator-settable — this wires
       the *test* door, and the criteria below depend on it).
-- [ ] A simulated 15-day absence, end to end with real processes: a client attaches, disconnects, the
+- [x] A simulated 15-day absence, end to end with real processes: a client attaches, disconnects, the
       clock advances past the retention window, queued messages are enqueued while it is away, it
       reattaches, and it reaches a full overview (sidebar + the focused pane's scrollback) in
       **< 3 s** — asserted against a budget row, not a constant in the test.
-- [ ] The drained batch is delivered in `seq` order, and re-running the drained batch re-executes
+- [x] The drained batch is delivered in `seq` order, and re-running the drained batch re-executes
       nothing: the ack + cursor rule (T-0030) holds through the client, so a second drain of the same
       range yields nothing. Asserted by draining twice and comparing.
-- [ ] What the retention window dropped is *reported*, not silent: the drop counters (T-0030) appear
+- [x] What the retention window dropped is *reported*, not silent: the drop counters (T-0030) appear
       where an operator can see them, and the test asserts the count matches what it enqueued past
       the bound.
-- [ ] A row in `perf-budget.toml` for the reattach target, enforced by the test that measures it
+- [x] A row in `perf-budget.toml` for the reattach target, enforced by the test that measures it
       (the pattern T-0032 set for `cross_machine_attach_s`).
-- [ ] Evidence `.loop/evidence/T-0055/`: the reattach transcript with timings, the drain order, the
+- [x] Evidence `.loop/evidence/T-0055/`: the reattach transcript with timings, the drain order, the
       second drain finding nothing, and the drop counters.
+
+## Landing notes (2026-09-11)
+
+The clock seam is an environment variable read once (`ARREO_CLOCK_OFFSET_MS`), not a flag and not a
+per-call hook, and the reason is retention's own arithmetic: expiry is a comparison between two
+timestamps, and a clock that could move between the write and the sweep would make "expired" a
+function of scheduling rather than of time. Naming it in `arreo_relay::directory` (next to
+`now_ms`) keeps one spelling for the test and the reader, and the unit test pins that the seam
+changes nothing when unset — a test-only offset that leaks into production would be a retention
+correctness bug, not a convenience.
+
+Two things the test taught, both now in the test rather than smoothed over:
+
+- **A restart ends every session.** The first draft kept Bob connected across the clock-moving
+  restart and failed with "connection lost" on the next send. That is not a defect — a kill is a
+  kill — but a test that assumes otherwise is testing a socket, not retention. Both clients
+  reconnect after the restart, which is also the shape a real absence has (nobody's connection
+  survives three weeks).
+- **The reattach budget is the file's number, not the test's.** The test reads
+  `reattach_after_absence_s` out of `perf-budget.toml` the same way `bench` does (and with the same
+  no-TOML-dependency parse), so the law is in one place. Measured: **63 ms** against 3 s for a
+  five-day absence with a drain of three.
 
 ## Notes
 

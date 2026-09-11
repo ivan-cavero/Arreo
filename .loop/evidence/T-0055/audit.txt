@@ -1,0 +1,33 @@
+# T-0055 evidence — a machine that was away for weeks reattaches in seconds
+
+The absence is simulated by moving the relay's clock across a restart
+(`ARREO_CLOCK_OFFSET_MS`), not by sleeping: a real fifteen-day wait is not a
+test, and a short TTL with a real sleep is worse than either — slow, and still
+not the window it claims to exercise. The offset is read once, so every clock
+read in a run shifts together.
+
+## 1. The absence, end to end (a real relay process, real clients)
+
+$ cargo test -p arreo-relay --test inbox a_machine_that_was_away -- --nocapture
+
+absence: reattached after 5 days in 63 ms (budget 3000 ms)
+test a_machine_that_was_away_for_weeks_reattaches_and_drains_once ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 11 filtered out; finished in 0.59s
+
+## 2. The seam changes nothing when unset (production reads the wall clock)
+
+$ cargo test -p arreo-relay --lib directory::
+test directory::tests::the_clock_is_the_wall_clock_when_the_seam_is_unset ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 9 filtered out; finished in 0.00s
+
+## 3. The full battery (final code)
+
+cargo test --workspace: 334 passed, 0 failed across 44 targets
+cargo clippy --workspace --all-targets -- -D warnings: 0 diagnostics
+cargo fmt --all -- --check: clean
+cargo vet --locked: Vetting Succeeded (336 exempted)
+cargo deny check: advisories ok, bans ok, licenses ok, sources ok
+cargo audit: 343 crate dependencies, no advisories
+cargo xtask check-targets: x86_64-unknown-linux-gnu PASS; x86_64-pc-windows-msvc SKIP (pure-Rust no-sqlite PASS)
+e2e slices: api green, lifecycle 2/2, persistence 3/3, tui 17/17, theme 27/27, relay 14/14
+cargo xtask bench: 6/6 PASS

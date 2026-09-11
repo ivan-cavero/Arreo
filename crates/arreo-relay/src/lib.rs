@@ -14,7 +14,7 @@ pub mod pairing;
 pub mod router;
 pub mod store;
 
-pub use directory::{Directory, DirectoryFailure, JoinTicket};
+pub use directory::{Directory, DirectoryFailure, JoinTicket, CLOCK_OFFSET_ENV};
 pub use inbox::{
     Drained, Enqueued, Inbox, InboxError, InboxLimits, InboxStats, DEFAULT_MAX_MB,
     DEFAULT_MAX_MESSAGES, DEFAULT_TTL_DAYS,
