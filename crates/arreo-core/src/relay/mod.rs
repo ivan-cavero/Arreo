@@ -49,7 +49,7 @@
 pub mod client;
 
 #[cfg(feature = "transport")]
-pub use client::{Incoming, RelayClient};
+pub use client::{Incoming, RelayClient, RelayReader, RelayWriter};
 
 use crate::identity::{DeviceCert, DeviceId, VerifyingKey};
 use serde::{Deserialize, Serialize};

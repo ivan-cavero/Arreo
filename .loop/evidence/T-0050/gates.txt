@@ -1,0 +1,31 @@
+T-0050 gate battery (final) — 2026-09-11T09:13:09Z
+
+== workspace suite ==
+passed=288 failed=0
+
+== clippy / fmt ==
+0
+(0 = clean)
+fmt clean
+
+== supply chain ==
+Vetting Succeeded (336 exempted)
+advisories ok, bans ok, licenses ok, sources ok
+0
+(0 = none)
+
+== cross-target ==
+check-targets: x86_64-unknown-linux-gnu PASS
+check-targets: x86_64-pc-windows-msvc SKIP (pure-Rust (arreo-core, no sqlite) PASS; C deps need SDK (lib.exe) — CI covers)
+check-targets: 1 pass, 1 skip (CI matrix is authority for skipped)
+
+== e2e slices ==
+api: all verbs green over the real socket
+lifecycle: 2 passed, 0 failed
+persistence: 3 passed, 0 failed
+tui: 17 passed, 0 failed
+theme: 27 passed, 0 failed
+
+== bench ==
+5
+of 6 budgets PASS

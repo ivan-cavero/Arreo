@@ -28,7 +28,7 @@ use super::noise::{FlightGuard, SecureChannel, TransportError};
 use crate::identity::keys::NoiseStatic;
 use crate::identity::{DeviceId, VerifyingKey};
 use quinn::crypto::rustls::QuicClientConfig;
-use quinn::{ClientConfig, Connection, Endpoint, ServerConfig};
+use quinn::{ClientConfig, Connection, Endpoint, IdleTimeout, ServerConfig};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls::pki_types::{ServerName, UnixTime};
 use std::collections::HashMap;
@@ -188,7 +188,18 @@ pub fn client_endpoint() -> Result<Endpoint, QuicError> {
     let quic = QuicClientConfig::try_from(crypto).map_err(|e| QuicError::Config(e.to_string()))?;
     let mut config = ClientConfig::new(Arc::new(quic));
     let mut transport = transport_config();
+    // Keep-alives hold a quiet-but-alive connection open (a NAT binding is what
+    // they are for), and the idle timeout is what notices the opposite case: a
+    // peer that is simply gone. The default is half a minute, which means a
+    // daemon whose relay died keeps writing into a dead connection for that long
+    // before its reconnect loop can start. Fifteen seconds is two missed
+    // keep-alives — long enough not to drop a live connection over one lost
+    // packet, short enough that "the relay is absent" costs a bounded, quick
+    // retry rather than a stall.
     transport.keep_alive_interval(Some(Duration::from_secs(5)));
+    transport.max_idle_timeout(Some(
+        IdleTimeout::try_from(Duration::from_secs(15)).expect("a valid idle timeout"),
+    ));
     config.transport_config(Arc::new(transport));
     endpoint.set_default_client_config(config);
     Ok(endpoint)

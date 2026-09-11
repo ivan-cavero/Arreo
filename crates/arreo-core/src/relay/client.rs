@@ -34,6 +34,176 @@ pub enum Incoming {
     Drain(DrainReport),
 }
 
+/// The relay's stream type: one QUIC bidi stream, joined into one object.
+pub type RelayIo = tokio::io::Join<quinn::RecvStream, quinn::SendStream>;
+
+/// Build one envelope for this device to send.
+///
+/// Shared by [`RelayClient`] and [`RelayWriter`] so the two cannot disagree
+/// about what a frame looks like.
+fn outbound(
+    account_id: &str,
+    src: &DeviceId,
+    dst: &DeviceId,
+    seq: u64,
+    kind: RelayKind,
+    payload: Vec<u8>,
+) -> RelayEnvelope {
+    RelayEnvelope {
+        header: RelayHeader {
+            v: RELAY_VERSION,
+            account_id: account_id.to_string(),
+            src_device: src.display_id(),
+            dst: dst.display_id(),
+            seq,
+            kind,
+        },
+        payload,
+    }
+}
+
+/// Read one message from a relay stream.
+///
+/// One framing, one decode, and the branch is the header's `kind` — so there is
+/// no window in which the reader is guessing which shape arrived.
+async fn read_incoming<R>(io: &mut R, buf: &mut Vec<u8>) -> Result<Incoming, ClientError>
+where
+    R: AsyncRead + Unpin,
+{
+    let envelope = read_envelope(io, buf).await?;
+    match envelope.header.kind {
+        RelayKind::Frame => Ok(Incoming::Envelope(envelope)),
+        RelayKind::Status => {
+            // A status payload is either a per-envelope outcome or a drain
+            // report; the drain report has a different field count, so try the
+            // shape the caller is in the middle of before the other.
+            if let Ok(report) = decode_payload::<DrainReport>(&envelope.payload) {
+                if report.v == RELAY_VERSION && report.next_seq != 0 {
+                    return Ok(Incoming::Drain(report));
+                }
+            }
+            let outcome: Outcome = decode_payload(&envelope.payload)?;
+            Ok(Incoming::Status {
+                seq: envelope.header.seq,
+                outcome,
+            })
+        }
+        // The relay never originates these, and a device reading them would
+        // mean the relay echoed a request back.
+        RelayKind::Drain | RelayKind::Ack => Err(ClientError::Protocol(RelayError::Frame(
+            format!("the relay sent a {:?} envelope", envelope.header.kind),
+        ))),
+    }
+}
+
+/// The write half of a relay session.
+///
+/// Split from [`RelayClient`] so a pump can own the writing direction while
+/// another task owns the reading direction — the shape a session needs to carry
+/// a peer's byte stream in both directions at once. Nothing here waits on the
+/// read side, so a writer can never be starved by a peer that has gone quiet.
+pub struct RelayWriter {
+    io: tokio::io::WriteHalf<RelayIo>,
+    account_id: String,
+    device_id: DeviceId,
+    next_seq: u64,
+}
+
+impl std::fmt::Debug for RelayWriter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RelayWriter")
+            .field("device_id", &self.device_id)
+            .finish_non_exhaustive()
+    }
+}
+
+impl RelayWriter {
+    /// Send one payload to `dst`, returning the sequence number the relay will
+    /// report on.
+    pub async fn send(&mut self, dst: &DeviceId, payload: &[u8]) -> Result<u64, ClientError> {
+        let seq = self.next_seq;
+        self.next_seq += 1;
+        let envelope = outbound(
+            &self.account_id,
+            &self.device_id,
+            dst,
+            seq,
+            RelayKind::Frame,
+            payload.to_vec(),
+        );
+        write_frame(&mut self.io, &envelope.encode()?).await?;
+        Ok(seq)
+    }
+
+    /// Send a control message (a drain or an ack) to the relay itself.
+    pub async fn control<T: serde::Serialize>(
+        &mut self,
+        kind: RelayKind,
+        payload: &T,
+    ) -> Result<(), ClientError> {
+        let seq = self.next_seq;
+        self.next_seq += 1;
+        let envelope = outbound(
+            &self.account_id,
+            &self.device_id,
+            &self.device_id.clone(),
+            seq,
+            kind,
+            encode_payload(payload)?,
+        );
+        write_frame(&mut self.io, &envelope.encode()?).await?;
+        Ok(())
+    }
+
+    /// Ask the relay to drain this device's durable inbox from `from_seq`.
+    pub async fn drain(&mut self, from_seq: u64) -> Result<(), ClientError> {
+        self.control(
+            RelayKind::Drain,
+            &DrainRequest {
+                v: RELAY_VERSION,
+                from_seq,
+            },
+        )
+        .await
+    }
+
+    /// Acknowledge everything up to and including `seq`.
+    pub async fn ack(&mut self, seq: u64) -> Result<(), ClientError> {
+        self.control(
+            RelayKind::Ack,
+            &Ack {
+                v: RELAY_VERSION,
+                seq,
+            },
+        )
+        .await
+    }
+
+    #[must_use]
+    pub fn device_id(&self) -> &DeviceId {
+        &self.device_id
+    }
+}
+
+/// The read half of a relay session.
+pub struct RelayReader {
+    io: tokio::io::ReadHalf<RelayIo>,
+    buf: Vec<u8>,
+}
+
+impl std::fmt::Debug for RelayReader {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RelayReader").finish_non_exhaustive()
+    }
+}
+
+impl RelayReader {
+    /// Read the next message from the relay.
+    pub async fn next(&mut self) -> Result<Incoming, ClientError> {
+        read_incoming(&mut self.io, &mut self.buf).await
+    }
+}
+
 /// A live session with the relay.
 pub struct RelayClient {
     io: tokio::io::Join<quinn::RecvStream, quinn::SendStream>,
@@ -166,22 +336,41 @@ impl RelayClient {
         &self.device_id
     }
 
+    /// Split the session into its two directions.
+    ///
+    /// A session that carries a peer's byte stream needs both directions moving
+    /// at once — the reader must never be blocked behind a writer — so the halves
+    /// are owned separately rather than borrowed from one task.
+    #[must_use]
+    pub fn into_split(self) -> (RelayWriter, RelayReader) {
+        let (read, write) = tokio::io::split(self.io);
+        (
+            RelayWriter {
+                io: write,
+                account_id: self.account_id,
+                device_id: self.device_id,
+                next_seq: self.next_seq,
+            },
+            RelayReader {
+                io: read,
+                buf: self.buf,
+            },
+        )
+    }
+
     /// Send one payload to `dst`, returning the sequence number the relay will
     /// report on.
     pub async fn send(&mut self, dst: &DeviceId, payload: &[u8]) -> Result<u64, ClientError> {
         let seq = self.next_seq;
         self.next_seq += 1;
-        let envelope = RelayEnvelope {
-            header: RelayHeader {
-                v: RELAY_VERSION,
-                account_id: self.account_id.clone(),
-                src_device: self.device_id.display_id(),
-                dst: dst.display_id(),
-                seq,
-                kind: RelayKind::Frame,
-            },
-            payload: payload.to_vec(),
-        };
+        let envelope = outbound(
+            &self.account_id,
+            &self.device_id,
+            dst,
+            seq,
+            RelayKind::Frame,
+            payload.to_vec(),
+        );
         write_frame(&mut self.io, &envelope.encode()?).await?;
         Ok(seq)
     }
@@ -223,17 +412,14 @@ impl RelayClient {
     ) -> Result<(), ClientError> {
         let seq = self.next_seq;
         self.next_seq += 1;
-        let envelope = RelayEnvelope {
-            header: RelayHeader {
-                v: RELAY_VERSION,
-                account_id: self.account_id.clone(),
-                src_device: self.device_id.display_id(),
-                dst: self.device_id.display_id(),
-                seq,
-                kind,
-            },
-            payload: encode_payload(payload)?,
-        };
+        let envelope = outbound(
+            &self.account_id,
+            &self.device_id,
+            &self.device_id.clone(),
+            seq,
+            kind,
+            encode_payload(payload)?,
+        );
         write_frame(&mut self.io, &envelope.encode()?).await?;
         Ok(())
     }
@@ -264,30 +450,7 @@ impl RelayClient {
     /// One framing, one decode, and the branch is the header's `kind` — so
     /// there is no window in which the client is guessing which shape arrived.
     pub async fn next(&mut self) -> Result<Incoming, ClientError> {
-        let envelope = read_envelope(&mut self.io, &mut self.buf).await?;
-        match envelope.header.kind {
-            RelayKind::Frame => Ok(Incoming::Envelope(envelope)),
-            RelayKind::Status => {
-                // A status payload is either a per-envelope outcome or a drain
-                // report; the drain report has a different field count, so try
-                // the shape the caller is in the middle of before the other.
-                if let Ok(report) = decode_payload::<DrainReport>(&envelope.payload) {
-                    if report.v == RELAY_VERSION && report.next_seq != 0 {
-                        return Ok(Incoming::Drain(report));
-                    }
-                }
-                let outcome: Outcome = decode_payload(&envelope.payload)?;
-                Ok(Incoming::Status {
-                    seq: envelope.header.seq,
-                    outcome,
-                })
-            }
-            // The relay never originates these, and a device reading them would
-            // mean the relay echoed a request back.
-            RelayKind::Drain | RelayKind::Ack => Err(ClientError::Protocol(RelayError::Frame(
-                format!("the relay sent a {:?} envelope", envelope.header.kind),
-            ))),
-        }
+        read_incoming(&mut self.io, &mut self.buf).await
     }
 
     /// Read until one envelope arrives, skipping the delivery reports of what

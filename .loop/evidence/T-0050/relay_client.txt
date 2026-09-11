@@ -1,0 +1,22 @@
+T-0050 relay session + stream — acceptance tests
+2026-09-11T09:01:31Z
+
+== relay client (real relay binary, real QUIC, real certs, real Noise) ==
+test the_backoff_is_exponential_capped_and_jittered ... ok
+test a_refused_registration_carries_the_relays_reason ... ok
+test a_delivery_failure_ends_the_stream ... ok
+test two_devices_hold_a_noise_session_through_the_relay ... ok
+test a_session_reports_when_its_relay_disappears ... ok
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 20.29s
+
+== core protocol (into_split kept the client honest) ==
+test relay::tests::a_truncated_or_oversized_envelope_is_refused_not_guessed ... ok
+test relay::tests::an_envelope_over_the_cap_cannot_be_encoded ... ok
+test relay::tests::an_envelope_round_trips_and_the_payload_is_never_parsed ... ok
+test relay::tests::an_undecodable_certificate_is_refused ... ok
+test relay::tests::the_proof_is_independent_of_how_the_device_id_is_announced ... ok
+test relay::tests::auth_accepts_a_real_device_and_refuses_every_impostor ... ok
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 103 filtered out; finished in 0.14s
+
+== relay suite (nothing regressed) ==
+passed=48 failed=0

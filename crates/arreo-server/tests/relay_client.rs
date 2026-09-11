@@ -1,0 +1,434 @@
+//! T-0050 acceptance tests: an encrypted byte stream between two devices
+//! through a real relay.
+//!
+//! Nothing is mocked. A real `arreo-relay` process serves a real QUIC listener
+//! with a real SQLite state directory; two real relay sessions authenticate to
+//! it with real device certificates; and T-0023's Noise channel runs over the
+//! stream this task built, so what the relay handles is ciphertext.
+//!
+//! The relay is exercised as a *binary* rather than a linked library on purpose:
+//! that keeps the AGPL `arreo-relay` crate out of this crate's dependency graph
+//! (§7/T-0035).
+
+use arreo_core::identity::{DeviceCert, DeviceId, DeviceKey, Role, RootKey, VerifyingKey};
+use arreo_core::transport::noise::{FlightGuard, SecureChannel};
+use arreo_server::relay_client::{backoff_delay, RelaySession, BACKOFF_BASE, BACKOFF_CEILING};
+use std::io::{BufRead, BufReader};
+use std::net::SocketAddr;
+use std::path::PathBuf;
+use std::process::{Child, Command, Stdio};
+use std::sync::{mpsc, Arc, Mutex};
+use std::time::Duration;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+/// The relay binary, built into the same target directory as this test's own
+/// binaries. Missing means the workspace was not built: a loud failure, because
+/// a silently skipped security test is worse than a red one.
+fn relay_binary() -> PathBuf {
+    let dir = PathBuf::from(env!("CARGO_BIN_EXE_arreo-server"))
+        .parent()
+        .expect("target dir")
+        .to_path_buf();
+    let relay = dir.join("arreo-relay");
+    assert!(
+        relay.exists(),
+        "{} is missing — run `cargo build -p arreo-relay` (or `cargo test --workspace`, \
+         which builds every binary) before this test",
+        relay.display()
+    );
+    relay
+}
+
+/// A running relay, its state directory, and everything it has logged.
+struct Relay {
+    child: Child,
+    addr: SocketAddr,
+    state_dir: PathBuf,
+    log: Arc<Mutex<String>>,
+}
+
+impl Drop for Relay {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        let _ = std::fs::remove_dir_all(&self.state_dir);
+    }
+}
+
+impl Relay {
+    fn start(tag: &str) -> Self {
+        let state_dir = std::env::temp_dir().join(format!(
+            "arreo-relay-client-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&state_dir);
+        std::fs::create_dir_all(&state_dir).expect("scratch state dir");
+        let mut child = Command::new(relay_binary())
+            .args([
+                "serve",
+                "--listen",
+                "127.0.0.1:0",
+                "--state-dir",
+                &state_dir.display().to_string(),
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("the relay starts");
+
+        let stderr = child.stderr.take().expect("stderr is piped");
+        let log = Arc::new(Mutex::new(String::new()));
+        let (ready_tx, ready_rx) = mpsc::channel();
+        {
+            let log = Arc::clone(&log);
+            std::thread::spawn(move || {
+                // Keep reading for the process's whole life: dropping the pipe
+                // would make the relay die on its next log line (EPIPE).
+                for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+                    if let Some(rest) = line.split("router on ").nth(1) {
+                        if let Some(addr) = rest.split_whitespace().next() {
+                            if let Ok(addr) = addr.parse::<SocketAddr>() {
+                                let _ = ready_tx.send(addr);
+                            }
+                        }
+                    }
+                    let mut held = log.lock().expect("log");
+                    held.push_str(&line);
+                    held.push('\n');
+                }
+            });
+        }
+        let addr = ready_rx
+            .recv_timeout(Duration::from_secs(20))
+            .expect("the relay announces its address");
+        Self {
+            child,
+            addr,
+            state_dir,
+            log,
+        }
+    }
+
+    fn log_text(&self) -> String {
+        self.log.lock().expect("log").clone()
+    }
+
+    fn register_account(&self, account_id: &str, root: &VerifyingKey) {
+        let output = Command::new(relay_binary())
+            .args([
+                "account",
+                "add",
+                "--state-dir",
+                &self.state_dir.display().to_string(),
+                "--account",
+                account_id,
+                "--root-key",
+                &root
+                    .to_bytes()
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect::<String>(),
+            ])
+            .output()
+            .expect("the account command runs");
+        assert!(
+            output.status.success(),
+            "registering an account failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// Every file the relay keeps, for the opacity scan.
+    fn state_bytes(&self) -> Vec<(PathBuf, Vec<u8>)> {
+        let mut out = Vec::new();
+        for entry in std::fs::read_dir(&self.state_dir).expect("state dir") {
+            let path = entry.expect("entry").path();
+            if path.is_file() {
+                out.push((path.clone(), std::fs::read(&path).expect("read")));
+            }
+        }
+        out
+    }
+}
+
+/// A device with a certificate issued by `root`.
+fn device(root: &RootKey, name: &str, serial: u64) -> (DeviceKey, DeviceCert) {
+    let key = DeviceKey::generate().expect("entropy");
+    let cert = DeviceCert::issue(root, &key.public(), name, Role::Owner, 1_000, serial);
+    (key, cert)
+}
+
+fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+    !needle.is_empty() && haystack.windows(needle.len()).any(|w| w == needle)
+}
+
+/// The headline criterion: two devices hold an encrypted byte stream through the
+/// relay, and the relay never sees the plaintext.
+#[tokio::test]
+async fn two_devices_hold_a_noise_session_through_the_relay() {
+    let relay = Relay::start("noise");
+    let root = RootKey::generate().expect("entropy");
+    relay.register_account("acct-1", &root.public());
+
+    let (alice_key, alice_cert) = device(&root, "alice", 1);
+    let (bob_key, bob_cert) = device(&root, "bob", 2);
+    let alice_id = alice_cert.device().clone();
+    let bob_id = bob_cert.device().clone();
+
+    // Both devices dial the relay: the destination must be known to the relay
+    // before an envelope addressed to it will be accepted.
+    let alice_session = RelaySession::dial(relay.addr, "acct-1", &alice_key, &alice_cert)
+        .await
+        .expect("alice registers");
+    let mut bob_session = RelaySession::dial(relay.addr, "acct-1", &bob_key, &bob_cert)
+        .await
+        .expect("bob registers");
+
+    // Alice initiates: her Noise handshake starts the moment she writes.
+    let alice_stream = alice_session.stream_to(&bob_id);
+    let alice_static = alice_key.noise_static();
+    let bob_public = bob_key.public();
+    // `connect`'s third argument is the id *we* announce — Alice announces
+    // herself, and pins Bob's key. Getting this backwards is how a handshake
+    // fails with `UnknownPeer` while looking like a key problem.
+    let announced = alice_id.display_id();
+    let initiator = tokio::spawn(async move {
+        SecureChannel::connect(alice_stream, &alice_static, &announced, &bob_public).await
+    });
+
+    // Bob learns a peer is talking to him, opens the matching stream, and
+    // completes the handshake as the responder.
+    let peer = tokio::time::timeout(Duration::from_secs(10), bob_session.next_peer())
+        .await
+        .expect("bob is told about the peer")
+        .expect("a peer arrived");
+    assert_eq!(peer, alice_id, "the announced peer is alice");
+
+    let bob_stream = bob_session.stream_to(&peer);
+    let bob_static = bob_key.noise_static();
+    let alice_public = alice_key.public();
+    let guard = FlightGuard::default();
+    let expected = alice_id.clone();
+    let responder = SecureChannel::accept(bob_stream, &bob_static, &guard, move |hint| {
+        (*hint == expected).then_some(alice_public)
+    });
+
+    let (mut alice, (mut bob, learned)) = tokio::join!(
+        async {
+            tokio::time::timeout(Duration::from_secs(20), initiator)
+                .await
+                .expect("alice's handshake completes")
+                .expect("alice's task")
+                .expect("alice's handshake")
+        },
+        async {
+            tokio::time::timeout(Duration::from_secs(20), responder)
+                .await
+                .expect("bob's handshake completes")
+                .expect("bob's handshake")
+        }
+    );
+    // The responder learns which device it authenticated — the id the daemon
+    // needs for its audit row and its per-verb policy.
+    assert_eq!(learned, alice_id, "bob authenticated alice");
+
+    // Each end authenticated the *other's* pinned key: that is the property the
+    // relay in the middle cannot fake.
+    assert_eq!(alice.remote_static(), bob_key.noise_static().public());
+    assert_eq!(bob.remote_static(), alice_key.noise_static().public());
+
+    // Data both ways, with a marker the relay must never hold.
+    let marker = "ARREO-RELAY-PLAINTEXT-MARKER-7d21";
+    let message = format!("\x1b[32magent\x1b[0m $ {marker}\n> waiting\n").into_bytes();
+    alice.write_all(&message).await.expect("alice writes");
+    alice.flush().await.expect("flush");
+    let mut got = vec![0u8; message.len()];
+    tokio::time::timeout(Duration::from_secs(10), bob.read_exact(&mut got))
+        .await
+        .expect("bob reads within the timeout")
+        .expect("bob reads");
+    assert_eq!(got, message, "the payload survives byte-identical");
+
+    // ...and back the other way, so the stream is proven bidirectional.
+    let reply = b"pong-through-the-relay".to_vec();
+    bob.write_all(&reply).await.expect("bob writes");
+    bob.flush().await.expect("flush");
+    let mut back = vec![0u8; reply.len()];
+    tokio::time::timeout(Duration::from_secs(10), alice.read_exact(&mut back))
+        .await
+        .expect("alice reads within the timeout")
+        .expect("alice reads");
+    assert_eq!(back, reply);
+
+    // A payload larger than one envelope exercises the chunking: the stream is a
+    // byte stream, so a write of any size must arrive whole, in order, with the
+    // envelope boundaries invisible above it.
+    let large: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+    let expected_large = large.clone();
+    alice.write_all(&large).await.expect("a large write");
+    alice.flush().await.expect("flush");
+    let mut received = vec![0u8; expected_large.len()];
+    tokio::time::timeout(Duration::from_secs(20), bob.read_exact(&mut received))
+        .await
+        .expect("the large payload arrives within the timeout")
+        .expect("the large payload arrives");
+    assert_eq!(
+        received, expected_large,
+        "chunking must be invisible above the stream"
+    );
+
+    // A zero-length write is a no-op, not an envelope: the stream stays healthy.
+    alice.write_all(b"").await.expect("an empty write");
+    alice.flush().await.expect("flush");
+    alice
+        .write_all(b"still here")
+        .await
+        .expect("write after empty");
+    alice.flush().await.expect("flush");
+    let mut tail = vec![0u8; b"still here".len()];
+    tokio::time::timeout(Duration::from_secs(10), bob.read_exact(&mut tail))
+        .await
+        .expect("the stream survives an empty write")
+        .expect("read");
+    assert_eq!(tail, b"still here");
+
+    // The relay carried ciphertext: the marker is nowhere in its state or logs.
+    for (path, bytes) in relay.state_bytes() {
+        assert!(
+            !contains(&bytes, marker.as_bytes()),
+            "the plaintext reached {} — the relay must not hold what it routes",
+            path.display()
+        );
+    }
+    let log = relay.log_text();
+    assert!(
+        !log.contains(marker),
+        "the plaintext reached the relay's log:\n{log}"
+    );
+    // The log is not empty, so the assertion above is not vacuous.
+    assert!(
+        log.contains("authenticated"),
+        "the relay logs its sessions:\n{log}"
+    );
+}
+
+/// A refusal from the relay is surfaced with the relay's own reason, and is not
+/// something a caller should retry in a tight loop.
+#[tokio::test]
+async fn a_refused_registration_carries_the_relays_reason() {
+    let relay = Relay::start("refused");
+    let root = RootKey::generate().expect("entropy");
+    relay.register_account("acct-1", &root.public());
+    let (key, cert) = device(&root, "alice", 1);
+
+    let refused = RelaySession::dial(relay.addr, "acct-not-registered", &key, &cert).await;
+    match refused {
+        Err(arreo_server::SessionError::Client(arreo_core::relay::ClientError::Refused {
+            reason,
+        })) => assert!(
+            reason.contains("unknown account"),
+            "the relay's own reason must reach the caller: {reason}"
+        ),
+        other => panic!("an unknown account must be refused: {other:?}"),
+    }
+}
+
+/// A stream whose bytes the relay could not deliver fails loudly instead of
+/// silently losing a chunk.
+#[tokio::test]
+async fn a_delivery_failure_ends_the_stream() {
+    let relay = Relay::start("undeliverable");
+    let root = RootKey::generate().expect("entropy");
+    relay.register_account("acct-1", &root.public());
+    let (alice_key, alice_cert) = device(&root, "alice", 1);
+    let session = RelaySession::dial(relay.addr, "acct-1", &alice_key, &alice_cert)
+        .await
+        .expect("alice registers");
+
+    // A destination the relay has never seen: the envelope cannot be delivered
+    // and cannot be queued, so the relay says so.
+    let stranger = DeviceKey::generate().expect("entropy");
+    let stranger_id = DeviceId::from_key(&stranger.public());
+    let mut stream = session.stream_to(&stranger_id);
+
+    stream
+        .write_all(b"into the void")
+        .await
+        .expect("buffered write");
+    stream.flush().await.expect("flush");
+
+    let mut buf = [0u8; 16];
+    let outcome = tokio::time::timeout(Duration::from_secs(10), stream.read(&mut buf))
+        .await
+        .expect("the failure arrives promptly");
+    let error = outcome.expect_err("a stream whose bytes were not delivered must fail");
+    assert_eq!(
+        error.kind(),
+        std::io::ErrorKind::ConnectionAborted,
+        "{error}"
+    );
+    let text = error.to_string();
+    assert!(
+        text.contains("does not know that device") || text.contains("offline"),
+        "the failure must say why: {text}"
+    );
+}
+
+/// The reconnect policy is a pure function, so its shape is asserted directly
+/// rather than by sleeping.
+#[test]
+fn the_backoff_is_exponential_capped_and_jittered() {
+    // Without jitter, exact doubling from the base.
+    assert_eq!(backoff_delay(0, 0.0), BACKOFF_BASE);
+    assert_eq!(backoff_delay(1, 0.0), BACKOFF_BASE * 2);
+    assert_eq!(backoff_delay(2, 0.0), BACKOFF_BASE * 4);
+    assert_eq!(backoff_delay(3, 0.0), BACKOFF_BASE * 8);
+
+    // It is capped: a relay that is down for an hour costs one retry per
+    // ceiling, not a spin.
+    assert_eq!(backoff_delay(20, 0.0), BACKOFF_CEILING);
+    assert_eq!(backoff_delay(64, 0.0), BACKOFF_CEILING);
+    assert!(backoff_delay(64, 1.0) <= BACKOFF_CEILING.mul_f64(1.25));
+
+    // Jitter spreads a fleet: the same attempt never waits exactly the same
+    // time, and the spread is bounded so a caller can still reason about it.
+    let quiet = backoff_delay(4, 0.0);
+    let loud = backoff_delay(4, 1.0);
+    assert!(loud > quiet, "jitter must add time: {loud:?} vs {quiet:?}");
+    assert!(
+        loud <= quiet.mul_f64(1.25),
+        "jitter must stay bounded: {loud:?} vs {quiet:?}"
+    );
+    // And the very first retry is quick, so a momentary blip is invisible.
+    assert!(backoff_delay(0, 0.0) <= Duration::from_millis(500));
+}
+
+/// A session whose relay goes away reports that it closed, so a caller can
+/// reconnect instead of writing into a dead connection.
+#[tokio::test]
+async fn a_session_reports_when_its_relay_disappears() {
+    let mut relay = Relay::start("gone");
+    let root = RootKey::generate().expect("entropy");
+    relay.register_account("acct-1", &root.public());
+    let (key, cert) = device(&root, "alice", 1);
+    let mut session = RelaySession::dial(relay.addr, "acct-1", &key, &cert)
+        .await
+        .expect("alice registers");
+
+    let _ = relay.child.kill();
+    let _ = relay.child.wait();
+
+    // Bounded, and bounded *quickly*: the client's idle timeout is 15 s, so a
+    // relay that simply vanished is noticed in seconds rather than half a
+    // minute — which is what lets a reconnect loop start promptly.
+    let start = std::time::Instant::now();
+    tokio::time::timeout(Duration::from_secs(30), session.closed())
+        .await
+        .expect("the session notices its relay is gone within a bounded time");
+    assert!(
+        start.elapsed() < Duration::from_secs(25),
+        "a vanished relay must be noticed promptly, took {:?}",
+        start.elapsed()
+    );
+}
