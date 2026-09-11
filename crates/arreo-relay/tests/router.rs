@@ -666,6 +666,54 @@ async fn a_write_for_another_accounts_machine_is_refused() {
     );
 }
 
+/// A second session for one device takes the route, and the session it replaced is
+/// **ended rather than left holding a connection** (T-0060).
+///
+/// The mechanism matters: the relay keeps one live route per device, so a CLI verb
+/// run on a machine that hosts a daemon replaces that daemon's session. Nothing
+/// about the replaced session would end on its own — its own reader holds a sender
+/// clone — so without this it sits connected, unrouted and unaware, and the machine
+/// is unreachable by name until something restarts the daemon.
+#[tokio::test]
+async fn a_replaced_session_is_ended_rather_than_left_stranded() {
+    let relay = Relay::start("displaced");
+    let root = RootKey::generate().expect("entropy");
+    relay.register_account("acct-1", &root.public());
+    let (alice_key, alice_cert) = device(&root, "alice", 1);
+
+    // The "daemon": a session that holds the route.
+    let daemon = RelaySession::dial(relay.addr, "acct-1", &alice_key, &alice_cert)
+        .await
+        .expect("alice registers");
+    let closed = daemon.closed_handle();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), closed.wait())
+            .await
+            .is_err(),
+        "the session must be live to begin with"
+    );
+
+    // The "CLI verb on that machine": the same device identity, so the same route.
+    let cli = RelaySession::dial(relay.addr, "acct-1", &alice_key, &alice_cert)
+        .await
+        .expect("the second session registers");
+
+    // The replaced session is told promptly (T-0050's backoff base is 250 ms, so a
+    // client that reconnects gets its route back in about that long).
+    tokio::time::timeout(Duration::from_secs(5), closed.wait())
+        .await
+        .expect("the replaced session must be ended, not left connected and unrouted");
+
+    // And the new session is the live one.
+    let still_open = cli.closed_handle();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), still_open.wait())
+            .await
+            .is_err(),
+        "the replacing session must be the one holding the route"
+    );
+}
+
 /// A request the relay cannot read is a refusal, not a session-ending error.
 #[tokio::test]
 async fn a_malformed_join_is_refused() {

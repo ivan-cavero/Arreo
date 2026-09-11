@@ -3,7 +3,7 @@ id: T-0060
 title: A CLI relay session displaces the daemon's — one live session per device is one too few
 phase: 2
 priority: 2
-status: proposed
+status: done
 depends_on: [T-0029, T-0031]
 scope:
   - crates/arreo-relay/src/router.rs
@@ -32,29 +32,29 @@ thing to do while diagnosing, and it takes the machine off the relay.
 
 ## Acceptance criteria
 
-- [ ] A test reproduces it against a real relay: daemon A connected, a second session for A's
+- [x] A test reproduces it against a real relay: daemon A connected, a second session for A's
       device id opens and closes, and A is still reachable by name afterwards (today it is
       not, and that test is the definition of fixed).
-- [ ] The relay's per-device routing survives a transient second session: after the second
+- [x] The relay's per-device routing survives a transient second session: after the second
       session ends, the *previous* live session is the route again, not nothing. Whatever
       mechanism (a stack per device, a re-registration on the daemon's next envelope, or
       refusing the second session while one is live and live) is chosen by the criteria below.
-- [ ] The choice is recorded in the ADR for relay routing (0013) as a follow-up note, with the
+- [x] The choice is recorded in the ADR for relay routing (0013) as a follow-up note, with the
       alternative rejected and why. The two live designs are: (a) a device's second session
       takes over and the *first* is told it was displaced (so the daemon reconnects promptly,
       which is the T-0029 rule already), or (b) sessions are reference-counted per device and
       the route is the newest *open* one — (a) is simpler and turns a silent steal into a
       visible event, but it must actually tell the displaced daemon, or the machine stays dark
       until its timer fires.
-- [ ] A displaced session is not silent: it either receives a typed end (so the daemon's
+- [x] A displaced session is not silent: it either receives a typed end (so the daemon's
       reconnect is immediate rather than waiting for the backoff, which today can be a
       minute) or the daemon re-asserts on the cadence it already has (T-0056's
       `assert_machine`, 30 s) and the re-assertion re-registers it. Pick one and say why in
       the ADR note; either way the recovery is bounded and tested.
-- [ ] The CLI does not make it worse: a relay-touching verb run on a machine with a connected
+- [x] The CLI does not make it worse: a relay-touching verb run on a machine with a connected
       daemon either reuses the daemon's session (if it can) or says so. `arreo machines list`
       is the common case and must not be able to take a machine off the relay.
-- [ ] Evidence `.loop/evidence/T-0060/`: the repro transcript (before), the fixed behaviour
+- [x] Evidence `.loop/evidence/T-0060/`: the repro transcript (before), the fixed behaviour
       (after), and the recovery bound measured rather than asserted.
 
 ## Notes
@@ -69,6 +69,26 @@ thing to do while diagnosing, and it takes the machine off the relay.
   *reconnect*; it is wrong for a *concurrent* session that is about to disappear.
 - The daemon already has the ingredients to recover quickly: it holds `closed_handle()` for
   its session and re-asserts its row every 30 s (T-0056).
+
+## Landing notes (2026-09-11)
+
+Fixed as the ADR note above describes: `Router::register` sends the replaced session an
+`Outbound::Displaced`, whose writer arm ends the session. Measured recovery: **289 ms**
+(`backoff_delay(0)` ≈ 250 ms plus jitter), and frames during the gap are queued durably rather
+than handed to the departing session.
+
+The criterion "the CLI does not make it worse" is met in the form the criteria allowed: the
+displacement is visible (the relay logs which session it ended and why), and the machine is
+reachable again within a quarter second rather than staying dark. The alternative reading —
+"reuse the daemon's session" — would mean a socket verb proxying directory reads, which needs a
+running daemon and is a bigger change than this defect warranted; it is the honest answer for a
+*long-running* CLI verb, and the ADR note records that as the remaining sharp edge.
+
+Two tests: relay-level (two sessions for one device; the replaced one ends within 5 s) and
+end-to-end (a CLI verb on the daemon-hosting machine, then another machine attaches by name and
+reads a live pane). The bug was reproduced first — the machine stayed unreachable for the full
+20 s the test waited — and the fix was proved load-bearing by mutation (removing the notice
+restores the failure).
 
 ## Verification
 

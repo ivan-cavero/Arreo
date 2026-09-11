@@ -719,3 +719,99 @@ fn an_offline_machine_is_refused_quickly_with_its_presence() {
     );
     drop(stale);
 }
+
+/// **T-0060's repro.** A CLI verb run *on the machine that hosts a daemon* must not
+/// leave that machine unreachable.
+///
+/// The mechanism: a relay session authenticates as a **device**, and a machine's
+/// daemon and its CLI share one device identity (that is the "one identity per
+/// device" rule). The relay keeps one route per device, so the CLI's session
+/// replaces the daemon's — and because the CLI's session *ends* when the command
+/// finishes, the route is then removed entirely while the daemon still holds a
+/// connection it believes in. The machine goes dark until something makes the
+/// daemon reconnect.
+///
+/// This is not hypothetical: `arreo machines list` is what an operator runs while
+/// diagnosing, and it did exactly that until this was fixed.
+#[test]
+fn a_cli_verb_on_a_daemon_host_does_not_leave_it_unreachable() {
+    let relay = Relay::start("displace");
+    let account_root = RootKey::generate().expect("entropy");
+    relay.register_account("acct-1", &account_root.public());
+
+    let mut a = Machine::new("displace-a", &relay, "acct-1", Some("workbox"));
+    let a_device = DeviceKey::generate().expect("entropy");
+    let a_cert = DeviceCert::issue(
+        &account_root,
+        &a_device.public(),
+        "workbox",
+        Role::Owner,
+        1_000,
+        1,
+    );
+    a.install_identity(&account_root, &a_device, &a_cert);
+    a.start_daemon();
+    await_registration(&a);
+    let (code, out) = a.run_local(&["spawn", "pane-a", "/bin/sh", "-c", "echo STILL-REACHABLE"]);
+    assert_eq!(code, 0, "{out}");
+
+    // C is the observer: a different machine, so it never competes for A's route.
+    let c = Machine::new("displace-c", &relay, "acct-1", None);
+    let c_device = DeviceKey::generate().expect("entropy");
+    let c_cert = DeviceCert::issue(
+        &account_root,
+        &c_device.public(),
+        "laptop",
+        Role::Owner,
+        1_000,
+        8,
+    );
+    c.install_identity(&RootKey::generate().expect("entropy"), &c_device, &c_cert);
+    // A pins C (the pairing step): a peer A has never pinned is refused by the
+    // Noise handshake, which would make this test fail for an unrelated reason.
+    let pinned = Command::new(binary("arreo"))
+        .args([
+            "devices",
+            "issue",
+            "--socket",
+            &a.socket.display().to_string(),
+            "--name",
+            "laptop",
+            "--role",
+            "operator",
+            "--key",
+            &c_device.public_hex(),
+        ])
+        .env("ARREO_IDENTITY_DIR", &a.dir)
+        .output()
+        .expect("the issue command runs");
+    assert!(
+        pinned.status.success(),
+        "A must be able to pin C: {}",
+        String::from_utf8_lossy(&pinned.stderr)
+    );
+
+    // The operator's diagnostic, run on A itself: the ordinary thing to do.
+    let (code, out) = a.run(&["machines", "list", "--json"]);
+    assert_eq!(code, 0, "the diagnostic itself must work: {out}");
+
+    // A must still be reachable, and quickly. The daemon is *told* its session was
+    // replaced, so it reconnects on the normal path (T-0050's backoff base is
+    // 250 ms) rather than waiting for a schedule of its own.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut last = String::new();
+    while Instant::now() < deadline {
+        let (_, out) = c.run(&["attach", "--machine", "workbox", "pane-a"]);
+        if out.contains("STILL-REACHABLE") {
+            return;
+        }
+        last = out;
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    panic!(
+        "A never became reachable again after a CLI verb ran on it (last attempt: {last}).\n\
+         A's daemon said:\n{}\nrelay said:\n{}",
+        a.daemon_log(),
+        relay.log()
+    );
+}

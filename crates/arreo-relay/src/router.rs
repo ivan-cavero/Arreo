@@ -116,6 +116,13 @@ enum Outbound {
     PeerGone(DeviceId),
     /// The answer to a `join` or `machines` request (T-0056).
     Directory(DirectoryReply),
+    /// Stop: a newer session for this device took the route (T-0060).
+    ///
+    /// Not a message for the peer — there is nothing to write. It exists so the
+    /// *relay* can end a session it has stopped routing to, rather than leaving it
+    /// connected and silently ignored. The writer returns on this, which closes the
+    /// stream, and the peer's client reconnects on the path it already has.
+    Displaced,
 }
 
 /// The live sessions, keyed by `(account, device)`.
@@ -208,7 +215,21 @@ impl Router {
         let mut live = self.lock_live();
         let token = live.next_token;
         live.next_token += 1;
-        live.senders.insert(session.key(), (sender, token));
+        let displaced = live.senders.insert(session.key(), (sender, token));
+        if let Some((previous, _)) = displaced {
+            // **A replaced route must be told, not just dropped** (T-0060). The map
+            // holds one entry per device, so a second session for the same device —
+            // a CLI verb run on the machine that hosts the daemon, say — takes the
+            // route. The replaced session's own reader keeps a sender clone alive, so
+            // nothing about it would ever end on its own: it would sit connected and
+            // unrouted, and the machine would be unreachable until something else
+            // happened to restart its daemon.
+            //
+            // `try_send` because this runs under the registry lock: a session whose
+            // queue is full is not reading its socket anyway, and the notice is a
+            // courtesy that must not block every other device's registration.
+            let _ = previous.try_send(Outbound::Displaced);
+        }
         token
     }
 
@@ -721,6 +742,17 @@ async fn handle_connection(connection: Connection, router: Arc<Router>) -> Resul
                 // Already framed: writing it directly is what keeps the stored
                 // bytes opaque end to end.
                 Outbound::Raw(bytes) => Ok(bytes),
+                Outbound::Displaced => {
+                    // Returning drops `send`, which ends the stream: the session is
+                    // over, and the device's client learns the way it learns about
+                    // any other ending (T-0060).
+                    eprintln!(
+                        "arreo-relay: ending a displaced session for {} — a newer session \
+                         holds the route",
+                        writer_session.device_id
+                    );
+                    return;
+                }
             };
             match frame {
                 Ok(bytes) => {

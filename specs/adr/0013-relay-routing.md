@@ -109,3 +109,51 @@
   extend rather than replacing.
 - The relay binary gains a tokio runtime and two new doors (`serve`, `account add`) while the T-0024
   pairing CLI keeps its exact behavior — a compatibility surface with tests.
+
+## Follow-up: one route per device, and the session it replaces (T-0060)
+
+The rule above — *a reconnecting device keeps its newer session* — is right for a
+**reconnect** and was wrong for a **concurrent** session that is about to disappear.
+Both look identical to the relay: a second authenticated session for a device id it
+already has.
+
+What the implementation did: `Router::register` replaced the map entry and nothing
+else. The replaced session kept its connection and its read loop (which holds its own
+sender clone, so the queue never closed), was never routed to again, and was never
+told. So a machine whose daemon was replaced stayed **dark**: connected, unrouted,
+unaware.
+
+That is not a corner case. A machine's daemon and its CLI share one device identity
+(one identity per device), so *any* relay-touching verb run on the machine that hosts
+a daemon replaces that daemon's session — and `arreo machines list` is what an
+operator runs while diagnosing. Measured: the machine stayed unreachable for as long
+as the test waited (20 s), with the daemon's log showing a healthy session the whole
+time.
+
+**Decision: the replaced session is told, and it ends.** `register` sends the
+displaced session's queue an `Outbound::Displaced`; its writer task returns, which
+drops the QUIC send stream, and the device's client learns the way it learns about
+any other ending. Recovery is then the client's ordinary reconnect path —
+`backoff_delay(0)` ≈ 250 ms measured, bounded by `BACKOFF_CEILING` — and frames that
+arrive during the gap are **queued durably** rather than handed to the session that
+is on its way out, so nothing is lost.
+
+**Rejected: reference-counting sessions per device, keeping the previous route as a
+fallback.** It looks strictly better — the daemon would never be interrupted at all —
+and it fails on delivery. While a short-lived CLI session is "on top", the relay
+would hand it the next frame addressed to that device; the CLI cannot serve it, and
+the relay has already reported `Delivered`, so a peer's message is lost. Displacing
+and promptly ending costs a quarter-second of queuing and loses nothing; the
+fallback stack costs nothing visible and can lose a message. Correctness over
+convenience, as in every other routing decision here.
+
+**Honest consequence, stated rather than hidden:** two processes sharing one device
+identity will always contend for the route, and a *long-running* CLI verb (an
+`attach`, say) can lose its session to its own machine's daemon reconnecting. That is
+the price of one route per device, and the fix for it is a client that does not share
+the daemon's identity — not a routing rule that lets two sessions both think they are
+the device. Recorded here because the next person will meet it.
+
+Tested at both levels: `crates/arreo-relay/tests/router.rs` (two sessions, one device;
+the first ends within 5 s) and `crates/arreo-cli/tests/remote_machine.rs` (a CLI verb
+on the daemon-hosting machine, then another machine attaches successfully).
