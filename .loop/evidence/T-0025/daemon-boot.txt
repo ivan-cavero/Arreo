@@ -1,0 +1,19 @@
+# T-0025 daemon boot — authority bootstrap and refusal 2026-09-11T02:40:08+02:00
+
+## clean boot (bootstrap)
+arreo-server: device authority ready (root b7c44c6c9a45c2dd…, 0 device(s))
+arreo-server: serving on /tmp/arreo-boot-ev/a.sock
+arreo-server: SIGTERM received, draining...
+permissions:
+700 /tmp/arreo-boot-ev/identity
+600 /tmp/arreo-boot-ev/identity/root.key
+
+## restart (root key reused)
+arreo-server: device authority ready (root b7c44c6c9a45c2dd…, 0 device(s))
+arreo-server: serving on /tmp/arreo-boot-ev/a.sock
+
+## unusable root key (refuses to serve, does not regenerate)
+arreo-server: device identity unavailable: identity: key file /tmp/arreo-boot-ev2/identity/root.key is malformed (want 32 bytes of lowercase hex, got 9 bytes)
+arreo-server: refusing to serve without a device authority (fix or remove the identity directory, then start again)
+  (exit 1)
+root.key after refusal: not a key

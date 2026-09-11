@@ -1,0 +1,42 @@
+# T-0025 device lifecycle — real CLI session 2026-09-11T02:39:55+02:00
+
+## identity + issue + authorize
+device dev_529fc5d0e448009b118a8d370eec7bd8 key 1b182ad76dcd146995009edd7a088571855daacded5913cfba463deedfd76ff8
+(key file: /tmp/arreo-ev-id/identity/device.key)
+pin it on the server with: arreo devices issue --name <name> --role <owner|viewer> --key 1b182ad76dcd146995009edd7a088571855daacded5913cfba463deedfd76ff8
+issued dev_529fc5d0e448009b118a8d370eec7bd8 (laptop) for owner as owner — serial 1
+allowed dev_529fc5d0e448009b118a8d370eec7bd8 (laptop) as owner
+allowed dev_529fc5d0e448009b118a8d370eec7bd8 to Send (role owner)
+  (exit 0)
+allowed dev_529fc5d0e448009b118a8d370eec7bd8 to Read (role owner)
+
+## viewer refused driving
+issued dev_2ad173750044a8c90b5db34556299d64 (phone) for viewer as viewer — serial 2
+allowed dev_2ad173750044a8c90b5db34556299d64 to Read (role viewer)
+denied: device dev_2ad173750044a8c90b5db34556299d64 (viewer) denied: viewer may not Send (needs Control)
+  (exit 1)
+
+## rotation
+rotated dev_2ad173750044a8c90b5db34556299d64 → dev_76c7991e8d9a79eb70e31ccfaa5dcc68 (serial 3); the old key no longer authorizes
+allowed dev_529fc5d0e448009b118a8d370eec7bd8 (laptop) as owner
+  (exit 0)
+root 9eccb7dfb1ee5c71…
+DEVICE                               NAME             ROLE    SERIAL  STATUS
+dev_2ad173750044a8c90b5db34556299d64 phone            viewer       2  rotated → dev_76c7991e8d9a79eb70e31ccfaa5dcc68
+dev_529fc5d0e448009b118a8d370eec7bd8 laptop           owner        1  never seen
+dev_76c7991e8d9a79eb70e31ccfaa5dcc68 phone            viewer       3  never seen
+
+## revocation
+revoked dev_2ad173750044a8c90b5db34556299d64
+root 9eccb7dfb1ee5c71…
+DEVICE                               NAME             ROLE    SERIAL  STATUS
+dev_2ad173750044a8c90b5db34556299d64 phone            viewer       2  revoked
+dev_529fc5d0e448009b118a8d370eec7bd8 laptop           owner        1  never seen
+dev_76c7991e8d9a79eb70e31ccfaa5dcc68 phone            viewer       3  never seen
+
+## audit log
+1789087196094 529fc5d0e448009b118a8d370eec7bd8  issued owner for laptop
+1789087196955 2ad173750044a8c90b5db34556299d64  issued viewer for phone
+1789087198577 76c7991e8d9a79eb70e31ccfaa5dcc68  issued viewer for phone
+1789087198618 2ad173750044a8c90b5db34556299d64  rotated to dev_76c7991e8d9a79eb70e31ccfaa5dcc68
+1789087199393 2ad173750044a8c90b5db34556299d64  revoked

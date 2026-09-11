@@ -33,9 +33,8 @@ pub enum PersistError {
 /// DB path for a socket path (`<socket>.db`).
 #[must_use]
 pub fn db_path_for(socket: &Path) -> PathBuf {
-    let mut path = socket.as_os_str().to_owned();
-    path.push(".db");
-    PathBuf::from(path)
+    // One rule, shared with the device authority and the CLI (T-0025).
+    arreo_core::identity::authority::sidecar_db(socket)
 }
 
 /// Snapshot `panes` (id → pane) into the DB at `socket`'s sidecar path.

@@ -81,10 +81,11 @@ fn audit_log_is_append_only() {
 }
 
 #[test]
-fn v1_database_migrates_to_v2() {
+fn v1_database_migrates_to_the_current_schema() {
     // A v1 DB has only meta+rollups (the T-0006 metrics schema). Opening it
-    // with the v2 store must migrate (sessions/panes/audit appear) and bump
-    // the version — never wipe user data (rollups survive).
+    // with the current store must migrate forward — sessions/panes/audit, then
+    // devices/audit.kind — and bump the version to SCHEMA_VERSION. Never wipe
+    // user data (rollups survive).
     let dir = std::env::temp_dir().join(format!("arreo-mig-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("mig.db");
@@ -102,7 +103,12 @@ fn v1_database_migrates_to_v2() {
         .unwrap();
     }
     let store = SessionStore::open(&path).expect("open migrates");
-    assert_eq!(store.schema_version().expect("version"), 2);
+    // The contract is "opening migrates to current", not "to a hardcoded N":
+    // the assertion does not need editing on the next migration.
+    assert_eq!(
+        store.schema_version().expect("version"),
+        arreo_core::store::SCHEMA_VERSION
+    );
     // Rollup data survived the migration.
     let conn = rusqlite::Connection::open(&path).unwrap();
     let count: i64 = conn
@@ -112,4 +118,57 @@ fn v1_database_migrates_to_v2() {
     // New tables exist and work.
     store.save_topology(&panes(2)).expect("save post-migration");
     assert_eq!(store.load_topology().expect("load").len(), 2);
+    // The v3 additions are present on a database that never had them.
+    assert!(store.devices().expect("devices table exists").is_empty());
+}
+
+#[test]
+fn v2_database_migrates_to_v3_keeping_its_audit_rows() {
+    // T-0025 adds `devices` and `audit.kind` in place. A v2 database with real
+    // audit rows must gain the column without losing or mangling those rows,
+    // and its old rows are prompt events (what they were).
+    let dir = std::env::temp_dir().join(format!("arreo-mig32-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("mig32.db");
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "PRAGMA journal_mode=WAL;
+             CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT);
+             INSERT INTO meta(key, value) VALUES ('schema_version', '2');
+             CREATE TABLE panes(id TEXT PRIMARY KEY, program TEXT NOT NULL,
+               args TEXT NOT NULL, cols INTEGER NOT NULL, rows INTEGER NOT NULL);
+             CREATE TABLE scrollback(pane TEXT NOT NULL, line_no INTEGER NOT NULL,
+               text TEXT NOT NULL, PRIMARY KEY (pane, line_no));
+             CREATE TABLE audit(ts_ms INTEGER NOT NULL, device TEXT NOT NULL,
+               agent TEXT NOT NULL, prompt TEXT NOT NULL, redacted INTEGER NOT NULL);
+             INSERT INTO audit VALUES (1234, 'dev_old', 'agent-1', 'do the thing', 0);",
+        )
+        .unwrap();
+    }
+    let store = SessionStore::open(&path).expect("open migrates");
+    let rows = store.audit_recent(10).expect("audit reads back");
+    assert_eq!(rows.len(), 1, "the pre-existing audit row survived");
+    assert_eq!(rows[0].prompt, "do the thing");
+    assert_eq!(rows[0].device, "dev_old");
+    assert_eq!(
+        rows[0].kind,
+        arreo_core::store::AuditKind::Prompt,
+        "a row written before the column existed is a prompt event"
+    );
+    // And the new kinds write/read alongside it.
+    store
+        .audit_event(
+            arreo_core::store::AuditKind::AuthReject,
+            arreo_core::store::AuditEvent {
+                ts_ms: 2000,
+                device: "dev_new".into(),
+                agent: String::new(),
+                prompt: "no certificate".into(),
+            },
+        )
+        .expect("reject row");
+    let rows = store.audit_recent(10).expect("audit reads back");
+    assert_eq!(rows[0].kind, arreo_core::store::AuditKind::AuthReject);
+    assert_eq!(rows[1].kind, arreo_core::store::AuditKind::Prompt);
 }

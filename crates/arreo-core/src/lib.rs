@@ -6,6 +6,7 @@
 
 pub mod enforce;
 pub mod fixtures;
+pub mod identity;
 pub mod lifecycle;
 pub mod metrics;
 pub mod proto;
@@ -15,3 +16,19 @@ pub mod state;
 pub mod store;
 pub mod theme;
 pub mod vt;
+
+/// Write bytes to an owner-only file (0600 on Unix, created before writing).
+/// Shared by identity key files and device certificates (T-0025).
+pub(crate) fn write_private_bytes(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
+    file.write_all(bytes)?;
+    file.sync_all()
+}

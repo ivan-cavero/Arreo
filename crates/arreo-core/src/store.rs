@@ -6,11 +6,17 @@
 //!
 //! Schema:
 //! - v1 (T-0006): `meta` + `rollups` (metrics history).
-//! - v2 (this task): + `panes(id TEXT PRIMARY KEY, program, args JSON,
+//! - v2 (T-0018): + `panes(id TEXT PRIMARY KEY, program, args JSON,
 //!   cols, rows)` + `scrollback(pane, line_no, text)` + `audit(ts_ms,
 //!   device, agent, prompt, redacted)`.
-//! - `open` runs `migrate()` (v1→v2 `CREATE TABLE IF NOT EXISTS` + version
-//!   bump); future versions append `migrate_vN` steps. Data is never dropped
+//! - v3 (T-0025): + `devices(id, name, role, public_key, serial, issued_at_ms,
+//!   last_seen_ms, revoked)` and `audit.kind` (so a refusal is a first-class
+//!   event, not a prompt with a strange name). **Public material only**: the
+//!   schema has no column a private key could occupy — a device's secret half
+//!   lives in its own 0600 file, never here, because the database is the thing
+//!   that gets copied, backed up and synced.
+//! - `open` runs `migrate()` (v1→v2→v3 `CREATE TABLE IF NOT EXISTS` + version
+//!   bumps); future versions append `migrate_vN` steps. Data is never dropped
 //!   by a migration — the migration test pins a surviving rollup row.
 //!
 //! Audit redaction: prompts are scanned with the fixture secret patterns
@@ -31,7 +37,7 @@ pub enum SessionError {
     Json(#[from] serde_json::Error),
 }
 
-pub const SCHEMA_VERSION: u32 = 2;
+pub const SCHEMA_VERSION: u32 = 3;
 
 /// One pane's persisted record: how to respawn it + what it showed.
 #[derive(Debug, Clone, PartialEq)]
@@ -61,6 +67,58 @@ pub struct StoredAudit {
     pub agent: String,
     pub prompt: String,
     pub redacted: bool,
+    pub kind: AuditKind,
+}
+
+/// What an audit row is about. Refusals are auditable events in their own
+/// right (T-0025): "the daemon said no" must be as visible as "someone asked".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuditKind {
+    /// An agent interaction (the original T-0018 rows).
+    Prompt,
+    /// A connection refused before any work happened.
+    AuthReject,
+    /// A device paired, rotated or revoked.
+    DeviceChange,
+    /// A row written by a newer schema than this build knows.
+    Unknown,
+}
+
+impl AuditKind {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Prompt => "prompt",
+            Self::AuthReject => "auth_reject",
+            Self::DeviceChange => "device_change",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    /// Parse a stored value. An unrecognized kind is `Unknown` rather than an
+    /// error: the audit log is append-only and must stay readable by an older
+    /// binary (forward compatibility for the operator's eyes, not for policy).
+    #[must_use]
+    pub fn parse(text: &str) -> Self {
+        match text {
+            "prompt" => Self::Prompt,
+            "auth_reject" => Self::AuthReject,
+            "device_change" => Self::DeviceChange,
+            _ => Self::Unknown,
+        }
+    }
+}
+
+/// True when `table` has `column` (v2→v3 added `audit.kind` in place).
+fn has_column(conn: &Connection, table: &str, column: &str) -> Result<bool, SessionError> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        if row.get::<_, String>(1)? == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 pub struct SessionStore {
@@ -102,7 +160,136 @@ impl SessionStore {
                 [],
             )?;
         }
+        if version < 3 {
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS devices(
+                   id TEXT PRIMARY KEY, name TEXT NOT NULL, role TEXT NOT NULL,
+                   public_key TEXT NOT NULL, serial INTEGER NOT NULL,
+                   issued_at_ms INTEGER NOT NULL, last_seen_ms INTEGER,
+                   revoked INTEGER NOT NULL DEFAULT 0, retired_to TEXT);
+                 CREATE INDEX IF NOT EXISTS devices_public_key ON devices(public_key);",
+            )?;
+            // Existing audit rows predate the kind column: they are all prompt
+            // events, which is exactly what the default says.
+            if !has_column(conn, "audit", "kind")? {
+                conn.execute_batch(
+                    "ALTER TABLE audit ADD COLUMN kind TEXT NOT NULL DEFAULT 'prompt';",
+                )?;
+            }
+            conn.execute(
+                "INSERT INTO meta(key, value) VALUES ('schema_version', '3')
+                 ON CONFLICT(key) DO UPDATE SET value='3'",
+                [],
+            )?;
+        }
         Ok(())
+    }
+
+    /// Persist a device row (public material only). Idempotent by id.
+    pub fn upsert_device(
+        &self,
+        device: &crate::identity::DeviceRecord,
+    ) -> Result<(), SessionError> {
+        let conn = self.lock()?;
+        conn.execute(
+            "INSERT INTO devices(id, name, role, public_key, serial, issued_at_ms,
+                                 last_seen_ms, revoked, retired_to)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+             ON CONFLICT(id) DO UPDATE SET
+               name=excluded.name, role=excluded.role, public_key=excluded.public_key,
+               serial=excluded.serial, issued_at_ms=excluded.issued_at_ms,
+               last_seen_ms=excluded.last_seen_ms, revoked=excluded.revoked,
+               retired_to=excluded.retired_to",
+            params![
+                device.id.as_str(),
+                device.name,
+                device.role.as_str(),
+                device.public_hex(),
+                device.serial as i64,
+                device.issued_at_ms,
+                device.last_seen_ms,
+                device.revoked as i64,
+                device.retired_to.as_ref().map(|id| id.as_str()),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Every device, newest issuance first is not useful here — id order is
+    /// stable, which is what the CLI and tests want.
+    pub fn devices(&self) -> Result<Vec<crate::identity::DeviceRecord>, SessionError> {
+        use crate::identity::{DeviceId, Role};
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, name, role, public_key, serial, issued_at_ms, last_seen_ms,
+                    revoked, retired_to
+             FROM devices ORDER BY id",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, i64>(5)?,
+                row.get::<_, Option<i64>>(6)?,
+                row.get::<_, i64>(7)?,
+                row.get::<_, Option<String>>(8)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (id, name, role, public_key, serial, issued_at_ms, last_seen_ms, revoked, retired) =
+                row?;
+            let role = Role::parse(&role)
+                .map_err(|_| SessionError::Sqlite(rusqlite::Error::InvalidQuery))?;
+            let id = DeviceId::parse(&id)
+                .map_err(|_| SessionError::Sqlite(rusqlite::Error::InvalidQuery))?;
+            let mut public = [0u8; 32];
+            for (index, byte) in public.iter_mut().enumerate() {
+                let pair = public_key
+                    .get(index * 2..index * 2 + 2)
+                    .ok_or(SessionError::Sqlite(rusqlite::Error::InvalidQuery))?;
+                *byte = u8::from_str_radix(pair, 16)
+                    .map_err(|_| SessionError::Sqlite(rusqlite::Error::InvalidQuery))?;
+            }
+            out.push(crate::identity::DeviceRecord {
+                id,
+                name,
+                role,
+                public_key: public,
+                serial: serial as u64,
+                issued_at_ms,
+                last_seen_ms,
+                revoked: revoked != 0,
+                retired_to: match retired {
+                    Some(text) => Some(
+                        DeviceId::parse(&text)
+                            .map_err(|_| SessionError::Sqlite(rusqlite::Error::InvalidQuery))?,
+                    ),
+                    None => None,
+                },
+            });
+        }
+        Ok(out)
+    }
+
+    /// Flip a device's revoked flag (T-0026 owns the propagation story; this
+    /// is the durable bit it needs).
+    pub fn set_device_revoked(&self, id: &str, revoked: bool) -> Result<bool, SessionError> {
+        let conn = self.lock()?;
+        let changed = conn.execute(
+            "UPDATE devices SET revoked=?2 WHERE id=?1",
+            params![id, revoked as i64],
+        )?;
+        Ok(changed > 0)
+    }
+
+    fn lock(&self) -> Result<std::sync::MutexGuard<'_, Connection>, SessionError> {
+        self.conn
+            .lock()
+            .map_err(|_| SessionError::Sqlite(rusqlite::Error::InvalidQuery))
     }
 
     /// Open (or create + migrate) a file store.
@@ -210,19 +397,24 @@ impl SessionStore {
     /// Append one audit event (redacting secret-shaped content first).
     /// There is deliberately NO update/delete API — append-only by construction.
     pub fn audit(&self, event: AuditEvent) -> Result<(), SessionError> {
+        self.audit_event(AuditKind::Prompt, event)
+    }
+
+    /// Append a typed audit event. `kind` is what makes a refusal readable as
+    /// a refusal in `arreo audit` rather than "a prompt that looks odd".
+    pub fn audit_event(&self, kind: AuditKind, event: AuditEvent) -> Result<(), SessionError> {
         let (prompt, redacted) = redact(&event.prompt);
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|_| SessionError::Sqlite(rusqlite::Error::InvalidQuery))?;
+        let conn = self.lock()?;
         conn.execute(
-            "INSERT INTO audit(ts_ms, device, agent, prompt, redacted) VALUES (?1, ?2, ?3, ?4, ?5)",
+            "INSERT INTO audit(ts_ms, device, agent, prompt, redacted, kind)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![
                 event.ts_ms as i64,
                 event.device,
                 event.agent,
                 prompt,
                 redacted as i64,
+                kind.as_str(),
             ],
         )?;
         Ok(())
@@ -230,12 +422,9 @@ impl SessionStore {
 
     /// Newest audit rows first (operator reads the tail), limited.
     pub fn audit_recent(&self, limit: usize) -> Result<Vec<StoredAudit>, SessionError> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|_| SessionError::Sqlite(rusqlite::Error::InvalidQuery))?;
+        let conn = self.lock()?;
         let mut stmt = conn.prepare(
-            "SELECT ts_ms, device, agent, prompt, redacted FROM audit
+            "SELECT ts_ms, device, agent, prompt, redacted, kind FROM audit
              ORDER BY ts_ms DESC LIMIT ?1",
         )?;
         let rows = stmt.query_map(params![limit as i64], |row| {
@@ -245,6 +434,7 @@ impl SessionStore {
                 agent: row.get(2)?,
                 prompt: row.get(3)?,
                 redacted: row.get::<_, i64>(4)? != 0,
+                kind: AuditKind::parse(&row.get::<_, String>(5)?),
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>()
@@ -263,6 +453,7 @@ impl SessionStore {
                     "agent": event.agent,
                     "prompt": event.prompt,
                     "redacted": event.redacted,
+                    "kind": event.kind.as_str(),
                 }))
                 .map_err(SessionError::Json)?,
             );

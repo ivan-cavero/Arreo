@@ -26,6 +26,8 @@ fn usage() -> ExitCode {
     eprintln!("  arreo service install|uninstall|status [--socket PATH]");
     eprintln!("  arreo server stop [--socket PATH]   (graceful: drain + exit 0)");
     eprintln!("  arreo audit [--limit N] [--socket PATH]   (append-only log, secrets redacted)");
+    eprintln!("  arreo devices <id|list|issue|rotate|revoke|authorize> [--json] [--socket PATH]");
+    eprintln!("      authorize --verb <read|send|...>   (the transport's own decision path)");
     ExitCode::from(2)
 }
 
@@ -59,6 +61,7 @@ fn main() -> ExitCode {
         Some("service") => cmd_service(&args[2..]),
         Some("server") => rt::block_on(cmd_server(&args[2..])),
         Some("audit") => cmd_audit(&args[2..]),
+        Some("devices") => cmd_devices(&args[2..]),
         _ => usage(),
     }
 }
@@ -1056,5 +1059,537 @@ fn cmd_audit(rest: &[String]) -> ExitCode {
             eprintln!("audit: {e}");
             ExitCode::FAILURE
         }
+    }
+}
+
+/// `arreo devices …` (T-0025): the server-host operator's view of device
+/// identity. Reads and writes the same files and store the daemon uses, so it
+/// works whether or not the daemon is running (WAL SQLite tolerates both).
+///
+/// Subcommands:
+///   `id`        — this machine's own device key + id (creates it if absent)
+///   `list`      — every pinned device (add `--json` for scripts)
+///   `issue`     — sign a certificate for a device public key
+///   `rotate`    — move a device onto a new key (the old key stops working)
+///   `revoke`    — refuse a device from now on (durable, audited)
+///   `authorize` — ask the authority about a key (exit 0 = allowed)
+fn cmd_devices(rest: &[String]) -> ExitCode {
+    let (socket, kept) = take_socket(rest);
+    let mut json = false;
+    let mut args: Vec<String> = Vec::new();
+    for arg in kept {
+        if arg == "--json" {
+            json = true;
+        } else {
+            args.push(arg);
+        }
+    }
+    let Some(sub) = args.first().map(String::as_str) else {
+        eprintln!("usage: arreo devices <id|list|issue|rotate|revoke|authorize> [options] [--socket PATH]");
+        return ExitCode::from(2);
+    };
+    match sub {
+        "id" => devices_id(json),
+        "list" => devices_list(&socket, json),
+        "issue" => devices_issue(&socket, &args[1..], json),
+        "rotate" => devices_rotate(&socket, &args[1..], json),
+        "revoke" => devices_revoke(&socket, &args[1..]),
+        "authorize" => devices_authorize(&socket, &args[1..], json),
+        other => {
+            eprintln!("devices: unknown subcommand {other:?}");
+            eprintln!("usage: arreo devices <id|list|issue|rotate|revoke|authorize> [options] [--socket PATH]");
+            ExitCode::from(2)
+        }
+    }
+}
+
+fn open_authority(
+    socket: &std::path::Path,
+) -> Result<arreo_core::identity::authority::DeviceAuthority, ExitCode> {
+    arreo_core::identity::authority::DeviceAuthority::load(
+        arreo_core::identity::authority::Layout::for_socket(socket),
+    )
+    .map_err(|e| {
+        eprintln!("devices: {e}");
+        ExitCode::FAILURE
+    })
+}
+
+/// This machine's client key: printed as id + public key, so the *server*
+/// operator can pin it. Creating it here means "my identity" is one command.
+fn devices_id(json: bool) -> ExitCode {
+    let path = arreo_core::identity::authority::client_key_path();
+    let key = match arreo_core::identity::authority::client_key() {
+        Ok(key) => key,
+        Err(e) => {
+            eprintln!("devices: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let id = arreo_core::identity::DeviceId::from_key(&key.public());
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "device": id.display_id(),
+                "public_key": key.public_hex(),
+                "key_file": path.display().to_string(),
+            })
+        );
+    } else {
+        println!("device {} key {}", id.display_id(), key.public_hex());
+        println!("(key file: {})", path.display());
+        println!("pin it on the server with: arreo devices issue --name <name> --role <owner|viewer> --key {}", key.public_hex());
+    }
+    ExitCode::SUCCESS
+}
+
+fn devices_list(socket: &std::path::Path, json: bool) -> ExitCode {
+    let authority = match open_authority(socket) {
+        Ok(authority) => authority,
+        Err(code) => return code,
+    };
+    let devices = authority.devices();
+    if json {
+        let rows: Vec<serde_json::Value> = devices
+            .iter()
+            .map(|device| {
+                serde_json::json!({
+                    "id": device.id.display_id(),
+                    "name": device.name,
+                    "role": device.role.as_str(),
+                    "public_key": device.public_hex(),
+                    "serial": device.serial,
+                    "issued_at_ms": device.issued_at_ms,
+                    "last_seen_ms": device.last_seen_ms,
+                    "revoked": device.revoked,
+                    "retired_to": device.retired_to.as_ref().map(arreo_core::identity::DeviceId::display_id),
+                })
+            })
+            .collect();
+        println!(
+            "{}",
+            serde_json::json!({
+                "root": authority.root_fingerprint(),
+                "devices": rows,
+            })
+        );
+        return ExitCode::SUCCESS;
+    }
+    println!("root {}…", &authority.root_fingerprint()[..16]);
+    if devices.is_empty() {
+        println!("no devices paired yet (pair one, or issue from a public key)");
+        return ExitCode::SUCCESS;
+    }
+    println!(
+        "{:<36} {:<16} {:<7} {:>6}  STATUS",
+        "DEVICE", "NAME", "ROLE", "SERIAL"
+    );
+    for device in devices {
+        let status = if device.revoked {
+            "revoked".to_string()
+        } else if let Some(replacement) = &device.retired_to {
+            format!("rotated → {}", replacement.display_id())
+        } else if device.last_seen_ms.is_some() {
+            "active".to_string()
+        } else {
+            "never seen".to_string()
+        };
+        println!(
+            "{:<36} {:<16} {:<7} {:>6}  {}",
+            device.id.display_id(),
+            device.name,
+            device.role.as_str(),
+            device.serial,
+            status
+        );
+    }
+    ExitCode::SUCCESS
+}
+
+/// Parse `--name`, `--role`, `--key <hex>` (or `--key-file <path>`).
+fn parse_issue_args(
+    args: &[String],
+) -> Result<(String, arreo_core::identity::Role, String), String> {
+    let mut name: Option<String> = None;
+    let mut role: Option<arreo_core::identity::Role> = None;
+    let mut key: Option<String> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--name" if i + 1 < args.len() => {
+                name = Some(args[i + 1].clone());
+                i += 2;
+            }
+            "--role" if i + 1 < args.len() => {
+                role = arreo_core::identity::Role::parse(&args[i + 1]).ok();
+                if role.is_none() {
+                    return Err(format!("unknown role {:?} (owner|viewer)", args[i + 1]));
+                }
+                i += 2;
+            }
+            "--key" if i + 1 < args.len() => {
+                key = Some(args[i + 1].clone());
+                i += 2;
+            }
+            "--key-file" if i + 1 < args.len() => {
+                key = Some(
+                    std::fs::read_to_string(&args[i + 1])
+                        .map_err(|e| format!("{}: {e}", args[i + 1]))?
+                        .trim()
+                        .to_string(),
+                );
+                i += 2;
+            }
+            other => return Err(format!("unexpected argument {other:?}")),
+        }
+    }
+    let name = name.ok_or("missing --name")?;
+    let role = role.ok_or("missing --role")?;
+    let key = key.ok_or("missing --key <hex> or --key-file <path>")?;
+    Ok((name, role, key))
+}
+
+fn parse_public_key_hex(hex: &str) -> Result<arreo_core::identity::VerifyingKey, String> {
+    let bytes = hex.trim();
+    if bytes.len() != 64 {
+        return Err(format!(
+            "public key must be 64 hex characters (got {})",
+            bytes.len()
+        ));
+    }
+    let mut out = [0u8; 32];
+    for (index, slot) in out.iter_mut().enumerate() {
+        *slot = u8::from_str_radix(&bytes[index * 2..index * 2 + 2], 16)
+            .map_err(|_| "public key is not hex".to_string())?;
+    }
+    arreo_core::identity::VerifyingKey::from_bytes(&out)
+        .map_err(|e| format!("public key is not a valid ed25519 point: {e}"))
+}
+
+fn devices_issue(socket: &std::path::Path, args: &[String], json: bool) -> ExitCode {
+    let (name, role, key_hex) = match parse_issue_args(args) {
+        Ok(parsed) => parsed,
+        Err(e) => {
+            eprintln!("devices issue: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    let key = match parse_public_key_hex(&key_hex) {
+        Ok(key) => key,
+        Err(e) => {
+            eprintln!("devices issue: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    let mut authority = match open_authority(socket) {
+        Ok(authority) => authority,
+        Err(code) => return code,
+    };
+    match authority.issue(&name, role, &key) {
+        Ok(cert) => {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "device": cert.device().display_id(),
+                        "name": cert.name(),
+                        "role": cert.role().as_str(),
+                        "serial": cert.serial(),
+                        "issued_at_ms": cert.payload.issued_at_ms,
+                    })
+                );
+            } else {
+                println!(
+                    "issued {} ({}) for {} as {} — serial {}",
+                    cert.device().display_id(),
+                    cert.name(),
+                    cert.role().as_str(),
+                    role,
+                    cert.serial()
+                );
+            }
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("devices issue: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn devices_rotate(socket: &std::path::Path, args: &[String], json: bool) -> ExitCode {
+    let mut device: Option<arreo_core::identity::DeviceId> = None;
+    let mut name: Option<String> = None;
+    let mut role: Option<arreo_core::identity::Role> = None;
+    let mut key: Option<String> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--device" if i + 1 < args.len() => {
+                device = arreo_core::identity::DeviceId::parse(&args[i + 1]).ok();
+                if device.is_none() {
+                    eprintln!("devices rotate: not a device id: {:?}", args[i + 1]);
+                    return ExitCode::from(2);
+                }
+                i += 2;
+            }
+            "--name" if i + 1 < args.len() => {
+                name = Some(args[i + 1].clone());
+                i += 2;
+            }
+            "--role" if i + 1 < args.len() => {
+                role = arreo_core::identity::Role::parse(&args[i + 1]).ok();
+                if role.is_none() {
+                    eprintln!(
+                        "devices rotate: unknown role {:?} (owner|viewer)",
+                        args[i + 1]
+                    );
+                    return ExitCode::from(2);
+                }
+                i += 2;
+            }
+            "--key" if i + 1 < args.len() => {
+                key = Some(args[i + 1].clone());
+                i += 2;
+            }
+            "--key-file" if i + 1 < args.len() => {
+                key = std::fs::read_to_string(&args[i + 1])
+                    .map(|text| text.trim().to_string())
+                    .ok();
+                i += 2;
+            }
+            other => {
+                eprintln!("devices rotate: unexpected argument {other:?}");
+                return ExitCode::from(2);
+            }
+        }
+    }
+    let (Some(device), Some(key_hex)) = (device, key) else {
+        eprintln!("usage: arreo devices rotate --device <id> [--name N] [--role R] --key <hex>");
+        return ExitCode::from(2);
+    };
+    let key = match parse_public_key_hex(&key_hex) {
+        Ok(key) => key,
+        Err(e) => {
+            eprintln!("devices rotate: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    let mut authority = match open_authority(socket) {
+        Ok(authority) => authority,
+        Err(code) => return code,
+    };
+    // The role and name default to the device's current ones: rotation is
+    // about the key, not about changing what the device may do.
+    let previous = authority.devices().into_iter().find(|r| r.id == device);
+    let Some(previous) = previous else {
+        eprintln!("devices rotate: no device {}", device.display_id());
+        return ExitCode::FAILURE;
+    };
+    let role = role.unwrap_or(previous.role);
+    let name = name.unwrap_or(previous.name);
+    match authority.rotate(&device, &name, role, &key) {
+        Ok(cert) => {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "device": cert.device().display_id(),
+                        "replaced": device.display_id(),
+                        "serial": cert.serial(),
+                    })
+                );
+            } else {
+                println!(
+                    "rotated {} → {} (serial {}); the old key no longer authorizes",
+                    device.display_id(),
+                    cert.device().display_id(),
+                    cert.serial()
+                );
+            }
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("devices rotate: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn devices_revoke(socket: &std::path::Path, args: &[String]) -> ExitCode {
+    let Some(raw) = args.first() else {
+        eprintln!("usage: arreo devices revoke <device-id>");
+        return ExitCode::from(2);
+    };
+    let Ok(device) = arreo_core::identity::DeviceId::parse(raw) else {
+        eprintln!("devices revoke: not a device id: {raw:?}");
+        return ExitCode::from(2);
+    };
+    let mut authority = match open_authority(socket) {
+        Ok(authority) => authority,
+        Err(code) => return code,
+    };
+    match authority.revoke(&device) {
+        Ok(()) => {
+            println!("revoked {}", device.display_id());
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("devices revoke: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Ask the authority about a key — the same call the remote transport makes.
+/// Exit 0 = this key may connect (and, with `--verb`, may do that verb).
+///
+/// With no key argument it uses this machine's own client key, which is the
+/// server-host case: the operator's own machine is a device like any other.
+/// A peer's key is passed explicitly (that is what the transport does with the
+/// key a connecting device proves possession of).
+fn devices_authorize(socket: &std::path::Path, args: &[String], json: bool) -> ExitCode {
+    let mut verb: Option<arreo_core::identity::role::Verb> = None;
+    let mut key_arg: Option<String> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--verb" if i + 1 < args.len() => {
+                match parse_verb(&args[i + 1]) {
+                    Some(parsed) => verb = Some(parsed),
+                    None => {
+                        eprintln!(
+                            "devices authorize: unknown verb {:?} \
+                             (read|attach|wait|metrics|panes|send|spawn|split|kill)",
+                            args[i + 1]
+                        );
+                        return ExitCode::from(2);
+                    }
+                }
+                i += 2;
+            }
+            other if !other.starts_with('-') && key_arg.is_none() => {
+                key_arg = Some(other.to_string());
+                i += 1;
+            }
+            other => {
+                eprintln!("devices authorize: unexpected argument {other:?}");
+                return ExitCode::from(2);
+            }
+        }
+    }
+    let key_hex = match key_arg {
+        Some(key) => key,
+        None => match arreo_core::identity::authority::client_key() {
+            Ok(key) => key.public_hex(),
+            Err(e) => {
+                eprintln!("devices authorize: {e}");
+                return ExitCode::FAILURE;
+            }
+        },
+    };
+    let key = match parse_public_key_hex(&key_hex) {
+        Ok(key) => key,
+        Err(e) => {
+            eprintln!("devices authorize: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    let mut authority = match open_authority(socket) {
+        Ok(authority) => authority,
+        Err(code) => return code,
+    };
+    // With `--verb`, this is the transport's exact decision path:
+    // authenticate, then enforce the role policy in one call.
+    if let Some(verb) = verb {
+        let device = arreo_core::identity::DeviceId::from_key(&key);
+        let role = authority.role_of(&device);
+        return match authority.check_verb(&key, verb) {
+            Ok(()) => {
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "allowed": true,
+                            "device": device.display_id(),
+                            "role": role.map(|r| r.as_str()),
+                            "verb": format!("{verb:?}").to_lowercase(),
+                        })
+                    );
+                } else {
+                    println!(
+                        "allowed {} to {verb:?} (role {})",
+                        device.display_id(),
+                        role.map(|r| r.as_str()).unwrap_or("?")
+                    );
+                }
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::json!({ "allowed": false, "reason": e.to_string() })
+                    );
+                } else {
+                    eprintln!("denied: {e}");
+                }
+                ExitCode::FAILURE
+            }
+        };
+    }
+    match authority.authorize(&key) {
+        Ok(record) => {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "allowed": true,
+                        "device": record.id.display_id(),
+                        "role": record.role.as_str(),
+                        "name": record.name,
+                    })
+                );
+            } else {
+                println!(
+                    "allowed {} ({}) as {}",
+                    record.id.display_id(),
+                    record.name,
+                    record.role
+                );
+            }
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({ "allowed": false, "reason": e.to_string() })
+                );
+            } else {
+                eprintln!("refused: {e}");
+            }
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// The verbs a device can be checked against, spelled as in `role::Verb`.
+fn parse_verb(text: &str) -> Option<arreo_core::identity::role::Verb> {
+    use arreo_core::identity::role::Verb;
+    match text.to_ascii_lowercase().as_str() {
+        "read" => Some(Verb::Read),
+        "attach" => Some(Verb::Attach),
+        "wait" => Some(Verb::Wait),
+        "metrics" => Some(Verb::Metrics),
+        "panes" => Some(Verb::Panes),
+        "send" => Some(Verb::Send),
+        "spawn" => Some(Verb::Spawn),
+        "split" => Some(Verb::Split),
+        "kill" => Some(Verb::Kill),
+        "admin" => Some(Verb::Admin),
+        "hello" => Some(Verb::Hello),
+        _ => None,
     }
 }

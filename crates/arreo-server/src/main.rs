@@ -7,6 +7,12 @@
 //! committed ring output (a final drain pass over the registry), removes the
 //! socket file, and exits 0 within `SHUTDOWN_DEADLINE`. Children keep running
 //! (the daemon never kills agents on its way out); T-0018 re-attaches them.
+//!
+//! Device authority (T-0025): boot loads (or bootstraps) the server root key
+//! and the pinned device certificates. A root key that exists but is unusable
+//! is a **loud exit**, not a regeneration — minting a new root would silently
+//! invalidate every paired device. The same authority is what the remote
+//! transport (T-0023) asks before accepting a peer.
 
 use arreo_server::lifecycle::SHUTDOWN_DEADLINE;
 use std::path::PathBuf;
@@ -31,6 +37,24 @@ async fn main() {
         }
     }
     let socket = socket.unwrap_or_else(default_socket);
+    // Bootstrap the device authority before serving: a device-gated session
+    // must never be possible against an authority that failed to load.
+    let authority = match arreo_server::devices::load_for_socket(&socket) {
+        Ok(authority) => authority,
+        Err(e) => {
+            eprintln!("arreo-server: device identity unavailable: {e}");
+            eprintln!(
+                "arreo-server: refusing to serve without a device authority \
+                 (fix or remove the identity directory, then start again)"
+            );
+            std::process::exit(1);
+        }
+    };
+    eprintln!(
+        "arreo-server: device authority ready (root {}…, {} device(s))",
+        &authority.root_fingerprint()[..16],
+        authority.devices().len()
+    );
     let daemon = arreo_server::Daemon::new(&socket);
     let registry = daemon.registry();
     let socket_path = socket.clone();

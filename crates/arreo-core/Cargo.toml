@@ -7,6 +7,12 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+# Device identity (T-0025): ed25519 device keys, pure Rust (no OpenSSL).
+# `getrandom` 0.3 is already in the graph via the dev-dependencies, so this
+# adds no new version — it only promotes the crate to a shipped dep.
+ed25519-dalek = "2"
+getrandom = "0.3"
+sha2 = "0.10"
 portable-pty = "0.9"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "time", "io-util"] }
 anyhow = "1"
@@ -18,6 +24,7 @@ toml = "0.8"
 regex = "1"
 rusqlite = { version = "0.31", features = ["bundled"], optional = true }
 base64 = "0.22"
+zeroize = "1"
 alacritty_terminal = "0.24"
 # Pinned: polling 3.11 pulls rustix 1.x while alacritty's rustix-openpty
 # needs rustix 0.38 — the mix breaks alacritty's tty/unix.rs on rustc 1.98.
