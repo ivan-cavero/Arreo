@@ -163,11 +163,14 @@ pub fn denial_message(
     verb: Verb,
     denial: &TrustDenial,
 ) -> String {
+    // The *operator's* word for the role, not the certificate's: this string ends
+    // with a command the operator will copy, and `--role owner` is a spelling
+    // nothing in the docs or `--help` mentions (ADR 0019).
     let grant = format!(
         "arreo machines trust {} --machine {} --role {} --yes",
         device.display_id(),
         machine,
-        TrustDenial::needed_role(verb).as_str()
+        TrustDenial::needed_role(verb).operator_term()
     );
     match denial {
         TrustDenial::Revoked { .. } => format!(
@@ -175,9 +178,10 @@ pub fn denial_message(
              Re-grant it with: {grant}"
         ),
         TrustDenial::InsufficientRole { role, .. } => format!(
-            "machine {machine} granted this device {role}, which may not {verb:?} \
+            "machine {machine} granted this device {}, which may not {verb:?} \
              (it needs {}). Grant it with: {grant}",
-            TrustDenial::needed_role(verb).as_str()
+            role.operator_term(),
+            TrustDenial::needed_role(verb).operator_term()
         ),
         TrustDenial::NoGrant { .. } => format!(
             "machine {machine} has no grant for this device, so {verb:?} is refused. \
@@ -296,7 +300,16 @@ mod tests {
         let denial = viewer.permits(Verb::Spawn).expect_err("viewer");
         let message = denial_message("the-pi", &device(), Verb::Spawn, &denial);
         assert!(message.contains("the-pi"), "the machine: {message}");
-        assert!(message.contains("owner"), "the role it needs: {message}");
+        assert!(
+            message.contains("--role operator"),
+            "the role it needs, in the word `--role` accepts: {message}"
+        );
+        assert!(
+            !message.contains("owner"),
+            "and not the certificate's spelling: it is not a word --role documents, so an \
+             operator who copies the command would be looking for one the docs never \
+             mention (T-0059): {message}"
+        );
         assert!(
             message.contains("arreo machines trust dev_11111111111111111111111111111111"),
             "the exact command: {message}"

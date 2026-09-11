@@ -241,6 +241,40 @@ impl Machine {
     /// The reply is what the gate produces: `Welcome` when the machine accepts
     /// the session, an `Error` when it refuses the verb.
     fn hello_as(&self, key: &DeviceKey, id: &DeviceId) -> Message {
+        self.converse(key, id, &[])
+            .into_iter()
+            .next()
+            .expect("a reply to Hello")
+    }
+
+    /// As [`Machine::converse`], but `between` runs after the handshake and before
+    /// the messages — the shape a test needs to change this machine's state
+    /// *while a session is live*.
+    fn converse_interleaved<'a>(
+        &self,
+        key: &DeviceKey,
+        id: &DeviceId,
+        messages: &[Message],
+        between: impl FnOnce() + 'a,
+    ) -> Vec<Message> {
+        self.talk(key, id, messages, Some(Box::new(between)))
+    }
+
+    /// Open a session, say Hello, then send each message in turn, returning every
+    /// reply. Stops early if the session is refused or closed — a refused
+    /// handshake ends the session, and pretending otherwise would make the test
+    /// invent replies.
+    fn converse(&self, key: &DeviceKey, id: &DeviceId, messages: &[Message]) -> Vec<Message> {
+        self.talk(key, id, messages, None)
+    }
+
+    fn talk(
+        &self,
+        key: &DeviceKey,
+        id: &DeviceId,
+        messages: &[Message],
+        between: Option<Box<dyn FnOnce() + '_>>,
+    ) -> Vec<Message> {
         let root = self.root();
         let addr = self.remote_addr();
         let log_text = self.log_text();
@@ -265,35 +299,126 @@ impl Machine {
                     log_text
                 ),
             };
-            let frame = codec::encode_frame(&Message::Hello {
+            let mut replies = Vec::new();
+            let mut buf = Vec::new();
+            let mut to_send: Vec<Message> = vec![Message::Hello {
                 v: VERSION,
                 client: "trust-test".to_string(),
                 wants: vec![VERSION],
-            })
-            .expect("encode");
-            {
-                use tokio::io::AsyncWriteExt;
-                channel.write_all(&frame).await.expect("write");
-                channel.flush().await.expect("flush");
-            }
-            let mut buf = Vec::new();
-            loop {
-                if let Ok((reply, _)) = codec::decode_frame(&buf) {
-                    return reply;
+            }];
+            to_send.extend(messages.iter().cloned());
+            let mut between = between;
+            for message in to_send {
+                let frame = codec::encode_frame(&message).expect("encode");
+                {
+                    use tokio::io::AsyncWriteExt;
+                    if channel.write_all(&frame).await.is_err() {
+                        break;
+                    }
+                    if channel.flush().await.is_err() {
+                        break;
+                    }
                 }
-                let mut chunk = [0u8; 8192];
-                use tokio::io::AsyncReadExt;
-                let read = channel.read(&mut chunk).await.expect("read");
-                assert!(read > 0, "the daemon closed the session without answering");
-                buf.extend_from_slice(&chunk[..read]);
+                match read_reply(&mut channel, &mut buf).await {
+                    Some(reply) => {
+                        // A refused handshake or a closed session ends the
+                        // conversation; there is nothing more to ask.
+                        let refused_hello = matches!(reply, Message::Error { .. })
+                            && matches!(message, Message::Hello { .. });
+                        let welcomed = matches!(reply, Message::Welcome { .. })
+                            && matches!(message, Message::Hello { .. });
+                        replies.push(reply);
+                        if refused_hello {
+                            break;
+                        }
+                        // The hook fires once, *after* the handshake is answered
+                        // and before the first verb: "change this machine's state
+                        // while the session is live". A session refused at Hello
+                        // never gets here, so the hook cannot muddy that case.
+                        if welcomed {
+                            if let Some(hook) = between.take() {
+                                // Deliberately blocking: the CLI is a child
+                                // process, and the session must not be served
+                                // while it runs.
+                                hook();
+                            }
+                        }
+                    }
+                    None => break,
+                }
             }
+            replies
         })
+    }
+
+    /// This machine's trust rows from its audit log, as an operator reads them.
+    fn trust_audit(&self) -> Vec<serde_json::Value> {
+        let output = Command::new(binary("arreo"))
+            .args(["audit", "--json", "--socket"])
+            .arg(&self.socket)
+            .env("ARREO_IDENTITY_DIR", &self.dir)
+            .output()
+            .expect("the CLI runs");
+        assert!(
+            output.status.success(),
+            "audit --json failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let value: serde_json::Value =
+            serde_json::from_slice(&output.stdout).expect("audit --json is JSON");
+        value["rows"]
+            .as_array()
+            .expect("rows")
+            .iter()
+            .filter(|row| {
+                row["action"]
+                    .as_str()
+                    .is_some_and(|action| action.starts_with("trust."))
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// Run a CLI command against this machine, expecting it to succeed.
+    fn cli(&self, args: &[&str]) {
+        let output = Command::new(binary("arreo"))
+            .args(args)
+            .arg("--socket")
+            .arg(&self.socket)
+            .env("ARREO_IDENTITY_DIR", &self.dir)
+            .output()
+            .expect("the CLI runs");
+        assert!(
+            output.status.success(),
+            "`arreo {}` failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     fn text(message: &Message) -> String {
         match message {
             Message::Error { message, .. } => message.clone(),
             other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+}
+
+/// Read one framed reply from an open channel, or `None` when the peer closed it.
+async fn read_reply(
+    channel: &mut arreo_core::transport::SecureChannel,
+    buf: &mut Vec<u8>,
+) -> Option<Message> {
+    use tokio::io::AsyncReadExt;
+    loop {
+        if let Ok((reply, consumed)) = codec::decode_frame(buf) {
+            buf.drain(..consumed);
+            return Some(reply);
+        }
+        let mut chunk = [0u8; 8192];
+        match channel.read(&mut chunk).await {
+            Ok(0) | Err(_) => return None,
+            Ok(read) => buf.extend_from_slice(&chunk[..read]),
         }
     }
 }
@@ -324,6 +449,177 @@ fn a_device_issued_after_boot_can_use_the_machine() {
     assert!(granted[0].is_live());
 }
 
+/// **The write path's real safety property** (T-0059): the CLI changes trust while
+/// a daemon is *running*, and the daemon acts on it without a restart.
+///
+/// This is what "one writer" was really about. There is one source of truth (the
+/// machine's store) and the daemon reads it rather than caching a grant, so an
+/// operator cutting and restoring access sees the effect immediately — and the
+/// alternative design (a socket verb) would have needed a running daemon to
+/// administer a machine whose daemon may be the very thing that is broken.
+#[test]
+fn the_cli_cuts_and_restores_a_running_daemons_access() {
+    let machine = Machine::start("cli-live");
+    let key = DeviceKey::generate().expect("entropy");
+    let id = DeviceId::from_key(&key.public());
+    machine.issue_via_cli("phone", "owner", &key);
+    assert!(
+        matches!(machine.hello_as(&key, &id), Message::Welcome { .. }),
+        "it starts out trusted:\n{}",
+        machine.log_text()
+    );
+
+    let name = arreo_core::mesh::default_machine_name();
+    let machine_id = arreo_core::mesh::MachineId::from_key(&machine.root().public());
+    // Cut this machine's grant, with the daemon still running.
+    machine.cli(&["devices", "revoke", &id.display_id(), "--machine", &name]);
+    let message = Machine::text(&machine.hello_as(&key, &id));
+    assert!(
+        message.contains("revoked") || message.contains("no grant"),
+        "a grant cut while the daemon runs must take effect at once: {message}"
+    );
+
+    // Restore it with `machines trust` — the command the refusal just printed.
+    machine.cli(&[
+        "machines",
+        "trust",
+        &id.display_id(),
+        "--role",
+        "operator",
+        "--yes",
+    ]);
+    assert!(
+        matches!(machine.hello_as(&key, &id), Message::Welcome { .. }),
+        "and a grant made while the daemon runs must take effect at once:\n{}",
+        machine.log_text()
+    );
+
+    // The trail shows both changes, from the console, naming the machine.
+    let rows = machine.trust_audit();
+    let actions: Vec<&str> = rows
+        .iter()
+        .filter_map(|row| row["action"].as_str())
+        .collect();
+    assert_eq!(
+        actions,
+        // In the order an operator reads them (`arreo audit` prints oldest first,
+        // which is the opposite of the store's newest-first API): the pairing
+        // default, the cut, the refusal the cut caused, and the re-grant.
+        vec!["trust.grant", "trust.revoke", "trust.refuse", "trust.grant"],
+        "every change and the refusal between them: {rows:#?}"
+    );
+    for row in &rows {
+        assert_eq!(row["kind"], serde_json::json!("trust"), "{row}");
+        let expected = if row["action"] == serde_json::json!("trust.refuse") {
+            serde_json::json!("refused")
+        } else {
+            serde_json::json!("ok")
+        };
+        assert_eq!(row["outcome"], expected, "{row}");
+        assert_eq!(
+            row["device"],
+            serde_json::json!(id.display_id()),
+            "the row is about the device it concerns: {row}"
+        );
+        assert_eq!(
+            row["agent"],
+            serde_json::json!(name),
+            "the machine it acted on, by name, for a reader: {row}"
+        );
+        assert!(
+            row["detail"]
+                .as_str()
+                .is_some_and(|detail| detail.contains(machine_id.as_str())),
+            "and by id in the detail, so an exported row is unambiguous even \
+             when the machine is renamed: {row}"
+        );
+    }
+    // The role is recorded in the operator's word, not the certificate's.
+    let regrant = rows.last().expect("the newest row");
+    assert!(
+        regrant["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains("role=operator")),
+        "{regrant}"
+    );
+}
+
+/// A refusal is recorded **once per session**, however many verbs are refused: a
+/// client that retries must not be able to fill the operator's log from outside,
+/// which would be the cheapest denial of service against an audit trail.
+///
+/// The refusals here come from **this machine's grant**, not from the account's
+/// role: the grant is cut while the session is live, and the client keeps asking.
+/// A bare viewer asking to spawn is refused by the *certificate* gate instead —
+/// a different fact with a different fix (re-pair), and not this task's row.
+#[test]
+fn a_refusal_is_recorded_once_per_session() {
+    let machine = Machine::start("refusal-once");
+    let key = DeviceKey::generate().expect("entropy");
+    let id = DeviceId::from_key(&key.public());
+    machine.issue_via_cli("phone", "owner", &key);
+    let name = arreo_core::mesh::default_machine_name();
+
+    // Read is something an owner may do; after the cut it is refused by the trust
+    // gate, and these three attempts are one session.
+    let read = Message::Read {
+        v: VERSION,
+        id: "pane-a".to_string(),
+        from_line: 0,
+    };
+    let replies = machine.converse_interleaved(
+        &key,
+        &id,
+        &[read.clone(), read.clone(), read.clone()],
+        || {
+            machine.cli(&["devices", "revoke", &id.display_id(), "--machine", &name]);
+        },
+    );
+    assert!(
+        matches!(replies.first(), Some(Message::Welcome { .. })),
+        "the session opens while the grant is still live: {replies:?}"
+    );
+    let refusals = replies
+        .iter()
+        .filter(|reply| matches!(reply, Message::Error { .. }))
+        .count();
+    assert_eq!(
+        refusals, 3,
+        "every verb after the cut is refused: {replies:?}"
+    );
+
+    let rows = machine.trust_audit();
+    let refusals: Vec<&serde_json::Value> = rows
+        .iter()
+        .filter(|row| row["action"] == serde_json::json!("trust.refuse"))
+        .collect();
+    assert_eq!(
+        refusals.len(),
+        1,
+        "three refusals in one session are one row, not three: {rows:#?}"
+    );
+    let refusal = refusals[0];
+    assert_eq!(
+        refusal["outcome"],
+        serde_json::json!("refused"),
+        "a refusal is not a success: {refusal}"
+    );
+    assert_eq!(
+        refusal["device"],
+        serde_json::json!(id.display_id()),
+        "the row is about the device that was refused: {refusal}"
+    );
+    assert!(
+        refusal["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains("--role operator")
+                || detail.contains("no grant")
+                || detail.contains("revoked")),
+        "and carries the reason the device was given: {}",
+        refusal["detail"]
+    );
+}
+
 /// **The criterion this task exists for.** A device this machine never granted
 /// authenticates and is still refused — and the refusal tells the operator the
 /// command that fixes it.
@@ -342,6 +638,9 @@ fn a_pinned_device_with_no_grant_is_refused_with_the_command() {
 
     let refusal = machine.hello_as(&key, &id);
     let message = Machine::text(&refusal);
+    // Printed as well as asserted, so the evidence transcript can quote what a
+    // refused device is actually told (`cargo test … -- --nocapture`).
+    eprintln!("refused session was told:\n  {message}");
     // The name is the one the daemon uses for itself (its hostname, by default):
     // the operator has to be able to find the machine the message is talking
     // about, so it is the same name `arreo machines list` would show.
@@ -395,7 +694,10 @@ fn a_viewer_is_refused_control_but_not_observation() {
         .check(&id, arreo_core::identity::role::Verb::Spawn)
         .expect_err("a viewer may not spawn");
     let message = refusal.to_string();
-    assert!(message.contains("owner"), "the role needed: {message}");
+    assert!(
+        message.contains("--role operator"),
+        "the role needed, in the word --role accepts: {message}"
+    );
     assert!(message.contains("arreo machines trust"), "{message}");
 }
 

@@ -161,6 +161,31 @@ impl TrustLedger {
         by: &DeviceId,
         now_ms: i64,
     ) -> Result<TrustRecord, crate::store::SessionError> {
+        self.grant_with_reason(device, role, by, now_ms, "")
+    }
+
+    /// The same, with a note for the audit row (`backfill`, or anything else a
+    /// future caller needs the trail to explain).
+    ///
+    /// **The row and its audit event are written here together** (T-0059), so no
+    /// caller can change this machine's trust without leaving a trace: the
+    /// console command, the pairing default and the boot migration all come
+    /// through this function, and a second writer that forgot the audit row is
+    /// not possible by construction.
+    ///
+    /// A failed audit write does not fail the grant: the grant is the fact the
+    /// operator asked for, and refusing it because the *log* could not be written
+    /// would leave the machine in the state the operator was trying to fix. The
+    /// error is returned, so the caller reports it loudly (this is a store on the
+    /// same disk as the grant that just succeeded, so it is a real fault).
+    pub fn grant_with_reason(
+        &self,
+        device: &DeviceId,
+        role: Role,
+        by: &DeviceId,
+        now_ms: i64,
+        reason: &str,
+    ) -> Result<TrustRecord, crate::store::SessionError> {
         let record = TrustRecord {
             machine_id: self.machine.clone(),
             device_id: device.clone(),
@@ -170,7 +195,86 @@ impl TrustLedger {
             revoked_at_ms: None,
         };
         self.store.record_trust(&record)?;
+        self.audit(
+            crate::store::actions::TRUST_GRANT,
+            device,
+            &format!(
+                "machine={} role={} by={}{}",
+                self.machine.as_str(),
+                role.operator_term(),
+                by.as_str(),
+                if reason.is_empty() {
+                    String::new()
+                } else {
+                    format!(" reason={reason}")
+                }
+            ),
+            now_ms,
+        )?;
         Ok(record)
+    }
+
+    /// Write one audit row about this machine's trust decisions.
+    ///
+    /// The row's `device` is the **subject** (the device the decision is about),
+    /// and the actor rides in `detail` — the convention the audit store states and
+    /// that revocation already follows, so "what happened to this device" is one
+    /// query.
+    fn audit(
+        &self,
+        action: &str,
+        subject: &DeviceId,
+        detail: &str,
+        now_ms: i64,
+    ) -> Result<(), crate::store::SessionError> {
+        self.audit_with(
+            action,
+            subject,
+            detail,
+            now_ms,
+            crate::store::AuditOutcome::Ok,
+        )
+    }
+
+    /// Record that this machine refused a device (T-0059).
+    ///
+    /// Called by the session path, **once per session** — the caller owns that
+    /// "once" (an `AtomicBool` on the session), because a client that retries a
+    /// refused verb in a loop must not be able to fill the log. The reason is the
+    /// same message the operator was shown, so the log and the screen agree.
+    pub fn record_refusal(
+        &self,
+        device: &DeviceId,
+        detail: &str,
+    ) -> Result<(), crate::store::SessionError> {
+        self.audit_with(
+            crate::store::actions::TRUST_REFUSE,
+            device,
+            detail,
+            now_ms(),
+            crate::store::AuditOutcome::Refused,
+        )
+    }
+
+    fn audit_with(
+        &self,
+        action: &str,
+        subject: &DeviceId,
+        detail: &str,
+        now_ms: i64,
+        outcome: crate::store::AuditOutcome,
+    ) -> Result<(), crate::store::SessionError> {
+        self.store.record(&crate::store::AuditEvent {
+            ts_ms: now_ms.max(0) as u64,
+            action: action.to_string(),
+            kind: crate::store::AuditKind::Trust,
+            outcome,
+            device: subject.display_id(),
+            agent: self.machine_name.clone(),
+            prompt: String::new(),
+            peer: None,
+            detail: Some(detail.to_string()),
+        })
     }
 
     /// Cut this machine's grant to `device`. `Ok(false)` means there was nothing
@@ -180,7 +284,19 @@ impl TrustLedger {
         device: &DeviceId,
         now_ms: i64,
     ) -> Result<bool, crate::store::SessionError> {
-        self.store.revoke_trust(&self.machine, device, now_ms)
+        let cut = self.store.revoke_trust(&self.machine, device, now_ms)?;
+        if cut {
+            self.audit(
+                crate::store::actions::TRUST_REVOKE,
+                device,
+                &format!("machine={}", self.machine.as_str()),
+                now_ms,
+            )?;
+        }
+        // Nothing was live: no row, because an audit log that records the same
+        // decision repeatedly says less than one that records it once (the same
+        // rule `DeviceAuthority::revoke` follows for an already-revoked device).
+        Ok(cut)
     }
 
     /// The rule, applied to this machine's ledger, with the refusal an operator
@@ -243,7 +359,7 @@ impl TrustLedger {
             // A device granting itself is exactly what the pairing default is:
             // there is no other device to name as the actor, and the pairing that
             // pinned it is what authorized it on this machine.
-            self.grant(device, Role::Owner, device, now_ms)?;
+            self.grant_with_reason(device, Role::Owner, device, now_ms, "backfill")?;
             granted.push(device.clone());
         }
         self.store.mark_trust_initialized()?;
@@ -327,6 +443,95 @@ impl SharedLedger {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store::actions;
+
+    /// Read this ledger's audit trail, as an operator would.
+    fn audit(ledger: &TrustLedger) -> Vec<crate::store::StoredAudit> {
+        ledger.store.audit_recent(50).expect("audit rows")
+    }
+
+    /// **Every trust change leaves a trace, and the trace names the actor**
+    /// (T-0059). One writer does it — `grant`/`revoke` above — so a caller cannot
+    /// change this machine's trust without the trail saying so.
+    #[test]
+    fn grant_and_revoke_each_write_one_audit_row() {
+        let pi = ledger("audit", "pi");
+        let phone = device('1');
+        let operator = device('2');
+
+        pi.grant(&phone, Role::Viewer, &operator, 1_000)
+            .expect("grant");
+        let rows = audit(&pi);
+        assert_eq!(rows.len(), 1, "one grant, one row: {rows:?}");
+        assert_eq!(rows[0].action, actions::TRUST_GRANT);
+        assert_eq!(rows[0].kind, crate::store::AuditKind::Trust);
+        assert_eq!(
+            rows[0].device,
+            phone.display_id(),
+            "the row is about the device the decision concerns"
+        );
+        let detail = rows[0].detail.clone().unwrap_or_default();
+        assert!(
+            detail.contains(operator.as_str()),
+            "and it names who did it: {detail}"
+        );
+        assert!(detail.contains("viewer"), "and the role granted: {detail}");
+        assert!(
+            detail.contains(pi.machine().as_str()),
+            "and the machine, so an exported row is unambiguous: {detail}"
+        );
+
+        // Revoking adds exactly one more row; revoking again adds none, because
+        // the interesting moment is the first one.
+        assert!(pi.revoke(&phone, 2_000).expect("revoke"));
+        assert!(!pi.revoke(&phone, 3_000).expect("revoke again"));
+        let rows = audit(&pi);
+        assert_eq!(
+            rows.len(),
+            2,
+            "grant + revoke, nothing for the no-op: {rows:?}"
+        );
+        assert_eq!(rows[0].action, actions::TRUST_REVOKE, "newest first");
+    }
+
+    /// The migration's grants are audited too, and marked as such — an operator
+    /// reading the trail after an upgrade must be able to tell a migration's
+    /// grant from one a human made.
+    #[test]
+    fn a_backfilled_grant_says_so_in_the_trail() {
+        let pi = ledger("audit-backfill", "pi");
+        let a = device('a');
+        pi.backfill_once(std::slice::from_ref(&a))
+            .expect("backfill");
+        let rows = audit(&pi);
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].action, actions::TRUST_GRANT);
+        assert!(
+            rows[0]
+                .detail
+                .as_deref()
+                .is_some_and(|d| d.contains("reason=backfill")),
+            "the migration announces itself: {:?}",
+            rows[0].detail
+        );
+    }
+
+    /// A refused check writes nothing: `check` is a *read* of the policy, called
+    /// on every verb of every session, so a row per refusal would be the trail
+    /// nobody reads (and the daemon writes the one refusal row it wants, once per
+    /// session, in its own path).
+    #[test]
+    fn a_refusal_by_check_alone_writes_no_row() {
+        let pi = ledger("audit-refuse", "pi");
+        let phone = device('3');
+        for _ in 0..5 {
+            assert!(pi.check(&phone, Verb::Read).is_err());
+        }
+        assert!(
+            audit(&pi).is_empty(),
+            "the policy check is not an audit writer; the session path is"
+        );
+    }
 
     fn ledger(tag: &str, name: &str) -> TrustLedger {
         let dir = std::env::temp_dir().join(format!(
@@ -425,8 +630,14 @@ mod tests {
             .check(&phone, Verb::Spawn)
             .expect_err("a viewer may not spawn")
             .to_string();
-        assert!(message.contains("owner"), "the role it needs: {message}");
-        assert!(message.contains("--role owner"), "the command: {message}");
+        assert!(
+            message.contains("--role operator"),
+            "the role it needs, in the operator's word: {message}"
+        );
+        assert!(
+            !message.contains("owner"),
+            "and not the certificate's spelling (T-0059): {message}"
+        );
 
         assert!(pi.revoke(&phone, 2_000).expect("revoke"));
         assert!(

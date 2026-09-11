@@ -3,7 +3,7 @@ id: T-0046
 title: Per-machine device trust — a grant on A is not a grant on B
 phase: 2
 priority: 2
-status: in-progress
+status: done
 depends_on: [T-0018, T-0043, T-0044]
 scope:
   - crates/arreo-core/src/mesh/trust.rs
@@ -32,7 +32,7 @@ hope — and the fix for a refusal must be one obvious command.
 - [x] Default grant: completing pairing with a machine grants that device `operator` on that machine
       only, recorded by the machine (not the peer, not the relay); the joining side cannot name a role
       in the join request — privilege escalation at join time is refused.
-- [~] Extending trust is explicit and target-side: `arreo machines trust <device> [--machine <name>]
+- [x] **(landed in T-0059)** Extending trust is explicit and target-side: `arreo machines trust <device> [--machine <name>]
       [--role viewer|operator]`, executed on or for the target machine, requires an existing owner
       grant on that machine, prints the device fingerprint being granted, and needs `--yes` or an
       interactive confirmation; an untrusted device cannot grant anything (exit 5), and neither A nor
@@ -41,15 +41,14 @@ hope — and the fix for a refusal must be one obvious command.
       `send`/`spawn`/attach-control require `operator`; a `viewer` device is refused `spawn`/`send`
       with exit 5 while `read`/`metrics` succeed — a role × verb matrix test asserts each cell,
       evaluated on B for a session targeting B.
-- [ ] Revocation is local and complete — **landed for the grant; `arreo devices revoke --machine`
-      (the flag that names which machine's grant to cut) is not** — see the landing notes.
+- [x] **(landed in T-0059)** Revocation is local, immediate and complete.
       The criterion as written: `arreo devices revoke <name> --machine <name>` `arreo devices revoke <name> --machine <name>` on B
       drops only B's grant (the same device keeps working against A), takes effect on the next
       connection, and tears down that device's live B sessions within ≤ 5 s; a relay-only revoke must
       neither grant nor deny (a test performs one and asserts access is unchanged).
 - [x] Refusal path is actionable: every denial names the machine, the missing role and the exact granting
       command; `.loop/evidence/T-0046/` shows deny → grant → attach succeeding in both directions.
-- [~] Auditability: every grant, revoke and refusal appends an audit row (device, machine, action,
+- [x] **(landed in T-0059)** Auditability: every grant, revoke and refusal appends an audit row (device, machine, action,
       timestamp) through T-0018's audit log; the rows are exportable and a test asserts none is
       silently missing.
 - [x] `specs/adr/0019-per-machine-device-trust.md` records the decision and the rejected alternatives:
@@ -131,9 +130,10 @@ second a decision).
 
 ## What landed, and what did not (2026-09-11)
 
-Both increments of the *mechanism* are in and verified. Three criteria are **not** met, and the task
-stays `in-progress` for them; they are filed as **T-0059** so the backlog is honest rather than the
-task being closed with unmatched boxes:
+T-0046's mechanism landed in two increments; the three criteria it could not reach — the operator's
+surface — landed in **T-0059**, which this task's own refusals named as the command to run. All eight
+criteria are now met. The table below is the state at the end of the second increment, kept because it
+is the record of what was still missing and why:
 
 | Criterion | State |
 | --- | --- |
@@ -142,15 +142,22 @@ task being closed with unmatched boxes:
 | Per-verb enforcement on the owning machine | **done** — the gate runs after authentication on every remote session (direct and relay), and the matrix, the refusal text and the no-grant/revoked cases are tested |
 | Refusal names machine, role and command | **done** — one builder, asserted for the no-grant, wrong-role and revoked cases |
 | The migration (existing pairings keep working) | **done** — a one-time backfill with a one-way marker; end-to-end transcript in `.loop/evidence/T-0046/backfill.txt` |
-| **`arreo machines trust <device> [--machine] [--role] [--yes]`** | **not landed** → T-0059 |
-| **`arreo devices revoke <name> --machine <name>`** | **not landed** → T-0059 (grants are revocable through the ledger API, which the tests exercise; the CLI flag that names *which* machine's grant to cut is not) |
-| **Audit rows for grant / revoke / refusal** | **not landed** → T-0059 |
+| **`arreo machines trust <device> [--machine] [--role] [--yes]`** | landed in T-0059 |
+| **`arreo devices revoke <name> --machine <name>`** | landed in T-0059 |
+| **Audit rows for grant / revoke / refusal** | landed in T-0059 (`trust.grant`/`trust.revoke`/`trust.refuse`, once per session for refusals) |
 
 The enforcement wiring also found and fixed a real bug in this turn: **every early session exit
 delivered nothing.** The refusal for a bad handshake — and T-0052's revocation error before its own
 fix — was written into the duplex and discarded when the channel dropped, because only the *normal*
 exit had the drain. The flush is now a wrapper around the whole session, so all seven exit paths
 deliver their last frame.
+
+## Closing note
+
+Every criterion is met. The denial T-0046 built — the one that ends with a command — now names a
+command that exists, and `crates/arreo-cli/tests/machines.rs` runs it and shows the grant taking
+effect. The operator's surface, the audit trail and the two revocations (device-level and
+machine-level) are T-0059's, with its own evidence under `.loop/evidence/T-0059/`.
 
 ## Verification
 

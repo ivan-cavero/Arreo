@@ -50,6 +50,24 @@ impl Role {
         }
     }
 
+    /// The word a **user** uses for this role: `viewer` or `operator`
+    /// (ROADMAP §3.7 and §4), as opposed to [`Role::as_str`], which keeps the
+    /// certificate's spelling (`owner`) because that is what is on disk and in
+    /// the wire format.
+    ///
+    /// Two spellings, one value — the same arrangement [`Role::parse`] already
+    /// accepts, completed on the way out. The refusal T-0046 shows an operator
+    /// ends with a command to copy, so it has to use the word that command's
+    /// `--role` documents; printing the certificate's spelling there would send
+    /// the operator looking for a role the roadmap never mentions.
+    #[must_use]
+    pub fn operator_term(self) -> &'static str {
+        match self {
+            Self::Owner => "operator",
+            Self::Viewer => "viewer",
+        }
+    }
+
     /// Does this role hold `capability`? Owner is a superset by construction —
     /// stated once here rather than repeated at every call site.
     #[must_use]

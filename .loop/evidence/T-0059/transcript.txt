@@ -1,0 +1,98 @@
+machine: vmi3525064    scratch: /tmp/arreo-t59ev-ad24
+
+== 1. Pin a device (a phone): this machine records the pairing default grant
+issued dev_43f0af53176614ea51c8ca7dcf71db9b (phone) for owner as owner — serial 1
+device: dev_43f0af53176614ea51c8ca7dcf71db9b
+
+== 2. DENY: cut this machine's grant, and see what the ledger says
+cut dev_43f0af53176614ea51c8ca7dcf71db9b's grant on vmi3525064 — it keeps whatever access it has elsewhere
+DEVICE                              ROLE     GRANTED              BY                                  STATE
+dev_43f0af53176614ea51c8ca7dcf71db9b operator 2026-09-11T21:47:14.496Z dev_43f0af53176614ea51c8ca7dcf71db9b revoked 2026-09-11T21:47:14.505Z
+
+== 3. The refusal a denied session receives (from the daemon, T-0046)
+   (driven over the real transport by crates/arreo-server/tests/trust.rs:
+    a_pinned_device_with_no_grant_is_refused_with_the_command)
+
+== 4. GRANT: the command that refusal names
+dev_43f0af53176614ea51c8ca7dcf71db9b may now observe and drive on vmi3525064
+DEVICE                              ROLE     GRANTED              BY                                  STATE
+dev_43f0af53176614ea51c8ca7dcf71db9b operator 2026-09-11T21:47:14.559Z dev_43f0af53176614ea51c8ca7dcf71db9b live
+
+== 5. ATTACH: the daemon side of the same story (real transport)
+   crates/arreo-server/tests/trust.rs drives a real daemon over QUIC and
+   asserts, in order: a device issued after boot connects; a pinned device
+   with no grant is refused with the command above; cutting a grant while a
+   session is live takes effect at once; restoring it does too.
+
+   ACTION        KIND    OUTCOME   AGENT       DETAIL
+   trust.grant   trust   ok        vmi3525064  machine=dfdb85b2e79ba94785636f916ca7f534 role=operator by=43f0af531766
+   trust.revoke  trust   ok        vmi3525064  machine=dfdb85b2e79ba94785636f916ca7f534
+   trust.grant   trust   ok        vmi3525064  machine=dfdb85b2e79ba94785636f916ca7f534 role=operator by=43f0af531766
+
+== 3 (continued). The exact text a refused device is told, from a real daemon
+
+$ cargo test -p arreo-server --test trust a_pinned_device_with_no_grant -- --nocapture
+refused session was told:
+  machine vmi3525064 has no grant for this device, so Hello is refused. Grant it with: arreo machines trust dev_7492cbc52b2fa4ec28f3da5fc7ea53c6 --machine vmi3525064 --role viewer --yes
+
+== 6. The daemon-side suite (real binaries, real QUIC, real store)
+
+$ cargo test -p arreo-server --test trust
+test a_device_issued_after_boot_can_use_the_machine ... ok
+test a_viewer_is_refused_control_but_not_observation ... ok
+test a_pinned_device_with_no_grant_is_refused_with_the_command ... ok
+test a_refusal_is_recorded_once_per_session ... ok
+test a_revoked_grant_refuses_the_next_session_and_regranting_restores_it ... ok
+test the_cli_cuts_and_restores_a_running_daemons_access ... ok
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.40s
+
+== 7. The CLI-side suite
+
+$ cargo test -p arreo-cli --test machines
+test an_unpaired_client_is_told_what_is_missing ... ok
+test a_missing_relay_configuration_is_exit_4 ... ok
+test the_test_config_is_one_the_shared_loader_accepts ... ok
+test trust_asks_before_granting ... ok
+test add_refuses_an_invite_that_names_no_account ... ok
+test trust_grants_lists_and_cuts_access_locally ... ok
+test add_reports_the_name_the_relay_actually_granted ... ok
+test add_takes_a_new_machine_into_the_account ... ok
+test list_and_status_read_the_accounts_directory ... ok
+test rename_and_remove_write_the_directory_and_never_leave_partial_state ... ok
+test an_unreachable_relay_answers_from_the_cache_and_says_so ... ok
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 20.79s
+
+== 8. Unit coverage
+
+test machines::tests::a_cached_row_is_never_online ... ok
+test machines::tests::ages_are_human ... ok
+test machines::tests::an_age_is_never_negative ... ok
+test machines::tests::the_exit_codes_are_distinct ... ok
+test machines::tests::a_cached_envelope_is_labelled ... ok
+test machines::tests::a_machine_name_matches_by_name_or_id ... ok
+test machines::tests::the_grants_envelope_is_schema_1_with_its_own_keys ... ok
+test machines::tests::trust_rejects_bad_arguments_before_touching_anything ... ok
+test machines::tests::a_flag_belongs_to_one_verb_or_none ... ok
+test machines::tests::usage_errors_are_exit_2 ... ok
+test machines::tests::the_json_envelope_is_schema_1_with_closed_presence_values ... ok
+test machines::tests::add_asks_for_the_code_and_the_invite ... ok
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+test result: ok. 19 passed; 0 failed; 0 ignored; 0 measured; 127 filtered out; finished in 0.07s
+
+== 9. The new behaviours proved to fail when their code is removed
+
+Each mutation was applied, the named test run, and the mutation reverted.
+
+(1) Remove the "trust is local" check in `machines trust` (the `--machine` guard):
+    trust_grants_lists_and_cuts_access_locally ..... FAILED
+      -> a grant for "some-other-machine" was accepted (exit 0) instead of refused.
+
+(2) Remove the once-per-session guard (always write the refusal row):
+    a_refusal_is_recorded_once_per_session ......... FAILED
+      -> three refusals in one session produced three rows, not one.
+
+(3) Remove the refusal row entirely (`if false`):
+    a_refusal_is_recorded_once_per_session ......... FAILED
+      -> zero rows: the refusal left no trace at all.
+
+All three restored; every suite green afterward.

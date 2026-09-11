@@ -131,6 +131,7 @@ fn kind_for(action: &str) -> AuditKind {
         actions::DEVICE_ISSUE | actions::DEVICE_ROTATE | actions::DEVICE_REVOKE => {
             AuditKind::DeviceChange
         }
+        actions::TRUST_GRANT | actions::TRUST_REVOKE | actions::TRUST_REFUSE => AuditKind::Trust,
         // Sessions, spawns and splits are lifecycle events with no older kind;
         // `Unknown` is the honest label, and the `action` is what readers use.
         _ => AuditKind::Unknown,

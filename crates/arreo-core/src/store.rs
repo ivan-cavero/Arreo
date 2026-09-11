@@ -125,6 +125,17 @@ pub mod actions {
     /// The level rides in `detail`, so one action name covers the ladder and an
     /// operator greps one string for the whole episode.
     pub const ENFORCE_ALERT: &str = "enforce.alert";
+    /// A device was granted access **to this machine** (T-0046/T-0059). Distinct
+    /// from `device.issue`, which is the account's answer: a device can hold a
+    /// valid certificate and have no access here, and that pair of facts is the
+    /// whole point of the per-machine model.
+    pub const TRUST_GRANT: &str = "trust.grant";
+    /// A machine's grant to a device was cut (T-0059). The device's certificate
+    /// is untouched — it is this machine's decision that changed.
+    pub const TRUST_REVOKE: &str = "trust.revoke";
+    /// A device was refused because of this machine's grant (T-0059): no grant,
+    /// too low a role, or a revoked grant.
+    pub const TRUST_REFUSE: &str = "trust.refuse";
 }
 
 /// One audit row (prompt already redacted on write).
@@ -237,6 +248,11 @@ pub enum AuditKind {
     PairingFailed,
     /// A row written by a newer schema than this build knows.
     Unknown,
+    /// This machine's trust decision: a grant recorded, a grant cut, or a device
+    /// refused for want of one (T-0059). One kind for all three because the
+    /// question an operator asks is "what happened with access to this machine",
+    /// and the `action` already distinguishes them.
+    Trust,
 }
 
 impl AuditKind {
@@ -248,6 +264,7 @@ impl AuditKind {
             Self::DeviceChange => "device_change",
             Self::PairingFailed => "pairing_failed",
             Self::Unknown => "unknown",
+            Self::Trust => "trust",
         }
     }
 
@@ -261,6 +278,7 @@ impl AuditKind {
             "auth_reject" => Self::AuthReject,
             "device_change" => Self::DeviceChange,
             "pairing_failed" => Self::PairingFailed,
+            "trust" => Self::Trust,
             _ => Self::Unknown,
         }
     }
@@ -283,6 +301,21 @@ pub struct SessionStore {
 }
 
 impl SessionStore {
+    /// Connection settings every store gets before a migration runs.
+    ///
+    /// **The busy timeout is what makes two writers safe** (T-0059). This store is
+    /// written by more than one process: the daemon holds a connection for the
+    /// whole time it runs, and the CLI opens its own for `devices issue`,
+    /// `devices revoke` and `machines trust`. SQLite allows one writer at a time,
+    /// and without a timeout the second one fails immediately with `SQLITE_BUSY`
+    /// — which an operator would see as "the command randomly fails sometimes".
+    /// Five seconds covers any write this product makes (all of them are single
+    /// rows) and turns a spurious failure into a short wait.
+    fn prepare(conn: &Connection) -> Result<(), SessionError> {
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        Ok(())
+    }
+
     fn migrate(conn: &Connection) -> Result<(), SessionError> {
         conn.execute_batch(
             "PRAGMA journal_mode=WAL;
@@ -686,6 +719,7 @@ impl SessionStore {
     /// Open (or create + migrate) a file store.
     pub fn open(path: &std::path::Path) -> Result<Self, SessionError> {
         let conn = Connection::open(path)?;
+        Self::prepare(&conn)?;
         Self::migrate(&conn)?;
         Ok(Self {
             conn: std::sync::Mutex::new(conn),
@@ -695,6 +729,7 @@ impl SessionStore {
     /// In-memory store (tests).
     pub fn open_memory() -> Result<Self, SessionError> {
         let conn = Connection::open_in_memory()?;
+        Self::prepare(&conn)?;
         Self::migrate(&conn)?;
         Ok(Self {
             conn: std::sync::Mutex::new(conn),

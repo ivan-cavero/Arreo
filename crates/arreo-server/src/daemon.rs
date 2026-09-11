@@ -754,6 +754,14 @@ pub struct SessionAuth {
     /// The peer's network address, when there is one: the local socket has none,
     /// and a remote session's is truncated before it reaches the log.
     address: Option<std::net::SocketAddr>,
+    /// Whether this session has already put a trust refusal on the record.
+    ///
+    /// **Once per session, not once per verb** (T-0059). A device that is
+    /// untrusted here retries, and a row per attempt would let a client fill the
+    /// operator's log from outside — the cheapest denial of service against an
+    /// audit trail. The first refusal is the interesting one: it says who tried,
+    /// when, and why they were turned away; the ten thousandth says nothing new.
+    refusal_recorded: std::sync::atomic::AtomicBool,
 }
 
 impl SessionAuth {
@@ -772,6 +780,7 @@ impl SessionAuth {
             peer,
             device,
             address: None,
+            refusal_recorded: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -837,13 +846,37 @@ impl SessionAuth {
         self.ledger
             .with(|ledger| ledger.check(&self.device, verb))
             .map_err(|denial| {
+                let message = denial.to_string();
                 eprintln!(
                     "daemon: refusing {verb:?} for {} on this machine: {denial}",
                     self.device
                 );
+                // One row per session (see `refusal_recorded`). The `swap` is
+                // what makes it once: the first caller sees `false` and writes,
+                // every later one sees `true` and does not.
+                if !self
+                    .refusal_recorded
+                    .swap(true, std::sync::atomic::Ordering::Relaxed)
+                {
+                    self.ledger.with(|ledger| {
+                        if let Err(e) = ledger.record_refusal(
+                            &self.device,
+                            // `machine` by *id* because it is the stable name: the
+                            // reason below carries the machine's human name, which
+                            // a rename makes ambiguous, and every other trust row
+                            // records the id for the same reason.
+                            &format!(
+                                "machine={} verb={verb:?} reason={message}",
+                                ledger.machine().as_str()
+                            ),
+                        ) {
+                            eprintln!("daemon: cannot record the trust refusal: {e}");
+                        }
+                    });
+                }
                 Message::Error {
                     v: VERSION,
-                    message: denial.to_string(),
+                    message,
                 }
             })
     }

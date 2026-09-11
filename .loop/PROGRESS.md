@@ -1,25 +1,26 @@
 ## State snapshot          ← REWRITTEN (not appended) at every checkpoint
-Task: T-0046 · per-machine device trust — IN PROGRESS. Both mechanism increments landed and verified
-(model, schema v7, ledger, boot backfill, the enforcement gate, grant-on-issue). THREE criteria are
-NOT met and are filed as **T-0059**: `arreo machines trust`, `arreo devices revoke --machine`, and the
-audit rows for grant/revoke/refusal.
-Where you are: a machine's own grant now decides what a device may do on it, enforced per verb on
-every remote session (direct and relay), and a refusal names the machine, the role and the exact
-command. 435 tests.
-Next step: **T-0059** (the operator's half of trust — the command T-0046's refusals already tell people
-to run). Then T-0045 (cross-server attach) and T-0048 (OSS launch).
+Task: T-0059 · `arreo machines trust` — DONE. With it **T-0046 is DONE** (all 8 criteria met; the
+mechanism landed in two earlier increments, the operator's surface here).
+Where you are: a machine's grant decides what a device may do on it, enforced per verb on every remote
+session; `machines trust <device>|--list` extends and lists it; `devices revoke <device> --machine X`
+cuts one machine's grant; every change and every first refusal leaves an audit row. 445 tests.
+Next step: **T-0045** (cross-server attach — `arreo attach --machine <name>` over the relay) is the
+next ready p3 task and the last piece of §3.7's scenario. T-0048 (OSS launch) is the other large one.
 Open workers: (none)
 Known broken: (none) · Parked: (none)
 Findings:
-- **Early session exits delivered nothing.** The drain T-0052 added lived at the tail of
-  `serve_session`, so only the normal exit flushed; every refusal was written and discarded. Now a
-  wrapper covers all exit paths — worth checking anywhere else a "last frame" is written.
-- **check-targets caught a feature gate**: the ledger needs `crate::store`, so it is gated on
-  `sqlite` like the store itself, while the rule stays ungated.
-- **A test-process store write is invisible to a daemon spawned afterwards** in the harness (empty DB
-  at the same path, new root key); the shell transcript is the migration's e2e proof. Mechanism unexplained.
-- **ADR 0010 was taken** — T-0046's fence named a file it could never write; renumbered to 0019.
-- **Absence must be refusal, and the backfill is what makes that safe**; the marker must be one-way.
+- **Two gates, two reasons, two fixes.** A viewer refused `spawn` is stopped by the *certificate*
+  (re-pair/re-issue to fix); a device with no grant is stopped by *this machine's ledger*
+  (`machines trust` to fix). Filing both as one event would hide which command the operator needs.
+- **A refusal row is written once per session, not once per verb** — otherwise a retrying client fills
+  the log from outside, the cheapest DoS against an audit trail.
+- **The refusal message printed the certificate's word (`owner`)** where the roadmap says `operator`;
+  `Role::operator_term` now renders the operator's word everywhere user-facing, and a test asserts the
+  absence of the other one.
+- **Two writers need a busy timeout.** `SessionStore` had none, so a CLI write during a daemon write
+  would fail with SQLITE_BUSY — "randomly fails" to an operator. Five seconds now.
+- **A test-process store write is invisible to a daemon spawned afterwards** in the harness
+  (mechanism still unexplained; the shell transcript covers that case).
 ## Event log               ← append-only; newest last; never rewrite
 - 2026-09-10 [turn 1] ledger created; repo at e489fac (docs only); T-0001 + T-0022 (AGENTS.md gardened) done
 - 2026-09-10 [turn 2] T-0002 PTY manager done+pushed (342606c; 9 tests); PROMPT.md v2 synced + ADR 0001 (ef6c595)
@@ -87,3 +88,5 @@ Findings:
 - 2026-09-11 [turn 45, follow-up] The T-0046 enforcement wiring was written and **reverted**: it broke the normal device flow. A device pinned after boot (`arreo devices issue --socket …`) has no grant, so the new `SessionAuth` gate refused it — the boot backfill only covers devices that existed at startup, and `crates/arreo-server/tests/audit.rs` caught it. The gate therefore cannot ship without **grant-on-issue**, which is architectural: `arreo devices issue` and the server half of `arreo pair` run in the CLI process (pairing may run with no daemon) but the CLI may not depend on `arreo-server` where `TrustLedger` lives — so the ledger's type most likely moves to `arreo-core`, whose store layer `SessionStore::record_trust` is already there. Reasoning recorded in the task file; nothing from the attempt committed; tree green at 431 tests
 
 - 2026-09-11 [turn 46] T-0046 increment 2 landed (task still in-progress; three criteria → T-0059): the trust gate is wired into `SessionAuth::check` after authentication on every remote session (direct and relay), `arreo devices issue` and the server half of `arreo pair` **grant on issue** (a device pinned without a grant would authenticate and then be refused, which is how the first wiring attempt broke `tests/audit.rs`), and the boot **backfill** grants pre-existing pairings once behind a one-way marker. `TrustLedger` moved to `arreo-core` (the CLI writes grants and may not depend on `arreo-server`) and is gated on the `sqlite` feature, which check-targets caught. Found a real bug: **every early session exit delivered nothing** — T-0052's drain lived at the tail, so a refused handshake wrote its Error into the duplex and dropped it; the flush is now a wrapper covering all exit paths. Not landed: `arreo machines trust`, `arreo devices revoke --machine`, audit rows (T-0059, filed with criteria). Evidence `.loop/evidence/T-0046/` (model.txt + backfill.txt). 435 tests, clippy/fmt clean, vet/deny/audit green, check-targets PASS/SKIP, 8 slices green, bench 6/6
+
+- 2026-09-11 [turn 47] T-0059 `arreo machines trust` done, which completes T-0046. New: `machines trust <device> [--machine] [--role viewer|operator] [--yes]` (prints the fingerprint, confirms, refuses an unpinned device so a typo is caught), `machines trust --list [--json]` (its own schema-1 contract), `devices revoke <id> --machine <name>` (cuts one machine's grant; without `--machine` it revokes the device and reports the live local grant it leaves behind), and the audit rows `trust.grant`/`trust.revoke`/`trust.refuse` with the refusal **once per session**. Two design findings: a viewer's refused spawn comes from the *certificate* gate (different fact, different fix) so it is not a trust row; and the refusal printed the certificate's `owner` where the roadmap says `operator`, fixed by `Role::operator_term` (the test asserts `owner` is *absent*). Also a real robustness fix: `SessionStore` had no busy timeout, so two writers (CLI + daemon) could fail with SQLITE_BUSY. Evidence `.loop/evidence/T-0059/` (transcript + mutation proofs). 445 tests, clippy/fmt clean, vet/deny/audit green, check-targets PASS/SKIP, 8 slices green, bench 6/6

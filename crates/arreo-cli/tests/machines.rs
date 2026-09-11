@@ -10,7 +10,7 @@
 //! `cargo test --workspace` (which builds every binary) — the same requirement
 //! `crates/arreo-server/tests/relay_daemon.rs` has, and for the same reason.
 
-use arreo_core::identity::{DeviceCert, DeviceKey, Role, RootKey, VerifyingKey};
+use arreo_core::identity::{DeviceCert, DeviceId, DeviceKey, Role, RootKey, VerifyingKey};
 use arreo_core::relay::join_proof_payload;
 use arreo_core::relay::session::RelaySession;
 use std::io::{BufRead, BufReader};
@@ -932,6 +932,194 @@ fn add_refuses_an_invite_that_names_no_account() {
         out.all()
     );
     assert!(out.stderr.contains("names no account"), "{}", out.all());
+}
+
+/// The trust surface through the real CLI (T-0059): the command T-0046's refusals
+/// tell operators to run, now that it exists.
+///
+/// Local, not over the relay: trust is this machine's own decision, so these need
+/// no relay at all — which is the point of the design (an operator must be able to
+/// fix a machine whose daemon will not start).
+#[test]
+fn trust_grants_lists_and_cuts_access_locally() {
+    let client = Client::new_bare("trust-local");
+    // A device for this machine to decide about, pinned through the product's own
+    // door (which also records the pairing default grant).
+    let device = DeviceKey::generate().expect("entropy");
+    let id = DeviceId::from_key(&device.public());
+    let issued = client.run(&[
+        "devices",
+        "issue",
+        "--name",
+        "phone",
+        "--role",
+        "owner",
+        "--key",
+        &device.public_hex(),
+    ]);
+    assert_eq!(issued.code, 0, "{}", issued.all());
+
+    // The pairing default is visible, in the operator's words.
+    let listed = client.run(&["machines", "trust", "--list"]);
+    assert_eq!(listed.code, 0, "{}", listed.all());
+    assert!(listed.stdout.contains(&id.display_id()), "{}", listed.all());
+    assert!(
+        listed.stdout.contains("operator"),
+        "the roadmap's word for the role, not the certificate's: {}",
+        listed.all()
+    );
+
+    let machine_name = arreo_core::mesh::default_machine_name();
+
+    // Cut this machine's grant only.
+    let cut = client.run(&[
+        "devices",
+        "revoke",
+        &id.display_id(),
+        "--machine",
+        &machine_name,
+    ]);
+    assert_eq!(cut.code, 0, "{}", cut.all());
+    assert!(
+        cut.stdout.contains("keeps whatever access"),
+        "{}",
+        cut.all()
+    );
+
+    let listed = client.run(&["machines", "trust", "--list", "--json"]);
+    let value = listed.json();
+    assert_eq!(
+        value["grants"][0]["live"],
+        serde_json::json!(false),
+        "the grant is revoked: {value}"
+    );
+    assert!(
+        value["grants"][0]["revoked_at"].as_str().is_some(),
+        "{value}"
+    );
+
+    // Restore it with the command the refusal would print.
+    let granted = client.run(&[
+        "machines",
+        "trust",
+        &id.display_id(),
+        "--role",
+        "operator",
+        "--yes",
+    ]);
+    assert_eq!(granted.code, 0, "{}", granted.all());
+    let listed = client.run(&["machines", "trust", "--list", "--json"]);
+    assert_eq!(listed.json()["grants"][0]["live"], serde_json::json!(true));
+
+    // Trust is local: another machine's name is refused, and nothing changes.
+    let other = client.run(&[
+        "machines",
+        "trust",
+        &id.display_id(),
+        "--machine",
+        "some-other-machine",
+        "--yes",
+    ]);
+    assert_eq!(other.code, 5, "{}", other.all());
+    assert!(
+        other.stderr.contains("Trust is local"),
+        "the refusal explains why: {}",
+        other.all()
+    );
+
+    // A device this machine never pinned would be inert: refused, so a typo in a
+    // fingerprint is caught instead of recorded.
+    let stranger = DeviceKey::generate().expect("entropy");
+    let unpinned = client.run(&[
+        "machines",
+        "trust",
+        &DeviceId::from_key(&stranger.public()).display_id(),
+        "--yes",
+    ]);
+    assert_eq!(unpinned.code, 3, "{}", unpinned.all());
+    assert!(
+        unpinned.stderr.contains("not pinned on this machine"),
+        "{}",
+        unpinned.all()
+    );
+
+    // Revoking a grant on a machine that is not this one is refused, not
+    // silently applied to the local ledger.
+    let wrong_machine = client.run(&[
+        "devices",
+        "revoke",
+        &id.display_id(),
+        "--machine",
+        "some-other-machine",
+    ]);
+    assert_eq!(wrong_machine.code, 5, "{}", wrong_machine.all());
+    assert!(
+        wrong_machine.stderr.contains("not this machine"),
+        "{}",
+        wrong_machine.all()
+    );
+
+    // And revoking the *device* reports the machine-local grant it leaves behind.
+    let revoked = client.run(&["devices", "revoke", &id.display_id()]);
+    assert_eq!(revoked.code, 0, "{}", revoked.all());
+    assert!(
+        revoked.stdout.contains("still holds a live"),
+        "the operator must not be left with a revoked device and a live grant: {}",
+        revoked.all()
+    );
+    assert!(
+        revoked.stdout.contains("--machine"),
+        "and is told the command that fixes it: {}",
+        revoked.all()
+    );
+}
+
+/// A confirmation is required unless `--yes`: an authorization that writes itself
+/// when a human hits enter is how the wrong device gets trusted.
+#[test]
+fn trust_asks_before_granting() {
+    let client = Client::new_bare("trust-confirm");
+    let device = DeviceKey::generate().expect("entropy");
+    let id = DeviceId::from_key(&device.public());
+    assert_eq!(
+        client
+            .run(&[
+                "devices",
+                "issue",
+                "--name",
+                "phone",
+                "--role",
+                "viewer",
+                "--key",
+                &device.public_hex(),
+            ])
+            .code,
+        0
+    );
+    // Downgrade to revoked so a re-grant is a real change to observe.
+    let name = arreo_core::mesh::default_machine_name();
+    assert_eq!(
+        client
+            .run(&["devices", "revoke", &id.display_id(), "--machine", &name])
+            .code,
+        0
+    );
+
+    // No `--yes` and no answer on stdin: nothing changes.
+    let unconfirmed = client.run(&["machines", "trust", &id.display_id()]);
+    assert_eq!(unconfirmed.code, 5, "{}", unconfirmed.all());
+    assert!(
+        unconfirmed.stderr.contains("not confirmed"),
+        "{}",
+        unconfirmed.all()
+    );
+    assert_eq!(
+        client
+            .run(&["machines", "trust", "--list", "--json"])
+            .json()["grants"][0]["live"],
+        serde_json::json!(false),
+        "an unconfirmed grant must not be recorded"
+    );
 }
 
 /// A relay that is not configured at all is exit 4 with a message that says

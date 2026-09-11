@@ -21,7 +21,9 @@
 //! lie this file exists to prevent (T-0043's read-only mirror invariant).
 
 use crate::ExitCode;
-use arreo_core::mesh::{CachedMachine, DirectoryCache, MachineRow, Name, Presence};
+use arreo_core::identity::{DeviceId, Role};
+use arreo_core::mesh::{CachedMachine, DirectoryCache, MachineId, MachineRow, Name, Presence};
+use arreo_core::mesh::{GrantedDevice, TrustLedger};
 use std::path::PathBuf;
 
 /// Exit codes, stated in `--help` and stable (T-0044's contract).
@@ -30,6 +32,9 @@ pub const USAGE: u8 = 2;
 pub const UNKNOWN_MACHINE: u8 = 3;
 pub const UNREACHABLE: u8 = 4;
 pub const CONFLICT: u8 = 5;
+/// A store or identity this command needed and could not read. Distinct from
+/// [`UNREACHABLE`], which is about the network: this one never touched it.
+pub const FAILURE: u8 = 1;
 
 /// The JSON schema version. Additive-only: the contract test fails on a removed
 /// or renamed key and on an out-of-enum value, so breaking a script is a red
@@ -48,6 +53,10 @@ pub fn run(rest: &[String]) -> ExitCode {
         "rename" => crate::rt::block_on(rename(args)),
         "remove" => crate::rt::block_on(remove(args)),
         "add" => crate::rt::block_on(add(args)),
+        // Local, not over the relay: trust is this machine's own decision, and
+        // the operator administering it is the machine acting (see the task's
+        // "The write path, decided").
+        "trust" => trust(args),
         other => {
             eprintln!("machines: unknown verb {other:?}");
             usage()
@@ -61,6 +70,10 @@ fn usage() -> ExitCode {
     eprintln!("       arreo machines rename <old> <new> [--config PATH]");
     eprintln!("       arreo machines remove <name> [--stale] [--force] [--config PATH]");
     eprintln!("       arreo machines add <pairing-code> --uri <invite> [--name N]");
+    eprintln!(
+        "       arreo machines trust <device> [--machine <name>] [--role viewer|operator] [--yes]"
+    );
+    eprintln!("       arreo machines trust --list [--json]     (who may use *this* machine)");
     eprintln!();
     eprintln!(
         "  --json     the script contract (schema {SCHEMA}); the human table is NOT one and may"
@@ -75,6 +88,12 @@ fn usage() -> ExitCode {
     );
     eprintln!("             the session, its key, and the account and relay to join");
     eprintln!("  --force    tombstone a machine that is answering right now (asks once otherwise)");
+    eprintln!("  --machine  which machine's trust to change: this one, or the command is refused");
+    eprintln!("  --role     viewer (observe) or operator (also drive); defaults to viewer");
+    eprintln!(
+        "  --yes      skip the confirmation (for scripts); without it the device is shown first"
+    );
+    eprintln!("  --socket   the machine's socket, whose store holds its trust ledger");
     eprintln!();
 
     eprintln!(
@@ -581,6 +600,357 @@ fn read_only_flag(options: &Options) -> Option<&'static str> {
     }
 }
 
+/// The local machine's identity and name, derived from the socket it serves.
+///
+/// One source for "which machine am I", shared by every trust verb: the root key
+/// (T-0056's `MachineId::from_key`), and the same default name the directory row
+/// uses. A machine that could not agree with itself about its own identity would
+/// write grants nothing else could match.
+fn local_machine(socket: &std::path::Path) -> Result<(MachineId, String, PathBuf), String> {
+    let layout = arreo_core::identity::authority::Layout::for_socket(socket);
+    let root = arreo_core::identity::RootKey::load_or_generate(&layout.root_key).map_err(|e| {
+        format!(
+            "cannot read this machine's key ({}): {e}",
+            layout.root_key.display()
+        )
+    })?;
+    Ok((
+        MachineId::from_key(&root.public()),
+        arreo_core::mesh::default_machine_name(),
+        layout.store,
+    ))
+}
+
+/// This machine's trust ledger, for a local administrative command.
+fn local_ledger(socket: &std::path::Path) -> Result<TrustLedger, String> {
+    let layout = arreo_core::identity::authority::Layout::for_socket(socket);
+    TrustLedger::open(
+        &layout.store,
+        &layout.root_key,
+        arreo_core::mesh::default_machine_name(),
+    )
+    .map_err(|e| e.to_string())
+}
+
+/// `arreo machines trust …`: extend, or list, this machine's grants (T-0059).
+///
+/// The command T-0046's refusals already tell operators to run — it exists so
+/// that advice is followable. It is deliberately **local**: trust is this
+/// machine's decision, there is no device-facing verb that can change it, and
+/// `--machine <other>` is refused rather than forwarded, because neither another
+/// machine nor the relay may grant here on someone else's behalf.
+/// What `machines trust` was asked to do, parsed once.
+struct TrustOptions {
+    list: bool,
+    machine: Option<String>,
+    role: Option<String>,
+    assume_yes: bool,
+    json: bool,
+    device: Option<String>,
+}
+
+fn trust(args: &[String]) -> ExitCode {
+    let (socket, kept) = crate::take_socket(args);
+    let mut options = TrustOptions {
+        list: false,
+        machine: None,
+        role: None,
+        assume_yes: false,
+        json: false,
+        device: None,
+    };
+
+    let mut i = 0;
+    while i < kept.len() {
+        match kept[i].as_str() {
+            "--list" => options.list = true,
+            "--yes" | "-y" => options.assume_yes = true,
+            "--json" => options.json = true,
+            "--machine" if i + 1 < kept.len() => {
+                options.machine = Some(kept[i + 1].clone());
+                i += 2;
+                continue;
+            }
+            "--role" if i + 1 < kept.len() => {
+                options.role = Some(kept[i + 1].clone());
+                i += 2;
+                continue;
+            }
+            other if !other.starts_with('-') && options.device.is_none() => {
+                options.device = Some(other.to_string());
+            }
+            other => {
+                eprintln!("machines trust: unexpected argument {other:?}");
+                return usage();
+            }
+        }
+        i += 1;
+    }
+
+    if options.list && options.device.is_some() {
+        eprintln!("machines trust: pass a device to grant, or --list to see the grants — not both");
+        return usage();
+    }
+    if !options.list && options.device.is_none() {
+        eprintln!("machines trust: nothing to do — pass a device to grant, or --list");
+        return usage();
+    }
+    let device = match &options.device {
+        None => None,
+        Some(raw) => match DeviceId::parse(raw) {
+            Ok(device) => Some(device),
+            Err(e) => {
+                eprintln!("machines trust: {raw:?} is not a device id: {e}");
+                return ExitCode::from(UNKNOWN_MACHINE);
+            }
+        },
+    };
+    let role = match options.role.as_deref() {
+        // Least privilege by default: a grant is easy to widen and awkward to
+        // notice, so the safe direction is the one that has to be asked for.
+        None => Role::Viewer,
+        Some(text) => match Role::parse(text) {
+            Ok(role) => role,
+            Err(_) => {
+                eprintln!("machines trust: --role takes viewer or operator (got {text:?})");
+                return usage();
+            }
+        },
+    };
+
+    let (this_machine, machine_name, _) = match local_machine(&socket) {
+        Ok(local) => local,
+        Err(message) => {
+            eprintln!("machines trust: {message}");
+            return ExitCode::from(FAILURE);
+        }
+    };
+
+    // `--machine` names whose trust is being changed, and only this machine's can
+    // be. A remote name is refused rather than silently redirected to the local
+    // ledger: acting on the wrong machine quietly is worse than not acting.
+    if let Some(named) = &options.machine {
+        if !machine_matches(named, &this_machine, &machine_name) {
+            eprintln!(
+                "machines trust: {named:?} is not this machine (which is {machine_name:?}, \
+                 {}). Trust is local: no machine — and not the relay — can grant on another's \
+                 behalf. Run this on {named} itself.",
+                this_machine.as_str()
+            );
+            return ExitCode::from(CONFLICT);
+        }
+    }
+
+    let ledger = match local_ledger(&socket) {
+        Ok(ledger) => ledger,
+        Err(message) => {
+            eprintln!("machines trust: {message}");
+            return ExitCode::from(FAILURE);
+        }
+    };
+
+    if options.list {
+        return list_grants(&ledger, &this_machine, &machine_name, options.json);
+    }
+    let device = device.expect("checked above: not --list means a device was given");
+
+    // A grant for a device this machine has never pinned is inert: the Noise
+    // handshake resolves the peer from the pin list, so it could never open a
+    // session to use the grant. Refusing is kinder than writing a row that does
+    // nothing, and it catches a mistyped fingerprint — the mistake this command
+    // is most likely to see. Checked *before* the confirmation, so the operator is
+    // never asked to confirm something that cannot work.
+    if !pinned_here(&socket, &device) {
+        eprintln!(
+            "machines trust: {} is not pinned on this machine, so a grant would do nothing \
+             (it could not authenticate here). Pin it first: `arreo devices issue --key …` \
+             on this machine, or `arreo pair` on the device.",
+            device.display_id()
+        );
+        return ExitCode::from(UNKNOWN_MACHINE);
+    }
+
+    // The fingerprint before the act: a mistyped id is visible while it is still
+    // cheap to stop.
+    let existing = ledger.devices().unwrap_or_default();
+    let previous = existing.iter().find(|row| row.device == device);
+    if !options.assume_yes {
+        println!(
+            "grant {} ({}) {} access to this machine ({machine_name})?",
+            device.display_id(),
+            describe_previous(previous),
+            role.operator_term()
+        );
+        if !confirm() {
+            eprintln!("machines trust: not confirmed; nothing changed");
+            return ExitCode::from(CONFLICT);
+        }
+    }
+
+    match ledger.grant(&device, role, &device, crate::now_ms_i64()) {
+        Ok(_) => {
+            if options.json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "granted": true,
+                        "device": device.display_id(),
+                        "role": role.operator_term(),
+                        "machine": machine_name,
+                        "machine_id": this_machine.as_str(),
+                    })
+                );
+            } else {
+                println!(
+                    "{} may now {} on {machine_name}",
+                    device.display_id(),
+                    describe_role(role)
+                );
+            }
+            ExitCode::from(OK)
+        }
+        Err(e) => {
+            eprintln!("machines trust: the grant could not be recorded: {e}");
+            ExitCode::from(FAILURE)
+        }
+    }
+}
+
+/// Does a `--machine` value name this machine? By id or by name, because both are
+/// things an operator has in hand.
+fn machine_matches(named: &str, this_machine: &MachineId, this_name: &str) -> bool {
+    named == this_name || named.eq_ignore_ascii_case(this_name) || named == this_machine.as_str()
+}
+
+/// Is this device pinned in this machine's authority?
+fn pinned_here(socket: &std::path::Path, device: &DeviceId) -> bool {
+    match crate::open_authority(socket) {
+        Ok(authority) => authority
+            .devices()
+            .iter()
+            .any(|record| &record.id == device),
+        // A store that cannot be read is not "pinned": the grant would be inert
+        // anyway, and the caller reports the failure separately.
+        Err(_) => false,
+    }
+}
+
+fn describe_role(role: Role) -> &'static str {
+    match role {
+        // The roadmap's word for the operator role (ADR 0019): `owner` is what
+        // the certificates say, `operator` is what a human says.
+        Role::Owner => "observe and drive",
+        Role::Viewer => "observe",
+    }
+}
+
+/// What this machine already thinks of the device, for the confirmation line.
+fn describe_previous(previous: Option<&GrantedDevice>) -> String {
+    match previous {
+        None => "no grant here yet".to_string(),
+        Some(row) if row.is_live() => format!("currently {}", row.role.operator_term()),
+        Some(row) => format!(
+            "grant revoked at {}",
+            arreo_core::store::rfc3339_ms(row.revoked_at_ms.unwrap_or_default())
+        ),
+    }
+}
+
+/// Ask on stdin. Reads one line and requires an explicit yes.
+///
+/// Deliberately not a default-yes: this writes an authorization, and a command
+/// that acts when a human hits enter without reading is how the wrong device gets
+/// trusted. `--yes` exists for scripts, which opt in knowingly.
+fn confirm() -> bool {
+    use std::io::Write as _;
+    print!("type 'yes' to confirm: ");
+    let _ = std::io::stdout().flush();
+    let mut line = String::new();
+    if std::io::stdin().read_line(&mut line).is_err() {
+        return false;
+    }
+    matches!(line.trim().to_ascii_lowercase().as_str(), "yes" | "y")
+}
+
+/// `machines trust --list`: who may use this machine.
+fn list_grants(
+    ledger: &TrustLedger,
+    this_machine: &MachineId,
+    machine_name: &str,
+    json: bool,
+) -> ExitCode {
+    let rows = match ledger.devices() {
+        Ok(rows) => rows,
+        Err(e) => {
+            eprintln!("machines trust: cannot read this machine's grants: {e}");
+            return ExitCode::from(FAILURE);
+        }
+    };
+    let now = crate::now_ms_i64();
+    if json {
+        println!(
+            "{}",
+            grants_envelope(&rows, machine_name, this_machine, now)
+        );
+        return ExitCode::from(OK);
+    }
+    if rows.is_empty() {
+        println!("(no device is trusted on {machine_name})");
+        println!();
+        println!("grant one with: arreo machines trust <device> --role viewer --yes");
+        return ExitCode::from(OK);
+    }
+    println!("DEVICE                              ROLE     GRANTED              BY                                  STATE");
+    for row in &rows {
+        println!(
+            "{:<35} {:<8} {:<20} {:<35} {}",
+            row.device.display_id(),
+            row.role.operator_term(),
+            arreo_core::store::rfc3339_ms(row.granted_at_ms),
+            row.granted_by.display_id(),
+            match row.revoked_at_ms {
+                None => "live".to_string(),
+                Some(at) => format!("revoked {}", arreo_core::store::rfc3339_ms(at)),
+            }
+        );
+    }
+    ExitCode::from(OK)
+}
+
+/// The `trust --list --json` contract.
+///
+/// Its own document with its own version: `machines list` describes the account's
+/// machines (from the relay) and this describes one machine's grants (from its
+/// own store). Two different questions with two different sources, so sharing one
+/// envelope would mean fields that are meaningless in half the cases.
+fn grants_envelope(
+    rows: &[GrantedDevice],
+    machine_name: &str,
+    machine_id: &MachineId,
+    now_ms: i64,
+) -> serde_json::Value {
+    let grants: Vec<serde_json::Value> = rows
+        .iter()
+        .map(|row| {
+            serde_json::json!({
+                "device": row.device.display_id(),
+                "role": row.role.operator_term(),
+                "granted_at": arreo_core::store::rfc3339_ms(row.granted_at_ms),
+                "granted_by": row.granted_by.display_id(),
+                "revoked_at": row.revoked_at_ms.map(arreo_core::store::rfc3339_ms),
+                "live": row.is_live(),
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "schema": SCHEMA,
+        "machine": machine_name,
+        "machine_id": machine_id.as_str(),
+        "as_of": arreo_core::store::rfc3339_ms(now_ms),
+        "grants": grants,
+    })
+}
+
 /// `arreo machines add <pairing-code> --uri <invite>`: join an account.
 ///
 /// This runs on the machine being **admitted** — the one that has no identity
@@ -1079,6 +1449,120 @@ fn human_age(secs: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn grant(hex: char, role: Role, granted_by: char, revoked: Option<i64>) -> GrantedDevice {
+        GrantedDevice {
+            device: DeviceId::parse(&hex.to_string().repeat(32)).expect("device"),
+            role,
+            granted_at_ms: 1_000,
+            granted_by: DeviceId::parse(&granted_by.to_string().repeat(32)).expect("device"),
+            revoked_at_ms: revoked,
+        }
+    }
+
+    /// The `trust --list --json` contract: its own document with its own version,
+    /// and the same additive-only discipline as the relay listing — a removed or
+    /// renamed key is a red build, because a script parses it.
+    #[test]
+    fn the_grants_envelope_is_schema_1_with_its_own_keys() {
+        let machine = MachineId::parse("22222222222222222222222222222222").expect("id");
+        let rows = vec![
+            grant('a', Role::Viewer, 'a', None),
+            grant('b', Role::Owner, 'c', Some(2_000)),
+        ];
+        let envelope = grants_envelope(&rows, "the-pi", &machine, 10_000);
+        assert_eq!(envelope["schema"], serde_json::json!(1));
+        assert_eq!(envelope["machine"], serde_json::json!("the-pi"));
+        assert_eq!(envelope["machine_id"], serde_json::json!(machine.as_str()));
+        assert!(envelope["as_of"].as_str().is_some_and(|t| t.ends_with('Z')));
+
+        let grants = envelope["grants"].as_array().expect("an array");
+        assert_eq!(grants.len(), 2);
+        for entry in grants {
+            for key in [
+                "device",
+                "role",
+                "granted_at",
+                "granted_by",
+                "revoked_at",
+                "live",
+            ] {
+                assert!(
+                    entry.get(key).is_some(),
+                    "the contract requires {key} (additive-only): {entry}"
+                );
+            }
+            let role = entry["role"].as_str().expect("role is text");
+            assert!(
+                ["viewer", "operator"].contains(&role),
+                "the role is the word --role accepts, not the certificate's: {role:?}"
+            );
+        }
+        // A live grant has no revocation time, and says so with `null` rather than
+        // by omitting the key.
+        assert_eq!(grants[0]["revoked_at"], serde_json::json!(null));
+        assert_eq!(grants[0]["live"], serde_json::json!(true));
+        assert_eq!(grants[1]["live"], serde_json::json!(false));
+        assert!(
+            grants[1]["revoked_at"].as_str().is_some(),
+            "a revoked grant carries when: {grants:?}"
+        );
+        assert_eq!(
+            grants[1]["role"],
+            serde_json::json!("operator"),
+            "the roadmap's word for the owner role (ADR 0019)"
+        );
+    }
+
+    /// `--machine` accepts what an operator has in hand: the name and the id.
+    #[test]
+    fn a_machine_name_matches_by_name_or_id() {
+        let machine = MachineId::parse("33333333333333333333333333333333").expect("id");
+        assert!(machine_matches("the-pi", &machine, "the-pi"));
+        assert!(machine_matches("THE-PI", &machine, "the-pi"));
+        assert!(machine_matches(machine.as_str(), &machine, "the-pi"));
+        assert!(!machine_matches("the-vps", &machine, "the-pi"));
+        // A name that merely contains this one is not this machine.
+        assert!(!machine_matches("the-pi-2", &machine, "the-pi"));
+    }
+
+    /// Argument mistakes are reported in the terms they were typed, and are
+    /// rejected before anything is opened or created — so a typo cannot leave a
+    /// key file or a store behind, and this test needs no filesystem.
+    #[test]
+    fn trust_rejects_bad_arguments_before_touching_anything() {
+        // Nothing to do: no device, no --list.
+        assert_eq!(run(&["trust".to_string()]), ExitCode::from(USAGE));
+        // Both at once: ambiguous, refused.
+        assert_eq!(
+            run(&[
+                "trust".to_string(),
+                "11111111111111111111111111111111".to_string(),
+                "--list".to_string()
+            ]),
+            ExitCode::from(USAGE)
+        );
+        // A device id that is not one.
+        assert_eq!(
+            run(&["trust".to_string(), "not-a-device".to_string()]),
+            ExitCode::from(UNKNOWN_MACHINE)
+        );
+        // A role the policy does not have. `admin` is Team-tier (ROADMAP §4).
+        assert_eq!(
+            run(&[
+                "trust".to_string(),
+                "11111111111111111111111111111111".to_string(),
+                "--role".to_string(),
+                "admin".to_string()
+            ]),
+            ExitCode::from(USAGE)
+        );
+        // An unknown flag.
+        assert_eq!(
+            run(&["trust".to_string(), "--nope".to_string()]),
+            ExitCode::from(USAGE)
+        );
+    }
 
     fn row(name: &str, presence: Presence, last_seen_ms: i64, conflict: bool) -> Row {
         Row {

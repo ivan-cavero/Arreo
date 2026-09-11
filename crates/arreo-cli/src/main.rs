@@ -2025,9 +2025,40 @@ fn devices_rotate(socket: &std::path::Path, args: &[String], json: bool) -> Exit
     }
 }
 
+/// `arreo devices revoke <name|id> [--machine <name>] [--json]` (T-0059).
+///
+/// Two different facts, deliberately kept apart — that separation is the whole
+/// point of the per-machine trust model (T-0046):
+///
+/// - **without `--machine`**: revoke the *device* — the account-level fact that
+///   its certificate no longer authenticates anywhere. Its access to *this*
+///   machine is a separate fact, so the command reports the live grant rather
+///   than silently leaving the operator with a record that says "revoked" while
+///   a ledger still says "trusted".
+/// - **with `--machine`**: cut *this machine's grant only*, leaving the device
+///   working everywhere else. That is the "a phone paired to the VPS is not
+///   automatically paired to the Pi" case, in reverse.
 fn devices_revoke(socket: &std::path::Path, args: &[String], json: bool) -> ExitCode {
+    // `--machine <name>` is pulled out first: it changes what this command means,
+    // not just how it looks.
+    let mut machine: Option<String> = None;
+    let mut rest: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        if args[i] == "--machine" && i + 1 < args.len() {
+            machine = Some(args[i + 1].clone());
+            i += 2;
+            continue;
+        }
+        rest.push(args[i].clone());
+        i += 1;
+    }
+    if let Some(named) = machine {
+        return revoke_machine_grant(socket, &rest, &named, json);
+    }
+    let args = rest.as_slice();
     let Some(raw) = args.first() else {
-        eprintln!("usage: arreo devices revoke <name|id> [--json]");
+        eprintln!("usage: arreo devices revoke <name|id> [--machine <name>] [--json]");
         return ExitCode::from(2);
     };
     let mut authority = match open_authority(socket) {
@@ -2049,6 +2080,9 @@ fn devices_revoke(socket: &std::path::Path, args: &[String], json: bool) -> Exit
     // case this command serves today.
     let revoker = arreo_core::identity::revocation::LOCAL_CLI;
     let now = arreo_core::identity::authority::now_ms();
+    // The machine-local fact, read *before* the revocation so the report is about
+    // the state the operator is leaving behind.
+    let local_grant = machine_grant(socket, &device);
     match authority.revoke(&device, revoker, now) {
         Ok(arreo_core::identity::authority::Revocation::Revoked) => {
             if json {
@@ -2060,10 +2094,16 @@ fn devices_revoke(socket: &std::path::Path, args: &[String], json: bool) -> Exit
                         "device": device.display_id(),
                         "by": revoker,
                         "at_ms": now,
+                        "machine_grant": local_grant.as_ref().map(|row| serde_json::json!({
+                            "machine": arreo_core::mesh::default_machine_name(),
+                            "role": row.role.as_str(),
+                            "live": row.is_live(),
+                        })),
                     })
                 );
             } else {
                 println!("revoked {}", device.display_id());
+                report_local_grant(&device, local_grant.as_ref());
             }
             ExitCode::SUCCESS
         }
@@ -2725,6 +2765,165 @@ fn now_ms_i64() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
+}
+
+/// The role this machine's ledger currently grants `device`, if there is a row.
+fn machine_grant(
+    socket: &std::path::Path,
+    device: &arreo_core::identity::DeviceId,
+) -> Option<arreo_core::mesh::GrantedDevice> {
+    let layout = arreo_core::identity::authority::Layout::for_socket(socket);
+    let ledger = arreo_core::mesh::TrustLedger::open(
+        &layout.store,
+        &layout.root_key,
+        arreo_core::mesh::default_machine_name(),
+    )
+    .ok()?;
+    ledger
+        .devices()
+        .ok()?
+        .into_iter()
+        .find(|row| &row.device == device)
+}
+
+/// Say what this machine's ledger still says, after an account-level revocation.
+///
+/// Only *this* machine's grants are visible from here — the others live in their
+/// own stores, by design (a machine's trust is its own). Saying so is the honest
+/// half of the report: a device revoked in the account is refused everywhere by
+/// the certificate check, but the machines whose ledgers still list it can only
+/// be cleaned up on those machines.
+fn report_local_grant(
+    device: &arreo_core::identity::DeviceId,
+    grant: Option<&arreo_core::mesh::GrantedDevice>,
+) {
+    let machine = arreo_core::mesh::default_machine_name();
+    match grant {
+        Some(row) if row.is_live() => {
+            println!(
+                "note: this machine ({machine}) still holds a live {role} grant for {} — the \
+                 device is already refused by its certificate, and the grant is what \
+                 `arreo machines trust --list` shows. Cut it with:",
+                device.display_id(),
+                role = row.role.as_str()
+            );
+            println!(
+                "  arreo devices revoke {} --machine {machine}",
+                device.display_id()
+            );
+            println!(
+                "note: other machines' ledgers are not visible from here; each holds its own."
+            );
+        }
+        Some(_) => {}
+        None => {}
+    }
+}
+
+/// `--machine <name>`: cut this machine's grant, and only it (T-0059).
+fn revoke_machine_grant(
+    socket: &std::path::Path,
+    args: &[String],
+    named: &str,
+    json: bool,
+) -> ExitCode {
+    let Some(raw) = args.first() else {
+        eprintln!("usage: arreo devices revoke <name|id> --machine <name> [--json]");
+        return ExitCode::from(2);
+    };
+    let layout = arreo_core::identity::authority::Layout::for_socket(socket);
+    let root = match arreo_core::identity::RootKey::load_or_generate(&layout.root_key) {
+        Ok(root) => root,
+        Err(e) => {
+            eprintln!("devices revoke: cannot read this machine's key: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let this_machine = arreo_core::mesh::MachineId::from_key(&root.public());
+    let this_name = arreo_core::mesh::default_machine_name();
+    if named != this_name
+        && !named.eq_ignore_ascii_case(&this_name)
+        && named != this_machine.as_str()
+    {
+        // Trust is local, so this cannot be done from here — and pretending
+        // otherwise (by cutting the local grant under a remote name) would be the
+        // worst outcome: a silent no-op on the machine the operator named.
+        eprintln!(
+            "devices revoke: {named:?} is not this machine (which is {this_name:?}, {}). A \
+             machine's grants live in its own store: run this on {named}.",
+            this_machine.as_str()
+        );
+        return ExitCode::from(5);
+    }
+    let Some(raw_device) = parse_device_reference_loose(raw) else {
+        eprintln!("devices revoke: {raw:?} is not a device id");
+        return ExitCode::from(3);
+    };
+    let ledger = match arreo_core::mesh::TrustLedger::open(
+        &layout.store,
+        &layout.root_key,
+        this_name.clone(),
+    ) {
+        Ok(ledger) => ledger,
+        Err(e) => {
+            eprintln!("devices revoke: cannot open this machine's trust ledger: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let now = arreo_core::identity::authority::now_ms();
+    match ledger.revoke(&raw_device, now) {
+        Ok(true) => {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "revoked": true,
+                        "grant": true,
+                        "machine": this_name,
+                        "machine_id": this_machine.as_str(),
+                        "device": raw_device.display_id(),
+                        "at_ms": now,
+                    })
+                );
+            } else {
+                println!(
+                    "cut {}'s grant on {this_name} — it keeps whatever access it has elsewhere",
+                    raw_device.display_id()
+                );
+            }
+            ExitCode::SUCCESS
+        }
+        Ok(false) => {
+            // Idempotent, like the device-level revoke: the desired state holds.
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "revoked": false,
+                        "grant": true,
+                        "already": true,
+                        "machine": this_name,
+                        "device": raw_device.display_id(),
+                    })
+                );
+            } else {
+                println!(
+                    "{} had no live grant on {this_name}",
+                    raw_device.display_id()
+                );
+            }
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("devices revoke: cannot cut the grant: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// A device id from text, without needing an authority to resolve a name.
+fn parse_device_reference_loose(raw: &str) -> Option<arreo_core::identity::DeviceId> {
+    arreo_core::identity::DeviceId::parse(raw).ok()
 }
 
 /// The account and relay a joining machine should register itself with

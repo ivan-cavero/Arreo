@@ -10,6 +10,8 @@ arreo machines status [<name>] [--json] [--offline] [--config PATH]
 arreo machines rename <old> <new> [--config PATH]
 arreo machines remove <name> [--stale] [--force] [--config PATH]
 arreo machines add    <pairing-code> --uri <invite> [--name N]
+arreo machines trust  <device> [--machine <name>] [--role viewer|operator] [--yes]
+arreo machines trust  --list [--json]
 ```
 
 Both verbs read the relay **directly** with this machine's paired device
@@ -184,3 +186,71 @@ A machine that is admitted but cannot reach the relay keeps its certificate and
 is told so; run `arreo machines add` again with a fresh code once the relay is
 reachable. Pairing codes are single-use (T-0024), so re-joining always takes a new
 one.
+
+## Trust: who may use *this* machine
+
+An account's certificate says what a device *is*. It does not say what a device
+may do **here** — that is this machine's own decision, stored in its own database,
+and it is the reason a phone paired to the VPS is not automatically trusted by the
+Pi (ROADMAP §3.7). The model and the rejected alternatives are in
+[ADR 0019](../specs/adr/0019-per-machine-device-trust.md).
+
+```console
+# on the machine whose access you are changing:
+arreo machines trust --list
+arreo machines trust dev_4f55... --role operator --yes
+arreo devices revoke dev_4f55... --machine workbox
+```
+
+What a refused device is told — the command it should be handed:
+
+```
+machine workbox has no grant for this device, so Read is refused.
+Grant it with: arreo machines trust dev_4f55... --machine workbox --role viewer --yes
+```
+
+**Two facts, two commands, never conflated:**
+
+| Command | What it changes | Where it applies |
+| --- | --- | --- |
+| `devices revoke <id>` | the **device** — its certificate no longer authenticates | every machine (account-level) |
+| `devices revoke <id> --machine <name>` | **this machine's grant** | one machine; the device keeps its access elsewhere |
+| `machines trust <id> --role ...` | **this machine's grant**, extending or restoring it | one machine |
+
+Trust is **local and cannot be delegated**: `--machine` must name this machine, or
+the command is refused (exit 5). No machine — and not the relay — can grant on
+another's behalf, because a grant recorded anywhere but the machine that will
+enforce it would be advice, not access.
+
+`machines trust` also refuses a device this machine has never **pinned** (exit 3):
+the Noise handshake resolves a peer from the pin list, so a grant for an unpinned
+key could never be used — refusing catches a mistyped fingerprint instead of
+recording it. Without `--yes` the device fingerprint and the role are shown and a
+confirmation is required; an authorization that writes itself when a human hits
+enter is how the wrong device gets trusted.
+
+Grants are `viewer` (observe) or `operator` (also drive); v1 has no finer grain.
+The default is `viewer`: widening a grant is easy, noticing one you did not mean is
+not. `owner` is accepted as a synonym when reading certificates, but this surface
+prints and documents the roadmap's word.
+
+### The trail
+
+Every grant, every cut, and the first refusal of each session appends an audit row:
+
+```
+trust.grant   kind=trust outcome=ok      device=dev_4f55... agent=workbox detail=machine=2cfb51f3... role=operator by=4f55...
+trust.revoke  kind=trust outcome=ok      device=dev_4f55... agent=workbox detail=machine=2cfb51f3...
+trust.refuse  kind=trust outcome=refused device=dev_4f55... agent=workbox detail=machine=2cfb51f3... verb=Read reason=...
+```
+
+`device` is the device the decision is **about**; the actor rides in `detail`
+(`by=...`), and the machine is named both ways — by name in `agent` for a reader, by
+id in `detail` so an exported row survives a rename. The refusal row is written
+**once per session**, not once per refused verb: a client that retries cannot fill
+the operator's log from outside.
+
+Upgrading a machine to this feature grants every device it had already pinned the
+default role **once**, and the row says `reason=backfill`. Without that, an upgrade
+would lock out every existing pairing — and without the one-way marker, an
+operator's deliberate "revoke everything" would quietly heal itself on restart.
