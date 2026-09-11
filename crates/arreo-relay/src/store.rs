@@ -200,6 +200,26 @@ impl RelayStore {
         Ok(found.is_some())
     }
 
+    /// Every device the relay has ever seen in an account, with its last-seen
+    /// timestamp: the read path presence reports from (T-0031).
+    ///
+    /// One query over the `relay_device_seen` index — no table scan, no join —
+    /// because this is the query a 10,000-device listing runs. The caller
+    /// derives the variant with the one rule (`presence_at`), so the window is
+    /// never re-derived here.
+    pub fn device_presence(&self, account_id: &str) -> Result<Vec<(String, i64)>, StoreError> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT device_id, last_seen_ms FROM relay_device
+             WHERE account_id = ?1 ORDER BY device_id",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![account_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
+    }
+
     /// The account's root public key, if the account is registered.
     pub fn account_root(&self, account_id: &str) -> Result<Option<[u8; 32]>, StoreError> {
         let conn = self.lock()?;
@@ -239,6 +259,27 @@ impl RelayStore {
             |row| row.get(0),
         )?;
         Ok(value.parse().unwrap_or(0))
+    }
+
+    /// The query plan for the presence listing (T-0031): the test asserts the
+    /// index serves it, because "fast on this box today" is not a guarantee and
+    /// a plan is.
+    pub fn explain_presence_query(&self) -> Result<String, StoreError> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "EXPLAIN QUERY PLAN SELECT device_id, last_seen_ms FROM relay_device
+             WHERE account_id = ?1 ORDER BY device_id",
+        )?;
+        let parts = stmt.query_map(["acct-1"], |row| {
+            Ok(format!(
+                "{}|{}|{}|{}",
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, String>(3)?
+            ))
+        })?;
+        Ok(parts.collect::<Result<Vec<_>, _>>()?.join("\n"))
     }
 
     /// The column names of `table`, in definition order.

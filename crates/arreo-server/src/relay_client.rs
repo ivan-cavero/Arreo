@@ -241,6 +241,38 @@ async fn serve(mut session: RelaySession, context: &RelayContext, peer: Option<&
     if let Err(e) = session.drain(1).await {
         eprintln!("arreo-server: cannot drain the relay inbox: {e}");
     }
+    // The heartbeat (T-0031): a quiet machine must stay `online` too. A session
+    // that only ever receives would otherwise age out while still connected, so
+    // a task refreshes `last_seen_ms` on the stated cadence until the session
+    // ends. Jittered, so a fleet that connected together does not write in
+    // lockstep; the first beat is immediate, so a fresh session is never stale
+    // on arrival. The task holds only the outbound half: when the session ends
+    // the send fails and the task exits with it.
+    {
+        let outbound = session.outbound_handle();
+        let closed = session.closed_handle();
+        tokio::spawn(async move {
+            use std::time::{SystemTime, UNIX_EPOCH};
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.subsec_nanos() as f64 / 1e9)
+                .unwrap_or(0.0);
+            // A spread in [-1, 1): distinct processes start at distinct
+            // nanoseconds, which is all the de-synchronization this needs.
+            let jitter = (nanos * 2.0 - 1.0).clamp(-1.0, 1.0);
+            let mut wait = arreo_core::relay::session::heartbeat_delay(jitter);
+            loop {
+                tokio::select! {
+                    () = closed.wait() => return,
+                    () = tokio::time::sleep(wait) => {}
+                }
+                if outbound.send_heartbeat().await.is_err() {
+                    return;
+                }
+                wait = arreo_core::relay::session::heartbeat_delay(0.0);
+            }
+        });
+    }
     if let Some(peer) = peer {
         // The probe takes a fresh stream per attempt: a failed handshake leaves a
         // stream unusable, so retrying on it would retry on a dead object.

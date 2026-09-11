@@ -35,38 +35,46 @@ use rusqlite::{params, OptionalExtension, TransactionBehavior};
 /// where it costs one `OnceLock` read and nothing else.
 pub const CLOCK_OFFSET_ENV: &str = "ARREO_CLOCK_OFFSET_MS";
 
-/// Milliseconds the relay's clock is offset by, from [`CLOCK_OFFSET_ENV`].
+/// The relay's clock offset in milliseconds, for tests that must compare
+/// against the relay's view of time (T-0031, T-0055).
 ///
-/// Read **once**, so every clock read in the process shifts together: retention
-/// is a comparison between two timestamps, and a clock that moved between a write
-/// and a sweep would make "expired" a function of scheduling rather than of time.
-/// That is also why this is a startup offset and not a per-call hook — a relay
-/// whose clock moves underneath it is a relay whose retention cannot be reasoned
-/// about.
-///
-/// Why the seam exists at all (T-0055): §3.14's promise is about a machine that
-/// was away for *weeks*, and the only honest way to test a retention window is to
-/// move the clock rather than to wait. A short TTL with a real sleep is the
-/// tempting middle and is worse than either: slow, and still not the window it
-/// claims to exercise.
-fn clock_offset_ms() -> i64 {
-    static OFFSET: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
-    *OFFSET.get_or_init(|| {
-        std::env::var(CLOCK_OFFSET_ENV)
-            .ok()
-            .and_then(|value| value.trim().parse::<i64>().ok())
-            .unwrap_or(0)
-    })
+/// The process running the test and the relay under test are different
+/// processes with different clocks once the seam is set; comparing the relay's
+/// stored rows against this process's wall clock asserts a window the test did
+/// not exercise. This reads the same variable the relay reads, so both sides
+/// agree — and it is `0` when the seam is unset, so production code paths that
+/// never set it are unaffected.
+#[must_use]
+pub fn clock_offset_ms() -> i64 {
+    std::env::var(CLOCK_OFFSET_ENV)
+        .ok()
+        .and_then(|value| value.trim().parse::<i64>().ok())
+        .unwrap_or(0)
 }
 
 /// Milliseconds since the Unix epoch — the clock every row is stamped with.
+///
+/// The offset is read **once** (see [`clock_offset_ms`]): retention is a
+/// comparison between two timestamps, and a clock that moved between a write
+/// and a sweep would make "expired" a function of scheduling rather than of
+/// time. That is also why this is a startup offset and not a per-call hook — a
+/// relay whose clock moves underneath it is a relay whose retention cannot be
+/// reasoned about.
+///
+/// Why the seam exists at all (T-0055): §3.14's promise is about a machine that
+/// was away for *weeks*, and the only honest way to test a retention window is
+/// to move the clock rather than to wait. A short TTL with a real sleep is the
+/// tempting middle and is worse than either: slow, and still not the window it
+/// claims to exercise.
 #[must_use]
 pub fn now_ms() -> i64 {
+    static OFFSET: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
+    let offset = *OFFSET.get_or_init(clock_offset_ms);
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
-        .saturating_add(clock_offset_ms())
+        .saturating_add(offset)
 }
 
 #[derive(Debug, thiserror::Error)]

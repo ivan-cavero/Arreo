@@ -1,29 +1,28 @@
 ## State snapshot          ← REWRITTEN (not appended) at every checkpoint
-Task: T-0035 · AGPL boundary (phase 2) — DONE, the boundary is architecture a machine checks
-Where you are: the relay declares AGPL-3.0-or-later explicitly (the live manifest bug is fixed),
-the gate asserts the one-way rule plus per-crate licenses plus REUSE truth plus the portable
-interface plus no CLI shortcut, and the protocol doc versions v1 with the peergone kind T-0054
-added. 340 workspace tests.
-Next step: **T-0031 (presence)**, then T-0028, T-0040, T-0049. T-0044 is blocked on the
-account-join RPC (its own note); **T-0036 is human-gated** — it needs a real minisign keypair
-whose secret the operator holds as a CI secret, and the gate is recorded in the task file.
+Task: T-0031 · relay presence (phase 2) — DONE, one staleness rule with a lifecycle
+Where you are: the relay reports online/offline/last-seen from the stated 90 s / 30-day rule;
+connect writes online, every envelope refreshes, disconnect stamps last_seen, a restart
+recomputes from storage with no phantom state, and 10,000 devices list from one indexed query.
+347 workspace tests.
+Next step: **T-0028**, then T-0040, T-0049. T-0044 is blocked on the account-join RPC (its own
+note); **T-0036 is human-gated** — it needs a real minisign keypair whose secret the operator
+holds as a CI secret, and the gate is recorded in the task file.
 Open workers: (none)
 Known broken: (none) · Parked: (none)
 Findings:
-- **Declaring the relay AGPL broke cargo-deny, and that is the gate working.** The license
-  allow-list had no AGPL entry because no crate had ever declared one. The fix keeps the dependency
-  ban untouched: AGPL is allowed as a first-party license, and the workspace_deps gate asserts the
-  per-crate side cargo-deny cannot express. Two gates divide the work; the evidence records both.
-- **A textual gate catches edges, not copy-paste** (T-0035's own honest gap): manifests and REUSE
-  are asserted, not code provenance. Worth remembering the next time "the boundary is enforced" is
-  claimed — it is enforced against linking, not against copying.
+- **A heartbeat needs no new wire kind.** Every envelope refreshes last_seen; a quiet session is
+  kept alive by a zero-length frame to self that the relay records and consumes. A second path for
+  the same fact is how a product starts lying about who is alive.
+- **A restart test must compare against the relay's clock, not the test's.** Comparing stored rows
+  against the wrong clock asserts a window the test did not exercise (T-0055's lesson, one layer
+  up). The test computes wall-plus-offset and says so.
+- **OnceLock means the first read wins** — now_ms() caches its offset, so a test that sets the seam
+  after earlier reads compares against 0. The test computes directly instead.
 - **A dropped handle must stop its task** (T-0033, T-0054 — pattern, not incident).
 - **A carrier that does not report departures makes reconnects unreliable** (T-0054, PeerGone).
-- **Retention compares two timestamps, so the clock must move as one** (T-0055,
-  ARREO_CLOCK_OFFSET_MS read once).
-- **A restart ends every session; a queue for an offline peer is not a failure** (T-0055, T-0030).
-- **A budget row bench cannot measure still needs enforcing** — the slice/test reads the number from
-  perf-budget.toml rather than holding a copy.
+- **Retention compares two timestamps, so the clock must move as one** (T-0055).
+- **A budget row bench cannot measure still needs enforcing** — read the number from
+  perf-budget.toml, never hold a copy.
 ## Event log               ← append-only; newest last; never rewrite
 - 2026-09-10 [turn 1] ledger created; repo at e489fac (docs only); T-0001 + T-0022 (AGENTS.md gardened) done
 - 2026-09-10 [turn 2] T-0002 PTY manager done+pushed (342606c; 9 tests); PROMPT.md v2 synced + ADR 0001 (ef6c595)
@@ -63,3 +62,5 @@ Findings:
 - 2026-09-11 [turn 33] T-0055 reattach-after-absence done (the last criterion T-0032 split out): the relay's clock is injectable through `ARREO_CLOCK_OFFSET_MS` (read once, so retention compares timestamps from one clock; pinned to no-op when unset by unit test), and a simulated five-day absence against a real relay proves reattach in 63 ms against the new `reattach_after_absence_s` budget row (dial + auth + drain of three in seq order, ack + cursor making the second drain empty), plus a twenty-five-day absence proving the window's drops are *counted* (`expired: 2`) rather than silent. Both clients reconnect after the clock-moving restart, which is the shape a real absence has. Evidence `.loop/evidence/T-0055/`. T-0032's file is now fully ticked. 334 workspace tests, clippy/fmt clean, vet/deny/audit green, check-targets PASS/SKIP, 6 e2e slices green, bench 6/6; remote == local
 
 - 2026-09-11 [turn 34] T-0035 AGPL boundary done: the relay declares AGPL-3.0-or-later explicitly (the live bug — it inherited the Apache workspace default while REUSE and LICENSE-RELAY said AGPL), the workspace_deps gate now asserts the one-way rule (relay may depend on core; nothing Apache may depend on the relay), per-crate licenses (every shipped crate Apache, the relay AGPL), REUSE truth (relay mapped, no phantom paths — the stale arreo-relay-proto entry retired), the portable interface (the envelope vocabulary reachable from Apache arreo-core), and no CLI relay verb. Declaring AGPL broke cargo-deny in the same turn and the fix keeps the dependency ban untouched (AGPL allowed as a first-party license; the per-crate side lives in the gate cargo-deny cannot express). Protocol doc versions v1 with the peergone kind T-0054 added (kind table, §4.6, refusal table, implementer step 10); deploy doc states the §13 obligations honestly; CONTRIBUTING records the rule. Mutation control (add arreo-relay to the CLI manifest → gate fails naming the crate; revert → green) plus licenses, REUSE diff and deny run in .loop/evidence/T-0035/. 340 workspace tests, clippy/fmt clean, vet/deny/audit green, check-targets PASS/SKIP, 6 e2e slices green, bench 6/6; remote == local
+
+- 2026-09-11 [turn 35] T-0031 relay presence done: `crates/arreo-relay/src/presence.rs` owns the relay-side rule (thresholds stay the T-0043 contract in core — 90 s window, 30-day stale — consumed, never re-derived), the router writes last_seen on connect / every envelope / disconnect, heartbeats are zero-length frames to self recorded and consumed by the relay (no new wire kind, no phantom self-peer), `Router::presence` applies the one rule at read so a kill -9 + restart recomputes with no phantom state, `DevicePresence::display` renders `offline (last seen 15 d)` never an error, and 10,000 devices list from one indexed query in budget. 7 presence tests (exact boundaries 0/89/90/91 s and 29/30/30d+1s, backwards-clock clamp, heartbeat schedule, 15-day rendering, lifecycle against the real binary, 10k timing + EXPLAIN, metadata-only schema). Evidence `.loop/evidence/T-0031/`. 347 workspace tests, clippy/fmt clean, vet/deny/audit green, check-targets PASS/SKIP, 6 e2e slices green, bench 6/6; remote == local

@@ -124,6 +124,10 @@ enum Outbound {
     Drain(u64),
     /// Acknowledge everything up to `seq`.
     Ack(u64),
+    /// Refresh this device's `last_seen_ms` (T-0031). A zero-length frame to
+    /// self: it reaches the relay's read loop, which is where the heartbeat is
+    /// recorded, and no peer ever sees it.
+    Heartbeat,
 }
 
 /// One peer's stream state.
@@ -434,6 +438,29 @@ impl RelaySession {
             .map_err(|_| SessionError::Closed)
     }
 
+    /// Refresh this device's `last_seen_ms` on the relay (T-0031).
+    ///
+    /// A zero-length frame to self: the relay records it and consumes it, so no
+    /// peer ever sees it, and the sender's own reader never announces itself as
+    /// a new peer. The caller decides the cadence — `HEARTBEAT_INTERVAL` is the
+    /// stated one — because a session that only ever receives would otherwise
+    /// age out while still connected.
+    pub async fn heartbeat(&self) -> Result<(), SessionError> {
+        self.outbound
+            .send(Outbound::Heartbeat)
+            .await
+            .map_err(|_| SessionError::Closed)
+    }
+
+    /// The outbound half, for a task that must keep beating after the session
+    /// handle moves on (the daemon's heartbeat task, T-0031).
+    #[must_use]
+    pub fn outbound_handle(&self) -> OutboundHandle {
+        OutboundHandle {
+            outbound: self.outbound.clone(),
+        }
+    }
+
     /// The sequence numbers still awaiting a delivery report, for tests and for
     /// the operator's own diagnostics.
     #[must_use]
@@ -443,6 +470,46 @@ impl RelaySession {
             Err(poisoned) => poisoned.into_inner().len(),
         }
     }
+}
+
+/// The outbound half of a session: enough to send, not enough to receive.
+///
+/// A heartbeat task holds this rather than the session, so the session can move
+/// into the accept loop while the task keeps beating. When the session ends the
+/// channel closes, the send fails, and the task exits with it — no leak, no
+/// second "is the session alive" flag to keep in sync.
+#[derive(Debug, Clone)]
+pub struct OutboundHandle {
+    outbound: mpsc::Sender<Outbound>,
+}
+
+impl OutboundHandle {
+    /// Send one heartbeat. Fails when the session is gone, which is the
+    /// task's signal to exit.
+    pub async fn send_heartbeat(&self) -> Result<(), SessionError> {
+        self.outbound
+            .send(Outbound::Heartbeat)
+            .await
+            .map_err(|_| SessionError::Closed)
+    }
+}
+
+/// How long until the next heartbeat, given a jitter fraction in `[-1, 1]`.
+///
+/// The stated cadence (30 s) plus up to the jitter (6 s) in either direction,
+/// so a fleet that connected together does not write in lockstep. Pure, so the
+/// policy is testable without sleeping.
+///
+/// The numbers are literals, not imports, on purpose: `arreo-core` may not
+/// depend on `arreo-relay` (the AGPL boundary, T-0035), and the relay's
+/// `presence` module states the same two constants. Two spellings of one fact
+/// would be a drift risk, so the relay test asserts the values agree — the
+/// direction the dependency rule allows the check to point.
+#[must_use]
+pub fn heartbeat_delay(jitter_fraction: f64) -> Duration {
+    let jitter = jitter_fraction.clamp(-1.0, 1.0);
+    let delay_ms = 30_000 + (6_000.0 * jitter) as i64;
+    Duration::from_millis(delay_ms.max(1) as u64)
 }
 
 /// The write direction: chunks out, drain/ack requests out, sequence numbers
@@ -460,6 +527,17 @@ async fn write_pump(
                 .map(|seq| Some((seq, peer.as_str().to_string()))),
             Outbound::Drain(from_seq) => writer.drain(from_seq).await.map(|()| None),
             Outbound::Ack(seq) => writer.ack(seq).await.map(|()| None),
+            // A heartbeat is addressed to self with an empty payload: it is
+            // routed back to this session's own reader, which drops it (a frame
+            // from self carries nothing to deliver), but the relay's read loop
+            // has already recorded it as `last_seen_ms` on the way through.
+            // Sending through the normal path keeps one framing and one
+            // attribution — a side channel would be a second answer to "who is
+            // alive".
+            Outbound::Heartbeat => {
+                let this = writer.device_id().clone();
+                writer.send(&this, &[]).await.map(|_| None)
+            }
         };
         match result {
             Ok(Some((seq, key))) => {

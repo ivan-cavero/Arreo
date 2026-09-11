@@ -137,6 +137,33 @@ impl Router {
         self.lock_live().senders.len()
     }
 
+    /// Presence for every device the relay has ever seen in `account_id`
+    /// (T-0031): the stored `last_seen_ms` plus the one rule applied at `now_ms`.
+    ///
+    /// The rule is applied here, at the read, so a `kill -9` + restart changes
+    /// nothing: presence is recomputed from storage, and nothing reads `online`
+    /// until it reconnects — there is no phantom state to clear, because there
+    /// is no live flag stored anywhere.
+    pub fn presence(
+        &self,
+        account_id: &str,
+        now_ms: i64,
+    ) -> Result<Vec<crate::presence::DevicePresence>, StoreError> {
+        Ok(self
+            .store
+            .device_presence(account_id)?
+            .into_iter()
+            .map(
+                |(device_id, last_seen_ms)| crate::presence::DevicePresence {
+                    device_id,
+                    account_id: account_id.to_string(),
+                    presence: crate::presence::presence_at(last_seen_ms, now_ms),
+                    last_seen_ms,
+                },
+            )
+            .collect())
+    }
+
     fn lock_live(&self) -> std::sync::MutexGuard<'_, Live> {
         match self.live.lock() {
             Ok(guard) => guard,
@@ -441,6 +468,15 @@ async fn handle_connection(connection: Connection, router: Arc<Router>) -> Resul
     // Read envelopes until the device goes away.
     let result = read_loop(&mut recv, &mut buf, &router, &session, &outbound).await;
     router.deregister(&session, token);
+    // Presence truth (T-0031): the disconnect writes `last_seen` now, so
+    // `online` cannot outlive the socket by more than the 90 s window. A relay
+    // `kill -9` skips this line, and that is fine — presence is recomputed from
+    // storage, so the dead device simply ages out instead of being cleared.
+    let _ = router.store().touch_device(
+        &session.account_id,
+        session.device_id.as_str(),
+        crate::directory::now_ms(),
+    );
     drop(outbound);
     let _ = writer.await;
     eprintln!(
@@ -517,6 +553,33 @@ where
                 });
                 continue;
             }
+        }
+
+        // The heartbeat (T-0031): every envelope a device sends refreshes its
+        // `last_seen_ms`, so a connected device stays `online` without a new
+        // wire kind — and a half-open connection whose peer went quiet ages out
+        // on its own. One indexed write per envelope is the cost; a dedicated
+        // heartbeat kind would add a second path for the same fact.
+        let _ = router.store().touch_device(
+            &session.account_id,
+            session.device_id.as_str(),
+            crate::directory::now_ms(),
+        );
+
+        // A frame addressed to self is not routed, it is consumed here. The
+        // touch above already recorded it as `last_seen_ms`, and answering
+        // `delivered` would be a lie — nothing was delivered, because there is
+        // no peer. Consuming it here keeps one framing for "I am alive" without
+        // creating a phantom peer on the sender's own session (its reader would
+        // otherwise announce itself as a new peer and open a stream to itself).
+        if envelope.header.dst == session.device_id.as_str()
+            || envelope.header.dst == session.device_id.display_id()
+        {
+            let _ = outbound.try_send(Outbound::Status {
+                seq,
+                outcome: Outcome::Delivered,
+            });
+            continue;
         }
 
         let outcome = match router.decide(session, &envelope.header) {

@@ -1,0 +1,36 @@
+# T-0031 evidence — relay presence from one stated staleness rule
+
+## 1. The rule, the lifecycle, the read path (real relay binary where it matters)
+
+$ cargo test -p arreo-relay --test presence
+
+test ages_render_honestly_in_every_shape ... ok
+test the_heartbeat_schedule_is_stated_and_bounded ... ok
+test the_staleness_boundaries_are_exact ... ok
+test a_backwards_clock_clamps_to_online ... ok
+test presence_rows_carry_no_payload ... ok
+test presence_follows_the_socket_not_a_flag ... ok
+test ten_thousand_devices_list_in_one_indexed_query ... ok
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.77s
+
+## 2. The boundary table the criterion asks for
+
+age → variant (injected clock, no sleeps): 0 s online, 89 s online, 90 s online,
+91 s offline, 29 d offline, 30 d offline, 30 d + 1 s stale; future last_seen → online.
+
+## 3. The 10k-device listing (one indexed query)
+
+test ten_thousand_devices_list_in_one_indexed_query ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 6 filtered out; finished in 0.77s
+
+## 4. The full battery (final code)
+
+cargo test --workspace: 347 passed, 0 failed across 45 targets
+cargo clippy --workspace --all-targets -- -D warnings: 0 diagnostics
+cargo fmt --all -- --check: clean
+cargo vet --locked: Vetting Succeeded (336 exempted)
+cargo deny check: advisories ok, bans ok, licenses ok, sources ok
+cargo audit: 343 crate dependencies, no advisories
+cargo xtask check-targets: x86_64-unknown-linux-gnu PASS; x86_64-pc-windows-msvc SKIP (pure-Rust no-sqlite PASS)
+e2e slices: api green, lifecycle 2/2, persistence 3/3, tui 17/17, theme 27/27, relay 14/14
+cargo xtask bench: 6/6 PASS

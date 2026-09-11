@@ -11,14 +11,19 @@
 pub mod directory;
 pub mod inbox;
 pub mod pairing;
+pub mod presence;
 pub mod router;
 pub mod store;
 
-pub use directory::{Directory, DirectoryFailure, JoinTicket, CLOCK_OFFSET_ENV};
+pub use directory::{clock_offset_ms, Directory, DirectoryFailure, JoinTicket, CLOCK_OFFSET_ENV};
 pub use inbox::{
     Drained, Enqueued, Inbox, InboxError, InboxLimits, InboxStats, DEFAULT_MAX_MB,
     DEFAULT_MAX_MESSAGES, DEFAULT_TTL_DAYS,
 };
 pub use pairing::{Mailbox, MAX_FRAME_BYTES, MAX_REMEMBERED_BURNS, READ_TIMEOUT};
+pub use presence::{
+    format_age, missed_beats, next_heartbeat_delay, presence_at, DevicePresence,
+    HEARTBEAT_INTERVAL, HEARTBEAT_JITTER,
+};
 pub use router::{Router, RouterError, Session};
 pub use store::{RelayStore, StoreError, SCHEMA_VERSION};
