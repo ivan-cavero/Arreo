@@ -9,11 +9,16 @@
 //! guarantees here (see the module docs for the exact rules).
 
 pub mod directory;
+pub mod inbox;
 pub mod pairing;
 pub mod router;
 pub mod store;
 
 pub use directory::{Directory, DirectoryFailure, JoinTicket};
+pub use inbox::{
+    Drained, Enqueued, Inbox, InboxError, InboxLimits, InboxStats, DEFAULT_MAX_MB,
+    DEFAULT_MAX_MESSAGES, DEFAULT_TTL_DAYS,
+};
 pub use pairing::{Mailbox, MAX_FRAME_BYTES, MAX_REMEMBERED_BURNS, READ_TIMEOUT};
 pub use router::{Router, RouterError, Session};
 pub use store::{RelayStore, StoreError, SCHEMA_VERSION};

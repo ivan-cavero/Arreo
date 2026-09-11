@@ -2,7 +2,8 @@
 
 > Normative for v1. Every statement below is a property of code that ships:
 > the vocabulary and the reference client in `crates/arreo-core/src/relay/`
-> (Apache-2.0) and the server in `crates/arreo-relay/src/router.rs` (AGPL-3.0).
+> (Apache-2.0) and the server in `crates/arreo-relay/src/router.rs`, with the
+> durable inbox of `crates/arreo-relay/src/inbox.rs` (AGPL-3.0).
 > The vocabulary lives in the Apache crate on purpose (ROADMAP §7, T-0035): a
 > third party can implement a client — or a server — from this document without
 > linking AGPL code. Where this document and the code disagree, the code is
@@ -61,8 +62,9 @@ the framing convention this product already uses everywhere (T-0013).
   MessagePack decoder stops. Everything after that point in the frame is the
   payload, carried byte for byte and never interpreted by the relay.
 - A payload may be empty (`len` = header length) and may be arbitrary bytes —
-  it is not required to be MessagePack. Only `status` payloads are MessagePack,
-  and only the relay writes those (§4.3).
+  it is not required to be MessagePack. Only `status`, `drain` and `ack`
+  payloads are MessagePack: the relay writes the statuses (§4.3, §4.4), and the
+  device writes the two control messages (§4.4).
 - Do not read an envelope with the handshake frame reader: the envelope carries
   its own length prefix, and stripping it would make the decoder read the header
   bytes as a length. Use one reader per class.
@@ -81,8 +83,15 @@ the compact form:
 
 So a `Hello` is a 3-element array, and `HelloReply::Challenge` is
 `{"Challenge": [v, nonce]}`. The enum names are exactly the ones in this
-document: `frame`, `status` for the envelope kind, and `delivered`, `offline`,
-`no_such_device`, `refused` for an outcome.
+document: `frame`, `status`, `drain`, `ack` for the envelope kind, and
+`delivered`, `offline`, `queued`, `no_such_device`, `refused` for an outcome.
+
+Those strings are load-bearing rather than descriptive. The kind carries
+`#[serde(rename_all = "lowercase")]` and the outcome
+`#[serde(rename_all = "snake_case")]`, so what goes on the wire is the variant
+name in that case, and a client that spells one differently is speaking a
+different protocol. `Outcome::Queued` is a struct variant, so it takes the
+one-entry-map form above: `{"queued": [<queued>]}`.
 
 Interop notes, both a property of the decoder (`rmp_serde::from_slice` /
 `from_read`, compact config):
@@ -264,7 +273,7 @@ in it to put pane text, agent state or a key.
 | `src_device` | string | the sender. The relay requires it to equal the session's own device id (parsed and compared, so `dev_<hex>` and `<hex>` are the same device) |
 | `dst` | string | the destination device id, in either spelling |
 | `seq` | u64 | the sender's own sequence number. The relay does not check or rewrite it; it echoes it on the status it answers with |
-| `kind` | `"frame"` or `"status"` | what the envelope is for (§4.2) |
+| `kind` | `"frame"`, `"status"`, `"drain"` or `"ack"` | what the envelope is for (§4.2) |
 
 The relay does **not** enforce monotonic `seq` and does not de-duplicate: a
 receiver that cares about ordering or replays must do that itself, on the
@@ -274,11 +283,17 @@ sender's sequence numbers.
 
 | Value | Direction | Payload |
 | --- | --- | --- |
-| `frame` | device → relay → device | opaque bytes; the relay never decodes or persists them |
-| `status` | relay → device only | MessagePack of one `Outcome` (§4.3), written by the relay |
+| `frame` | device → relay → device | opaque bytes; the relay never decodes them, and keeps them only as the destination's queued bytes (§4.5) |
+| `status` | relay → device only | MessagePack of one `Outcome` (§4.3) or one `DrainReport` (§4.4), written by the relay |
+| `drain` | device → relay only | MessagePack of one `DrainRequest` (§4.4): hand me what is queued for me |
+| `ack` | device → relay only | MessagePack of one `Ack` (§4.4): I hold everything up to this cursor |
 
 A device that sends `kind = "status"` is refused per-envelope: statuses are the
-relay's to originate.
+relay's to originate. `drain` and `ack` are the mirror image — the device's to
+originate, and the relay never sends them, so a client that reads one is reading
+its own request echoed back and should treat it as a protocol error. Neither is
+a *frame*: a control message carries nothing for another device, and it never
+reaches the routing decision of §4.3.
 
 ### 4.3 Status envelopes and `Outcome`
 
@@ -286,19 +301,165 @@ Every frame the relay reads earns exactly one status envelope back to its
 sender, on the same stream. Its header is: `v = 1`, `account_id` = the session's
 account, `src_device = "relay"` (a reserved word — device ids are 32 hex
 characters, so it can never collide with one), `dst` = the sender's own device
-id in `dev_<hex>` form, `seq` = the sequence number of the frame being reported,
-`kind = "status"`. Its payload decodes to:
+id in `dev_<hex>` form, `seq` = the sequence number of the frame being reported
+(for the report a `drain` earns, `seq` is the cursor to resume from instead —
+§4.4), `kind = "status"`. Its payload decodes to:
 
 | Outcome | Name on the wire | Meaning |
 | --- | --- | --- |
 | `Delivered` | `delivered` | handed to the destination's outbound queue. Not a read receipt: the destination's application may not have looked at it yet |
-| `Offline` | `offline` | the destination is a known device that is not connected, or is connected but has stopped reading (its queue is full). Retry later |
+| `Offline` | `offline` | the destination is connected but has stopped reading, so its outbound queue is full. Retry later. A *known* device that is not connected is no longer `offline` — it is `queued` (§4.4) |
+| `Queued` | `queued` | committed to the destination's durable inbox, and delivered when that device drains (§4.4). Carries `queued: u64`, what is queued for that device now. `queued` and `offline` are different answers on purpose: `queued` means the bytes are on disk, `offline` means they are not |
 | `NoSuchDevice` | `no_such_device` | no device with that id has ever authenticated in this account. A wrong address, not a transient state |
 | `Refused` | `refused` | the relay would not carry this envelope at all; the reason is the string described in §5.2 |
+
+So the three "where did it go" answers a sender can get are now distinct:
+`delivered` (a live session's queue), `queued` (the destination's durable inbox)
+and `offline` (a live session that is not keeping up).
 
 A sender that never reads its own stream loses statuses: when the sender's
 outbound queue is full, the relay drops the status, logs
 `<device> is not reading its delivery reports; dropping one`, and moves on.
+
+### 4.4 `drain`, `ack`, and the drain report
+
+These two kinds are the device talking about *its own* inbox rather than sending
+to a peer. They are ordinary envelopes on the same stream, their payload is
+MessagePack, and the device writes it.
+
+`kind = "drain"`, payload `DrainRequest`:
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `v` | u32 | protocol version; the reference client writes `1`. Unlike the handshake, the relay does not read this field on a control message — the envelope header's `v` (§4.1) is the one it enforces |
+| `from_seq` | u64 | the first inbox sequence number wanted. A device that has acked nothing asks from `1`; otherwise the `next_seq` of the previous drain report |
+
+`kind = "ack"`, payload `Ack`:
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `v` | u32 | protocol version; the reference client writes `1`, and the relay does not read it (see `DrainRequest` above) |
+| `seq` | u64 | I hold everything up to and including this inbox sequence number: the rows at or below it are deleted and the cursor advances in one transaction. Acking something already gone is harmless and removes nothing |
+
+The relay answers a drain with, in this order, on the same stream:
+
+1. **the messages**, one `frame` envelope each, in ascending inbox `seq`, at
+   most **256** in one drain. Each one is the queued envelope byte for byte —
+   header and payload exactly as its sender wrote it — because the relay
+   replays the stored frame and never decodes the header inside it. So
+   `src_device` and `seq` on a drained frame are the *sender's* (§4.1), not the
+   relay's;
+2. **one drain report**, a `status` envelope from `src_device = "relay"` whose
+   payload is a `DrainReport`:
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `v` | u32 | protocol version; the relay writes `1`, and the reference client checks it |
+| `delivered` | u64 | messages delivered by this drain |
+| `dropped` | u64 | messages dropped since the previous drain — evicted by a bound, or expired. Carried once: the watermark moves in the drain's own transaction |
+| `expired` | u64 | the part of `dropped` that this drain's own expiry sweep found |
+| `queued` | u64 | what is still queued for this device afterwards |
+| `next_seq` | u64 | the cursor to resume from: one past the highest message delivered, or `from_seq` when nothing was waiting |
+
+The report's envelope header is the status header of §4.3 with one difference:
+its `seq` is `next_seq`, the resume cursor, because a drain is not a report on
+one frame. Its payload is a six-element array, where an `Outcome` is a variant
+name or a one-entry map (§2.3) — that shape is how a client tells the two apart,
+and the reference client tells them apart that way.
+
+The relay answers an `ack` with nothing at all: no status envelope follows it.
+And for both control kinds the relay uses the session's own device rather than
+the header: `account_id`, `src_device`, `dst` and the request's own `seq` are not
+read (§4.1's checks belong to frames). The reference client writes its own id as
+`dst`.
+
+A `drain` or `ack` whose payload does not decode as the expected type ends the
+session (§5.3), like any other malformed envelope.
+
+**Two sequence numbers, and they are not the same one:**
+
+- the **frame header's `seq`** is the sender's own, carried end to end
+  unchanged; it is the key a consumer de-duplicates on (§4.5);
+- the **inbox `seq`** is the relay's numbering of one destination's queue, and
+  it is the only thing `from_seq`, `ack.seq` and `next_seq` speak. It is
+  assigned as one past the highest row that device currently has, so it numbers
+  *this* queue: once a device's inbox is empty, the numbering starts at `1`
+  again. A cursor is an index into the current queue, not a durable high-water
+  mark — a client that has acked everything should ask from `1` next time
+  rather than resume from a stale high cursor.
+
+### 4.5 The inbox, and what the consumer must do
+
+A destination that is a **known** device with no live session is no longer
+answered `offline`: the relay commits the envelope to that device's durable
+inbox *before* it answers `queued` (§4.3). A phone that is asleep, and a relay
+that is restarted, both stop mattering — the bytes are in `relay.db` (the
+operator's guide, §3), stored as the framed envelope the relay cannot read.
+
+The flow end to end:
+
+```text
+sender                          relay                          destination
+  frame dst=bob     ------->   bob is known, no session
+                               commit to bob's inbox
+                    <-------   status: queued { queued: n }
+                                                                 drain { from_seq: 1 }
+                               bob's rows, ascending
+                    -----------------------------------------> frame (bob's queued envelope)
+                    -----------------------------------------> frame …
+                    -----------------------------------------> status: DrainReport { delivered,
+                                                                 dropped, expired, queued, next_seq }
+                                                                 ack { seq: next_seq - 1 }
+                               rows deleted; cursor advanced
+```
+
+1. The sender addresses a `frame` to `bob`. If `bob` is a known device with no
+   live session, the sender is told `queued` and the bytes are already on disk.
+2. `bob` reconnects — after a sleep, a crash, a relay restart — and sends
+   `drain` from its cursor, `1` the first time.
+3. The relay replays up to 256 queued envelopes and then the drain report. The
+   messages are ordinary `frame` envelopes, so a client's existing receive path
+   handles them unchanged.
+4. `bob` processes them and sends `ack` with the report's `next_seq - 1`; the
+   relay deletes those rows.
+
+**The wire is at-least-once, not exactly-once.** A row is deleted only by an
+`ack`, so a consumer that disconnects mid-drain, or drains twice without acking,
+sees the same message again; a `drain` itself never removes anything. What makes
+the consumer see each message once is its own de-duplication of the pair
+`(src_device, seq)` from the frame's own header, which is identical across a
+redelivery. Be precise about what that pair is: the relay neither checks nor
+rewrites the sender's `seq` (§4.1), and the reference client starts its own
+`seq` at 1 on each new session, so the pair identifies a message within one
+sender *session* rather than across that device's history. Claiming end-to-end
+exactly-once without the consumer's half would be a lie.
+
+The rest of the queue's honest properties:
+
+- **Ordering is per destination, not per sender.** The inbox is one queue per
+  destination device, numbered in arrival order, and it drains in that order.
+  There is no per-producer fairness and no per-sender quota: every producer's
+  messages to the same destination share one message/byte budget, and a producer
+  that fills it evicts the destination's oldest messages whichever producer
+  wrote them.
+- **The bounds are enforced, and a forced drop is counted rather than silent.**
+  Per device, by default, 10,000 messages, 64 MiB and a 30-day retention window
+  (§6); the operator sets all three. Eviction is oldest-first and happens before
+  the write, so a full inbox never exceeds its bound. A message larger than the
+  whole byte budget is refused (`Outcome::Refused`, §5.2) rather than emptying
+  the queue to make room for it. Every eviction and expiry lands in the durable
+  counters and in the next drain report.
+- **Expiry is lazy plus hourly.** An `enqueue` and a `drain` sweep what is past
+  its TTL, and the relay sweeps the whole store once an hour whether or not
+  there is traffic, so a device that never returns cannot keep the disk full.
+- **There is no push wakeup.** Nothing here wakes a sleeping phone; the
+  guarantee is that the queue is *there* when the device wakes and drains. A
+  device that never comes back has its messages evicted or expired, and those
+  drops are counted.
+- **The relay still cannot read what it stores.** A queued payload is bytes, and
+  the row is bookkeeping plus one opaque blob — the schema has nowhere to put a
+  key or a pane. End-to-end confidentiality remains the daemons' Noise session
+  (T-0023), and wiring the daemon side to the relay is T-0050.
 
 ## 5. Refusals
 
@@ -326,8 +487,9 @@ is the whole record.)
 
 These arrive as `Outcome::Refused { reason }` on the status envelope for the
 offending frame — reported rather than dropped silently, so a misbehaving client
-learns why. Each is also logged to stderr as
-`refused envelope from <device>: <reason>`.
+learns why. Each refusal the routing decision makes is also logged to stderr as
+`refused envelope from <device>: <reason>`; the last row below is logged by the
+inbox itself, with its own line (the operator's guide, §11).
 
 | What the envelope does | Reason string |
 | --- | --- |
@@ -337,6 +499,7 @@ learns why. Each is also logged to stderr as
 | `kind` is `status` | `a device may not send status envelopes` |
 | `dst` is not a well-formed device id | `malformed dst: <detail>` |
 | the device registry lookup itself fails | `device registry lookup failed: <detail>` |
+| the destination's inbox refuses the message: it is larger than that device's whole byte budget, or the store failed (§4.5) | `inbox refused the message: <detail>` |
 
 ### 5.3 Not answered at all
 
@@ -349,6 +512,11 @@ failures rather than routing decisions:
 - an envelope whose header cannot be decoded or whose `v` is not 1: the read
   loop ends, the connection is dropped, and the relay logs the protocol error.
   The sender sees the stream close, not a refusal.
+
+A `drain` or `ack` whose payload does not decode as a `DrainRequest` or an `Ack`
+ends the session the same way (§4.4). A control message with a payload the relay
+cannot read is a broken client, not a routing decision, so there is no outcome
+to report it with.
 
 ### 5.4 The per-address handshake budget
 
@@ -375,13 +543,17 @@ goes quiet occupies one task but does not stop the next device from connecting.
 | envelope | 1 MiB (1,048,576 bytes), header + payload | a sender cannot encode more; a receiver refuses a length prefix over it before allocating |
 | handshake message | 16 KiB (16,384 bytes) | encode refuses it; a reader refuses the prefix |
 | outbound queue per connection | 64 items | a destination that falls behind counts as `Offline`; a sender that stops reading loses its statuses |
+| inbox, per destination device | 10,000 messages, 64 MiB and a 30-day retention window by default — all three are operator settings | a known-but-offline destination is `queued` under these bounds; eviction is oldest-first, a message past its TTL expires, and both are counted (§4.5) |
+| one drain | 256 messages | a device returning after a month drains repeatedly rather than being handed one unbounded burst |
 | handshake budget | 3 connections / 10 s / source IP | the 4th connection is dropped at accept |
 | QUIC connection timeout | 10 s | the relay drops a peer that does not complete the QUIC handshake |
 | refusal grace | 2 s | how long the relay keeps a refused connection open so the peer can read the reason |
 
 There is no global cap on concurrent connections and no cap on how long a peer
 may stay silent mid-handshake; a flood from many addresses is bounded only by
-these per-connection limits.
+these per-connection limits. The inbox bounds are per device too, so the disk
+the queue can take is that bound times the number of devices that have been
+queued to — there is no global inbox cap.
 
 ## 7. Versioning
 
@@ -392,9 +564,9 @@ guessed at.**
 - `Hello.v`, `Auth.v`, `RelayHeader.v` must be `1`.
 - A wrong `Hello.v` or `Auth.v` gets a typed refusal with the version named in
   the reason; a wrong `RelayHeader.v` ends the session.
-- New message types and new `kind` values (a presence heartbeat is T-0031, an
-  inbox acknowledgement is T-0030) are additive changes governed by this field,
-  not silent reinterpretations of v1.
+- New message types and new `kind` values are additive changes governed by this
+  field, not silent reinterpretations of v1: `drain` and `ack` (§4.4) arrived
+  that way, and a presence heartbeat (T-0031) will too.
 
 ## 8. Security properties, and their limits
 
@@ -422,23 +594,29 @@ guessed at.**
 | Can see | Cannot see |
 | --- | --- |
 | the header: account, sender, destination, sequence, kind | the payload's meaning — it is bytes, and the decode path stops at the end of the header |
-| the device certificates and the proof of possession | the payload's *meaning*: it holds the bytes, so a payload sent in the clear is readable, and an end-to-end encrypted one is not (§8.3) |
+| the device certificates and the proof of possession | the payload's *meaning*: it holds the bytes — in memory while routing, and in `relay.db` for up to the retention window while queued — so a payload sent in the clear is readable, and an end-to-end encrypted one is not (§8.3) |
 | when a device authenticated (first/last seen) | pane text, agent state or keys: no relay-side type can hold them, and the schema test fails if such a column appears |
 
 ### 8.3 Limits, stated plainly
 
-- **The relay does not encrypt payloads.** It carries bytes it cannot read; it
-  does not make them unreadable. End-to-end confidentiality is the daemons'
-  Noise session (T-0023), and wiring the daemon side to the relay is T-0050. **A
-  client that sends plaintext gives the relay plaintext.**
+- **The relay does not encrypt payloads.** It carries bytes it cannot read, and
+  while a message is queued it keeps those bytes in `relay.db` for up to the
+  retention window; it does not make them unreadable. End-to-end confidentiality
+  is the daemons' Noise session (T-0023), and wiring the daemon side to the
+  relay is T-0050. **A client that sends plaintext gives the relay plaintext.**
 - **No revocation list (T-0026).** The relay verifies the certificate chain and
   the proof of possession; it has no revocation list, so a revoked device's
   certificate still verifies here.
-- **No durable inbox (T-0030).** An offline destination is answered `offline`;
-  the envelope is not queued or stored, and the sender must decide what to do.
+- **The inbox is a queue, not a delivery guarantee.** A known-but-offline
+  destination is answered `queued` and its bytes are on disk (§4.5), but the
+  wire is at-least-once: an unacked message is redelivered until the consumer
+  acks it, and the consumer's own `(src_device, seq)` de-duplication is what
+  makes one delivery — nothing in the relay enforces that. There is also no push
+  wakeup, and inside the bounds (§6) a message can be evicted or expire, which
+  is counted rather than silent but is still a message that was lost.
 - **No presence (T-0031).** `relay_device` records first/last seen, but nothing
-  derives online/offline from it yet, so `offline` means "no live session right
-  now", not "last seen 2 days ago".
+  derives online/offline from it yet, so there is no "last seen 2 days ago"
+  answer and no way to tell a device that is asleep from one that is gone.
 - **No durable audit rows (T-0033).** Refusals are written to stderr.
 - **The transport's TLS is unauthenticated.** A middlebox that terminates TLS
   can drop or delay traffic — a denial-of-service surface — but can never read
@@ -458,5 +636,18 @@ guessed at.**
 5. Address every envelope with its own `account_id`, `src_device`, `dst`,
    a `seq` it can match against the status it gets back, and `kind = "frame"`.
 6. Read statuses: they are the only statement about delivery. `delivered` means
-   queued, not read; `offline` means retry; `no_such_device` means the address
-   is wrong; `refused` means the relay rejected the envelope itself.
+   handed to a live session's queue, not read; `queued` means committed to the
+   destination's durable inbox, not delivered; `offline` means a live session
+   that has stopped reading, so retry; `no_such_device` means the address is
+   wrong; `refused` means the relay rejected the envelope itself.
+7. Drain your own inbox with `kind = "drain"` and
+   `DrainRequest { v: 1, from_seq }` — from `1` the first time and whenever you
+   have acked everything, otherwise from the previous report's `next_seq`. The
+   messages come first, as ordinary `frame` envelopes (at most 256 of them), and
+   one `DrainReport` follows.
+8. Ack what you have processed with `kind = "ack"` and `Ack { v: 1, seq }`,
+   where `seq` is the report's `next_seq - 1`. An `ack` is the only thing that
+   removes a queued message, and the relay answers it with nothing.
+9. De-duplicate on the drained frame's own header `(src_device, seq)` before
+   acting on it: the wire is at-least-once, and a disconnect mid-drain
+   redelivers what was not acked (§4.5).

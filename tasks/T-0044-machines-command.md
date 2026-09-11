@@ -82,9 +82,17 @@ serving the directory over a socket:
 - The integration test drives "the real CLI against a loopback relay + daemon
   pair", which presupposes the relay has something to serve on loopback.
 
-T-0043 landed the *rules and the durable store*; it did not land a relay RPC
-surface. Claiming T-0044 without it would mean inventing an account-join
-transport inside a CLI task — the wrong file, and the wrong fence.
+T-0043 landed the *rules and the durable store*; T-0029 landed the router
+(device authentication and envelope routing) — but **neither issues a
+`JoinTicket` over the wire.** The missing piece is an account-join RPC: after the
+T-0024 pairing flow pins a device, something must ask the relay to admit the
+machine, and the relay must mint a single-use ticket for it. That is the
+machine-registration half of the daemon's relay client, so it belongs to
+**T-0050**, not to a CLI task. Claiming T-0044 without it would mean inventing an
+account-join transport inside `arreo-cli` — the wrong file, and the wrong fence.
+
+Confirmed again after T-0029 landed (2026-09-11): the router has no join verb.
+T-0044 stays blocked until T-0050 adds one.
 
 `status <name>`'s trusted-device count already declares itself `null` until
 T-0046, which is the honest pattern; this note applies the same standard to the

@@ -87,6 +87,15 @@ pub enum RelayKind {
     /// Relay → sender: what became of one `Frame`. The payload is the
     /// MessagePack encoding of [`Outcome`], written by the relay itself.
     Status,
+    /// Device → relay: hand me what is queued for me from `from_seq` on. The
+    /// payload is the MessagePack encoding of [`DrainRequest`]; the relay
+    /// answers with one [`RelayKind::Frame`] envelope per message plus a
+    /// [`RelayKind::Status`] carrying the per-drain counts (T-0030).
+    Drain,
+    /// Device → relay: I have the messages up to `seq`. The payload is the
+    /// MessagePack encoding of [`Ack`]; acking is what advances the cursor and
+    /// removes the rows.
+    Ack,
 }
 
 impl RelayKind {
@@ -95,6 +104,8 @@ impl RelayKind {
         match self {
             Self::Frame => "frame",
             Self::Status => "status",
+            Self::Drain => "drain",
+            Self::Ack => "ack",
         }
     }
 }
@@ -270,6 +281,15 @@ pub enum Outcome {
     /// The destination is a known device that is not connected (or has stopped
     /// reading). T-0030 turns this branch into a durable queue.
     Offline,
+    /// The message was committed to the destination's durable inbox and will be
+    /// delivered when it drains (T-0030). Distinct from `Offline` on purpose: a
+    /// sender that is told `Queued` knows its bytes are on disk, and one told
+    /// `Offline` knows they are not.
+    Queued {
+        /// What is queued for that device now, so a sender can see a queue
+        /// growing rather than discovering it later.
+        queued: u64,
+    },
     /// No such device in this account.
     NoSuchDevice,
     /// The relay would not carry this envelope at all — a spoofed sender, a
@@ -288,6 +308,43 @@ pub fn fresh_nonce() -> Result<[u8; 32], RelayError> {
     let mut nonce = [0u8; 32];
     getrandom::fill(&mut nonce).map_err(|e| RelayError::Transport(format!("no entropy: {e}")))?;
     Ok(nonce)
+}
+
+/// Device → relay: drain my inbox from this cursor (T-0030).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DrainRequest {
+    pub v: u32,
+    /// The first sequence number wanted; a device that has acked nothing asks
+    /// from 1.
+    pub from_seq: u64,
+}
+
+/// Device → relay: I hold everything up to and including `seq` (T-0030).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Ack {
+    pub v: u32,
+    pub seq: u64,
+}
+
+/// Relay → device, as the payload of a [`RelayKind::Status`] envelope after a
+/// drain: what the drain did, including the drops it is reporting.
+///
+/// A drop the consumer is never told about is a drop that silently lost
+/// something, so the count travels on every drain — including the zeroes, which
+/// are the reassurance that nothing was lost.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DrainReport {
+    pub v: u32,
+    /// Messages delivered by this drain.
+    pub delivered: u64,
+    /// Messages dropped (evicted by a bound, or expired) since the last drain.
+    pub dropped: u64,
+    /// Messages that expired during this drain.
+    pub expired: u64,
+    /// What is still queued for this device afterwards.
+    pub queued: u64,
+    /// The cursor to resume from next time.
+    pub next_seq: u64,
 }
 
 /// What can go wrong on the device side of the protocol.

@@ -18,12 +18,14 @@
 //!   core, and the router only carries the result. That is what keeps the trust
 //!   decision in one reviewed function rather than spread across a socket loop.
 
+use crate::inbox::{Drained, Inbox, InboxError, InboxLimits};
 use crate::store::{RelayStore, StoreError};
 use arreo_core::identity::{DeviceId, VerifyingKey};
 use arreo_core::relay::{
-    decode_message, encode_message, encode_payload, fresh_nonce, read_envelope, read_frame,
-    verify_auth, write_frame, Auth, AuthReply, Hello, HelloReply, Outcome, RelayEnvelope,
-    RelayError, RelayHeader, RelayKind, MAX_HANDSHAKE_BYTES, RELAY_SENDER, RELAY_VERSION,
+    decode_message, decode_payload, encode_message, encode_payload, fresh_nonce, read_envelope,
+    read_frame, verify_auth, write_frame, Ack, Auth, AuthReply, DrainReport, DrainRequest, Hello,
+    HelloReply, Outcome, RelayEnvelope, RelayError, RelayHeader, RelayKind, MAX_HANDSHAKE_BYTES,
+    RELAY_SENDER, RELAY_VERSION,
 };
 use arreo_core::transport::{accept_connection, Connection, Endpoint, HandshakeLimiter, QuicError};
 use std::collections::HashMap;
@@ -48,6 +50,8 @@ pub const OUTBOUND_QUEUE: usize = 64;
 pub enum RouterError {
     #[error("relay store: {0}")]
     Store(#[from] StoreError),
+    #[error("relay inbox: {0}")]
+    Inbox(#[from] InboxError),
     #[error("relay transport: {0}")]
     Transport(#[from] QuicError),
     #[error("relay protocol: {0}")]
@@ -77,6 +81,12 @@ enum Outbound {
     Envelope(RelayEnvelope),
     /// This device's report on one of its own envelopes.
     Status { seq: u64, outcome: Outcome },
+    /// A drained message, replayed exactly as it was stored: the relay holds the
+    /// framed bytes and never rebuilds them, because rebuilding would mean
+    /// decoding a header it is not supposed to read.
+    Raw(Vec<u8>),
+    /// A drain report.
+    Drain(DrainReport),
 }
 
 /// The live sessions, keyed by `(account, device)`.
@@ -85,18 +95,21 @@ struct Live {
     next_token: u64,
 }
 
-/// The router: the store, the live sessions, and the handshake budget.
+/// The router: the store, the inbox, the live sessions, and the handshake budget.
 pub struct Router {
     store: RelayStore,
+    inbox: Inbox,
     live: Mutex<Live>,
     limiter: HandshakeLimiter,
 }
 
 impl Router {
     #[must_use]
-    pub fn new(store: RelayStore) -> Self {
+    pub fn new(store: RelayStore, limits: InboxLimits) -> Self {
+        let inbox = Inbox::new(store.clone(), limits);
         Self {
             store,
+            inbox,
             live: Mutex::new(Live {
                 senders: HashMap::new(),
                 next_token: 1,
@@ -108,6 +121,11 @@ impl Router {
     #[must_use]
     pub fn store(&self) -> &RelayStore {
         &self.store
+    }
+
+    #[must_use]
+    pub fn inbox(&self) -> &Inbox {
+        &self.inbox
     }
 
     /// How many devices are connected right now (tests, and the operator's log).
@@ -196,7 +214,9 @@ impl Router {
         let key = (session.account_id.clone(), dst.as_str().to_string());
         match self.lock_live().senders.get(&key) {
             Some((sender, _)) => Decision::Deliver(sender.clone()),
-            None => Decision::Offline,
+            // Known, not connected: this is the case §3.14 exists for, so it
+            // goes to the durable queue rather than being refused (T-0030).
+            None => Decision::Queue(dst),
         }
     }
 }
@@ -204,15 +224,44 @@ impl Router {
 /// The router's answer for one envelope.
 #[derive(Debug)]
 enum Decision {
-    /// Hand this envelope to the destination's queue.
+    /// Hand this envelope to the destination's live queue.
     Deliver(mpsc::Sender<Outbound>),
-    Offline,
+    /// Commit it to the destination's durable inbox (T-0030).
+    Queue(DeviceId),
     NoSuchDevice,
     Refuse(String),
 }
 
+/// How often the relay sweeps expired inbox rows on its own.
+///
+/// The sweep is also lazy (inside enqueue and drain), but a device that never
+/// returns would otherwise keep its expired rows — and a self-hosted relay's
+/// disk — forever. One hour is frequent enough to bound that and cheap enough to
+/// ignore.
+pub const SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+
 /// Serve sessions until the endpoint closes.
 pub async fn serve(endpoint: Endpoint, router: Arc<Router>) -> Result<(), RouterError> {
+    // The periodic sweep, so expiry does not depend on traffic arriving.
+    {
+        let router = Arc::clone(&router);
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(SWEEP_INTERVAL);
+            // The first tick is immediate; skip it so a restart does not sweep
+            // before the router is serving.
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                match router.inbox.sweep(crate::directory::now_ms()) {
+                    Ok(0) => {}
+                    Ok(expired) => {
+                        eprintln!("arreo-relay: inbox sweep expired {expired} message(s)")
+                    }
+                    Err(e) => eprintln!("arreo-relay: inbox sweep failed: {e}"),
+                }
+            }
+        });
+    }
     loop {
         // Only the accept is serialized; the peer-paced handshake runs in its
         // own task, so one quiet peer cannot stop the next device connecting
@@ -338,6 +387,12 @@ async fn handle_connection(connection: Connection, router: Arc<Router>) -> Resul
                 Outbound::Status { seq, outcome } => {
                     status_envelope(&writer_session, seq, &outcome).and_then(|e| e.encode())
                 }
+                Outbound::Drain(report) => {
+                    drain_report_envelope(&writer_session, &report).and_then(|e| e.encode())
+                }
+                // Already framed: writing it directly is what keeps the stored
+                // bytes opaque end to end.
+                Outbound::Raw(bytes) => Ok(bytes),
             };
             match frame {
                 Ok(bytes) => {
@@ -387,6 +442,51 @@ where
         };
         let seq = envelope.header.seq;
 
+        // Control messages (T-0030) never reach the routing decision: they are
+        // the device talking about its own inbox, not sending to a peer.
+        match envelope.header.kind {
+            RelayKind::Drain => {
+                let request: DrainRequest = decode_payload(&envelope.payload)?;
+                let drained = router.inbox.drain(
+                    session.device_id.as_str(),
+                    request.from_seq,
+                    crate::inbox::DEFAULT_DRAIN_LIMIT,
+                    crate::directory::now_ms(),
+                )?;
+                // The messages first, then the report: a device that stops
+                // reading mid-batch sees messages without a report and drains
+                // again, which is exactly the at-least-once contract.
+                for raw in &drained.raw {
+                    if outbound.try_send(Outbound::Raw(raw.clone())).is_err() {
+                        eprintln!(
+                            "arreo-relay: {} is not reading its drain; stopping this batch",
+                            session.device_id
+                        );
+                        break;
+                    }
+                }
+                let report = drain_report(&drained);
+                let _ = outbound.try_send(Outbound::Drain(report));
+                continue;
+            }
+            RelayKind::Ack => {
+                let ack: Ack = decode_payload(&envelope.payload)?;
+                router.inbox.ack(session.device_id.as_str(), ack.seq)?;
+                continue;
+            }
+            RelayKind::Frame => {}
+            RelayKind::Status => {
+                // A device may not originate the relay's own kind.
+                let _ = outbound.try_send(Outbound::Status {
+                    seq,
+                    outcome: Outcome::Refused {
+                        reason: "a device may not send status envelopes".to_string(),
+                    },
+                });
+                continue;
+            }
+        }
+
         let outcome = match router.decide(session, &envelope.header) {
             Decision::Deliver(destination) => {
                 match destination.try_send(Outbound::Envelope(envelope)) {
@@ -396,7 +496,31 @@ where
                     Err(_) => Outcome::Offline,
                 }
             }
-            Decision::Offline => Outcome::Offline,
+            Decision::Queue(dst) => {
+                let body = envelope.encode()?;
+                // The envelope is stored *whole*, exactly as it arrived: the
+                // relay keeps the framing it must replay and never decodes the
+                // header inside it, so the queue holds bytes rather than
+                // understanding. The sender is told `queued` only after the
+                // commit returns, which is the durability claim.
+                match router
+                    .inbox
+                    .enqueue(dst.as_str(), &body, crate::directory::now_ms())
+                {
+                    Ok(enqueued) => Outcome::Queued {
+                        queued: enqueued.queued,
+                    },
+                    Err(e) => {
+                        eprintln!(
+                            "arreo-relay: cannot queue for {dst}: {e}; refusing instead of \
+                             dropping silently"
+                        );
+                        Outcome::Refused {
+                            reason: format!("inbox refused the message: {e}"),
+                        }
+                    }
+                }
+            }
             Decision::NoSuchDevice => Outcome::NoSuchDevice,
             Decision::Refuse(reason) => {
                 eprintln!(
@@ -465,6 +589,36 @@ where
     let _ = tokio::io::AsyncWriteExt::shutdown(send).await;
     let _ = tokio::time::timeout(std::time::Duration::from_secs(2), connection.closed()).await;
     Ok(())
+}
+
+/// The report a drain is answered with.
+fn drain_report(drained: &Drained) -> DrainReport {
+    DrainReport {
+        v: RELAY_VERSION,
+        delivered: drained.messages.len() as u64,
+        dropped: drained.dropped,
+        expired: drained.expired,
+        queued: drained.queued,
+        next_seq: drained.next_seq,
+    }
+}
+
+/// A drain report as the payload of a status envelope from the relay.
+fn drain_report_envelope(
+    session: &Session,
+    report: &DrainReport,
+) -> Result<RelayEnvelope, RelayError> {
+    Ok(RelayEnvelope {
+        header: RelayHeader {
+            v: RELAY_VERSION,
+            account_id: session.account_id.clone(),
+            src_device: RELAY_SENDER.to_string(),
+            dst: session.device_id.display_id(),
+            seq: report.next_seq,
+            kind: RelayKind::Status,
+        },
+        payload: encode_payload(report)?,
+    })
 }
 
 /// A status envelope from the relay itself.

@@ -247,10 +247,11 @@ async fn an_unknown_destination_is_refused_by_name() {
     }
 }
 
-/// A known device that is not connected is `Offline` — distinct from unknown,
-/// because the sender's next move differs (retry later vs fix the address).
+/// A known device that is not connected is **queued** (T-0030), not refused —
+/// and distinct from an unknown device, which is a mistake the sender should see
+/// immediately rather than have queued forever.
 #[tokio::test]
-async fn a_known_device_that_is_offline_is_reported_as_such() {
+async fn a_known_device_that_is_offline_is_queued_not_refused() {
     let relay = Relay::start("offline");
     let root = RootKey::generate().expect("entropy");
     relay.register_account("acct-1", &root.public());
@@ -272,15 +273,26 @@ async fn a_known_device_that_is_offline_is_reported_as_such() {
         .expect("alice authenticates");
     alice.send(&bob_id, b"anyone there?").await.expect("send");
     match alice.next().await.expect("answered") {
-        Incoming::Status { outcome, .. } => {
-            assert_eq!(
-                outcome,
-                Outcome::Offline,
-                "a known device is offline, not unknown"
-            );
-        }
+        Incoming::Status { outcome, .. } => match outcome {
+            Outcome::Queued { queued } => {
+                assert_eq!(
+                    queued, 1,
+                    "the sender is told the queue depth it just added to"
+                );
+            }
+            other => panic!("a known offline device must be queued, got {other:?}"),
+        },
         other => panic!("expected a status, got {other:?}"),
     }
+
+    // And the queue is real: bob drains it when he returns.
+    let mut bob = RelayClient::connect(relay.addr, "acct-1", &bob_key, &bob_cert)
+        .await
+        .expect("bob returns");
+    let (messages, report) = bob.drain_all(1).await.expect("drain");
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].payload, b"anyone there?");
+    assert_eq!(report.delivered, 1);
 }
 
 /// A device may not speak as another, and may not reach into another account.

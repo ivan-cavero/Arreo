@@ -94,6 +94,9 @@ fn serve(args: &[String]) {
     let mut state_dir: Option<PathBuf> = None;
     let mut pairing_socket: Option<PathBuf> = None;
     let mut pairing_tcp: Option<String> = None;
+    let mut ttl_days = arreo_relay::DEFAULT_TTL_DAYS;
+    let mut max_messages = arreo_relay::DEFAULT_MAX_MESSAGES;
+    let mut max_mb = arreo_relay::DEFAULT_MAX_MB;
 
     let mut args = args.iter();
     while let Some(arg) = args.next() {
@@ -105,6 +108,9 @@ fn serve(args: &[String]) {
             "--state-dir" => state_dir = args.next().map(PathBuf::from),
             "--pairing-socket" => pairing_socket = args.next().map(PathBuf::from),
             "--pairing-tcp" => pairing_tcp = args.next().cloned(),
+            "--inbox-ttl-days" => ttl_days = number(args.next(), "--inbox-ttl-days"),
+            "--inbox-max-messages" => max_messages = number(args.next(), "--inbox-max-messages"),
+            "--inbox-max-mb" => max_mb = number(args.next(), "--inbox-max-mb"),
             other => usage_error(&format!("unknown flag {other}")),
         }
     }
@@ -168,7 +174,15 @@ fn serve(args: &[String]) {
             std::process::exit(1);
         }
     };
-    let router = Arc::new(arreo_relay::Router::new(store));
+    let limits = match arreo_relay::InboxLimits::from_options(ttl_days, max_messages, max_mb) {
+        Ok(limits) => limits,
+        Err(e) => usage_error(&e.to_string()),
+    };
+    eprintln!(
+        "arreo-relay: inbox retention {} day(s), bounds {} message(s) / {} MiB per device",
+        ttl_days, max_messages, max_mb
+    );
+    let router = Arc::new(arreo_relay::Router::new(store, limits));
     // The endpoint is created *inside* the runtime: quinn needs a reactor, and
     // building it before `block_on` fails with "no async runtime found".
     let result = runtime.block_on(async move {
@@ -267,6 +281,14 @@ fn hex_to_key(hex: &str) -> Option<arreo_core::identity::VerifyingKey> {
         bytes[index] = (hi * 16 + lo) as u8;
     }
     arreo_core::identity::VerifyingKey::from_bytes(&bytes).ok()
+}
+
+/// Parse a numeric flag, refusing a missing or non-numeric value loudly.
+fn number(value: Option<&String>, flag: &str) -> u64 {
+    match value.and_then(|v| v.parse::<u64>().ok()) {
+        Some(number) => number,
+        None => usage_error(&format!("{flag} needs a positive whole number")),
+    }
 }
 
 fn usage_error(message: &str) -> ! {

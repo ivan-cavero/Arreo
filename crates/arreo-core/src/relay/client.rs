@@ -9,9 +9,10 @@
 //! [`RelayEnvelope`]s whose payloads this side also never inspects.
 
 use super::{
-    decode_message, decode_payload, encode_message, proof_payload, read_envelope, read_frame,
-    write_frame, Auth, AuthReply, ClientError, Hello, HelloReply, Outcome, RelayEnvelope,
-    RelayError, RelayHeader, RelayKind, MAX_HANDSHAKE_BYTES, RELAY_VERSION,
+    decode_message, decode_payload, encode_message, encode_payload, proof_payload, read_envelope,
+    read_frame, write_frame, Ack, Auth, AuthReply, ClientError, DrainReport, DrainRequest, Hello,
+    HelloReply, Outcome, RelayEnvelope, RelayError, RelayHeader, RelayKind, MAX_HANDSHAKE_BYTES,
+    RELAY_VERSION,
 };
 use crate::identity::{DeviceCert, DeviceId, DeviceKey};
 use crate::transport::{client_endpoint, SERVER_NAME};
@@ -29,6 +30,8 @@ pub enum Incoming {
     Envelope(RelayEnvelope),
     /// The relay's report on one envelope this device sent.
     Status { seq: u64, outcome: Outcome },
+    /// The relay's report on a drain (T-0030).
+    Drain(DrainReport),
 }
 
 /// A live session with the relay.
@@ -183,6 +186,78 @@ impl RelayClient {
         Ok(seq)
     }
 
+    /// Ask the relay to drain this device's durable inbox from `from_seq`.
+    ///
+    /// The messages arrive as ordinary envelopes (so the caller's existing
+    /// handling works), followed by an [`Incoming::Drain`] report carrying the
+    /// per-drain counts. Draining does *not* remove anything: only [`Self::ack`]
+    /// does, which is what makes a disconnect mid-drain safe.
+    pub async fn drain(&mut self, from_seq: u64) -> Result<(), ClientError> {
+        self.control(
+            RelayKind::Drain,
+            &DrainRequest {
+                v: RELAY_VERSION,
+                from_seq,
+            },
+        )
+        .await
+    }
+
+    /// Acknowledge everything up to and including `seq`, removing those rows.
+    pub async fn ack(&mut self, seq: u64) -> Result<(), ClientError> {
+        self.control(
+            RelayKind::Ack,
+            &Ack {
+                v: RELAY_VERSION,
+                seq,
+            },
+        )
+        .await
+    }
+
+    /// Send one control message (a drain or an ack) as a frame envelope.
+    async fn control<T: serde::Serialize>(
+        &mut self,
+        kind: RelayKind,
+        payload: &T,
+    ) -> Result<(), ClientError> {
+        let seq = self.next_seq;
+        self.next_seq += 1;
+        let envelope = RelayEnvelope {
+            header: RelayHeader {
+                v: RELAY_VERSION,
+                account_id: self.account_id.clone(),
+                src_device: self.device_id.display_id(),
+                dst: self.device_id.display_id(),
+                seq,
+                kind,
+            },
+            payload: encode_payload(payload)?,
+        };
+        write_frame(&mut self.io, &envelope.encode()?).await?;
+        Ok(())
+    }
+
+    /// Drain and collect: the request, the messages, and the report.
+    ///
+    /// Convenient for a caller that wants the batch, and honest about the shape
+    /// — the report is returned even when it is all zeroes, because "nothing was
+    /// dropped" is information.
+    pub async fn drain_all(
+        &mut self,
+        from_seq: u64,
+    ) -> Result<(Vec<RelayEnvelope>, DrainReport), ClientError> {
+        self.drain(from_seq).await?;
+        let mut messages = Vec::new();
+        loop {
+            match self.next().await? {
+                Incoming::Envelope(envelope) => messages.push(envelope),
+                Incoming::Drain(report) => return Ok((messages, report)),
+                Incoming::Status { .. } => continue,
+            }
+        }
+    }
+
     /// Read the next message: an envelope for this device, or the relay's report
     /// on something this device sent.
     ///
@@ -193,12 +268,25 @@ impl RelayClient {
         match envelope.header.kind {
             RelayKind::Frame => Ok(Incoming::Envelope(envelope)),
             RelayKind::Status => {
+                // A status payload is either a per-envelope outcome or a drain
+                // report; the drain report has a different field count, so try
+                // the shape the caller is in the middle of before the other.
+                if let Ok(report) = decode_payload::<DrainReport>(&envelope.payload) {
+                    if report.v == RELAY_VERSION && report.next_seq != 0 {
+                        return Ok(Incoming::Drain(report));
+                    }
+                }
                 let outcome: Outcome = decode_payload(&envelope.payload)?;
                 Ok(Incoming::Status {
                     seq: envelope.header.seq,
                     outcome,
                 })
             }
+            // The relay never originates these, and a device reading them would
+            // mean the relay echoed a request back.
+            RelayKind::Drain | RelayKind::Ack => Err(ClientError::Protocol(RelayError::Frame(
+                format!("the relay sent a {:?} envelope", envelope.header.kind),
+            ))),
         }
     }
 
@@ -208,7 +296,7 @@ impl RelayClient {
         loop {
             match self.next().await? {
                 Incoming::Envelope(envelope) => return Ok(envelope),
-                Incoming::Status { .. } => continue,
+                Incoming::Status { .. } | Incoming::Drain(_) => continue,
             }
         }
     }

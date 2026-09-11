@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 
 /// Current schema version. Bumped only alongside a migration below.
-pub const SCHEMA_VERSION: u32 = 2;
+pub const SCHEMA_VERSION: u32 = 3;
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -34,8 +34,13 @@ pub enum StoreError {
 /// One connection behind a mutex, like the session store: the relay's writes are
 /// small and serialized anyway (a claim has to be serialized to be correct), and
 /// WAL lets readers proceed while a writer holds the write lock.
+#[derive(Clone)]
 pub struct RelayStore {
-    conn: Mutex<Connection>,
+    /// Shared, not copied: the relay has exactly one connection (the migration
+    /// owner), and the inbox and the router both hold a handle to it rather than
+    /// opening a second one — two connections would mean two WAL writers and two
+    /// ideas about locking.
+    conn: std::sync::Arc<Mutex<Connection>>,
     path: Option<PathBuf>,
 }
 
@@ -45,7 +50,7 @@ impl RelayStore {
         let conn = Connection::open(path)?;
         Self::migrate(&conn)?;
         Ok(Self {
-            conn: Mutex::new(conn),
+            conn: std::sync::Arc::new(Mutex::new(conn)),
             path: Some(path.to_path_buf()),
         })
     }
@@ -55,7 +60,7 @@ impl RelayStore {
         let conn = Connection::open_in_memory()?;
         Self::migrate(&conn)?;
         Ok(Self {
-            conn: Mutex::new(conn),
+            conn: std::sync::Arc::new(Mutex::new(conn)),
             path: None,
         })
     }
@@ -123,6 +128,34 @@ impl RelayStore {
                    last_seen_ms INTEGER NOT NULL,
                    PRIMARY KEY (account_id, device_id));
                  CREATE INDEX IF NOT EXISTS relay_device_seen ON relay_device(last_seen_ms);",
+            )?;
+        }
+        // v3 (T-0030): the durable per-device inbox. The row is deliberately
+        // four columns of bookkeeping plus one opaque blob — there is nowhere to
+        // put a key, a pairing code or agent state, and a test asserts the
+        // column set for that reason.
+        if version < 3 {
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS inbox(
+                   device_id TEXT NOT NULL,
+                   seq INTEGER NOT NULL,
+                   received_at_ms INTEGER NOT NULL,
+                   expires_at_ms INTEGER NOT NULL,
+                   bytes BLOB NOT NULL,
+                   PRIMARY KEY (device_id, seq));
+                 CREATE INDEX IF NOT EXISTS inbox_expiry ON inbox(expires_at_ms);
+                 -- Per-device counters that must survive a restart, because a
+                 -- drop the operator cannot count is a drop that never happened.
+                 CREATE TABLE IF NOT EXISTS inbox_stats(
+                   device_id TEXT PRIMARY KEY,
+                   dropped_total INTEGER NOT NULL DEFAULT 0,
+                   expired_total INTEGER NOT NULL DEFAULT 0,
+                   bytes INTEGER NOT NULL DEFAULT 0,
+                   queued INTEGER NOT NULL DEFAULT 0,
+                   -- The dropped_total watermark the last drain reported: the
+                   -- per-drain drop count is durable rather than inferred, and a
+                   -- drain cannot report the same drop twice.
+                   dropped_reported INTEGER NOT NULL DEFAULT 0);",
             )?;
         }
         conn.execute(

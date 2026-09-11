@@ -1,0 +1,33 @@
+T-0030 durable inbox — acceptance tests
+2026-09-11T08:36:07Z
+
+== inbox (bounds, expiry, exactly-once, crash durability) ==
+test a_message_larger_than_the_budget_is_refused ... ok
+test the_default_bounds_are_the_stated_numbers ... ok
+test expiry_is_counted_and_lazy ... ok
+test the_byte_bound_evicts_too ... ok
+test a_full_inbox_evicts_oldest_first_and_counts_it ... ok
+test an_unacked_message_is_redelivered_and_the_cursor_deduplicates ... ok
+test the_inbox_holds_no_meaningful_columns ... ok
+test the_inbox_migration_leaves_the_directory_intact ... ok
+test the_cli_refuses_impossible_inbox_bounds ... ok
+test a_drain_without_an_ack_redelivers ... ok
+test an_offline_device_is_queued_durably_and_drains_after_a_crash ... ok
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.48s
+
+== router (now queues for a known offline device) ==
+test a_foreign_certificate_is_refused ... ok
+test a_certificate_without_a_proof_is_refused ... ok
+test a_spoofed_sender_and_a_foreign_account_are_refused ... ok
+test a_replayed_proof_is_refused ... ok
+test a_stalled_peer_does_not_block_the_next_device ... ok
+test a_restart_keeps_the_account_and_still_admits_its_devices ... ok
+test an_unknown_account_is_refused ... ok
+test an_oversized_envelope_ends_the_session_without_buffering_it ... ok
+test a_reconnecting_device_keeps_its_newer_session ... ok
+test a_zero_length_payload_is_carried ... ok
+test a_peer_that_keeps_failing_is_rate_limited ... ok
+test an_unknown_destination_is_refused_by_name ... ok
+test a_known_device_that_is_offline_is_queued_not_refused ... ok
+test two_devices_exchange_opaque_bytes_through_the_relay ... ok
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.60s

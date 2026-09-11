@@ -41,4 +41,12 @@ tui_attach_30panes_ms = { phase0 = false, target = 300, unit = "ms" }
 cross_machine_attach_s = { phase0 = false, target = 3, unit = "s" }
 config_sync_s = { phase0 = false, target = 10, unit = "s" }
 server_handoff_reattach_s = { phase0 = false, target = 2, unit = "s" }
+# T-0030 gives this row its mechanism: a message committed to a device's durable
+# inbox is not lost inside the retention window, and every forced drop is counted
+# (`dropped_total`/`expired_total`) and reported on the next drain — so a loss is
+# observable rather than silent. Asserted today by
+# `crates/arreo-relay/tests/inbox.rs` (counters, eviction, expiry, crash
+# durability); the end-to-end `relay` slice (T-0034) asserts it across two real
+# daemons, which is why it is still `phase0 = false` here — `cargo xtask bench`
+# measures load and does not check this row.
 queued_loss = { phase0 = false, target = 0, unit = "messages" }
