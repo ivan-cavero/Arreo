@@ -1,11 +1,12 @@
 # .loop/PROGRESS.md
 ## State snapshot          ← REWRITTEN (not appended) at every checkpoint
-Task: T-0023 · Noise-QUIC remote transport (phase 2, priority 2)
+Task: T-0024 · SPAKE2 pairing (phase 2, priority 2) — chosen over T-0023 at equal priority
 Why: T-0025 just shipped the device authority (keys, certs, roles, revocation) but nothing yet *uses* it over a network: the daemon still speaks only over the local unix socket, so "remote & security" (the roadmap's differentiator) has identity with no transport. T-0023 is the connection path that consumes `DeviceAuthority::authorize`/`check_verb` — without it Phase 2 has no remote session at all.
 Approach: per the task file — quinn (pure Rust, tokio-native, no OpenSSL; mobile core + size budget) carrying one bidi stream per session with the existing msgpack frames (ADR 0006), inside a Noise-KK handshake (snow) whose static key is the pinned device key; local unix socket unchanged (a second path, never a rewrite). The loopback listener behind `ARREO_TRANSPORT_TEST_LISTEN=1` is the test seam. Slice wiring belongs to T-0027, which also carries the tamper/replay negatives.
 Deps: new crates `quinn`, `snow` (and their trees) — but the vet/deny gates need a ledger note and regenerated exemptions; T-0025 already had to repair two red gates from T-0015, so verify `cargo vet --locked` + `cargo deny check` in the same commit that adds them.
 Where you are: Phase 1 closed (T-0015 TUI 8bd4664, T-0016 theming 4075ad5, T-0016 resilience 7772b1b); Phase 2 queue drafted (cdafea9, T-0023..T-0048, all `proposed`); T-0025 done+pushed (978569a); HEAD == origin/main; Phase 1 exit recorded in `.loop/PHASE-DONE.md` with two human-gated items
-Next step: read T-0023 → dep survey (quinn/snow fetch + vet) → frame-over-QUIC + Noise-KK tests → tamper/replay negatives → wire into the daemon behind the authority → evidence → commit+push
+Next step: read T-0024 → add `spake2` (+ vet/deny in the same commit) → word-list code + session state machine (single-use, TTL, guess budget) → relay mailbox in `arreo-relay/src/pairing.rs` → `arreo pair` CLI → real-process test → evidence → commit+push. Then T-0023 (transport), which consumes the same authority.
+Ordering note: T-0023 and T-0024 are both p2 with deps met. T-0024 first because it is self-contained (no QUIC/snow tree), it is the *only* production path that calls `DeviceAuthority::issue` besides the CLI — so it proves T-0025 end-to-end — and it leaves the heavier network dependency for a turn with more room to spare.
 Open workers: (none)
 Known broken: (none) · Parked: (none)
 Findings:
