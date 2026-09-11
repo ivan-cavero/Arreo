@@ -80,6 +80,10 @@ pub enum AuditKind {
     AuthReject,
     /// A device paired, rotated or revoked.
     DeviceChange,
+    /// A pairing attempt that did not produce a certificate (T-0024): a wrong
+    /// code, an expired window, or a peer that never completed. The reason
+    /// lives in `prompt`, and the session id in `agent`.
+    PairingFailed,
     /// A row written by a newer schema than this build knows.
     Unknown,
 }
@@ -91,6 +95,7 @@ impl AuditKind {
             Self::Prompt => "prompt",
             Self::AuthReject => "auth_reject",
             Self::DeviceChange => "device_change",
+            Self::PairingFailed => "pairing_failed",
             Self::Unknown => "unknown",
         }
     }
@@ -104,6 +109,7 @@ impl AuditKind {
             "prompt" => Self::Prompt,
             "auth_reject" => Self::AuthReject,
             "device_change" => Self::DeviceChange,
+            "pairing_failed" => Self::PairingFailed,
             _ => Self::Unknown,
         }
     }

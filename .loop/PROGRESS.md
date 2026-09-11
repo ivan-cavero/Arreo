@@ -15,7 +15,6 @@ Findings:
 - `xtask check-targets` had been failing for x86_64-pc-windows-msvc since T-0010 (lite pass compiled `sqlite`- and Linux-only test files); fixed in 9b6f04c. The gate works now — trust its SKIP.
 - Long-lived dev boxes accumulate `arreo-server` processes on `/tmp/arreo-*.sock`; reap with `pkill -f "arreo-server --socket /tmp/"` before interactive work. The committed slices clean up after themselves.
 ## Event log               ← append-only; newest last; never rewrite
-## Event log               ← append-only; newest last; never rewrite
 - 2026-09-10 [turn 1] ledger created; repo at e489fac (docs only); T-0001 + T-0022 (AGENTS.md gardened) done
 - 2026-09-10 [turn 2] T-0002 PTY manager done+pushed (342606c; 9 tests); PROMPT.md v2 synced + ADR 0001 (ef6c595)
 - 2026-09-10 [turn 2] T-0003 VT state done+pushed (80fb3ab; 9 tests); ADR 0002; remote == local

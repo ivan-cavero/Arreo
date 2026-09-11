@@ -1,0 +1,22 @@
+# T-0024 pairing — real transcripts (2026-09-11T03:06:26+02:00)
+
+## happy path: server shows a code, the phone types it
+server invite:  {"code":"panda noodle lemon locust","expires_in_secs":30,"mailbox":"/tmp/pair-ev/relay.sock","role":"server","server_key":"01b0283624739f7e0ac32a896e64e927480890acea6fe394b68016b5c0f6cfa6","session":"9d5586176daa02c69d30d0e1ad0d5436","uri":"arreo://pair?v=1&mb=%2Ftmp%2Fpair-ev%2Frelay.sock&s=9d5586176daa02c69d30d0e1ad0d5436&k=01b0283624739f7e0ac32a896e64e927480890acea6fe394b68016b5c0f6cfa6&ttl=30"}
+phone:          {"cert_file":"/tmp/pair-ev/phone/identity/devices/e4d231fefa8f72b30b0e6e8ab2b22cc2.cert","device":"dev_e4d231fefa8f72b30b0e6e8ab2b22cc2","name":"laptop","paired":true,"role":"owner","server_key":"01b0283624739f7e0ac32a896e64e927480890acea6fe394b68016b5c0f6cfa6"}
+server result:  {"device":"dev_e4d231fefa8f72b30b0e6e8ab2b22cc2","name":"laptop","paired":true,"role":"owner","serial":1}
+
+## what the server pinned
+root 01b0283624739f7e…
+DEVICE                               NAME             ROLE    SERIAL  STATUS
+dev_e4d231fefa8f72b30b0e6e8ab2b22cc2 laptop           owner        1  never seen
+
+## what the phone stored
+phone/identity/device.key
+phone/identity/devices/e4d231fefa8f72b30b0e6e8ab2b22cc2.cert
+phone/identity/server.key
+
+## the audit trail (device_change + auth_reject/pairing_failed are distinct kinds)
+1789088787021 device_change  e4d231fefa8f72b30b0e6e8ab2b22cc2  issued owner for laptop
+
+## replaying the same invite (code included) is refused: one session, one pairing
+pair: mailbox: session is no longer available (used or expired)

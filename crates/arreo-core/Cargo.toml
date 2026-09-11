@@ -13,6 +13,12 @@ rust-version.workspace = true
 ed25519-dalek = "2"
 getrandom = "0.3"
 sha2 = "0.10"
+# Pairing (T-0024): SPAKE2 (RFC 9382) over ed25519 — the PAKE is a crate
+# because hand-written PAKEs are exactly where crypto dies — plus HMAC for the
+# post-PAKE confirmation. `hmac` rides the same `digest` 0.10 tree as `sha2`
+# and `curve25519-dalek` was already in the graph via ed25519-dalek.
+spake2 = "0.4"
+hmac = "0.12"
 portable-pty = "0.9"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "time", "io-util"] }
 anyhow = "1"

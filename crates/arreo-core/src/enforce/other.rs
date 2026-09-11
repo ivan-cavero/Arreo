@@ -7,7 +7,7 @@
 //! every method says exactly where it belongs.
 
 use super::{Breach, Budget, EnforceError};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 pub struct Guard;
 

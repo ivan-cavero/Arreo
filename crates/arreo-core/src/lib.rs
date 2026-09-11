@@ -9,6 +9,7 @@ pub mod fixtures;
 pub mod identity;
 pub mod lifecycle;
 pub mod metrics;
+pub mod pairing;
 pub mod proto;
 pub mod pty;
 pub mod state;

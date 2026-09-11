@@ -6,9 +6,10 @@
 ## Layout
 
 Workspace crates: `arreo-core` (PTY, VT state, state engine, metrics, protocol,
-themes), `arreo-server` (daemon), `arreo-cli` (`arreo` binary), `arreo-tui`
-(ratatui client: sidebar, pane wall, theme picker), `arreo-relay` (AGPL relay,
-Phase 2+), `arreo-plugin-api` (WASM plugin host, Phase 4+). Dev tooling: `xtask`.
+device identity, pairing, themes), `arreo-server` (daemon), `arreo-cli` (`arreo`
+binary), `arreo-tui` (ratatui client: sidebar, pane wall, theme picker),
+`arreo-relay` (AGPL: pairing mailbox today, routing/presence next),
+`arreo-plugin-api` (WASM plugin host, Phase 4+). Dev tooling: `xtask`.
 
 **Dependency direction (enforced by `cargo test`, see `xtask/tests/workspace_deps.rs`):**
 `arreo-server` and `arreo-cli` depend on `arreo-core`; nothing except `xtask`
@@ -28,6 +29,7 @@ cargo fmt --all -- --check               # must be clean
 cargo xtask e2e                          # e2e battery (stubs until wired per task)
 cargo xtask e2e --slice tui              # TUI: sidebar/wall/mouse on a real pty
 cargo xtask e2e --slice theme            # theming: depth fallback + shared tokens
+cargo test -p arreo-cli --test pairing   # pairing: three real processes (needs arreo-relay built)
 cargo xtask bench                        # benchmarks vs perf-budget.toml
 cargo xtask conpty-smoke                 # Windows ConPTY smoke (T-0007)
 cargo xtask <cmd> --enforce              # fail when budgets exist but unmet

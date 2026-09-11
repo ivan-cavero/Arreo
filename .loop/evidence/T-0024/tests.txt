@@ -1,0 +1,46 @@
+# T-0024 — the three test suites that back the claims (2026-09-11T03:07:07+02:00)
+
+## pairing code + flow + mailbox wire (unit)
+test pairing::code::tests::codes_round_trip_through_the_human_form ... ok
+test pairing::code::tests::a_code_never_equals_another_by_accident ... ok
+test pairing::flow::tests::percent_encoding_round_trips_every_byte ... ok
+test pairing::code::tests::the_list_is_exactly_256_distinct_lowercase_words ... ok
+test pairing::flow::tests::a_partial_or_bad_invite_is_refused ... ok
+test pairing::flow::tests::a_flight_cannot_be_moved_between_sessions_or_roles ... ok
+test pairing::flow::tests::a_truncated_or_empty_frame_is_refused_before_parsing ... ok
+test pairing::code::tests::parsing_forgives_formatting_but_not_wrong_words ... ok
+test pairing::flow::tests::public_keys_parse_strictly ... ok
+test pairing::tests::a_wrong_code_and_a_dead_mailbox_are_different_errors ... ok
+test pairing::flow::tests::session_ids_are_random_and_unguessable ... ok
+test pairing::flow::tests::the_invite_uri_round_trips_and_carries_no_code ... ok
+test pairing::tests::an_unknown_word_error_carries_its_hint ... ok
+test pairing::wire::tests::addresses_parse_paths_and_hostports_only ... ok
+test pairing::flow::tests::the_identity_binding_separates_servers_and_sessions ... ok
+test pairing::wire::tests::a_malformed_payload_is_a_typed_error ... ok
+test pairing::code::tests::generated_codes_use_the_whole_space_and_do_not_repeat ... ok
+test pairing::wire::tests::a_request_round_trips_through_one_line_of_json ... ok
+test pairing::flow::tests::a_wrong_code_derives_a_different_key_and_fails_confirmation ... ok
+test pairing::flow::tests::two_phones_with_the_same_code_derive_the_same_key ... ok
+test result: ok. 20 passed; 0 failed; 0 ignored; 0 measured; 60 filtered out; finished in 0.12s
+
+## the relay's mailbox rules (unit, incl. the socket path)
+test pairing::tests::a_session_carries_four_flights_once_each ... ok
+test pairing::tests::a_session_id_is_single_use ... ok
+test pairing::tests::status_reports_the_time_left_and_unknown_sessions_are_named ... ok
+test pairing::tests::nonsense_requests_are_refused_without_touching_state ... ok
+test pairing::tests::frames_are_read_whole_and_oversized_ones_are_refused ... ok
+test pairing::tests::the_burn_memory_is_bounded_but_keeps_the_recent_ids ... ok
+test pairing::tests::the_socket_path_serves_the_same_lifecycle ... ok
+test pairing::tests::expiry_closes_the_window_and_retires_the_id ... ok
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.10s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+## three real processes: relay binary + two arreo pair processes
+test a_phone_that_arrives_after_the_window_is_told_so ... ok
+test pairing_reports_useful_errors_for_bad_arguments ... ok
+test a_wrong_code_leaves_no_trace_on_the_phone_and_burns_the_session ... ok
+test two_real_processes_pair_with_a_four_word_code ... ok
+test an_unanswered_pairing_expires_instead_of_hanging ... ok
+test sessions_are_isolated_from_each_other ... ok
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.29s

@@ -417,6 +417,13 @@ impl DeviceAuthority {
         Ok(())
     }
 
+    /// Record a failed pairing attempt (T-0024). Pairing failures are events in
+    /// the audit log: "someone tried and got it wrong" is exactly what an
+    /// operator wants to see, and `auth_reject` would read as a connection.
+    pub fn audit_pairing_failure(&self, session: &str, reason: &str) -> Result<(), AuthorityError> {
+        self.audit(AuditKind::PairingFailed, session, reason)
+    }
+
     fn note_refusal(&self, device: &DeviceId, reason: &str) -> Result<(), AuthorityError> {
         self.audit(AuditKind::AuthReject, device.as_str(), reason)
     }

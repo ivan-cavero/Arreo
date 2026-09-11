@@ -27,6 +27,8 @@ fn usage() -> ExitCode {
     eprintln!("  arreo server stop [--socket PATH]   (graceful: drain + exit 0)");
     eprintln!("  arreo audit [--limit N] [--socket PATH]   (append-only log, secrets redacted)");
     eprintln!("  arreo devices <id|list|issue|rotate|revoke|authorize> [--json] [--socket PATH]");
+    eprintln!("  arreo pair [--role owner|viewer] [--ttl-secs N] [--mailbox ADDR] [--json]   (show a code; pins the device that types it)");
+    eprintln!("  arreo pair --join \"four words\" --uri arreo://pair?... [--name N] [--json]   (this device joins)");
     eprintln!("      authorize --verb <read|send|...>   (the transport's own decision path)");
     ExitCode::from(2)
 }
@@ -62,6 +64,7 @@ fn main() -> ExitCode {
         Some("server") => rt::block_on(cmd_server(&args[2..])),
         Some("audit") => cmd_audit(&args[2..]),
         Some("devices") => cmd_devices(&args[2..]),
+        Some("pair") => cmd_pair(&args[2..]),
         _ => usage(),
     }
 }
@@ -1045,8 +1048,9 @@ fn cmd_audit(rest: &[String]) -> ExitCode {
         Ok(events) => {
             for event in events.iter().rev() {
                 println!(
-                    "{} {} {} {}{}",
+                    "{} {:<14} {} {} {}{}",
                     event.ts_ms,
+                    event.kind.as_str(),
                     event.device,
                     event.agent,
                     if event.redacted { "[redacted] " } else { "" },
@@ -1592,4 +1596,394 @@ fn parse_verb(text: &str) -> Option<arreo_core::identity::role::Verb> {
         "hello" => Some(Verb::Hello),
         _ => None,
     }
+}
+
+/// `arreo pair` (T-0024): pin a device using a four-word code.
+///
+/// Server side (on the machine running the daemon):
+///   `arreo pair [--name <label>] [--role owner|viewer] [--ttl-secs 300]
+///               [--mailbox <path|host:port>] [--socket PATH] [--json]`
+/// prints the code and the invite URI, waits, and issues a certificate.
+///
+/// Phone side (on the device being paired):
+///   `arreo pair --join "<four words>" --uri <arreo://pair?...> [--name <label>] [--json]`
+/// generates a keypair (in memory), proves the code, and stores the
+/// certificate the server signs.
+///
+/// The code is the only shared secret, it never travels, and a wrong guess
+/// burns the session — see `arreo_core::pairing` for the exact argument.
+fn cmd_pair(rest: &[String]) -> ExitCode {
+    let (socket, kept) = take_socket(rest);
+    let mut join_code: Option<String> = None;
+    let mut uri: Option<String> = None;
+    let mut name: Option<String> = None;
+    let mut role: Option<arreo_core::identity::Role> = None;
+    let mut ttl_secs: u64 = arreo_core::pairing::flow::DEFAULT_TTL.as_secs();
+    let mut mailbox: Option<String> = None;
+    let mut json = false;
+
+    let mut i = 0;
+    while i < kept.len() {
+        match kept[i].as_str() {
+            "--join" if i + 1 < kept.len() => {
+                join_code = Some(kept[i + 1].clone());
+                i += 2;
+            }
+            "--uri" if i + 1 < kept.len() => {
+                uri = Some(kept[i + 1].clone());
+                i += 2;
+            }
+            "--name" if i + 1 < kept.len() => {
+                name = Some(kept[i + 1].clone());
+                i += 2;
+            }
+            "--role" if i + 1 < kept.len() => {
+                match arreo_core::identity::Role::parse(&kept[i + 1]) {
+                    Ok(parsed) => role = Some(parsed),
+                    Err(e) => {
+                        eprintln!("pair: {e}");
+                        return ExitCode::from(2);
+                    }
+                }
+                i += 2;
+            }
+            "--ttl-secs" if i + 1 < kept.len() => {
+                match kept[i + 1].parse::<u64>() {
+                    Ok(secs) if secs >= 1 => ttl_secs = secs,
+                    _ => {
+                        eprintln!("pair: --ttl-secs wants a positive number of seconds");
+                        return ExitCode::from(2);
+                    }
+                }
+                i += 2;
+            }
+            "--mailbox" if i + 1 < kept.len() => {
+                mailbox = Some(kept[i + 1].clone());
+                i += 2;
+            }
+            "--json" => {
+                json = true;
+                i += 1;
+            }
+            other => {
+                eprintln!("pair: unexpected argument {other:?}");
+                eprintln!("usage: arreo pair [--name N] [--role owner|viewer] [--ttl-secs N] [--mailbox ADDR] [--json]");
+                eprintln!("       arreo pair --join \"four words\" --uri arreo://pair?... [--name N] [--json]");
+                return ExitCode::from(2);
+            }
+        }
+    }
+
+    match (join_code, uri) {
+        (Some(_), None) => {
+            eprintln!(
+                "pair: --join also needs --uri (it carries the mailbox, session and server key)"
+            );
+            ExitCode::from(2)
+        }
+        (None, Some(_)) => {
+            eprintln!("pair: --uri without --join: the code is typed by the human, never carried in the invite");
+            ExitCode::from(2)
+        }
+        (Some(code), Some(uri)) => cmd_pair_phone(&code, &uri, name, json),
+        (None, None) => cmd_pair_server(&socket, name, role, ttl_secs, mailbox, json),
+    }
+}
+
+/// Default mailbox when the server does not name one: the same runtime dir the
+/// daemon's socket lives in, so a local relay is found without configuration.
+fn default_mailbox() -> std::path::PathBuf {
+    if let Some(runtime) = std::env::var_os("XDG_RUNTIME_DIR") {
+        return std::path::PathBuf::from(runtime).join("arreo-relay.sock");
+    }
+    std::path::PathBuf::from("/tmp/arreo-relay.sock")
+}
+
+fn cmd_pair_server(
+    socket: &std::path::Path,
+    name: Option<String>,
+    role: Option<arreo_core::identity::Role>,
+    ttl_secs: u64,
+    mailbox: Option<String>,
+    json: bool,
+) -> ExitCode {
+    use arreo_core::pairing::flow::PairingServer;
+    use arreo_core::pairing::{MailboxAddr, PairingError};
+
+    let addr = match mailbox {
+        Some(text) => match MailboxAddr::parse(&text) {
+            Ok(addr) => addr,
+            Err(e) => {
+                eprintln!("pair: {e}");
+                return ExitCode::from(2);
+            }
+        },
+        None => MailboxAddr::Unix(default_mailbox()),
+    };
+    let mut authority = match open_authority(socket) {
+        Ok(authority) => authority,
+        Err(code) => return code,
+    };
+    let ttl = std::time::Duration::from_secs(ttl_secs);
+
+    // The server's identity key signs the certificate *and* is the SPAKE2
+    // identity, so the code authenticates exactly the machine the phone will
+    // trust.
+    let root = match arreo_core::identity::RootKey::load_or_generate(&root_key_path()) {
+        Ok(root) => root,
+        Err(e) => {
+            eprintln!("pair: cannot load the server identity key: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let mut server = match PairingServer::begin(&root, addr, ttl) {
+        Ok(server) => server,
+        Err(e) => {
+            eprintln!("pair: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let invite = server.invite().clone();
+    let code = server.code().phrase();
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "role": "server",
+                "code": code,
+                "uri": invite.uri(),
+                "session": invite.session,
+                "mailbox": invite.mailbox.as_str(),
+                "server_key": invite.server_key,
+                "expires_in_secs": ttl_secs,
+            })
+        );
+    } else {
+        println!("pair this device (expires in {}s):", ttl_secs);
+        println!();
+        println!("  code: {code}");
+        println!("  uri:  {}", invite.uri());
+        println!();
+        println!("On the device being paired:");
+        println!("  arreo pair --join \"{code}\" --uri '{}'", invite.uri());
+    }
+    // Flush both streams so a caller reading our stdout sees the code before we
+    // block waiting for the phone.
+    use std::io::Write as _;
+    let _ = std::io::stdout().flush();
+
+    let request = match server.receive() {
+        Ok(request) => request,
+        Err(e) => return pair_failed(&authority, &invite.session, &e, json),
+    };
+    // The phone proposes a name; the server may override it. Either way it is
+    // untrusted text: trimmed, length-capped, and control characters dropped so
+    // it cannot corrupt a terminal or a log line.
+    let label = name.unwrap_or_else(|| request.name.clone());
+    let Some(label) = sanitize_device_name(&label) else {
+        let error = PairingError::BadInvite("the device name is empty".into());
+        return pair_failed(&authority, &invite.session, &error, json);
+    };
+    let role = role.unwrap_or(arreo_core::identity::Role::Viewer);
+    let cert = match authority.issue(&label, role, &request.public_key) {
+        Ok(cert) => cert,
+        Err(e) => {
+            let error = PairingError::BadInvite(e.to_string());
+            return pair_failed(&authority, &invite.session, &error, json);
+        }
+    };
+    if let Err(e) = server.complete(&cert) {
+        eprintln!("pair: the device was pinned but its certificate could not be delivered: {e}");
+        eprintln!("pair: re-run `arreo pair` — the device did not store a certificate");
+        return ExitCode::FAILURE;
+    }
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "paired": true,
+                "device": cert.device().display_id(),
+                "name": label,
+                "role": role.as_str(),
+                "serial": cert.serial(),
+            })
+        );
+    } else {
+        println!("paired {} ({label}) as {role}", cert.device().display_id());
+    }
+    ExitCode::SUCCESS
+}
+
+/// One failure path for the server: audited, reported, never silent.
+fn pair_failed(
+    authority: &arreo_core::identity::authority::DeviceAuthority,
+    session: &str,
+    error: &arreo_core::pairing::PairingError,
+    json: bool,
+) -> ExitCode {
+    // The audit trail is the operator's record of "someone tried"; the reason
+    // goes in `prompt` and the session id in `agent`.
+    let _ = authority.audit_pairing_failure(session, &error.to_string());
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({ "paired": false, "reason": error.to_string(), "session": session })
+        );
+    } else {
+        eprintln!("pairing failed: {error}");
+    }
+    ExitCode::FAILURE
+}
+
+fn cmd_pair_phone(code_text: &str, uri: &str, name: Option<String>, json: bool) -> ExitCode {
+    use arreo_core::pairing::flow::PairingPhone;
+    use arreo_core::pairing::{Code, Invite};
+
+    let code = match Code::parse(code_text) {
+        Ok(code) => code,
+        Err(e) => {
+            eprintln!("pair: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    let invite = match Invite::parse_uri(uri) {
+        Ok(invite) => invite,
+        Err(e) => {
+            eprintln!("pair: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    // The dev box default is the machine's own hostname; a phone passes
+    // --name. Either way the server may override it.
+    let label = name.unwrap_or_else(default_device_name);
+    let Some(label) = sanitize_device_name(&label) else {
+        eprintln!("pair: the device name is empty");
+        return ExitCode::from(2);
+    };
+
+    // An existing keypair is reused (re-pairing the same device keeps its
+    // identity); a fresh one is generated in memory and only written once the
+    // certificate arrives — a failed pairing must leave nothing behind.
+    let key_path = arreo_core::identity::identity_root().join("device.key");
+    let (key, generated) = match arreo_core::identity::DeviceKey::load(&key_path) {
+        Ok(key) => (key, false),
+        Err(arreo_core::identity::KeyError::Missing { .. }) => {
+            match arreo_core::identity::DeviceKey::generate() {
+                Ok(key) => (key, true),
+                Err(e) => {
+                    eprintln!("pair: {e}");
+                    return ExitCode::FAILURE;
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!("pair: cannot read {path}: {e}", path = key_path.display());
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let phone = match PairingPhone::join(&invite, &code, key, &label) {
+        Ok(phone) => phone,
+        Err(e) => {
+            eprintln!("pair: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let paired = match phone.await_cert() {
+        Ok(paired) => paired,
+        Err(e) => {
+            eprintln!("pair: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    // Success is the only moment anything is written.
+    if generated {
+        if let Err(e) = paired.key.save(&key_path) {
+            eprintln!("pair: paired, but cannot save the device key: {e}");
+            return ExitCode::FAILURE;
+        }
+    }
+    let cert = &paired.cert;
+    let cert_dir = arreo_core::identity::identity_root().join("devices");
+    let cert_path = match cert.save(&cert_dir) {
+        Ok(path) => path,
+        Err(e) => {
+            eprintln!("pair: paired, but cannot save the certificate: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    // Pin the server's key so later connections can verify its certificates
+    // without the invite (public material — no secret here).
+    let server_key_path = arreo_core::identity::identity_root().join("server.key");
+    let pinned = arreo_core::identity::identity_root();
+    if let Err(e) = arreo_core::identity::keys::create_private_dir(&pinned).and_then(|()| {
+        std::fs::write(&server_key_path, format!("{}\n", invite.server_key)).map_err(|e| {
+            arreo_core::identity::KeyError::Io {
+                path: server_key_path.clone(),
+                detail: e.to_string(),
+            }
+        })
+    }) {
+        eprintln!("pair: paired, but cannot save the server key: {e}");
+        return ExitCode::FAILURE;
+    }
+
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "paired": true,
+                "device": cert.device().display_id(),
+                "name": cert.name(),
+                "role": cert.role().as_str(),
+                "cert_file": cert_path.display().to_string(),
+                "server_key": invite.server_key,
+            })
+        );
+    } else {
+        println!(
+            "paired with this server as {} ({})",
+            cert.role(),
+            cert.device().display_id()
+        );
+        println!("certificate: {}", cert_path.display());
+    }
+    ExitCode::SUCCESS
+}
+
+/// The server's identity key path (its root key — one identity per server).
+fn root_key_path() -> std::path::PathBuf {
+    arreo_core::identity::identity_root().join("root.key")
+}
+
+/// Trim, cap and de-control an untrusted device name.
+fn sanitize_device_name(raw: &str) -> Option<String> {
+    let cleaned: String = raw
+        .trim()
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(64)
+        .collect();
+    let cleaned = cleaned.trim().to_string();
+    if cleaned.is_empty() {
+        None
+    } else {
+        Some(cleaned)
+    }
+}
+
+/// This machine's default device name: its hostname, or a stable fallback.
+fn default_device_name() -> String {
+    std::fs::read_to_string("/etc/hostname")
+        .ok()
+        .map(|text| text.trim().to_string())
+        .filter(|text| !text.is_empty())
+        .or_else(|| {
+            std::env::var("HOSTNAME")
+                .ok()
+                .filter(|text| !text.is_empty())
+        })
+        .unwrap_or_else(|| "device".to_string())
 }
