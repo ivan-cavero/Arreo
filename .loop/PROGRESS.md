@@ -1,22 +1,20 @@
 ## State snapshot          ← REWRITTEN (not appended) at every checkpoint
-Task: T-0040 · metrics history (phase 2) — DONE, a durable per-pane series with a bounded store
-Where you are: three tiers (10 s/24 h, 1 m/30 d, 1 h/365 d) in one v6 table keyed
-(pane, ts_ms, step_ms); the daemon writes 10 s rows, rolls tiers forward, prunes hourly without
-ever emptying a live graph; CLI history with downshift notes, socket history verbs, TUI sparkline
-with peak. 364 workspace tests.
-Next step: **T-0049**, then T-0041 (needs T-0040, now unblocked). T-0044 is blocked on the
-account-join RPC (its own note); **T-0036 is human-gated** — it needs a real minisign keypair
-whose secret the operator holds as a CI secret, and the gate is recorded in the task file.
+Task: T-0049 · CLI broken pipe (phase 2) — DONE, one decision applied once
+Where you are: default SIGPIPE disposition at the single entry point; `arreo <verb> |
+head -1` dies by signal (141, silent) instead of panicking (101 + text). Proven on audit,
+devices list, and panes (live daemon) — all three fail without the fix, pass with it — plus
+a construction test covering pair mid-wait. 368 workspace tests.
+Next step: **T-0041** (needs T-0040, unblocked). T-0044 is blocked on the account-join RPC
+(its own note); **T-0036 is human-gated** — it needs a real minisign keypair whose secret
+the operator holds as a CI secret, and the gate is recorded in the task file.
 Open workers: (none)
 Known broken: (none) · Parked: (none)
 Findings:
-- **Two spellings of "now" downshifted every query.** The CLI sent until=u64::MAX, the daemon
-  mapped only 0 → now, so the span was 292M years and everything fell to the coarsest tier.
-  The first evidence capture caught it. Both sentinels now map, with the reason written down.
-- **A zombie tree is data, not a sampling bug.** An exited pane records pids=1/rss=0 — the
-  death as a cliff to zero. Only a live pane's newest row is prune-protected.
-- **rmp-serde encodes internally-tagged enums as arrays** (T-0028); **negotiate never caps at
-  VERSION** (T-0028). **A heartbeat needs no new wire kind** (T-0031).
+- **A test that cannot fail proves nothing.** Read-one-line-then-close passed 3/3 without
+  the fix (7 KB fits the 64 KB buffer). Immediate close is deterministic; non-emptiness
+  comes from the file run. Same reason single-line --json variants were dropped.
+- **Two spellings of "now" downshifted every query** (T-0040). **A zombie tree is data**
+  (T-0040). **rmp-serde encodes tagged enums as arrays** (T-0028).
 - **A dropped handle must stop its task** (T-0033, T-0054). **Retention compares two
   timestamps, so the clock must move as one** (T-0055).
 - **A budget row bench cannot measure still needs enforcing** — read from perf-budget.toml.
@@ -65,3 +63,5 @@ Findings:
 - 2026-09-11 [turn 36] T-0028 protocol N−1 window done: `negotiate` is a window ([server-1, server], highest common wins, echoed in Welcome.v, typed Error naming offers + range outside it), `{op,v}` classification from the map/array head without a full decode (unknown ops default to request — refused loudly, session open; unknown events ignored and counted), new serde-default fields downgrade silently, wider gaps refuse as deferred updates. Refused handshakes write auth.reject rows (row before the Error frame), the 1 MB budget moved into frame_body_len (refused before allocation), per-verb check_version stays as the second layer. ADR 0017; 7 matrix tests over frozen v0 corpora + 3 live-daemon tests (v0 client keeps working, outside-window refusal with audit row, unknown teleport refused with session surviving); new `compat` slice (`cargo xtask e2e --slice compat`) wired into CI. Evidence `.loop/evidence/T-0028/`. 357 workspace tests, clippy/fmt clean, vet/deny/audit green, check-targets PASS/SKIP, 7 e2e slices green, bench 6/6; remote == local
 
 - 2026-09-11 [turn 37] T-0040 metrics history done: v6 `metrics_series` table keyed (pane, ts_ms, step_ms) with avg+peak RSS/cpu/pids (three tiers 10 s/24 h, 1 m/30 d, 1 h/365 d); idempotent record (bucket floor + weighted merge, peak keeps the worst moment), rollups read the tier below never /proc, hourly prune that never deletes a live pane's newest row, ≤ 2 MB/pane asserted; socket MetricsHistory/MetricsSeries verbs with step downshift (N−1 safe via serde-default fields); CLI `metrics history` with duration parsing and downshift notes; daemon 10 s writer + rollup + hourly prune tasks (tick measures its own work, cadence cannot drift); TUI sparkline with peak in the focused title (empty renders nothing, never a flat line). 7 store tests + writer-overhead test + tui --case metrics-graph (18 assertions); evidence `.loop/evidence/T-0040/` incl. a real-bug transcript (until=u64::MAX vs 0). 364 workspace tests, clippy/fmt clean, vet/deny/audit green, check-targets PASS/SKIP, 7 e2e slices green, bench 6/6; remote == local
+
+- 2026-09-11 [turn 38] T-0049 CLI broken pipe done: default SIGPIPE disposition restored once at the top of main (one unsafe block, no libc dependency, no-op on non-Unix) so `arreo <verb> | head -1` dies by signal (141, silent) instead of Rust's EPIPE-panic (101 + text). Proven on audit, devices list (both seeded to 50 rows via devices issue), and panes (live daemon + 50 spawns) — all three fail without the fix with `panicked at .../stdio.rs`, pass with it; byte-identity vs file run proves no verb changed output. Pair mid-wait covered by construction test (one definition per platform, one call before any verb). Evidence `.loop/evidence/T-0049/`. 368 workspace tests, clippy/fmt clean, vet/deny/audit green, check-targets PASS/SKIP, api slice green, bench 6/6; remote == local

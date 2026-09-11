@@ -10,6 +10,31 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
 
+/// Restore the default SIGPIPE disposition (T-0049).
+///
+/// Rust ignores SIGPIPE process-wide, so a write to a closed pipe fails with
+/// EPIPE — and `println!` panics on that (exit 101 + `panicked at` text).
+/// Every Unix tool a pipeline composes (`head`, `less`, a harness that stops
+/// reading) closes the pipe, so the CLI must die by signal (exit 141, silent)
+/// instead. `unsafe` is confined here: `signal(2)` with `SIG_DFL` cannot
+/// violate memory safety (it installs no handler, runs no code), and the
+/// alternative — a `libc` dependency for one call — is scaffolding. No-op on
+/// non-Unix (Windows has no SIGPIPE; `println!` there fails closed already).
+#[cfg(unix)]
+fn restore_default_sigpipe() {
+    unsafe {
+        const SIGPIPE: i32 = 13;
+        const SIG_DFL: usize = 0;
+        extern "C" {
+            fn signal(signum: i32, handler: usize) -> usize;
+        }
+        signal(SIGPIPE, SIG_DFL);
+    }
+}
+
+#[cfg(not(unix))]
+fn restore_default_sigpipe() {}
+
 fn usage() -> ExitCode {
     eprintln!("usage:");
     eprintln!("  arreo --version");
@@ -46,6 +71,19 @@ fn usage() -> ExitCode {
 }
 
 fn main() -> ExitCode {
+    // Broken-pipe discipline (T-0049), decided once here rather than at 245
+    // `println!` sites: restore the default SIGPIPE disposition so the process
+    // dies the way every other Unix tool does when its consumer goes away
+    // (`head -1` → SIGPIPE → exit 141, no panic text), instead of Rust's
+    // default of ignoring SIGPIPE and failing the write with EPIPE — which
+    // `println!` turns into `panicked at 'failed printing to stdout'` + exit
+    // 101. Why this over a Result-routing writer: one `unsafe` block at the
+    // single entry point versus touching every print site and auditing that no
+    // future `println!` reintroduces the panic; the disposition is
+    // process-wide, which is exactly the scope of the problem (every verb
+    // prints). No new dependency (`libc` for one call is scaffolding); the
+    // raw `signal(2)` binding is three lines with its contract stated.
+    restore_default_sigpipe();
     let args: Vec<String> = std::env::args().collect();
     // NOTE: only argv[1] counts (chaos-found, T-0017: a global `.any()`
     // swallowed child args, so `arreo record X --version` printed OUR version

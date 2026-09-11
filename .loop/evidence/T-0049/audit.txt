@@ -1,0 +1,45 @@
+# T-0049 evidence — the CLI never panics on a closed pipe
+
+The fix is one decision applied once: default SIGPIPE disposition at the single
+entry point (no new dependency, no per-site `let _ =`). The process dies the way
+every other Unix tool does (exit 141, silent) instead of Rust's EPIPE-panic
+(exit 101 + `panicked at` text).
+
+## 1. The pipe tests (seeded listings piped into an immediately-closed pipe)
+
+$ cargo test -p arreo-cli --test pipe
+
+test pair_is_covered_by_construction ... ok
+test panes_survives_a_closed_pipe ... ok
+test audit_survives_a_closed_pipe ... ok
+test devices_list_survives_a_closed_pipe ... ok
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 36.57s
+
+## 2. Without the fix: all four fail (exit 101 + panic text)
+
+Stashed main.rs, re-ran, restored: 0 passed, 4 failed — audit, devices list
+and panes each print `panicked at .../stdio.rs` with exit 101; the
+construction test fails on the missing call. (Full transcript in the
+ledger entry; the run is deterministic because the close precedes any
+possible write — spawn+close is microseconds, exec+query+print is ms.)
+
+## 3. A test that cannot fail proves nothing (lesson learned in this turn)
+
+The first draft read one line then closed: 50 rows (~7 KB) fit the 64 KB
+pipe buffer, so the child usually finished before the close landed — and
+passed 3/3 WITHOUT the fix. The deterministic shape closes immediately;
+that the verb would have written is proven by the file run (asserted
+non-empty). The --json single-line variants were dropped for the same
+reason: head -1 reads all of one line, so the child exits first.
+
+## 4. The full battery (final code)
+
+cargo test --workspace: 368 passed, 0 failed across 49 targets
+cargo clippy --workspace --all-targets -- -D warnings: 0 diagnostics
+cargo fmt --all -- --check: clean
+cargo vet --locked: Vetting Succeeded (336 exempted)
+cargo deny check: advisories ok, bans ok, licenses ok, sources ok
+cargo audit: 343 crate dependencies, no advisories
+cargo xtask check-targets: x86_64-unknown-linux-gnu PASS; x86_64-pc-windows-msvc SKIP (pure-Rust no-sqlite PASS)
+e2e slices: api green (criterion's slice)
+cargo xtask bench: 6/6 PASS

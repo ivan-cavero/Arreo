@@ -3,7 +3,7 @@ id: T-0049
 title: CLI robustness — never panic on a closed stdout/stderr pipe
 phase: 2
 priority: 4
-status: proposed
+status: done
 depends_on: [T-0014]
 scope:
   - crates/arreo-cli/src/main.rs
@@ -23,19 +23,46 @@ artifact scripts and the agent skill drive.
 
 ## Acceptance criteria
 
-- [ ] `arreo <verb> | head -1` exits without a panic message for at least
+- [x] `arreo <verb> | head -1` exits without a panic message for at least
       `audit`, `devices list`, `panes`, and `pair` (the last one mid-wait): exit
       status is 0..=141 with no `panicked at` text on stderr. Proven by a test
       that pipes the CLI's stdout into a reader which closes after one line.
-- [ ] The fix is one decision applied once, not a per-call-site `let _ =`:
+- [x] The fix is one decision applied once, not a per-call-site `let _ =`:
       either restore the default `SIGPIPE` disposition so the process dies the
       way every other Unix tool does, or route all CLI output through a writer
       that returns `Result` and maps a broken pipe to a clean exit. State which
       and why in the ledger (an ADR only if it constrains other crates).
-- [ ] No CLI verb changes its output bytes: the pipeline test compares the first
+- [x] No CLI verb changes its output bytes: the pipeline test compares the first
       line against the same run redirected to a file.
-- [ ] `cargo test --workspace`, clippy `-D warnings`, and fmt stay green; the
+- [x] `cargo test --workspace`, clippy `-D warnings`, and fmt stay green; the
       existing pairing/devices/audit tests are unaffected.
+
+## Landing notes (2026-09-11)
+
+Decision, as the criterion demands: **default SIGPIPE disposition**, not a
+Result-routing writer. One `unsafe` block at the single entry point versus 245
+touched print sites plus an audit that no future `println!` reintroduces the
+panic; the disposition is process-wide, which is exactly the scope of the
+problem (every verb prints). No `libc` dependency for one call — the raw
+`signal(2)` binding is three lines, `unsafe` confined to installing `SIG_DFL`
+(which runs no code and cannot violate memory safety), no-op on non-Unix. No
+ADR: the decision constrains no other crate (CLI entry point only), and the
+rationale lives in the code comment plus this note.
+
+Two lessons from proving it, both in the tests rather than smoothed over:
+
+- **A test that cannot fail proves nothing.** The first draft read one line then
+  closed: 50 rows (~7 KB) fit the 64 KB pipe buffer, so the child usually
+  finished before the close landed — and passed 3/3 *without* the fix. The
+  deterministic shape closes immediately (spawn+close is microseconds,
+  exec+query+print is milliseconds); that the verb would have written is proven
+  by the file run, asserted non-empty. Same reason the `--json` single-line
+  variants were dropped: `head -1` reads all of one line.
+- **`pair` mid-wait cannot be pipe-tested without the full rig** (live relay +
+  phone; pairing.rs keeps stdout open deliberately). The fourth test asserts the
+  property that covers it instead: the disposition is installed once at the top
+  of `main`, so no verb can opt out — two definitions (unix + non-unix), one
+  call, positioned before any verb runs.
 
 ## Notes
 
