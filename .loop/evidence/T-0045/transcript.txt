@@ -63,3 +63,24 @@ test an_offline_machine_is_refused_quickly_with_its_presence ... ok
 test a_daemon_reaches_another_machines_pane_through_the_same_client ... ok
 test attach_by_name_reaches_another_machines_pane ... ok
 test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.67s
+
+## 4. Conformance: the same command, the same output, local or remote
+
+$ cargo test -p arreo-cli --test remote_machine the_same_commands -- --nocapture
+test the_same_commands_produce_the_same_output_locally_and_remotely ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 5 filtered out; finished in 3.52s
+
+One scripted sequence — spawn, panes, read, send, wait, metrics — replayed
+against a local pane and against the same pane reached by name from a
+different machine; outputs compared, normalised only for the fields that are
+measurements (rss sample, timestamp, match confidence) and the pane id.
+
+## 5. All four T-0045 acceptance tests
+
+test an_unknown_machine_is_refused_by_name ... ok
+test an_offline_machine_is_refused_quickly_with_its_presence ... ok
+test a_daemon_reaches_another_machines_pane_through_the_same_client ... ok
+test attach_by_name_reaches_another_machines_pane ... ok
+test the_same_commands_produce_the_same_output_locally_and_remotely ... ok
+test a_cli_verb_on_a_daemon_host_does_not_leave_it_unreachable ... ok
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.93s

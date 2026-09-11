@@ -1,26 +1,26 @@
 ## State snapshot          ← REWRITTEN (not appended) at every checkpoint
-Task: T-0045 · cross-server attach — 4 of 7 criteria met; **T-0060 is DONE** (it went first because
-conformance would multiply the surface it broke).
-Where you are: `arreo attach --machine <name>` reaches another machine's pane by name, with the dial key
-in the directory row (written by the relay from the verified certificate), distinct fast honest
-failures, and a daemon reaching another machine as a test. A CLI verb on a daemon-hosting machine no
-longer takes that machine off the relay (T-0060: it is told, ends, and reconnects in 289 ms). 454 tests.
-Next step: **T-0045's two remaining criteria** — `--machine` on `read`/`send`/`wait`/`metrics`
-(conformance), then remote-pane observability in the TUI. The resolution is already a reusable
-function (`remote::resolve`), so the first is small.
+Task: **T-0045 · cross-server attach — DONE except what its own fence could not hold.** Five of seven
+criteria are met in the task; one is re-scoped to T-0061 (TUI, outside the fence) and one (the budget
+row) to T-0047. T-0060 is DONE.
+Where you are: `arreo attach --machine <name>` and `panes`/`read`/`send`/`wait`/`split`/`metrics` all
+reach another machine by name through the account's directory, with identical output locally and
+remotely (a conformance test compares them), distinct fast failures, a daemon-as-client test, and a
+CLI verb no longer able to take its own machine off the relay. 455 tests, all green.
+Next step: **T-0061** (remote-pane observability in the TUI: the machine/link header and the question
+payload — ROADMAP §3.11's flagship moment, and the piece that makes a remote blocked agent actionable
+from the sidebar). Then T-0048 (OSS launch) or T-0047 (the mesh slice).
 Open workers: (none)
 Known broken: (none) · Parked: (none)
 Findings:
-- **Displacing a session is not the same as replacing a route.** The relay swapped its map entry and
-  left the old session connected, unrouted and unaware — a machine went dark while its daemon's log
-  said everything was fine. The replaced session is now told (`Outbound::Displaced`) and ends, so
-  recovery is the client's ordinary 289 ms reconnect.
-- **Reference-counting per device was rejected for a delivery reason**: while a short-lived CLI session
-  sat "on top", the relay would report `Delivered` for frames it handed to a session that could not
-  serve them. Correctness over convenience, again.
+- **The task's own fence can exclude its own criterion** — found three times now (T-0045's observability
+  criterion names TUI work; T-0046's named a taken ADR number; T-0044's needed two transports that did
+  not exist). Re-scoping with the reason written down beats editing outside the fence.
+- **A criterion whose test asserts a tautology is not a test**: "run the same script through both paths
+  and compare" is impossible when both paths run the same function; the conformance test compares
+  *outputs* instead, which is what a caller experiences.
+- **`send` is silent on success** — an assertion that every verb "produced output" fails a correct verb.
 - **A stale binary from a mutation test cost an hour** (`cargo test -p X` does not rebuild another
   crate's bins) — rebuild the workspace before believing an integration test.
-- **`check-targets` caught the moved client's Unix socket** (feature-gated now).
 ## Event log               ← append-only; newest last; never rewrite
 - 2026-09-10 [turn 1] ledger created; repo at e489fac (docs only); T-0001 + T-0022 (AGENTS.md gardened) done
 - 2026-09-10 [turn 2] T-0002 PTY manager done+pushed (342606c; 9 tests); PROMPT.md v2 synced + ADR 0001 (ef6c595)
@@ -96,3 +96,5 @@ Findings:
 - 2026-09-11 [turn 49] T-0045's dial key landed and `arreo attach --machine <name>` works end to end: `MachineRow.daemon_key` (an eighth export column; older exports still parse), the relay writing it from the **authenticated session** (proved by mutation: a request-carried key fails the assertion), the verb resolving through the directory with distinct, fast, honest failures (unknown name 3, no dial key 4, offline-before-dial 4 with presence + the relay's own timestamp, trust refusal 5 carrying the peer's message), and the handshake budget cut to 3×3s so a silent peer fails inside §5's 10 s row. Four acceptance tests over three real processes each, plus a daemon-as-client test. Two findings: **a CLI relay session displaces the daemon's** (filed as T-0060 — an operator running `machines list` on a daemon-hosting box takes it off the relay), and the earlier "bug" that cost an hour was **my own mutation's stale binary** (`cargo test -p X` does not rebuild another crate's bins). Also removed a flaky 50 ms stopwatch assertion from the relay's presence test (the index-plan assertion is the real guard). 452 tests, clippy/fmt clean, vet/deny/audit green, check-targets PASS/SKIP, 8 slices green, bench 6/6. Evidence `.loop/evidence/T-0045/`
 
 - 2026-09-11 [turn 50] T-0060 done (it went before T-0045's conformance because every `--machine` verb would multiply the surface it broke): a second relay session for one device now **ends the session it replaced** (`Outbound::Displaced`), so a CLI verb run on a daemon-hosting machine no longer takes that machine off the relay. Reproduced first (the machine stayed unreachable the full 20 s the test waited, daemon log healthy throughout), fixed, and proved load-bearing by mutation. Recovery measured at 289 ms (backoff base 250 ms + jitter), and frames during the gap are queued durably rather than handed to the departing session. ADR 0013 has the follow-up note including the rejected reference-counting design (it can lose a message while reporting Delivered). Two tests: relay-level (replaced session ends within 5 s) and end-to-end (CLI verb on A, then C attaches by name and reads a live pane). 454 tests, clippy/fmt clean, check-targets PASS/SKIP
+
+- 2026-09-11 [turn 51] T-0045's conformance criterion landed: `--machine <name> [--config PATH]` on `panes`, `read`, `send`, `wait`, `split`, `metrics` and `metrics history`, all through one `Session` type (local socket or relay client) with the flags lifted out before each verb parses its own — so local and remote differ only in what had to be resolved. `request()` is gone with its last caller. The conformance test replays one scripted sequence against a local pane and the same pane by name from another machine and asserts equal output (normalised only for measurements and the pane id); it caught that `send` is silent on success, so the "produced output" check now excludes it. Criterion 4 **re-scoped to T-0061** with the reason: the criterion is TUI work and T-0045's fence lists no `arreo-tui` path — the third time a task's own fence excluded its own criterion. 455 tests, clippy/fmt clean, evidence `.loop/evidence/T-0045/`
