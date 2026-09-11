@@ -26,6 +26,9 @@ pub mod directory;
 /// without a database can still answer "may this device do this".
 #[cfg(feature = "sqlite")]
 pub mod ledger;
+/// The daemon client, over either transport (the Unix socket, or the relay to
+/// another machine). Gated on `transport` for the remote half.
+pub mod session;
 pub mod trust;
 
 pub use directory::{
@@ -35,4 +38,6 @@ pub use directory::{
 };
 #[cfg(feature = "sqlite")]
 pub use ledger::{GrantedDevice, LedgerError, SharedLedger, TrustLedger, TrustRefusal};
+#[cfg(feature = "transport")]
+pub use session::{Client as MeshClient, ClientError as MeshClientError, RemoteTarget, Target};
 pub use trust::{denial_message, evaluate, TrustDenial, TrustRecord};
