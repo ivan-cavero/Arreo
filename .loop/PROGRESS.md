@@ -2,10 +2,10 @@
 Task: T-0043 · machine directory (phase 2) — DONE, evidence recorded
 Where you are: directory landed (core rules + relay SQLite store + ADR 0012); all
 gates green on the final code
-Next step: T-0044 (`arreo machines` list/add/rename/remove/status) — it is the
-first *reader* of the directory and the first place the read-only server cache
-gets wired into a live path. T-0026 (device revocation, p3) also has its deps met
-and unblocks T-0027 and T-0033.
+Next step: **T-0029 (relay v0)** — p2, deps met (T-0018/T-0023/T-0025), and now
+the unambiguous head of the queue: it is the relay's router, which T-0044 needs
+(see the finding below). It also unblocks the largest cluster (T-0030, T-0031,
+T-0032, T-0033, T-0034, T-0035, and transitively T-0045..T-0047).
 Open workers: (none)
 Known broken: (none) · Parked: (none)
 Findings:
@@ -31,6 +31,14 @@ Findings:
 - **The task file's ADR number was already taken** (`0009` is device-identity).
   Accepted ADRs are immutable, so the decision landed as 0012 and the task file
   points there with the reason. Check the number before writing one.
+- **T-0044 was not actually ready, and the task file now says so.** Its `add`
+  verb completes an *account join*, but a `JoinTicket` (T-0043) exists only
+  in-process — nothing issues one over the wire, and the criterion's own
+  integration test needs "a loopback relay + daemon pair". Both need T-0029's
+  router, so T-0044's `depends_on` gained T-0029 with the reason written into the
+  file. The alternative was inventing an account-join transport inside a CLI task
+  — wrong file, wrong fence. (The same standard is why `status`'s trusted-device
+  count is specified as `null` until T-0046 rather than a fabricated 0.)
 - Ready-queue note: **T-0036 (signed releases, p1) is human-gated** — it needs a
   `MINISIGN_SECRET_KEY` CI secret and a committed public key, neither of which an
   agent may provision (and no fake secrets). It stays `proposed` until a human

@@ -4,7 +4,7 @@ title: "`arreo machines` — list/add/rename/remove/status with a stable script 
 phase: 2
 priority: 2
 status: proposed
-depends_on: [T-0043]
+depends_on: [T-0043, T-0029]
 scope:
   - crates/arreo-cli/src/main.rs
   - crates/arreo-cli/src/machines.rs
@@ -69,3 +69,23 @@ is the only way to see tombstoned names, by design.
 cargo test -p arreo-cli --test machines
 cargo fmt --all -- --check
 ```
+
+## Re-scope (2026-09-11, during T-0043's landing)
+
+**`depends_on` gained T-0029, and the reason is a real prerequisite, not a
+preference.** Two criteria in this file cannot be met without the relay actually
+serving the directory over a socket:
+
+- `add <pairing-code>` completes an *account join*, and a join needs a
+  `JoinTicket` (T-0043) — which today exists only in-process. Nothing issues one
+  over the wire yet; that is the relay's router (T-0029).
+- The integration test drives "the real CLI against a loopback relay + daemon
+  pair", which presupposes the relay has something to serve on loopback.
+
+T-0043 landed the *rules and the durable store*; it did not land a relay RPC
+surface. Claiming T-0044 without it would mean inventing an account-join
+transport inside a CLI task — the wrong file, and the wrong fence.
+
+`status <name>`'s trusted-device count already declares itself `null` until
+T-0046, which is the honest pattern; this note applies the same standard to the
+join path rather than shipping a stubbed `add`.
