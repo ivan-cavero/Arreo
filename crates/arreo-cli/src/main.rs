@@ -1881,6 +1881,21 @@ fn devices_issue(socket: &std::path::Path, args: &[String], json: bool) -> ExitC
     };
     match authority.issue(&name, role, &key) {
         Ok(cert) => {
+            // The certificate makes the device able to connect; the grant makes
+            // this machine willing to answer. Recorded before the certificate is
+            // reported, so a device the operator has been told about is always
+            // one this machine will actually serve.
+            if let Err(e) = grant_on_this_machine(socket, cert.device(), role) {
+                eprintln!(
+                    "devices issue: {} was issued, but this machine could not record its \
+                     access ({e}); grant it with `arreo machines trust {} --role {} --yes` \
+                     before it can connect",
+                    cert.device().display_id(),
+                    cert.device().display_id(),
+                    role.as_str()
+                );
+                return ExitCode::FAILURE;
+            }
             if json {
                 println!(
                     "{}",
@@ -2476,6 +2491,15 @@ fn cmd_pair_server(
             return pair_failed(&authority, &invite.session, &error, json);
         }
     };
+    // The machine that pairs a device is the machine that decides what it may do
+    // here (T-0046), so the grant is recorded before the certificate is handed
+    // over: a device told it is paired must not then be refused by this machine.
+    if let Err(e) = grant_on_this_machine(socket, cert.device(), role) {
+        let error = PairingError::BadInvite(format!(
+            "the device was pinned but this machine could not record its access: {e}"
+        ));
+        return pair_failed(&authority, &invite.session, &error, json);
+    }
     if let Err(e) = server.complete(&cert) {
         eprintln!("pair: the device was pinned but its certificate could not be delivered: {e}");
         eprintln!("pair: re-run `arreo pair` — the device did not store a certificate");
@@ -2662,6 +2686,45 @@ fn cmd_pair_phone(code_text: &str, uri: &str, name: Option<String>, json: bool) 
         println!("certificate: {}", cert_path.display());
     }
     ExitCode::SUCCESS
+}
+
+/// Grant a device access to **this** machine (T-0046).
+///
+/// Called where a certificate is created, because that is the moment a device
+/// becomes able to connect: issued without a grant, it would authenticate
+/// perfectly and then be refused by the trust gate, and the operator would have
+/// no way to tell that from a network fault. Also the reason this lives in the
+/// CLI's process rather than the daemon's — `arreo devices issue` and the server
+/// half of `arreo pair` run here, and pairing may run with no daemon at all.
+///
+/// The grant mirrors the role just issued, because at this moment the account's
+/// question and this machine's question have the same answer. Later they can
+/// differ: `arreo machines trust` is how an operator makes them differ.
+fn grant_on_this_machine(
+    socket: &std::path::Path,
+    device: &arreo_core::identity::DeviceId,
+    role: arreo_core::identity::Role,
+) -> Result<(), String> {
+    let layout = arreo_core::identity::authority::Layout::for_socket(socket);
+    let ledger = arreo_core::mesh::TrustLedger::open(
+        &layout.store,
+        &layout.root_key,
+        arreo_core::mesh::default_machine_name(),
+    )
+    .map_err(|e| e.to_string())?;
+    // No acting device: this is the machine's console (see `granted_by`).
+    ledger
+        .grant(device, role, device, now_ms_i64())
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
+/// Epoch milliseconds, for records this process writes (trust grants).
+fn now_ms_i64() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 /// The account and relay a joining machine should register itself with

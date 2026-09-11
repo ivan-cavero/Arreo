@@ -79,6 +79,7 @@ pub async fn serve(
     endpoint: Endpoint,
     local: NoiseStatic,
     authority: Arc<Mutex<DeviceAuthority>>,
+    ledger: arreo_core::mesh::SharedLedger,
     registry: Registry,
     sessions: Sessions,
     db: PathBuf,
@@ -101,6 +102,7 @@ pub async fn serve(
         let limiter = Arc::clone(&limiter);
         let guard = Arc::clone(&guard);
         let authority = Arc::clone(&authority);
+        let ledger = ledger.clone();
         let registry = Arc::clone(&registry);
         let sessions = Arc::clone(&sessions);
         let db = db.clone();
@@ -134,8 +136,13 @@ pub async fn serve(
             // The peer's address goes into the audit trail (truncated at write),
             // so "who connected, from where" answers "where" as a network rather
             // than a location history.
-            let auth = SessionAuth::new(Arc::clone(&authority), peer, session.device.clone())
-                .with_peer_address(connection.remote_address());
+            let auth = SessionAuth::new(
+                Arc::clone(&authority),
+                ledger.clone(),
+                peer,
+                session.device.clone(),
+            )
+            .with_peer_address(connection.remote_address());
             auth.touch();
             eprintln!("arreo-server: remote session from {}", session.device);
 
@@ -205,6 +212,7 @@ pub async fn listen_on(
     addr: SocketAddr,
     local: NoiseStatic,
     authority: Arc<Mutex<DeviceAuthority>>,
+    ledger: arreo_core::mesh::SharedLedger,
     registry: Registry,
     sessions: Sessions,
     db: PathBuf,
@@ -212,7 +220,7 @@ pub async fn listen_on(
     let endpoint = server_endpoint(addr)?;
     let bound = endpoint.local_addr().map_err(QuicError::Io)?;
     tokio::spawn(async move {
-        if let Err(e) = serve(endpoint, local, authority, registry, sessions, db).await {
+        if let Err(e) = serve(endpoint, local, authority, ledger, registry, sessions, db).await {
             eprintln!("arreo-server: remote transport stopped: {e}");
         }
     });
@@ -303,6 +311,7 @@ mod tests {
         let scratch = Scratch::new(tag);
         let mut authority = DeviceAuthority::load(scratch.layout.clone()).expect("authority");
         let device = DeviceKey::generate().expect("entropy");
+        let device_id = arreo_core::identity::DeviceId::from_key(&device.public());
         authority
             .issue("phone", role, &device.public())
             .expect("pin the device");
@@ -312,10 +321,26 @@ mod tests {
         let root = RootKey::load_or_generate(&scratch.layout.root_key).expect("root key");
         let registry: Registry = Arc::new(RwLock::new(HashMap::<String, Arc<PaneEntry>>::new()));
         let sessions: Sessions = Arc::new(crate::daemon::LiveSessions::default());
+        // The machine's own ledger, with the device this test speaks as granted:
+        // T-0046's gate is per machine, and this test is about the transport.
+        let ledger = arreo_core::mesh::SharedLedger::new(
+            crate::TrustLedger::open(
+                &scratch.layout.store,
+                &scratch.layout.root_key,
+                "scratch".to_string(),
+            )
+            .expect("ledger"),
+        );
+        ledger.with(|ledger| {
+            ledger
+                .grant(&device_id, role, &device_id, 1_000)
+                .expect("grant the device this test speaks as")
+        });
         let addr = listen_on(
             "127.0.0.1:0".parse().expect("loopback"),
             root.noise_static(),
             Arc::clone(&authority),
+            ledger,
             registry,
             sessions,
             scratch.layout.store.clone(),

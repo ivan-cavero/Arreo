@@ -1,0 +1,20 @@
+== 1. A device pinned, then put into the pre-T-0046 state on purpose
+      (pinned by an older build: a certificate, no grant row, no ledger marker)
+issued dev_84cb2335ccf4e51af845cb179329c151 (phone) for owner as owner — serial 1
+   machine_trust rows     = 0
+   meta[trust_initialized] = None
+
+== 2. The daemon boots on that identity: the migration grants it
+arreo-server: device authority ready (root 32205e13a5fbd6b2…, 1 device(s))
+arreo-server: trust ledger initialized — granted 1 previously pinned device(s) access to this machine, matching how they were already treated; change any of them with `arreo machines trust`
+arreo-server: serving on /tmp/arreo-t46-backfill-3zPp/arreo.sock
+
+== 3. The grant is now a fact, and the marker is set (one-way)
+   meta[trust_initialized] = 1
+   grant: machine=2cfb51f31e4f5c82… device=84cb2335ccf4e51a… role=owner revoked_at=None
+
+== 4. A deliberate revocation, then a restart: it is NOT backfilled back
+   revoked_at_ms          = 1789160580448
+arreo-server: device authority ready (root 32205e13a5fbd6b2…, 1 device(s))
+arreo-server: serving on /tmp/arreo-t46-backfill-3zPp/arreo.sock
+   after restart revoked_at_ms = 1789160580448 (unchanged: the backfill ran once, ever)

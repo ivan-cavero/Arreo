@@ -1,13 +1,24 @@
-//! This machine's trust ledger (T-0046, ROADMAP §3.7).
+//! A machine's trust ledger: who may use *this* machine (T-0046, ROADMAP §3.7).
 //!
-//! One sentence: the machine decides who may touch *it*, from its own store,
-//! against its own identity — the account's certificate says who a device is, and
-//! this says what it may do *here*.
+//! One sentence: the machine decides who may touch it, from its own store,
+//! against its own identity — the account's certificate says who a device *is*,
+//! and this says what it may do *here*.
 //!
-//! The rule itself is pure and lives in [`arreo_core::mesh::trust`]; this module
-//! is the machine-local half: which machine these rows belong to, how a grant is
-//! made and cut, and the one-time backfill that keeps machines paired before this
-//! existed from being locked out of their own devices.
+//! [`crate::mesh::trust`] holds the rule (the record, the capabilities, the
+//! refusals). This holds the machine-local half: which machine these rows belong
+//! to, how a grant is made and cut, and the one-time backfill that keeps machines
+//! paired before this existed from being locked out of their own devices.
+//!
+//! ## Why this lives in `arreo-core` and not in the daemon
+//!
+//! **A grant is written where a certificate is created**, and that is not always
+//! the daemon: `arreo devices issue` and the server half of `arreo pair` run in
+//! the *CLI* process against the authority directly (pairing may run with no
+//! daemon at all). The dependency rule forbids `arreo-cli` depending on
+//! `arreo-server`, so a ledger that lived in the daemon could not be written by
+//! the command that creates devices — which would leave every newly issued device
+//! ungranted and refused by the gate this ledger feeds. The store layer
+//! (`SessionStore::record_trust`) was already here; this is its policy skin.
 //!
 //! ## The two gates, in order
 //!
@@ -21,10 +32,10 @@
 //! automatically paired to the Pi" true rather than aspirational — the phone's
 //! certificate is perfectly valid on the Pi, and the Pi has no grant row for it.
 
-use arreo_core::identity::role::Verb;
-use arreo_core::identity::{DeviceId, Role};
-use arreo_core::mesh::{denial_message, evaluate, MachineId, TrustRecord};
-use arreo_core::store::SessionStore;
+use crate::identity::role::Verb;
+use crate::identity::{DeviceId, Role};
+use crate::mesh::{denial_message, evaluate, MachineId, TrustRecord};
+use crate::store::SessionStore;
 use std::path::Path;
 use std::sync::Mutex;
 
@@ -91,7 +102,7 @@ impl TrustLedger {
         root_key: &Path,
         machine_name: String,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        let root = arreo_core::identity::RootKey::load_or_generate(root_key)?;
+        let root = crate::identity::RootKey::load_or_generate(root_key)?;
         let store = SessionStore::open(db)?;
         Ok(Self::new(
             store,
@@ -111,7 +122,7 @@ impl TrustLedger {
     }
 
     /// Every grant this machine holds, live and revoked, sorted by device.
-    pub fn devices(&self) -> Result<Vec<GrantedDevice>, arreo_core::store::SessionError> {
+    pub fn devices(&self) -> Result<Vec<GrantedDevice>, crate::store::SessionError> {
         let mut rows: Vec<GrantedDevice> = self
             .store
             .trust_records()?
@@ -130,10 +141,7 @@ impl TrustLedger {
     }
 
     /// This machine's grant to one device, if there is a row at all.
-    fn record(
-        &self,
-        device: &DeviceId,
-    ) -> Result<Option<TrustRecord>, arreo_core::store::SessionError> {
+    fn record(&self, device: &DeviceId) -> Result<Option<TrustRecord>, crate::store::SessionError> {
         Ok(self
             .store
             .trust_records()?
@@ -152,7 +160,7 @@ impl TrustLedger {
         role: Role,
         by: &DeviceId,
         now_ms: i64,
-    ) -> Result<TrustRecord, arreo_core::store::SessionError> {
+    ) -> Result<TrustRecord, crate::store::SessionError> {
         let record = TrustRecord {
             machine_id: self.machine.clone(),
             device_id: device.clone(),
@@ -171,7 +179,7 @@ impl TrustLedger {
         &self,
         device: &DeviceId,
         now_ms: i64,
-    ) -> Result<bool, arreo_core::store::SessionError> {
+    ) -> Result<bool, crate::store::SessionError> {
         self.store.revoke_trust(&self.machine, device, now_ms)
     }
 
@@ -202,10 +210,7 @@ impl TrustLedger {
 
     /// Is there a live grant for this device at all? Used by the CLI to say
     /// whether a device is known here, without picking a verb.
-    pub fn has_live_grant(
-        &self,
-        device: &DeviceId,
-    ) -> Result<bool, arreo_core::store::SessionError> {
+    pub fn has_live_grant(&self, device: &DeviceId) -> Result<bool, crate::store::SessionError> {
         Ok(self.record(device)?.is_some_and(|record| record.is_live()))
     }
 
@@ -268,7 +273,7 @@ pub enum LedgerError {
     Refused(#[from] TrustRefusal),
     /// The machine could not decide.
     #[error("cannot read this machine's trust ledger: {0}")]
-    Store(#[from] arreo_core::store::SessionError),
+    Store(#[from] crate::store::SessionError),
 }
 
 /// A trust refusal, as an error type that carries the operator's message.
@@ -449,9 +454,7 @@ mod tests {
         let a = device('a');
         let b = device('b');
 
-        let granted = pi
-            .backfill_once(&[a.clone(), b.clone()])
-            .expect("backfill");
+        let granted = pi.backfill_once(&[a.clone(), b.clone()]).expect("backfill");
         assert_eq!(granted.len(), 2);
         for device in [&a, &b] {
             assert!(pi.check(device, Verb::Spawn).is_ok(), "{device} works");

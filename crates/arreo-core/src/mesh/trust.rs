@@ -52,9 +52,21 @@ pub struct TrustRecord {
     pub device_id: DeviceId,
     pub role: Role,
     pub granted_at_ms: i64,
-    /// The device that made the grant. Same as `device_id` when a device granted
-    /// itself (the pairing default), and different when an operator extended
-    /// trust to a second device — which is the case the audit trail exists for.
+    /// The device that made the grant, or the granted device itself when no
+    /// device did — one rule, because the cases collapse cleanly:
+    ///
+    /// - a device granted itself (the pairing default: it proved possession of
+    ///   its key to this machine, which is what authorizes it here);
+    /// - an operator at this machine's console granted it (`arreo devices issue`,
+    ///   the one-time backfill) — there is no acting *device* to name, so the
+    ///   row is honest rather than inventing one;
+    /// - a device extended trust to another (`arreo machines trust` run by a
+    ///   trusted device) — the only case where the two ids differ, and exactly
+    ///   the case an audit trail exists to preserve.
+    ///
+    /// The operator's identity is not lost when the two match: the audit log
+    /// records the acting device for the issuance itself, and a trust row is not
+    /// the place to keep a second copy of it.
     pub granted_by: DeviceId,
     /// `None` while the grant is live. The row is never deleted: "who had access
     /// and when it stopped" is the question a revocation is asked to answer.

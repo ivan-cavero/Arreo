@@ -71,6 +71,11 @@ pub struct RelayContext {
     pub cert: Arc<DeviceCert>,
     /// The name this machine asserts in the account's directory (T-0056).
     pub machine_name: String,
+    /// This machine's trust ledger (T-0046). A relay peer runs the same
+    /// `serve_session` behind the same gate, so this machine's decision about who
+    /// may use it applies over the relay exactly as it does on a direct
+    /// connection — the relay carries bytes and decides nothing.
+    pub ledger: arreo_core::mesh::SharedLedger,
 }
 
 impl Clone for RelayContext {
@@ -83,6 +88,7 @@ impl Clone for RelayContext {
             device: Arc::clone(&self.device),
             cert: Arc::clone(&self.cert),
             machine_name: self.machine_name.clone(),
+            ledger: self.ledger.clone(),
         }
     }
 }
@@ -381,7 +387,12 @@ async fn serve_peer(stream: RelayStream, context: &RelayContext, announced: Devi
     };
     // A relay peer has no direct address of its own — what the daemon sees is
     // the relay, which is the honest thing to record.
-    let auth = crate::daemon::SessionAuth::new(Arc::clone(&authority), key, device.clone());
+    let auth = crate::daemon::SessionAuth::new(
+        Arc::clone(&authority),
+        context.ledger.clone(),
+        key,
+        device.clone(),
+    );
     auth.touch();
     eprintln!("arreo-server: relay peer {device} authenticated");
     let (reader, writer) = tokio::io::split(channel);

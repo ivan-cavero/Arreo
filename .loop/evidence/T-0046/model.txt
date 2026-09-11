@@ -67,3 +67,45 @@ depend on `arreo-server`, where `TrustLedger` lives. So the ledger's type most
 likely moves to `arreo-core` — its store layer (`SessionStore::record_trust`) is
 already there, and the CLI already writes device records directly. Recorded in
 the task file; the tree is back to increment 1, 431 tests.
+
+
+## 7. Increment 2: the enforcement gate, grant-on-issue, and the backfill
+
+$ cargo test -p arreo-server --test trust
+  a_device_issued_after_boot_can_use_the_machine ............ ok
+  a_pinned_device_with_no_grant_is_refused_with_the_command . ok
+  a_viewer_is_refused_control_but_not_observation ........... ok
+  a_revoked_grant_refuses_the_next_session_and_regranting_restores_it ... ok
+  4 passed, 0 failed
+
+The refusal a device with no grant actually receives (from the test's assertion):
+
+  machine <hostname> has no grant for this device, so Hello is refused.
+  Grant it with: arreo machines trust dev_6fe8d3bc… --machine <hostname> --role viewer --yes
+
+The migration, end to end (see backfill.txt for the full transcript): a device
+pinned with no ledger, a daemon boot that grants it once, the marker set, and a
+deliberate revocation surviving a restart.
+
+## 8. A real bug found by the wiring: early exits delivered nothing
+
+The first wiring gave a bare close instead of the refusal. Cause: the drain that
+T-0052 added lived at the *tail* of `serve_session`, so only the normal exit
+flushed; every early return (a refused handshake, a bad first frame, a read
+error) wrote its Error into the duplex and dropped the channel with it. The flush
+is now a wrapper around the whole session — all exit paths deliver their last
+frame.
+
+## 9. Two environment findings worth recording
+
+- **check-targets caught the feature gate.** `mesh/ledger.rs` uses
+  `crate::store::SessionStore`, which the sqlite-free build does not have, so the
+  pure-Rust Windows type-check broke. The ledger module is now gated on the
+  `sqlite` feature like `crate::store` itself, while the *rule* stays ungated (a
+  build without a database can still answer "may this device do this").
+- **A store written by this test process is not visible to a daemon it spawns
+  afterwards** in the test harness: the daemon opens an empty database at the same
+  path (its own read_dir shows a different inode) and bootstraps a new root key
+  beside a root.key it also cannot see. The identical sequence from a shell works,
+  which is why the backfill's e2e proof is a shell transcript rather than a test.
+  Recorded in the test file so the next person does not spend the same hour.

@@ -71,6 +71,54 @@ async fn main() {
     let registry = daemon.registry();
     let sessions = daemon.sessions();
     let socket_path = socket.clone();
+
+    // This machine's trust ledger (T-0046), opened before anything is served: a
+    // session must never be gated by a ledger that failed to load.
+    let ledger = match arreo_server::TrustLedger::open(
+        &arreo_server::db_path_for(&socket_path),
+        &arreo_server::transport::root_key_path(),
+        arreo_core::mesh::default_machine_name(),
+    ) {
+        Ok(ledger) => ledger,
+        Err(e) => {
+            eprintln!("arreo-server: cannot open this machine's trust ledger: {e}");
+            eprintln!(
+                "arreo-server: refusing to serve without it — every remote verb is gated \
+                 by a grant, and a ledger that failed to load would refuse them all"
+            );
+            std::process::exit(1);
+        }
+    };
+    // **The backfill runs before the first session is served.** Every device
+    // pinned before this machine ran this code has a certificate and no grant, so
+    // the strict rule would lock them all out — and the symptom would read as
+    // "the machine stopped trusting me" rather than as a migration. It runs once,
+    // ever: a marker that could re-run would silently undo an operator's
+    // deliberate "revoke everything".
+    {
+        let existing: Vec<arreo_core::identity::DeviceId> = authority
+            .devices()
+            .into_iter()
+            // Only devices that may still connect. A revoked device must not be
+            // granted by a migration, or revocation would have a back door.
+            .filter(|record| arreo_core::identity::revocation::may_connect(record).is_ok())
+            .map(|record| record.id)
+            .collect();
+        match ledger.backfill_once(&existing) {
+            Ok(granted) if granted.is_empty() => {}
+            Ok(granted) => eprintln!(
+                "arreo-server: trust ledger initialized — granted {} previously pinned \
+                 device(s) access to this machine, matching how they were already treated; \
+                 change any of them with `arreo machines trust`",
+                granted.len()
+            ),
+            Err(e) => {
+                eprintln!("arreo-server: cannot initialize the trust ledger: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
+    let ledger = arreo_core::mesh::SharedLedger::new(ledger);
     let authority = std::sync::Arc::new(std::sync::Mutex::new(authority));
 
     // Relay (T-0051). A configuration that enables the relay but is incomplete
@@ -93,6 +141,7 @@ async fn main() {
                         // they are moved into the relay task, so the log line
                         // and the join request cannot disagree.
                         machine_name: settings.name.clone(),
+                        ledger: ledger.clone(),
                     };
                     eprintln!(
                         "arreo-server: relay enabled for account {} via {}",
@@ -133,6 +182,7 @@ async fn main() {
                     addr,
                     local,
                     authority,
+                    ledger.clone(),
                     registry,
                     std::sync::Arc::clone(&sessions),
                     db,

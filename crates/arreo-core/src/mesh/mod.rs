@@ -19,6 +19,13 @@
 //! types here have nowhere to put one.
 
 pub mod directory;
+/// The machine-local trust ledger. Gated like [`crate::store`] itself: it lives
+/// on a `SessionStore`, and the sqlite-free build (the pure-Rust surface
+/// `check-targets` type-checks for foreign targets) has no store to put it on.
+/// The *rule* above is ungated — it is pure types and arithmetic, and a build
+/// without a database can still answer "may this device do this".
+#[cfg(feature = "sqlite")]
+pub mod ledger;
 pub mod trust;
 
 pub use directory::{
@@ -26,4 +33,6 @@ pub use directory::{
     Name, Presence, HEARTBEAT_SECS, JOIN_TICKET_SECS, NAME_MAX, ONLINE_WINDOW_SECS,
     STALE_AFTER_SECS, TOMBSTONE_SECS,
 };
+#[cfg(feature = "sqlite")]
+pub use ledger::{GrantedDevice, LedgerError, SharedLedger, TrustLedger, TrustRefusal};
 pub use trust::{denial_message, evaluate, TrustDenial, TrustRecord};

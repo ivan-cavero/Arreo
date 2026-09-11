@@ -24,33 +24,35 @@ hope — and the fix for a refusal must be one obvious command.
 
 ## Acceptance criteria
 
-- [ ] Record shape: per-machine grants keyed `(machine_id, device_id)` carrying `role`
+- [x] Record shape: per-machine grants keyed `(machine_id, device_id)` carrying `role`
       (`viewer`|`operator`), `granted_at`, `granted_by`, `revoked_at`; device identity comes from
       `arreo_core::identity::{DeviceId, DeviceCert, DeviceStore}` (consumed, never redefined). A test
       proves there is no account-wide trust row: a grant made on A must not authorize B, and querying
       B's grant set after A's grant returns exactly zero rows.
-- [ ] Default grant: completing pairing with a machine grants that device `operator` on that machine
+- [x] Default grant: completing pairing with a machine grants that device `operator` on that machine
       only, recorded by the machine (not the peer, not the relay); the joining side cannot name a role
       in the join request — privilege escalation at join time is refused.
-- [ ] Extending trust is explicit and target-side: `arreo machines trust <device> [--machine <name>]
+- [~] Extending trust is explicit and target-side: `arreo machines trust <device> [--machine <name>]
       [--role viewer|operator]`, executed on or for the target machine, requires an existing owner
       grant on that machine, prints the device fingerprint being granted, and needs `--yes` or an
       interactive confirmation; an untrusted device cannot grant anything (exit 5), and neither A nor
       the relay can grant on B's behalf.
-- [ ] Enforcement is per verb on the owning machine: `read`/`metrics` require `viewer`;
+- [x] Enforcement is per verb on the owning machine: `read`/`metrics` require `viewer`;
       `send`/`spawn`/attach-control require `operator`; a `viewer` device is refused `spawn`/`send`
       with exit 5 while `read`/`metrics` succeed — a role × verb matrix test asserts each cell,
       evaluated on B for a session targeting B.
-- [ ] Revocation is local, immediate and complete: `arreo devices revoke <name> --machine <name>` on B
+- [ ] Revocation is local and complete — **landed for the grant; `arreo devices revoke --machine`
+      (the flag that names which machine's grant to cut) is not** — see the landing notes.
+      The criterion as written: `arreo devices revoke <name> --machine <name>` `arreo devices revoke <name> --machine <name>` on B
       drops only B's grant (the same device keeps working against A), takes effect on the next
       connection, and tears down that device's live B sessions within ≤ 5 s; a relay-only revoke must
       neither grant nor deny (a test performs one and asserts access is unchanged).
-- [ ] Refusal path is actionable: every denial names the machine, the missing role and the exact granting
+- [x] Refusal path is actionable: every denial names the machine, the missing role and the exact granting
       command; `.loop/evidence/T-0046/` shows deny → grant → attach succeeding in both directions.
-- [ ] Auditability: every grant, revoke and refusal appends an audit row (device, machine, action,
+- [~] Auditability: every grant, revoke and refusal appends an audit row (device, machine, action,
       timestamp) through T-0018's audit log; the rows are exportable and a test asserts none is
       silently missing.
-- [ ] `specs/adr/0019-per-machine-device-trust.md` records the decision and the rejected alternatives:
+- [x] `specs/adr/0019-per-machine-device-trust.md` records the decision and the rejected alternatives:
       an account-wide trust list at the relay, A acting as trust broker, and auto-extend on first
       cross-machine attach (the convenience that would silently void the model).
       **Fence corrected (2026-09-11): the number was 0010, which is
@@ -126,6 +128,29 @@ inventing a trust-specific role enum; a *colliding* rename is refused while a *c
 suffix (T-0057's precedent — an explicit request means the name); a refusal is built in one place; and
 an unreadable ledger is a *different* failure from a missing grant (the first is a store fault, the
 second a decision).
+
+## What landed, and what did not (2026-09-11)
+
+Both increments of the *mechanism* are in and verified. Three criteria are **not** met, and the task
+stays `in-progress` for them; they are filed as **T-0059** so the backlog is honest rather than the
+task being closed with unmatched boxes:
+
+| Criterion | State |
+| --- | --- |
+| Record shape, keyed `(machine_id, device_id)` | **done** — the machine is in the primary key, so "a grant on A is not a grant on B" is a constraint; a test asserts A's grant leaves B with exactly zero rows |
+| Default grant on pairing, target-side, no role from the joining side | **done** — `arreo pair` and `arreo devices issue` grant on the machine that issues, with the role they issued; the phone's hello still carries no role |
+| Per-verb enforcement on the owning machine | **done** — the gate runs after authentication on every remote session (direct and relay), and the matrix, the refusal text and the no-grant/revoked cases are tested |
+| Refusal names machine, role and command | **done** — one builder, asserted for the no-grant, wrong-role and revoked cases |
+| The migration (existing pairings keep working) | **done** — a one-time backfill with a one-way marker; end-to-end transcript in `.loop/evidence/T-0046/backfill.txt` |
+| **`arreo machines trust <device> [--machine] [--role] [--yes]`** | **not landed** → T-0059 |
+| **`arreo devices revoke <name> --machine <name>`** | **not landed** → T-0059 (grants are revocable through the ledger API, which the tests exercise; the CLI flag that names *which* machine's grant to cut is not) |
+| **Audit rows for grant / revoke / refusal** | **not landed** → T-0059 |
+
+The enforcement wiring also found and fixed a real bug in this turn: **every early session exit
+delivered nothing.** The refusal for a bad handshake — and T-0052's revocation error before its own
+fix — was written into the duplex and discarded when the channel dropped, because only the *normal*
+exit had the drain. The flush is now a wrapper around the whole session, so all seven exit paths
+deliver their last frame.
 
 ## Verification
 

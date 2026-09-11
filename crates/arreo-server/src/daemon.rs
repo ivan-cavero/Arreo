@@ -744,6 +744,11 @@ const FINAL_FRAME_GRACE: std::time::Duration = std::time::Duration::from_millis(
 /// half of that is exactly the mistake this type exists to make impossible.
 pub struct SessionAuth {
     authority: Arc<Mutex<DeviceAuthority>>,
+    /// This machine's own trust ledger (T-0046): who may use *this* machine.
+    /// Deliberately separate from `authority`, which answers who the device is
+    /// in the account — the two questions have different answers and different
+    /// owners, and only this one is per machine.
+    ledger: arreo_core::mesh::SharedLedger,
     peer: VerifyingKey,
     device: DeviceId,
     /// The peer's network address, when there is one: the local socket has none,
@@ -757,11 +762,13 @@ impl SessionAuth {
     #[must_use]
     pub fn new(
         authority: Arc<Mutex<DeviceAuthority>>,
+        ledger: arreo_core::mesh::SharedLedger,
         peer: VerifyingKey,
         device: DeviceId,
     ) -> Self {
         Self {
             authority,
+            ledger,
             peer,
             device,
             address: None,
@@ -801,16 +808,44 @@ impl SessionAuth {
     }
 
     /// `Err` carries the refusal to send back; the verb never runs.
+    ///
+    /// **Two gates, in order (T-0046).** First *who are you*: the certificate —
+    /// pinned, not revoked, verifying under the account root, which is the same
+    /// answer on every machine of the account. Then *may you, here*: this
+    /// machine's own grant, which is a different answer on each machine and is
+    /// the one ROADMAP §3.7 is about.
+    ///
+    /// The second gate is why a phone paired to the VPS can reach the VPS and
+    /// nothing else: its certificate is perfectly valid on the Pi, and the Pi has
+    /// no grant row for it.
+    ///
+    /// The ledger's verdict is final in **both** directions, and a store it could
+    /// not read is refused as an error rather than allowed: "I could not check"
+    /// must never be the answer that lets someone in.
     fn check(&self, message: &Message) -> Result<(), Message> {
         let verb = verb_of(message);
-        let mut authority = self.lock();
-        authority.check_verb(&self.peer, verb).map_err(|denial| {
-            eprintln!("daemon: refusing {verb:?} for {}: {denial}", self.device);
-            Message::Error {
-                v: VERSION,
-                message: denial.to_string(),
-            }
-        })
+        {
+            let mut authority = self.lock();
+            authority.check_verb(&self.peer, verb).map_err(|denial| {
+                eprintln!("daemon: refusing {verb:?} for {}: {denial}", self.device);
+                Message::Error {
+                    v: VERSION,
+                    message: denial.to_string(),
+                }
+            })?;
+        }
+        self.ledger
+            .with(|ledger| ledger.check(&self.device, verb))
+            .map_err(|denial| {
+                eprintln!(
+                    "daemon: refusing {verb:?} for {} on this machine: {denial}",
+                    self.device
+                );
+                Message::Error {
+                    v: VERSION,
+                    message: denial.to_string(),
+                }
+            })
     }
 
     /// The critical section is one in-memory lookup plus a certificate verify —
@@ -871,6 +906,41 @@ where
     R: AsyncReadExt + Unpin,
     W: AsyncWriteExt + Unpin,
 {
+    let result = serve_session_inner(&mut reader, &mut writer, registry, sessions, db, auth).await;
+
+    // **The last frame must reach the peer, on *every* way out (T-0052, T-0046).**
+    // Closing the write half signals the transport's pump to drain what the
+    // session already wrote and exit; the bounded pause is what lets it finish
+    // before this future returns and its streams drop. Without it the bytes are
+    // written into the duplex and discarded with the channel, and the client sees
+    // a bare close instead of the reason it was refused.
+    //
+    // This is a *wrapper* rather than a tail because the session has many exits —
+    // a refused handshake, a bad first frame, a read error, the normal end — and a
+    // tail only covers the last. T-0052 fixed the normal end; the refused
+    // handshake then delivered nothing, which a test caught (T-0046). Bounded,
+    // not awaited forever: a peer that stops reading must cost this much and no
+    // more.
+    let _ = writer.shutdown().await;
+    tokio::time::sleep(FINAL_FRAME_GRACE).await;
+    result
+}
+
+/// The session itself. Every exit here is covered by [`serve_session`]'s flush.
+async fn serve_session_inner<R, W>(
+    // `mut` on the writer so the body can reborrow: `write_message` takes
+    // `&mut T` and the compiler needs a mutable binding to hand one out.
+    reader: &mut R,
+    mut writer: &mut W,
+    registry: Registry,
+    sessions: Sessions,
+    db: PathBuf,
+    auth: Option<SessionAuth>,
+) -> Result<(), DaemonError>
+where
+    R: AsyncReadExt + Unpin,
+    W: AsyncWriteExt + Unpin,
+{
     let mut buf = Vec::new();
     // The audit trail for this session: the identity comes from the gate, so a
     // remote action is attributed to the device that took it (T-0033) and a local
@@ -911,13 +981,27 @@ where
     // A timeout turns the migration hazard into a loud close.
     let hello = tokio::time::timeout(
         std::time::Duration::from_secs(5),
-        read_message(&mut reader, &mut buf),
+        read_message(reader, &mut buf),
     )
     .await;
     let hello = match hello {
         Ok(hello) => hello,
         Err(_) => return Ok(()),
     };
+    // **The trust gate applies to the handshake too** (T-0046). A device this
+    // machine has pinned but never granted gets its refusal here, in answer to
+    // Hello — one round trip, with the command that fixes it — rather than a
+    // Welcome followed by a refusal on whatever verb it tried next. `Verb::Hello`
+    // is in the policy for exactly this reason: the machine answers, or it does
+    // not. (A device this machine has *not* pinned never gets this far: the Noise
+    // handshake resolves the peer's key from the pin list, so pinning is the
+    // first gate and this is the second.)
+    if let (Some(auth), Ok(message)) = (&auth, &hello) {
+        if let Err(refusal) = auth.check(message) {
+            write_message(writer, &refusal).await?;
+            return Ok(());
+        }
+    }
     match hello {
         Ok(Message::Hello { wants, .. }) => match codec::negotiate(VERSION, &wants) {
             Ok(v) => {
@@ -1024,7 +1108,7 @@ where
                     _ => continue,
                 }
             }
-            message = read_message(&mut reader, &mut buf) => {
+            message = read_message(reader, &mut buf) => {
                 match message {
                     Ok(message) => message,
                     Err(e) => break e.to_string(),
@@ -1037,7 +1121,7 @@ where
         // observe.
         if let Some(auth) = &auth {
             if let Err(refusal) = auth.check(&message) {
-                write_message(&mut writer, &refusal).await?;
+                write_message(writer, &refusal).await?;
                 continue;
             }
         }
@@ -1052,7 +1136,7 @@ where
             // back around: answer it and keep the session open.
             let message = message.clone();
             if message_text(&message).starts_with("unknown request ") {
-                write_message(&mut writer, &message).await?;
+                write_message(writer, &message).await?;
                 continue;
             }
         }
@@ -1107,7 +1191,7 @@ where
             });
         }
         if let Some(reply) = reply {
-            write_message(&mut writer, &reply).await?;
+            write_message(writer, &reply).await?;
         }
     };
     // The session is over. Recorded with the reason, so the trail reads as a
@@ -1122,15 +1206,6 @@ where
             Some(&ended_because),
         );
     }
-    // **The last frame must reach the peer.** Closing the write half signals
-    // the transport's pump to drain what the session already wrote and exit;
-    // the bounded pause is what lets it finish before this future returns and
-    // its streams drop (T-0052 found this the hard way: without it the typed
-    // revocation error was written, discarded, and the client saw a bare
-    // close). Bounded, not awaited forever: a peer that stops reading must
-    // cost this much and no more.
-    let _ = tokio::io::AsyncWriteExt::shutdown(&mut writer).await;
-    tokio::time::sleep(FINAL_FRAME_GRACE).await;
     Ok(())
 }
 
