@@ -6,6 +6,12 @@ Next step: **T-0050 (daemon relay client)** — p2, and now *ready*: T-0030 was 
 so "offline is normal" has an honest answer. It is the head of the queue and the single biggest
 unblocker (T-0032 remote TUI attach and T-0034's relay slice both wait on it, and T-0044's
 account-join RPC lives in it too).
+Queue-reading caveat for the next turn: a mechanical `depends_on` scan lists **T-0044 as ready**,
+but it is not — its own re-scope note records that nothing issues a `JoinTicket` over the wire yet,
+and that RPC belongs to T-0050. Read the task file's notes, not just its frontmatter. The other
+genuinely-ready work is T-0026 (revocation, p3), T-0031 (presence, p3, relay), T-0028 (protocol
+N-1 window, p3), T-0035 (AGPL boundary, p3), T-0040 (metrics history, p3), T-0048/T-0049; T-0036
+(p1) stays human-gated on the minisign key.
 Open workers: (none)
 Known broken: (none) · Parked: (none)
 Findings:
