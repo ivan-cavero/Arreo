@@ -87,6 +87,9 @@ enum Outbound {
     Raw(Vec<u8>),
     /// A drain report.
     Drain(DrainReport),
+    /// This device's peer went offline (T-0054): the named device is the one that
+    /// left.
+    PeerGone(DeviceId),
 }
 
 /// The live sessions, keyed by `(account, device)`.
@@ -157,13 +160,37 @@ impl Router {
     }
 
     fn deregister(&self, session: &Session, token: u64) {
-        let mut live = self.lock_live();
-        if live
-            .senders
-            .get(&session.key())
-            .is_some_and(|(_, held)| *held == token)
-        {
+        let notified: Vec<mpsc::Sender<Outbound>> = {
+            let mut live = self.lock_live();
+            // The token check: a device that reconnected while its old
+            // connection was winding down must not be removed by the old
+            // connection's cleanup. And a departure is only news if *this*
+            // connection was the live one — otherwise the device is still here
+            // under a newer registration.
+            let was_live = live
+                .senders
+                .get(&session.key())
+                .is_some_and(|(_, held)| *held == token);
+            if !was_live {
+                return;
+            }
             live.senders.remove(&session.key());
+            // Everyone else in the account, because the relay does not track who
+            // holds a stream to whom (T-0054): the notice is account-wide news and
+            // the receivers decide whether they cared.
+            live.senders
+                .iter()
+                .filter(|((account, device), _)| {
+                    *account == session.account_id && *device != session.device_id.as_str()
+                })
+                .map(|(_, (sender, _))| sender.clone())
+                .collect()
+        };
+        // Outside the lock: a full queue must not hold the registry while it
+        // drains, and a device that is behind misses the notice rather than
+        // blocking every other device's disconnect.
+        for sender in notified {
+            let _ = sender.try_send(Outbound::PeerGone(session.device_id.clone()));
         }
     }
 
@@ -390,6 +417,9 @@ async fn handle_connection(connection: Connection, router: Arc<Router>) -> Resul
                 Outbound::Drain(report) => {
                     drain_report_envelope(&writer_session, &report).and_then(|e| e.encode())
                 }
+                Outbound::PeerGone(departed) => {
+                    peer_gone_envelope(&writer_session, &departed).and_then(|e| e.encode())
+                }
                 // Already framed: writing it directly is what keeps the stored
                 // bytes opaque end to end.
                 Outbound::Raw(bytes) => Ok(bytes),
@@ -475,8 +505,10 @@ where
                 continue;
             }
             RelayKind::Frame => {}
-            RelayKind::Status => {
-                // A device may not originate the relay's own kind.
+            // A device may not originate the relay's own kinds: a forged
+            // departure notice would let any device in an account make another
+            // device's peers drop their streams.
+            RelayKind::Status | RelayKind::PeerGone => {
                 let _ = outbound.try_send(Outbound::Status {
                     seq,
                     outcome: Outcome::Refused {
@@ -622,6 +654,25 @@ fn drain_report_envelope(
 }
 
 /// A status envelope from the relay itself.
+/// The departure notice for one device (T-0054).
+///
+/// The whole message is the header: `src_device` names the device that left, and
+/// there is no payload because there is nothing else to say. The sender is the
+/// relay's reserved word, so a receiver cannot mistake it for a device's frame.
+fn peer_gone_envelope(session: &Session, departed: &DeviceId) -> Result<RelayEnvelope, RelayError> {
+    Ok(RelayEnvelope {
+        header: RelayHeader {
+            v: RELAY_VERSION,
+            account_id: session.account_id.clone(),
+            src_device: departed.as_str().to_string(),
+            dst: session.device_id.display_id(),
+            seq: 0,
+            kind: RelayKind::PeerGone,
+        },
+        payload: Vec::new(),
+    })
+}
+
 fn status_envelope(
     session: &Session,
     seq: u64,

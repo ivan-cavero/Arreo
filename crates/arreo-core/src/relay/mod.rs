@@ -105,6 +105,23 @@ pub enum RelayKind {
     /// MessagePack encoding of [`Ack`]; acking is what advances the cursor and
     /// removes the rows.
     Ack,
+    /// Relay → device: a device in your account went offline. `src_device` is the
+    /// device that left and there is no payload — the news *is* the header, which
+    /// is why this kind needs no struct of its own.
+    ///
+    /// It exists because a carrier that does not report departures makes a
+    /// reconnect unreliable: a peer that vanished is not noticed until one of its
+    /// reads or writes fails, so the far end keeps a dead stream and hands the
+    /// next handshake to it. Announcing the departure is what lets the other side
+    /// release that stream (T-0054).
+    ///
+    /// It is **account-wide, not addressed**: the relay does not track which
+    /// device holds a stream to which, so every live device in the account is
+    /// told, and a receiver that has no stream for the named peer ignores it. The
+    /// cost is one small envelope per live device per disconnect, bounded by the
+    /// account's size; the alternative was a subscription table in the relay,
+    /// which is state that can be wrong.
+    PeerGone,
 }
 
 impl RelayKind {
@@ -115,6 +132,7 @@ impl RelayKind {
             Self::Status => "status",
             Self::Drain => "drain",
             Self::Ack => "ack",
+            Self::PeerGone => "peergone",
         }
     }
 }
@@ -626,6 +644,47 @@ mod tests {
             },
             payload: payload.to_vec(),
         }
+    }
+
+    /// Every kind has a distinct wire name, and a departure notice carries no
+    /// payload at all — its whole meaning is the header's sender.
+    #[test]
+    fn a_departure_notice_is_a_header_and_nothing_else() {
+        let names: Vec<&str> = [
+            RelayKind::Frame,
+            RelayKind::Status,
+            RelayKind::Drain,
+            RelayKind::Ack,
+            RelayKind::PeerGone,
+        ]
+        .iter()
+        .map(|kind| kind.as_str())
+        .collect();
+        let unique: std::collections::HashSet<&&str> = names.iter().collect();
+        assert_eq!(
+            unique.len(),
+            names.len(),
+            "two kinds share a wire name: {names:?}"
+        );
+
+        let notice = RelayEnvelope {
+            header: RelayHeader {
+                v: RELAY_VERSION,
+                account_id: "acct-1".into(),
+                // The device that *left*, which is the whole message.
+                src_device: "dev_33333333333333333333333333333333".into(),
+                dst: "dev_44444444444444444444444444444444".into(),
+                seq: 0,
+                kind: RelayKind::PeerGone,
+            },
+            payload: Vec::new(),
+        };
+        let encoded = notice.encode().expect("encode");
+        let (decoded, consumed) = RelayEnvelope::decode(&encoded).expect("decode");
+        assert_eq!(consumed, encoded.len());
+        assert_eq!(decoded.header.kind, RelayKind::PeerGone);
+        assert_eq!(decoded.header.src_device, notice.header.src_device);
+        assert!(decoded.payload.is_empty(), "there is nothing else to say");
     }
 
     #[test]

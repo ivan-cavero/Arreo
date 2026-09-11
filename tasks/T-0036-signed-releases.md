@@ -66,6 +66,33 @@ channels-and-trust, §4 supply chain) — no byte of an update is trusted withou
 - The end-to-end slice that drives sign → verify → refuse from a local channel is T-0042;
   this task lands the verifier, the pinned key and the release job.
 
+## Gate (recorded 2026-09-11, while selecting the next task)
+
+**This task needs a human before it can start, and it is not a code problem.**
+
+Three of its criteria are about a key that must exist in two places only one of which I can reach:
+
+- `supply-chain/arreo.pub` must be a *real* public key — a placeholder would be worse than nothing,
+  because the release job would verify against a key nobody holds and fail closed on every artifact
+  (a green-looking gate that can never pass).
+- The matching secret must be created by the key's owner as the `MINISIGN_SECRET_KEY` CI secret.
+  Setting a repository secret needs GitHub credentials and, more importantly, key *custody*: the
+  point of an offline signing key is that it is generated and held by the person who owns it, not by
+  an agent that has been reading the repo.
+- `docs/release.md`'s rotation procedure (current + next key) is a statement about who holds what,
+  which is an operator's decision.
+
+What is *not* gated, and what a later pass can do without the human: the verifier itself
+(`arreo_core::update::verify` with its typed errors), the `arreo update verify` door, the
+tamper-refusal test against a locally generated throwaway keypair, and the release workflow's
+structure. The task is left whole rather than half-landed because its central claim — "every
+artifact carries a signature from a key pinned in this repo" — is only true once the key is real,
+and a verifier nobody can use is not a deliverable.
+
+**Action for the operator:** generate the keypair offline (`minisign -G`), commit the public half to
+`supply-chain/arreo.pub`, and add the secret half as `MINISIGN_SECRET_KEY`. The task is then
+unblocked end to end.
+
 ## Verification
 
 ```console

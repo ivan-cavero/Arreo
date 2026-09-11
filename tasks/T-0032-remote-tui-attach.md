@@ -49,20 +49,20 @@ lost session and not duplicated output.
 - [x] Remote parity is asserted on the wire, not by screenshot: the same frame sequence
       (Hello→Welcome, Snapshot, Delta, Resume) is observed against the remote daemon as
       against a local one in the same run, with identical decode results for the same pane.
-- [ ] **Split (see the re-scope below).** Drop = reconnect with bounded, honest backoff: full
-      jitter, base 250 ms, cap 30 s, unlimited retries while the TUI is open, and `reconnecting`
-      plus the next attempt in the status bar. Killing the relay connection at three points and
-      reattaching renders a transcript **byte-identical** to a control run with no drop: no
-      duplicated line, no gap. — The **client half is done and proven** (backoff, status line, the
-      cursor-owned resume that replays an uninterrupted read exactly); the **drop case is blocked on
-      T-0054**, because the relay does not tell a device that its peer disconnected, so the far end
-      holds the dead stream and swallows the next handshake. Retrying harder cannot remove that
-      wait, and the evidence is recorded rather than papered over.
-- [ ] **Split, for the same reason as the drop criterion.** §3.14 reattach: after a simulated 15-day gap (injected clock + TTL overrides, never a real
-      sleep) the client reaches a full overview in **< 3 s**, drains its queued messages in `seq`
-      order, and re-running the drained batch re-executes nothing (ack + cursor, T-0030). §5's
-      `cross_machine_attach_s = 3` is enforced and the reattach row it implies is added to
-      `perf-budget.toml`.
+- [x] Drop = reconnect with bounded, honest backoff: full jitter, base 250 ms, cap 30 s, unlimited
+      retries while the TUI is open, and `reconnecting` plus the next attempt in the status bar.
+      Killing the connection and reattaching renders a transcript **byte-identical** to a control run
+      with no drop: no duplicated line, no gap.
+      — Unblocked by **T-0054** (the relay now announces a device's departure, and a dropped session
+      closes its connection), which was found and fixed in this task's own turn: the reconnect that
+      took over 60 s before now completes in **77 ms**, asserted in
+      `crates/arreo-tui/tests/remote.rs::a_dropped_connection_reconnects_promptly_and_resumes_exactly`
+      and at the relay level in `crates/arreo-server/tests/relay_client.rs`.
+- [ ] **Split to T-0055** (see the re-scope below). §3.14 reattach: after a simulated 15-day gap
+      (injected clock + TTL overrides, never a real sleep) the client reaches a full overview in
+      **< 3 s**, drains its queued messages in `seq` order, and re-running the drained batch
+      re-executes nothing (ack + cursor, T-0030). §5's `cross_machine_attach_s = 3` is enforced and
+      the reattach row it implies is added to `perf-budget.toml`.
 - [x] Remote input is attributable: every remote `send` carries the device id and lands as an
       audit row on the machine that owns the pane (device, pane, timestamp, redacted; T-0033 owns
       the schema); a device without operator permission gets a typed error and no keystroke. Both
@@ -101,24 +101,31 @@ cargo test -p arreo-tui --test remote                # the client against a real
 
 ## Re-scope (2026-09-11, while landing: the drop criterion)
 
-**The reconnect half of the drop criterion moves to T-0054 (relay peer-disconnect signalling).**
+**The reconnect half of the drop criterion moved to T-0054 — and came back within the same turn.**
 
-The client side is built and proven: `Target` carries a remote daemon, the poller holds one
+The client side was built and proven first: `Target` carries a remote daemon, the poller holds one
 connection and reconnects on failure with the relay session's backoff (250 ms base, 30 s cap,
 jittered), the status bar names the target and the next attempt, and the resume is cursor-owned, so a
 resumed read replays an uninterrupted read line for line with no duplication and no gap.
 
-What does **not** work is reconnecting to a peer that has not noticed the drop. The relay routes by
-device id and keeps one stream per peer (ADR 0014) but never tells a device that its peer went away,
-so the daemon still holds the dead stream and delivers the next handshake into it, where the Noise
-layer reads it as garbage and the stream ends. The reconnect loop recovers only after the daemon
-gives up that stream, which took more than 60 s in this turn's measurements — and no amount of client
-retrying removes the wait. That is a wire-protocol addition plus a relay-side broadcast, with its own
-failure modes (a notice racing the reconnect, a notice for a peer that already reconnected), so it is
-its own task rather than a line here. Evidence for the claim is in `.loop/evidence/T-0032/`.
+What did **not** work was reconnecting to a peer that had not noticed the drop: the relay never told a
+device that its peer went away, so the far end held the dead stream and handed the next handshake to
+it, where the Noise layer read it as garbage. Measured: more than 60 s, and no client retry removes
+the wait. That was split into T-0054 rather than claimed here.
+
+**T-0054 then landed in this same turn, so the criterion is met and ticked.** The fix was two-part:
+the relay now announces departures (`RelayKind::PeerGone`, account-wide, device-forbidden), and a
+dropped `RelaySession` now closes its connection (its pump tasks are aborted on drop — without which
+the relay never learned the device had left, so the notice had nothing to announce). Reconnect after
+a killed client: **77 ms**, transcript byte-identical from the cursor.
 
 The §3.14 reattach criterion (a simulated 15-day gap, then a full overview in < 3 s with the inbox
-drained in `seq` order) depends on the same reconnect path and moves with it.
+drained in `seq` order) is **split to T-0055**, because its blocker is relay-side rather than
+transport-side: the relay's clock is not injectable, so a test cannot make "15 days passed" a fact
+about the relay's view, and its retention window cannot be exercised without either a real 15-day
+sleep (not a test) or a short TTL with a real sleep (slow *and* not the window it claims). That is a
+clock seam in the relay, with its own risk — a seam that leaks into production would be a retention
+correctness bug — so it is its own task rather than a line here.
 
 Two smaller honest notes from landing:
 

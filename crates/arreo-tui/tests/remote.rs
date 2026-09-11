@@ -519,17 +519,6 @@ async fn the_client_reaches_a_remote_daemon_and_sees_the_same_pane() {
 /// no gap" — proven on the wire rather than by screenshot, and proven the way the
 /// TUI actually consumes it: one long-lived session, incremental `Read{from_line}`
 /// per pane, the cursor owned by the UI.
-///
-/// **What is *not* proven here, and why.** The criterion also asks for the drop
-/// case: kill the connection, reattach, get the same transcript. The client side
-/// of that is built (a reconnect loop with the session's backoff, and the cursors
-/// that make the resume exact), but the *far end* cannot yet accept a reconnect
-/// promptly: the relay does not tell a device that its peer disconnected, so the
-/// daemon keeps the dead stream and delivers the next handshake into it, where it
-/// is swallowed. That is T-0054 (relay peer-disconnect signalling), filed with the
-/// evidence from this turn; retrying harder cannot remove it. Until it lands, the
-/// reconnect path is exercised against a *closed* session (which the far end does
-/// notice), not against an abruptly killed one.
 #[tokio::test]
 async fn resume_from_the_cursor_replays_without_duplication_or_gaps() {
     let fixture = Fixture::start("resume");
@@ -591,6 +580,102 @@ async fn resume_from_the_cursor_replays_without_duplication_or_gaps() {
     );
 }
 
+/// A drop is a reconnect, not a lost session: after the client's connection dies,
+/// a *fresh* session to the same peer is accepted promptly, and the transcript it
+/// builds from the UI's cursor is byte-identical to a run that never dropped.
+///
+/// This is the case T-0032 could not pass on its own, and the reason T-0054
+/// exists. The client's connection is killed the way a real one dies — the QUIC
+/// endpoint closes, so the relay sees the device leave — and the reconnect must
+/// then be accepted *without* waiting for the far end to notice a dead stream.
+/// Before the departure notice, the far end kept the dead stream and handed the
+/// new handshake to it; the measurement in T-0032's evidence is that reconnect
+/// taking more than 60 s. Now the relay tells the peer the device left, the peer
+/// ends that stream, and the next connection is served by a fresh one.
+#[tokio::test]
+async fn a_dropped_connection_reconnects_promptly_and_resumes_exactly() {
+    let fixture = Fixture::start("drop");
+    let pane = fixture.pane(
+        "chatty",
+        "i=0; while [ $i -lt 400 ]; do echo line-$i; i=$((i+1)); sleep 0.05; done; sleep 60",
+    );
+    tokio::time::sleep(Duration::from_millis(800)).await;
+
+    // The control: read everything so far, then close cleanly.
+    let control = {
+        let mut conn = Client::connect_to(&fixture.target())
+            .await
+            .expect("the control session opens");
+        let lines = read_lines(&mut conn, &pane, 0).await;
+        conn.close().await;
+        lines
+    };
+    assert!(
+        control.len() >= 5,
+        "the pane must have produced something: {control:?}"
+    );
+
+    // The session under test: read, then *kill* it the way a crash does.
+    let (first, cursor) = {
+        let mut conn = Client::connect_to(&fixture.target())
+            .await
+            .expect("the session opens");
+        let lines = read_lines(&mut conn, &pane, 0).await;
+        assert!(!lines.is_empty(), "the first read returned nothing");
+        let cursor = lines.len();
+        // Abrupt: the relay sees the connection go away without a goodbye, which
+        // is what makes this the drop case rather than a tidy close.
+        conn.kill();
+        (lines, cursor)
+    };
+
+    // The reconnect must be accepted promptly. The deadline is deliberately far
+    // below the >60 s that T-0032 measured without the departure notice, and
+    // above the relay's own connect budget, so a regression to "wait for the far
+    // end to give up" fails here instead of merely being slow.
+    let started = Instant::now();
+    let mut resumed = Client::connect_to(&fixture.target())
+        .await
+        .unwrap_or_else(|e| {
+            panic!(
+                "the reconnect was not accepted: {e}\nrelay log:\n{}\npeer log:\n{}",
+                fixture.relay.log_text(),
+                fixture.machine.log_text()
+            )
+        });
+    let reconnect_ms = started.elapsed().as_millis() as u64;
+    assert!(
+        reconnect_ms < 10_000,
+        "the reconnect took {reconnect_ms} ms; a peer that is told its peer left must \
+         accept the next connection promptly"
+    );
+
+    // The lines printed while nothing was connected are delivered, and the
+    // transcript is exactly what an uninterrupted read would have produced.
+    let rest = read_lines(&mut resumed, &pane, cursor).await;
+    let mut transcript = first.clone();
+    transcript.extend(rest.iter().cloned());
+    let mut seen = std::collections::HashSet::new();
+    for line in &transcript {
+        assert!(
+            seen.insert(line.clone()),
+            "line {line:?} was delivered twice after the reconnect: {transcript:?}"
+        );
+    }
+    let overlap = control.len().min(transcript.len());
+    assert_eq!(
+        transcript[..overlap],
+        control[..overlap],
+        "the reconnected transcript must match an uninterrupted read, line for line"
+    );
+    assert!(
+        transcript.len() > cursor,
+        "the reconnected read must deliver what arrived during the drop: \
+         cursor={cursor} transcript={}",
+        transcript.len()
+    );
+    println!("drop: reconnected in {reconnect_ms} ms and resumed from line {cursor}");
+}
 /// A device without operator permission gets a typed error and no keystroke —
 /// over the relay, where the decision is the peer daemon's and not the relay's.
 ///

@@ -432,3 +432,109 @@ async fn a_session_reports_when_its_relay_disappears() {
         start.elapsed()
     );
 }
+
+/// A device that leaves ends the streams its peers hold for it (T-0054).
+///
+/// The relay does not track who holds a stream to whom, so the notice is
+/// account-wide: every other live device hears that the departed one is gone, and
+/// a receiver with no stream for it ignores the news. The behaviour that matters
+/// is what the *holder* observes — its stream to the departed peer ends with a
+/// reason, rather than accepting writes that can never be delivered or waiting
+/// for a read to fail on its own. That wait is what made a reconnect take over a
+/// minute before this landed.
+#[tokio::test]
+async fn a_departing_device_ends_the_streams_its_peers_hold() {
+    let relay = Relay::start("peergone");
+    let root = RootKey::generate().expect("entropy");
+    relay.register_account("acct-1", &root.public());
+
+    let (alice_key, alice_cert) = device(&root, "alice", 1);
+    let (bob_key, bob_cert) = device(&root, "bob", 2);
+    let bob_id = bob_cert.device().clone();
+
+    let alice_session = RelaySession::dial(relay.addr, "acct-1", &alice_key, &alice_cert)
+        .await
+        .expect("alice registers");
+    let bob_session = RelaySession::dial(relay.addr, "acct-1", &bob_key, &bob_cert)
+        .await
+        .expect("bob registers");
+
+    // Alice holds a stream to Bob and has written into it, so the stream is
+    // established in both directions rather than merely allocated.
+    let mut alice_stream = alice_session.stream_to(&bob_id);
+    alice_stream.write_all(b"before").await.expect("write");
+    alice_stream.flush().await.expect("flush");
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    // Bob leaves the way a crash does: the session is dropped, which closes the
+    // connection — and is why `RelaySession` aborts its pumps on drop.
+    drop(bob_session);
+
+    // Alice's stream ends, promptly and with a reason. A read is what observes
+    // it: the relay's notice reaches the session's reader, which ends the stream
+    // for that peer.
+    let mut buf = [0u8; 16];
+    let outcome = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        alice_stream.read(&mut buf),
+    )
+    .await
+    .expect("the departure ends the stream instead of leaving it hanging");
+    match outcome {
+        // End of stream, or the typed error the session recorded. Either is an
+        // end the layer above can act on; what must not happen is a read that
+        // waits forever, or a write that appears to succeed.
+        Ok(0) => {}
+        Ok(n) => panic!("read {n} bytes from a stream whose peer left: {buf:?}"),
+        Err(e) => {
+            let text = e.to_string();
+            assert!(
+                text.contains("offline") || text.contains("closed") || text.contains("ended"),
+                "the end must say why: {text}"
+            );
+        }
+    }
+
+    // The point of the notice: the peer comes back and is reachable at once. A
+    // fresh stream to the same device id carries data again, which is what makes
+    // a reconnect a reconnect rather than a wait. (A write into the *old* stream
+    // is not asserted to fail: the relay queues for an offline device by design
+    // (T-0030), so bytes written after the departure are durably queued rather
+    // than lost — the stream ending is about the reader learning promptly, which
+    // is the assertion above.)
+    let mut bob_again = RelaySession::dial(relay.addr, "acct-1", &bob_key, &bob_cert)
+        .await
+        .expect("bob re-registers");
+
+    let mut fresh = alice_session.stream_to(&bob_id);
+    fresh.write_all(b"after").await.expect("write");
+    fresh.flush().await.expect("flush");
+
+    let arrival = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        let peer = bob_again.next_peer().await;
+        peer
+    })
+    .await
+    .expect("the re-registered peer is reachable again");
+    let alice_id = alice_cert.device().clone();
+    assert_eq!(
+        arrival,
+        Some(alice_id.clone()),
+        "the arriving peer is alice"
+    );
+
+    let mut bob_stream = bob_again.stream_to(&alice_id);
+    let mut buf = [0u8; 8];
+    let read = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        bob_stream.read(&mut buf),
+    )
+    .await
+    .expect("the bytes arrive")
+    .expect("read");
+    assert_eq!(
+        &buf[..read],
+        b"after",
+        "the fresh stream carries data again"
+    );
+}

@@ -32,6 +32,9 @@ pub enum Incoming {
     Status { seq: u64, outcome: Outcome },
     /// The relay's report on a drain (T-0030).
     Drain(DrainReport),
+    /// A device in this account went offline (T-0054). The device id is the
+    /// header's `src_device`; there is no payload.
+    PeerGone(DeviceId),
 }
 
 /// The relay's stream type: one QUIC bidi stream, joined into one object.
@@ -88,6 +91,16 @@ where
                 outcome,
             })
         }
+        // A departure notice carries its whole meaning in the header, so there
+        // is nothing to decode — and an unparseable sender is a relay that is
+        // broken rather than news about a device.
+        RelayKind::PeerGone => match DeviceId::parse(&envelope.header.src_device) {
+            Ok(peer) => Ok(Incoming::PeerGone(peer)),
+            Err(e) => Err(ClientError::Protocol(RelayError::Frame(format!(
+                "the relay announced a departure from an unparseable device {:?}: {e}",
+                envelope.header.src_device
+            )))),
+        },
         // The relay never originates these, and a device reading them would
         // mean the relay echoed a request back.
         RelayKind::Drain | RelayKind::Ack => Err(ClientError::Protocol(RelayError::Frame(
@@ -439,7 +452,10 @@ impl RelayClient {
             match self.next().await? {
                 Incoming::Envelope(envelope) => messages.push(envelope),
                 Incoming::Drain(report) => return Ok((messages, report)),
-                Incoming::Status { .. } => continue,
+                // Not this call's business: a drain wants its messages and its
+                // report, and a departure is handled where streams live (the
+                // session's reader, T-0054).
+                Incoming::Status { .. } | Incoming::PeerGone(_) => continue,
             }
         }
     }
@@ -459,7 +475,7 @@ impl RelayClient {
         loop {
             match self.next().await? {
                 Incoming::Envelope(envelope) => return Ok(envelope),
-                Incoming::Status { .. } | Incoming::Drain(_) => continue,
+                Incoming::Status { .. } | Incoming::Drain(_) | Incoming::PeerGone(_) => continue,
             }
         }
     }

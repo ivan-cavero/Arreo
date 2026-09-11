@@ -267,6 +267,31 @@ impl Client {
         }
     }
 
+    /// Stop the session tidily: flush what is queued, then close.
+    ///
+    /// The graceful half of a pair whose other half is [`Client::kill`]. For a
+    /// remote client both end with the relay session dropped — which is what
+    /// tells the relay this device left, and therefore what tells its peers
+    /// (T-0054) — but only this one waits for queued bytes to reach the wire.
+    pub async fn close(mut self) {
+        match &mut self.link {
+            Link::Local { writer, .. } => {
+                let _ = writer.flush().await;
+            }
+            Link::Remote { channel, .. } => {
+                let _ = AsyncWriteExt::shutdown(channel).await;
+            }
+        }
+    }
+
+    /// Stop the session the way a crash does: no flush, no goodbye.
+    ///
+    /// Named rather than left as a bare `drop` at the call site, because the
+    /// difference between this and [`Client::close`] is exactly what a
+    /// drop/reconnect test is asserting, and a reader should not have to infer it
+    /// from the absence of a call.
+    pub fn kill(self) {}
+
     /// Send one verb and read its answer, on a connection already open.
     ///
     /// Distinct from [`Client::request`], which opens a connection per call:

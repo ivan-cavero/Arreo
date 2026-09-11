@@ -1,0 +1,58 @@
+# T-0054 evidence — a device's departure is announced to its peers
+
+The headline measurement: a reconnect after a killed client, before and after.
+
+| | T-0032's turn (no notice) | After T-0054 |
+| --- | --- | --- |
+| reconnect to a peer that had not noticed the drop | failed every attempt for **>60 s** (the test was re-scoped rather than claimed) | **77 ms** |
+
+The fix was two-part, and the second part was the deeper bug: the relay now announces
+departures (`RelayKind::PeerGone`), and a dropped `RelaySession` now closes its connection
+(its pump tasks are aborted on drop). Without the second, the relay never learned the device
+had left, so the notice had nothing to announce.
+
+## 1. The drop/reconnect case, end to end (real relay, two machines, real client)
+
+$ cargo test -p arreo-tui --test remote -- --nocapture
+
+test the_client_reaches_a_remote_daemon_and_sees_the_same_pane ... ok
+test a_viewer_is_refused_with_a_typed_error_and_no_keystroke ... ok
+test resume_from_the_cursor_replays_without_duplication_or_gaps ... ok
+drop: reconnected in 380 ms and resumed from line 29
+test a_dropped_connection_reconnects_promptly_and_resumes_exactly ... ok
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.60s
+
+## 2. The relay-level contract (real relay process)
+
+$ cargo test -p arreo-server --test relay_client
+test the_backoff_is_exponential_capped_and_jittered ... ok
+test a_refused_registration_carries_the_relays_reason ... ok
+test a_delivery_failure_ends_the_stream ... ok
+test a_departing_device_ends_the_streams_its_peers_hold ... ok
+test two_devices_hold_a_noise_session_through_the_relay ... ok
+test a_session_reports_when_its_relay_disappears ... ok
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 20.26s
+
+## 3. The vocabulary (a notice is a header and nothing else)
+
+$ cargo test -p arreo-core --lib relay::
+test relay::tests::an_envelope_round_trips_and_the_payload_is_never_parsed ... ok
+test relay::tests::a_departure_notice_is_a_header_and_nothing_else ... ok
+test relay::tests::a_truncated_or_oversized_envelope_is_refused_not_guessed ... ok
+test relay::tests::an_undecodable_certificate_is_refused ... ok
+test relay::tests::an_envelope_over_the_cap_cannot_be_encoded ... ok
+test relay::tests::the_proof_is_independent_of_how_the_device_id_is_announced ... ok
+test relay::tests::auth_accepts_a_real_device_and_refuses_every_impostor ... ok
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 112 filtered out; finished in 0.20s
+
+## 4. The full battery (final code)
+
+cargo test --workspace: 332 passed, 0 failed across 44 targets
+cargo clippy --workspace --all-targets -- -D warnings: 0 diagnostics
+cargo fmt --all -- --check: clean
+cargo vet --locked: Vetting Succeeded (336 exempted)
+cargo deny check: advisories ok, bans ok, licenses ok, sources ok
+cargo audit: 343 crate dependencies, no advisories
+cargo xtask check-targets: x86_64-unknown-linux-gnu PASS; x86_64-pc-windows-msvc SKIP (pure-Rust no-sqlite PASS)
+e2e slices: api green, lifecycle 2/2, persistence 3/3, tui 17/17, theme 27/27, relay 14/14
+cargo xtask bench: 6/6 PASS

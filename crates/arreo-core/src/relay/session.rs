@@ -235,6 +235,24 @@ pub struct RelaySession {
     new_peers: mpsc::Receiver<DeviceId>,
     inflight: Arc<Mutex<HashMap<u64, String>>>,
     closed: Arc<Closed>,
+    /// Abort handles for the two pumps.
+    ///
+    /// Held so that **dropping the session closes the connection**. The pumps
+    /// own the QUIC streams, and a detached tokio task is not stopped by dropping
+    /// the handle that spawned it — so without this a dropped session left the
+    /// device registered with the relay, and every peer kept a stream to a client
+    /// that had gone. That is not a tidiness bug: it is what made a reconnect
+    /// arrive at a far end that still believed the old session was live
+    /// (T-0054/T-0032). The same lesson as `SecureChannel`'s `Drop`.
+    pumps: Vec<tokio::task::AbortHandle>,
+}
+
+impl Drop for RelaySession {
+    fn drop(&mut self) {
+        for pump in &self.pumps {
+            pump.abort();
+        }
+    }
 }
 
 impl std::fmt::Debug for RelaySession {
@@ -279,6 +297,7 @@ impl RelaySession {
             new_peers_tx,
             Arc::clone(&inflight),
         ));
+        let pumps = vec![writer_task.abort_handle(), reader_task.abort_handle()];
 
         // The session is closed when either direction stops: a half-open session
         // would accept writes that can never be delivered.
@@ -300,6 +319,7 @@ impl RelaySession {
             new_peers,
             inflight,
             closed,
+            pumps,
         }
     }
 
@@ -560,6 +580,29 @@ async fn read_pump(
                         };
                         held.live.remove(&key);
                     }
+                }
+            }
+            Incoming::PeerGone(peer) => {
+                // End the stream we hold for that peer, if any: the far end is
+                // gone, so anything still queued for it can never arrive, and a
+                // stream that waits for a peer that has left is a stream the
+                // layer above keeps writing into. Ignored when we have no stream
+                // for that peer — the notice is account-wide news, and a device
+                // that did not care is not an error.
+                let key = peer.as_str().to_string();
+                let target = {
+                    let mut held = match peers.lock() {
+                        Ok(guard) => guard,
+                        Err(poisoned) => poisoned.into_inner(),
+                    };
+                    held.live.remove(&key)
+                };
+                if let Some(target) = target {
+                    eprintln!(
+                        "arreo-server: {peer} went offline; ending its stream rather than \
+                         leaving a session that can never deliver"
+                    );
+                    target.break_stream("the peer went offline".to_string());
                 }
             }
             Incoming::Status { seq, outcome } => {
