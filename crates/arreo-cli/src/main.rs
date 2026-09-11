@@ -63,7 +63,16 @@ fn usage() -> ExitCode {
     eprintln!("  arreo audit prune --before MS   (never automatic; says how many rows went)");
     eprintln!("  arreo devices <id|list|issue|rotate|revoke|authorize> [--json] [--socket PATH]");
     eprintln!("      list --revoked|--all   (live devices by default; tombstones with --revoked)");
-    eprintln!("      revoke <name|id>       (idempotent; the audit row names who and when)");
+    eprintln!("      revoke <name|id> [--machine <name>]");
+    eprintln!(
+        "          without --machine: revoke the device (its certificate stops working everywhere)"
+    );
+    eprintln!(
+        "          with --machine:    cut only that machine's grant, leaving the device working"
+    );
+    eprintln!(
+        "                             elsewhere (idempotent; the audit row names who and when)"
+    );
     eprintln!("  arreo pair [--role owner|viewer] [--ttl-secs N] [--mailbox ADDR] [--config PATH] [--json]");
     eprintln!(
         "      show a code; pins the device that types it. With a [relay] section configured, the"
