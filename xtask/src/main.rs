@@ -19,6 +19,7 @@ mod harness;
 mod lifecycle_slice;
 mod package;
 mod persistence_slice;
+mod relay_slice;
 mod theme_slice;
 mod tui_slice;
 
@@ -61,6 +62,7 @@ fn e2e(rest: &[String]) -> ExitCode {
         Some("persistence") => persistence_slice::run(rest),
         Some("tui") => tui_slice::run(rest),
         Some("theme") => theme_slice::run(rest),
+        Some("relay") => relay_slice::run(rest),
         Some(other) => {
             eprintln!("xtask e2e: unknown slice {other:?} (have: chaos, api, lifecycle, persistence, state, enforcement, tui, theme)");
             ExitCode::from(2)

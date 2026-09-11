@@ -88,7 +88,7 @@ pub fn bench(rest: &[String]) -> ExitCode {
     }
 }
 
-fn workspace_root() -> PathBuf {
+pub fn workspace_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("xtask lives one level below the workspace root")
@@ -139,6 +139,29 @@ impl Budget {
             daemon_binary_mb: get("daemon_binary_mb")?,
         })
     }
+}
+
+/// Read one numeric target out of `perf-budget.toml`.
+///
+/// Public so a slice that measures something `bench` cannot — a cross-machine
+/// attach needs a relay and two daemons, which is not a load measurement — can
+/// still enforce the budget file's number rather than a copy of it. The file is
+/// the law; a slice with its own constant is a second source for one fact.
+pub fn budget_target(key: &str) -> Result<u64, String> {
+    let path = workspace_root().join("perf-budget.toml");
+    let text = std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let line = text
+        .lines()
+        .find(|l| l.trim_start().starts_with(key))
+        .ok_or_else(|| format!("perf-budget.toml has no row {key}"))?;
+    line.split("target")
+        .nth(1)
+        .and_then(|rest| rest.split('=').nth(1))
+        .or_else(|| line.split('=').nth(1))
+        .and_then(|v| v.trim().split(|c: char| !c.is_ascii_digit()).next())
+        .filter(|v| !v.is_empty())
+        .and_then(|v| v.parse().ok())
+        .ok_or_else(|| format!("perf-budget.toml row {key} has no numeric target"))
 }
 
 struct Check {

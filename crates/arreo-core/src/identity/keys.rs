@@ -36,6 +36,8 @@ pub enum KeyError {
     },
     #[error("no identity at {path}")]
     Missing { path: PathBuf },
+    #[error("public key: {0}")]
+    PublicKey(String),
 }
 
 /// The permission bits every key file and its directory must carry (Unix).
@@ -337,6 +339,31 @@ fn random_seed() -> Result<[u8; 32], KeyError> {
     let mut seed = [0u8; 32];
     getrandom::fill(&mut seed).map_err(|e| KeyError::Entropy(e.to_string()))?;
     Ok(seed)
+}
+
+/// Parse a hex ed25519 public key: the format `server.key` is written in, and the
+/// format `arreo devices issue --key` accepts.
+///
+/// **One parser for the workspace, on purpose.** This existed three times (the
+/// pairing flow, the CLI, and — with T-0032 — the TUI), and a hex parser that
+/// disagrees with another about what is acceptable is the two-spellings hazard
+/// with a security consequence: a key one door accepts and another rejects is a
+/// pairing that works and a connection that does not.
+pub fn verifying_key_from_hex(text: &str) -> Result<VerifyingKey, KeyError> {
+    let trimmed = text.trim();
+    if trimmed.len() != 64 {
+        return Err(KeyError::PublicKey(format!(
+            "expected 64 hex characters, got {}",
+            trimmed.len()
+        )));
+    }
+    let mut bytes = [0u8; 32];
+    for (index, slot) in bytes.iter_mut().enumerate() {
+        *slot = u8::from_str_radix(&trimmed[index * 2..index * 2 + 2], 16)
+            .map_err(|_| KeyError::PublicKey("not hex".to_string()))?;
+    }
+    VerifyingKey::from_bytes(&bytes)
+        .map_err(|e| KeyError::PublicKey(format!("not a valid ed25519 point: {e}")))
 }
 
 pub(crate) fn hex(bytes: &[u8]) -> String {

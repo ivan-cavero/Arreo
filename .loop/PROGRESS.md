@@ -1,46 +1,44 @@
 ## State snapshot          ← REWRITTEN (not appended) at every checkpoint
-Task: T-0033 · machine audit log (phase 2) — DONE, evidence recorded
-Where you are: the daemon's trail answers who connected, from where, what they did and what was
-refused, with one writer, one row per action, and redaction at write. 326 workspace tests.
-Next step: **T-0032 (remote TUI attach)** — p3, unblocked now that the audit row shape exists (a
-remote action is attributed to the acting device, proven over the real transport). Then T-0035
-(AGPL boundary), T-0031 (presence), T-0028, T-0040, T-0049. T-0053 is the relay's own audit table
-(the half split out of T-0033 this turn); T-0052 is the live-session cutoff split from T-0026.
-T-0044 stays blocked on the account-join RPC (its own note); T-0036 stays human-gated on minisign.
+Task: T-0032 · remote TUI attach (phase 2) — DONE for the client half; the drop case is T-0054's
+Where you are: the TUI on one machine drives another machine's panes through the relay — one client
+code path, one protocol, one cursor. The relay *session* moved into `arreo-core` (a client needs what
+a daemon needs, and `arreo-tui` may not depend on `arreo-server`). 328 workspace tests.
+Next step: **T-0054 (relay peer-disconnect signalling)** — it is now the blocker for T-0032's drop
+criterion and for T-0034 (the relay e2e slice), because a reconnect is only prompt once the far end
+learns its peer left. Then T-0035 (AGPL boundary), T-0031 (presence), T-0028, T-0040, T-0049. T-0052
+(live-session cutoff) and T-0053 (relay audit) are the other split halves. T-0044 stays blocked on
+the account-join RPC; T-0036 stays human-gated on minisign.
 Open workers: (none)
 Known broken: (none) · Parked: (none)
 Findings:
-- **A flagged secret was stored unmasked.** The scan matched a token prefix anywhere in a line while
-  the masker matched only a whitespace-delimited word *beginning* with it, so
-  `GITHUB_TOKEN=ghp_...` was flagged, left intact and written with `redacted = 1` — a live token on
-  disk beside a flag claiming it was redacted. The scanner and the masker now share one definition
-  (`fixtures::find_token`), and the regression test scans *every* file SQLite writes (`.db`, `-wal`,
-  `-shm`): a scan of the main file alone passed whether or not redaction ran.
-- **One column, two meanings, again.** `device` held the actor for `device.revoke` and the subject
-  for `device.issue`/`device.rotate`; it is now always the subject (the actor of a revocation is in
-  `detail`), and the log uses one spelling per device (`dev_<hex>`) so "everything about this
-  device" is one query. This is the sixth occurrence of the two-spellings/one-fact class — treat it
-  as suspect by default.
-- **An outcome baked in as a constant lied.** `AuditOutcome::Refused` was hardcoded in the
-  authority's audit helper, so issuing and rotating certificates were recorded as refusals. An
-  outcome must be a parameter; a row that sends an operator looking for a failure that never
-  happened is worse than no row.
-- **A pinned device needed a restart; a revoked one did not.** The authority's index is a boot-time
-  snapshot. `DeviceAuthority::device` now reloads once on a miss (a device pinned while the daemon
-  ran) and gives the store the last word on revocation (so a device revoked by *another* process is
-  refused at once — the handshake resolver reads that index). Both doors it must not close are
-  pinned by test: a store row cannot authorize a device on its own, and a cert file with no store
-  row still can.
-- **A dropped `SecureChannel` did not close.** A `JoinHandle` does not abort its task on drop, so
-  the pump kept the connection open and the peer noticed only at the 15 s QUIC idle timeout. `Drop`
-  aborts the pump; `shutdown()` is the graceful close. Consequence for callers: a *dropped* channel
-  discards what the pump had not flushed — flush explicitly (the 1 MB test now does).
-- **A test that scans a file must scan the WAL.** `std::fs::read(<db>)` missed the rows still in the
-  write-ahead log, which made both a positive and a negative assertion vacuous. Assert the scan can
-  see a row it knows is there before trusting it about a row it hopes is not.
-- **`u64::MAX as i64` is `-1`, and SQLite reads a negative bound as "no limit".** The values that
-  most clearly mean "everything" were the ones taking an unintended path. Clamp every
-  Rust-to-SQLite conversion.
+- **A carrier that does not report a peer's departure blocks reconnects.** The relay routes by device
+  id and keeps one stream per peer, but never tells a device that its peer went away — so after an
+  abrupt drop the far end holds the dead stream and swallows the next handshake. Measured: a
+  reconnect took >60 s, and no client retry removes the wait. T-0054 filed with the evidence; the
+  drop criterion in T-0032 was split rather than claimed.
+- **One client, two transports, and the session belongs to both ends.** The relay session lived in
+  `arreo-server`, which the TUI may not depend on (AGENTS.md). Moving it to `arreo-core::relay::session`
+  is not a refactor for tidiness: §3.7's "uniform protocol, three roles" means the daemon and the
+  client hold the *same* session object, and a second copy would have been a second answer to
+  "how do I reconnect".
+- **A dropped stream must be re-parked, not discarded.** `read_pump` dropped a chunk when a peer's
+  stream had no reader — which is exactly the case after a disconnect — so a reconnecting peer's
+  first handshake flight was silently eaten. Now: no reader means the stream ended, so the chunk is
+  parked for a fresh stream and the peer is announced again; a *slow* reader still ends its stream
+  loudly, because a gap in a byte stream is undetectable above Noise.
+- **One connection per pass is wrong for a multiplexed transport.** An early TUI draft opened a
+  connection per poll (the CLI pattern). Against the relay that is a dial and a handshake every
+  second, and it collides with the one-stream-per-peer rule. The connection is long-lived; the loop
+  is a reconnect loop.
+- **A hex-key parser existed three times** (pairing, CLI, and the one this task needed).
+  `identity::verifying_key_from_hex` is now the only one — a key one door accepts and another rejects
+  is a pairing that works and a connection that does not.
+- **A budget row bench cannot measure still needs enforcing.** `cross_machine_attach_s` needs two
+  daemons and a relay, so `bench` cannot time it; the `relay` slice does, and it reads the number
+  *from `perf-budget.toml`* rather than holding a copy. Measured 406 ms against the 3 s budget.
+- **A test that scans a file must scan the WAL** (from T-0033, reconfirmed): the same shape here is
+  "assert the fixture is real before asserting what it lacks" — the slice checks the marker is on
+  screen before checking the relay does not hold it.
 ## Event log               ← append-only; newest last; never rewrite
 - 2026-09-10 [turn 1] ledger created; repo at e489fac (docs only); T-0001 + T-0022 (AGENTS.md gardened) done
 - 2026-09-10 [turn 2] T-0002 PTY manager done+pushed (342606c; 9 tests); PROMPT.md v2 synced + ADR 0001 (ef6c595)
@@ -74,3 +72,5 @@ Findings:
 - 2026-09-11 [turn 29] T-0026 device revocation done (split: the live-session cutoff became T-0052): `arreo_core::identity::revocation` (one home for may-connect/may-pin, used by the authorization check, the transport resolver and the pinning door), store v4 (`devices.revoked_at`/`revoked_by` + `audit.action`), `arreo devices revoke <name|id>` idempotent with an audit row naming who and when, `devices list --revoked|--all` tombstones, re-pair refused for a burned key (a fresh key may take the name), the resolver now logs the real refusal reason; 7 acceptance tests through the real binaries (durable across kill -9, offline case, re-pair, ambiguous/unknown refs, live device unaffected) + 5 decision tests + 12 authority tests; fixed the third "written but not rendered" defect (audit action) and migrated two T-0025 tests to the new listing contract; 306 workspace tests, clippy/fmt clean, vet/deny/audit green, check-targets PASS/SKIP, five e2e slices green, bench 6/6; evidence in `.loop/evidence/T-0026/`
 
 - 2026-09-11 [turn 30] T-0033 machine audit log done (split: the relay's own table became T-0053): store v5 (`audit.action/outcome/peer/detail`, one `AuditEvent` struct, one writer, `actions` vocabulary, `audit_query`/`audit_recent`/`audit_by_action`/`audit_export`/`audit_size`/`audit_prune`), peer truncation at write (IPv4 /24, IPv6 /48), redaction at write, `arreo audit` tail + `--json` + `export --format jsonl|json` + explicit `prune --before`, the daemon's `SessionAudit` (connect/disconnect for remote sessions; attach/send/spawn/split; nothing for reads), a 100 MiB boot warning that never prunes, `docs/audit.md`. Five defects fixed in the same pass: a flagged token stored unmasked (scan/mask now share one definition of a token), `device.issue`/`device.rotate` audited as `refused`, `u64::MAX`/`usize::MAX` meaning "everything" by accident, the `device` column holding the actor for revoke but the subject for issue (now always the subject, actor in `detail`, one spelling per device), and the pin-requires-restart / revoke-is-live asymmetry. Also: a dropped `SecureChannel` now closes (was a 15 s idle-timeout delay before the session's end was written) and the new core test file is gated on `sqlite` so the C-free cross-target pass stays green. 326 workspace tests, clippy/fmt clean, vet/deny/audit green, check-targets PASS/SKIP, 5 e2e slices green, bench 6/6; evidence in `.loop/evidence/T-0033/`; remote == local
+
+- 2026-09-11 [turn 31] T-0032 remote TUI attach done for the client half (the drop criterion split to the new T-0054): `Target` (local socket | remote through the relay) in `arreo-tui::client`, `--remote/--peer/--account/--identity`, the same `Message` verbs and msgpack frames over both transports, a long-lived connection with a reconnect loop on the relay session's own backoff (250 ms base, 30 s cap, jitter) and a `reconnecting` status line, cursor-owned resume (no duplicated line, no gap), peer-key pinning via the pairing-written `server.key`, ADR 0015. Moved `RelaySession`/`RelayStream`/`StreamFactory`/`Closed` from `arreo-server` into `arreo-core::relay::session` (a client needs the same session a daemon does; the dependency rule forbids the TUI reaching into the server), fixed a real defect the move exposed (a dropped peer stream discarded the next handshake flight instead of re-parking it), consolidated three copies of the hex-key parser into `identity::verifying_key_from_hex`, and added the `relay` e2e slice: real relay + real peer daemon + the real TUI on a pty with real key events, 14 assertions including the §5 `cross_machine_attach_s` budget read from `perf-budget.toml` (406 ms vs 3 s) and the relay-holds-no-plaintext scan. Evidence `.loop/evidence/T-0032/` (frames + gates); 328 workspace tests, clippy/fmt clean, vet/deny/audit green, check-targets PASS/SKIP, 6 e2e slices green, bench 6/6; remote == local

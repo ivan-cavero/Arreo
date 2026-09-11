@@ -34,7 +34,8 @@ pub use cert::{
     ROOT_KEY_ID,
 };
 pub use keys::{
-    create_private_dir, identity_dir, identity_root, DeviceKey, KeyError, RootKey, IDENTITY_DIR_ENV,
+    create_private_dir, identity_dir, identity_root, verifying_key_from_hex, DeviceKey, KeyError,
+    RootKey, IDENTITY_DIR_ENV,
 };
 pub use revocation::{authorized_role, may_connect, may_pin, Denied};
 pub use role::{Capability, Role, RoleError};

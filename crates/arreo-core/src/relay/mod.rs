@@ -51,6 +51,15 @@ pub mod client;
 #[cfg(feature = "transport")]
 pub use client::{Incoming, RelayClient, RelayReader, RelayWriter};
 
+/// A live relay session: dial once, then hold a byte stream to each peer.
+///
+/// Distinct from [`client`], which is the protocol and one connection's
+/// mechanics: this is the session *policy* on top — multiplexing peers,
+/// attributing delivery reports, and the reconnect schedule. Both a daemon and a
+/// client need it, so it lives here rather than in either (T-0032).
+#[cfg(feature = "transport")]
+pub mod session;
+
 use crate::identity::{DeviceCert, DeviceId, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;

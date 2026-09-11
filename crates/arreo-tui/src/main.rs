@@ -1,11 +1,22 @@
-//! `arreo-tui` binary (T-0015): sidebar + pane wall over the daemon socket.
+//! `arreo-tui` binary (T-0015): sidebar + pane wall over the daemon socket, or
+//! over the relay to a daemon on another machine (T-0032).
 //!
-//! Usage: `arreo-tui [--socket PATH]`. Polls panes+metrics every second,
-//! streams the focused pane, quits on `q`/Esc/Ctrl-C. Mouse clicks focus.
+//! Usage: `arreo-tui [--socket PATH]` or `arreo-tui --remote <addr> --peer
+//! <device-id> --account <acct>`. Polls panes+metrics every second, streams the
+//! focused pane, quits on `q`/Esc/Ctrl-C. Mouse clicks focus.
+//!
+//! **The remote case is the same client.** Every verb below is the same
+//! `Message`, the same framing and the same resume cursor whether the bytes came
+//! from a Unix socket or from the relay; [`Target`] is the only thing that
+//! differs, and the reconnect loop is transport-blind. A drop is a reconnect
+//! with backoff, never a lost session: the pane cursors live in the UI's
+//! subscription, so a reconnect resumes exactly where the transcript stopped
+//! (`Read { from_line }` replays from the cursor, and the transcript is
+//! byte-identical to a run that never dropped).
 
 use arreo_core::proto::{AgentState, Message, VERSION};
 use arreo_core::theme::{Depth, Variant};
-use arreo_tui::client::{default_socket, Client, PaneSummary};
+use arreo_tui::client::{default_socket, Client, PaneSummary, Target};
 use arreo_tui::model::PaneView;
 use arreo_tui::theme::ThemeState;
 use arreo_tui::ui::{App, ViewMode};
@@ -14,6 +25,7 @@ use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 use std::io::Stdout;
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -21,6 +33,10 @@ use std::time::Duration;
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let mut socket: Option<PathBuf> = None;
+    let mut remote: Option<SocketAddr> = None;
+    let mut peer: Option<String> = None;
+    let mut account: Option<String> = None;
+    let mut identity: Option<PathBuf> = None;
     let mut theme: Option<String> = None;
     let mut variant: Option<String> = None;
     let mut depth: Option<String> = None;
@@ -28,6 +44,22 @@ async fn main() -> anyhow::Result<()> {
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--socket" => socket = args.next().map(PathBuf::from),
+            "--remote" => {
+                remote = match args.next().map(|addr| addr.parse()) {
+                    Some(Ok(addr)) => Some(addr),
+                    Some(Err(e)) => {
+                        eprintln!("arreo-tui: --remote wants a relay address: {e}");
+                        std::process::exit(2);
+                    }
+                    None => {
+                        eprintln!("arreo-tui: --remote wants an address (host:port)");
+                        std::process::exit(2);
+                    }
+                }
+            }
+            "--peer" => peer = args.next(),
+            "--account" => account = args.next(),
+            "--identity" => identity = args.next().map(PathBuf::from),
             "--theme" => theme = args.next(),
             "--variant" => variant = args.next(),
             "--depth" => depth = args.next(),
@@ -36,6 +68,13 @@ async fn main() -> anyhow::Result<()> {
                     "usage: arreo-tui [--socket PATH] [--theme NAME] \
                      [--variant dark|light] [--depth truecolor|256|16|none]"
                 );
+                println!(
+                    "       arreo-tui --remote HOST:PORT --peer DEVICE_ID [--account A] \
+                     [--identity DIR]"
+                );
+                println!("  --remote  a daemon on another machine, through the relay");
+                println!("  --peer    that machine's device id (as `arreo devices list` shows it)");
+                println!("  --identity  this device's identity dir (default: the standard one)");
                 return Ok(());
             }
             other => {
@@ -44,7 +83,44 @@ async fn main() -> anyhow::Result<()> {
             }
         }
     }
-    let socket = socket.unwrap_or_else(default_socket);
+    let target = match (remote, &peer) {
+        (Some(relay), Some(peer)) => {
+            let root = identity.unwrap_or_else(arreo_core::identity::identity_root);
+            let Some(account) = account.or_else(|| std::env::var("ARREO_ACCOUNT").ok()) else {
+                eprintln!(
+                    "arreo-tui: --account is required for a remote target (or set ARREO_ACCOUNT)"
+                );
+                eprintln!(
+                    "  the account is the relay-side tenant both machines are registered under"
+                );
+                std::process::exit(2);
+            };
+            match Target::remote(relay, &account, peer, &root) {
+                Ok(target) => target,
+                Err(e) => {
+                    eprintln!("arreo-tui: {e}");
+                    eprintln!(
+                        "  a remote target needs this device paired with that machine \
+                         (`arreo pair --join`), which writes device.key, the certificate and \
+                         the pinned server key into {}",
+                        root.display()
+                    );
+                    std::process::exit(2);
+                }
+            }
+        }
+        // A peer without a relay is a typo, not a default: silently attaching to
+        // the local daemon would show the user the wrong machine's panes.
+        (None, Some(_)) => {
+            eprintln!("arreo-tui: --peer needs --remote HOST:PORT");
+            std::process::exit(2);
+        }
+        (Some(_), None) => {
+            eprintln!("arreo-tui: --remote needs --peer DEVICE_ID");
+            std::process::exit(2);
+        }
+        (None, None) => Target::Local(socket.unwrap_or_else(default_socket)),
+    };
     let request = ThemeRequest {
         theme,
         variant: variant.as_deref().and_then(parse_variant),
@@ -59,7 +135,7 @@ async fn main() -> anyhow::Result<()> {
     )?;
     let backend = CrosstermBackend::new(std::io::stdout());
     let mut terminal = Terminal::new(backend)?;
-    let result = run(&socket, request, &mut terminal).await;
+    let result = run(target, request, &mut terminal).await;
     disable_raw_mode()?;
     crossterm::execute!(
         std::io::stdout(),
@@ -71,6 +147,8 @@ async fn main() -> anyhow::Result<()> {
 
 /// One daemon snapshot delivered to the UI loop.
 enum Poll {
+    /// A connection state worth showing (reconnecting, and where it is trying).
+    Status(String),
     /// Sidebar truth for one cycle (pane summaries, or why the cycle failed).
     Panes(Result<Vec<PaneSummary>, String>),
     /// Incremental scrollback for the focused pane (`from_line` = where the
@@ -115,7 +193,7 @@ fn parse_depth(raw: &str) -> Option<Depth> {
 }
 
 async fn run(
-    socket: &std::path::Path,
+    target: Target,
     request: ThemeRequest,
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
 ) -> anyhow::Result<()> {
@@ -137,11 +215,7 @@ async fn run(
     // input. The UI loop only drains events and applies finished snapshots.
     let (tx, mut rx) = tokio::sync::mpsc::channel::<Poll>(8);
     let subscription = Arc::new(Mutex::new(Subscription::default()));
-    let poller = tokio::spawn(poll_daemon(
-        socket.to_path_buf(),
-        tx,
-        Arc::clone(&subscription),
-    ));
+    let poller = tokio::spawn(poll_daemon(target.clone(), tx, Arc::clone(&subscription)));
 
     let mut needs_draw = true;
     loop {
@@ -200,8 +274,9 @@ async fn run(
                     );
                 }
                 Poll::Panes(Err(e)) => {
-                    app.status = format!("daemon unreachable: {e} (is arreo-server running?)");
+                    app.status = format!("daemon unreachable: {e}");
                 }
+                Poll::Status(line) => app.status = line,
                 Poll::Delta {
                     id,
                     from_line,
@@ -265,15 +340,89 @@ struct Subscription {
 
 /// Daemon-facing loop: sidebar truth once a second, then one incremental
 /// `Read` per subscribed pane, pushed to the UI over a channel.
+///
+/// **One connection, held.** The verbs of a pass share it, and it outlives the
+/// pass: a *remote* connection is a session with a peer device, and the far end
+/// multiplexes one stream per peer — opening a second session for the same
+/// device while the first is still held does not create a second stream, it
+/// hands the new handshake to the old one. So the connection is long-lived and
+/// the loop is a reconnect loop, not a connect-per-pass loop.
+///
+/// **A failure is a reconnect, never a lost transcript.** The backoff is
+/// [`arreo_core::relay::session::backoff_delay`]'s (exponential, capped at 30 s,
+/// jittered), the attempt counter resets on the first pass that answers, and the
+/// UI is told what is happening instead of being shown a frozen screen. The pane
+/// cursors live in the subscription and are *not* reset, so a resumed read
+/// replays from exactly where the transcript stopped.
+///
+/// **The drop case is bounded by the far end, not by this loop.** A client that
+/// vanishes is not noticed by the daemon until one of its reads or writes fails,
+/// and the relay does not tell a device that its peer went away (T-0054), so a
+/// reconnect may have to wait for the daemon to give up the old stream. The loop
+/// keeps trying — it never gives up while the TUI is open — and says so in the
+/// status bar.
 async fn poll_daemon(
-    socket: std::path::PathBuf,
+    target: Target,
     tx: tokio::sync::mpsc::Sender<Poll>,
     subscription: Arc<Mutex<Subscription>>,
 ) {
     let mut tick = tokio::time::interval(Duration::from_secs(1));
+    let mut attempt: u32 = 0;
+    let mut conn: Option<Client> = None;
     loop {
-        tick.tick().await;
-        let summaries = poll_summaries(&socket).await.map_err(|e| e.to_string());
+        if conn.is_none() {
+            match Client::connect_to(&target).await {
+                Ok(opened) => {
+                    conn = Some(opened);
+                    let _ = tx
+                        .send(Poll::Status(format!("connected to {}", target.describe())))
+                        .await;
+                }
+                Err(e) => {
+                    let delay = report_disconnected(&tx, &target, attempt, &e).await;
+                    tokio::time::sleep(delay).await;
+                    attempt = attempt.saturating_add(1);
+                    continue;
+                }
+            }
+        }
+        // The session can also die *between* verbs, which on a remote target is
+        // the difference between a one-second stall and an honest status line —
+        // so the wait for the next tick races the session's own closure signal.
+        let closed = conn.as_ref().and_then(Client::closed);
+        let next_tick = tick.tick();
+        let drop_notice = async {
+            match &closed {
+                Some(closed) => closed.wait().await,
+                // Local connections report a closure by failing the next read.
+                None => std::future::pending::<()>().await,
+            }
+        };
+        tokio::select! {
+            _ = next_tick => {}
+            () = drop_notice => {
+                let delay = report_closed(&tx, &target, attempt).await;
+                conn = None;
+                tokio::time::sleep(delay).await;
+                attempt = attempt.saturating_add(1);
+                continue;
+            }
+        }
+        let Some(active) = conn.as_mut() else {
+            continue;
+        };
+        let summaries = poll_summaries(active).await.map_err(|e| e.to_string());
+        // A pass that answered is the thing the attempt counter measures: a
+        // connection that opens and then refuses every verb (a role refusal, a
+        // peer that is not serving) is not healthy, and backing off is the
+        // honest response rather than a one-second retry loop.
+        let answered = summaries.is_ok();
+        if answered {
+            attempt = 0;
+        } else {
+            attempt = attempt.saturating_add(1);
+            conn = None;
+        }
         let ids: Vec<String> = match &summaries {
             Ok(summaries) => summaries.iter().map(|s| s.id.clone()).collect(),
             Err(_) => Vec::new(),
@@ -299,6 +448,9 @@ async fn poll_daemon(
             }
             Err(_) => Vec::new(),
         };
+        let Some(active) = conn.as_mut() else {
+            continue;
+        };
         for id in targets {
             let from_line = subscription
                 .lock()
@@ -307,15 +459,13 @@ async fn poll_daemon(
                 .unwrap_or(0);
             if let Ok(Message::Delta {
                 lines, from_line, ..
-            }) = Client::request(
-                &socket,
-                &Message::Read {
+            }) = active
+                .call(&Message::Read {
                     v: VERSION,
                     id: id.clone(),
                     from_line,
-                },
-            )
-            .await
+                })
+                .await
             {
                 if let Ok(mut slot) = subscription.lock() {
                     slot.cursors.insert(id.clone(), from_line + lines.len());
@@ -334,6 +484,63 @@ async fn poll_daemon(
             }
         }
     }
+}
+
+/// Tell the UI the connection is gone and how long until the next attempt, and
+/// return that delay.
+///
+/// The backoff is the relay session's own policy — one schedule for a daemon
+/// reconnecting to a relay and a client reconnecting to a daemon, because they
+/// are the same event: "the carrier went away".
+async fn report_disconnected(
+    tx: &tokio::sync::mpsc::Sender<Poll>,
+    target: &Target,
+    attempt: u32,
+    error: &arreo_tui::client::ClientError,
+) -> Duration {
+    let delay = arreo_core::relay::session::backoff_delay(attempt, jitter());
+    let line = if matches!(target, Target::Local(_)) {
+        format!("daemon unreachable: {error}")
+    } else {
+        format!(
+            "reconnecting to {} (attempt {}, next in {:.1}s): {error}",
+            target.describe(),
+            attempt + 1,
+            delay.as_secs_f64()
+        )
+    };
+    let _ = tx.send(Poll::Status(line)).await;
+    delay
+}
+
+/// The same, for a session that ended between two passes (the idle drop).
+async fn report_closed(
+    tx: &tokio::sync::mpsc::Sender<Poll>,
+    target: &Target,
+    attempt: u32,
+) -> Duration {
+    let delay = arreo_core::relay::session::backoff_delay(attempt, jitter());
+    let _ = tx
+        .send(Poll::Status(format!(
+            "reconnecting to {} (attempt {}, next in {:.1}s): the session closed",
+            target.describe(),
+            attempt + 1,
+            delay.as_secs_f64()
+        )))
+        .await;
+    delay
+}
+
+/// A jitter fraction in `[0, 1)`, from the clock.
+///
+/// Same reasoning as the daemon's: jitter is a spread problem, not a secrecy
+/// one, so distinct processes starting at distinct nanoseconds is the whole
+/// requirement and needs no dependency.
+fn jitter() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| f64::from(d.subsec_nanos()) / 1e9)
+        .unwrap_or(0.0)
 }
 
 fn state_name(state: &AgentState) -> &'static str {
@@ -363,15 +570,13 @@ fn merge_views(app: &mut App, views: Vec<PaneView>) {
     app.model.set_panes(merged);
 }
 
-async fn poll_summaries(socket: &std::path::Path) -> anyhow::Result<Vec<PaneSummary>> {
-    let panes = match Client::request(
-        socket,
-        &Message::Panes {
+async fn poll_summaries(conn: &mut Client) -> anyhow::Result<Vec<PaneSummary>> {
+    let panes = match conn
+        .call(&Message::Panes {
             v: VERSION,
             panes: vec![],
-        },
-    )
-    .await
+        })
+        .await
     {
         Ok(Message::Panes { panes, .. }) => panes,
         Ok(Message::Error { message, .. }) => anyhow::bail!("panes: {message}"),
@@ -381,21 +586,19 @@ async fn poll_summaries(socket: &std::path::Path) -> anyhow::Result<Vec<PaneSumm
     let mut out = Vec::new();
     for pane in panes {
         // Metrics per pane (best-effort; unknown RAM on error).
-        let ram_kb = match Client::request(
-            socket,
-            &Message::MetricsReq {
+        let ram_kb = match conn
+            .call(&Message::MetricsReq {
                 v: VERSION,
                 id: pane.id.clone(),
-            },
-        )
-        .await
+            })
+            .await
         {
             Ok(Message::Metrics { rss_bytes, .. }) => rss_bytes / 1024,
             _ => 0,
         };
         // State via non-blocking wait (timeout 0 would spin; use short wait
         // for question, else derive from liveness below).
-        let state = state_for(socket, &pane.id, pane.alive).await;
+        let state = state_for(conn, &pane.id, pane.alive).await;
         out.push(PaneSummary {
             id: pane.id,
             alive: pane.alive,
@@ -409,18 +612,16 @@ async fn poll_summaries(socket: &std::path::Path) -> anyhow::Result<Vec<PaneSumm
 
 /// Resolve one pane's state: ask the daemon to wait ~0 for each actionable
 /// state in priority order (question → blocked → done), else liveness.
-async fn state_for(socket: &std::path::Path, id: &str, alive: bool) -> AgentState {
+async fn state_for(conn: &mut Client, id: &str, alive: bool) -> AgentState {
     for want in [AgentState::Question, AgentState::Blocked] {
-        if let Ok(Message::StateEvent { .. }) = Client::request(
-            socket,
-            &Message::Wait {
+        if let Ok(Message::StateEvent { .. }) = conn
+            .call(&Message::Wait {
                 v: VERSION,
                 id: id.to_string(),
                 state: want,
                 timeout_ms: 150,
-            },
-        )
-        .await
+            })
+            .await
         {
             return want;
         }

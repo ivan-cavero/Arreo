@@ -1,0 +1,65 @@
+# T-0032 evidence — remote TUI attach
+
+Every command below was run against the final code on this turn. The slice output
+comes from a real relay process, two real daemons and the real `arreo-tui` binary
+on a pty; the frames in this directory are the screens it painted.
+
+## 1. The slice: real relay, real peer machine, real TUI, real key events
+
+$ cargo xtask e2e --slice relay --interactive-evidence
+
+[PASS] relay: the client device is pinned on the peer machine
+[PASS] relay: the peer daemon is serving and connected to the relay
+[PASS] relay: the peer machine owns a pane
+[PASS] relay: the TUI lists the remote machine's pane
+[PASS] relay: attaching streams the remote pane's output
+[PASS] relay: the cross-machine attach meets its §5 budget
+relay: cross-machine attach 609 ms (budget 3000 ms)
+[PASS] relay: the remote pane's whole scrollback arrived
+[PASS] relay: the peer's audit trail names the client device
+[PASS] relay: the peer recorded the session that carried the attach
+[PASS] relay: no keystroke was audited as input
+[PASS] relay: the relay holds no pane content
+[PASS] relay: the relay's log holds no pane content
+[PASS] relay: an unreachable relay is a visible state, not a hang
+[PASS] relay: q quits the remote TUI cleanly
+relay: 14 passed, 0 failed
+
+## 2. The client against a real relay (in-process acceptance tests)
+
+$ cargo test -p arreo-tui --test remote
+test the_client_reaches_a_remote_daemon_and_sees_the_same_pane ... ok
+test resume_from_the_cursor_replays_without_duplication_or_gaps ... ok
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.82s
+
+## 3. The frames a reviewer reads
+
+--- .loop/evidence/T-0032/01-connected.txt
+
+
+
+
+
+--- .loop/evidence/T-0032/02-remote-pane-listed.txt
+┌agents────────────────────┐┌(no focus — Enter on a sidebar row)───────────────────────────────────────────────────────┐
+│● working                 ││                                                                                          │
+│  remote-pane   3M █░░░░░░││                                                                                          │
+│                          ││                                                                                          │
+
+--- .loop/evidence/T-0032/03-attached-remote-output.txt
+┌agents────────────────────┐┌remote-pane [working]─────────────────────────────────────────────────────────────────────┐
+│● working                 ││REMOTE-MACHINE-MARKER-7c31                                                                │
+│▸ remote-pane   3M █░░░░░░││second-line                                                                               │
+│                          ││                                                                                          │
+
+--- .loop/evidence/T-0032/04-peer-audit.txt
+1789130807545 device.issue           ok       dev_6666ddcac6a9a4ccf3a188e12089cd79              -                  -                        issued owner for tui
+1789130807723 spawn                  ok       local-cli        remote-pane  -                  -                        /bin/sh
+1789130808027 session.connect        ok       dev_6666ddcac6a9a4ccf3a188e12089cd79              -                  -                        
+
+--- .loop/evidence/T-0032/05-unreachable-relay.txt
+┌agents────────────────────┐┌(no focus — Enter on a sidebar row)───────────────────────────────────────────────────────┐
+│                          ││                                                                                          │
+│                          ││                                                                                          │
+│                          ││                                                                                          │
+

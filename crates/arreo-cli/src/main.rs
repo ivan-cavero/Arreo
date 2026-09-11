@@ -1608,21 +1608,10 @@ fn parse_issue_args(
     Ok((name, role, key))
 }
 
+/// The one hex-key parser (`arreo_core::identity::verifying_key_from_hex`),
+/// with this command's error phrasing kept for its own output.
 fn parse_public_key_hex(hex: &str) -> Result<arreo_core::identity::VerifyingKey, String> {
-    let bytes = hex.trim();
-    if bytes.len() != 64 {
-        return Err(format!(
-            "public key must be 64 hex characters (got {})",
-            bytes.len()
-        ));
-    }
-    let mut out = [0u8; 32];
-    for (index, slot) in out.iter_mut().enumerate() {
-        *slot = u8::from_str_radix(&bytes[index * 2..index * 2 + 2], 16)
-            .map_err(|_| "public key is not hex".to_string())?;
-    }
-    arreo_core::identity::VerifyingKey::from_bytes(&out)
-        .map_err(|e| format!("public key is not a valid ed25519 point: {e}"))
+    arreo_core::identity::verifying_key_from_hex(hex).map_err(|e| e.to_string())
 }
 
 fn devices_issue(socket: &std::path::Path, args: &[String], json: bool) -> ExitCode {

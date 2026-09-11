@@ -1,0 +1,3 @@
+1789130807545 device.issue           ok       dev_6666ddcac6a9a4ccf3a188e12089cd79              -                  -                        issued owner for tui
+1789130807723 spawn                  ok       local-cli        remote-pane  -                  -                        /bin/sh
+1789130808027 session.connect        ok       dev_6666ddcac6a9a4ccf3a188e12089cd79              -                  -                        

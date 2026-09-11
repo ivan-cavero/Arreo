@@ -38,6 +38,12 @@ daemon_binary_mb = { phase0 = true, target = 20, unit = "MB" }
 phone_cold_attach_s = { phase0 = false, target = 1, unit = "s" }
 phone_idle_delta_kbs = { phase0 = false, target = 5, unit = "KB/s" }
 tui_attach_30panes_ms = { phase0 = false, target = 300, unit = "ms" }
+# T-0032 gives this row its mechanism and its enforcement: the `relay` slice
+# (`cargo xtask e2e --slice relay`) starts a real relay, a real peer daemon and
+# the real TUI, then times a real keypress to the peer's output appearing on
+# screen — and reads this row's number rather than a copy of it. Still
+# `phase0 = false` because `bench` measures load, and this needs two daemons and
+# a relay; the slice is the authority.
 cross_machine_attach_s = { phase0 = false, target = 3, unit = "s" }
 config_sync_s = { phase0 = false, target = 10, unit = "s" }
 server_handoff_reattach_s = { phase0 = false, target = 2, unit = "s" }
