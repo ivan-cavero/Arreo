@@ -249,7 +249,12 @@ pub async fn accept_connection(
     };
     let peer = incoming.remote_address().ip();
     if limiter.check(peer).is_err() {
-        // Refuse before any QUIC handshake work is done on our side.
+        // Refuse before any QUIC handshake work is done on our side. The refusal
+        // is logged here because this is the only place that knows *which* peer
+        // was turned away — a silent refusal is a support ticket with no lead.
+        eprintln!(
+            "arreo: refused {peer}: over its handshake budget ({HANDSHAKE_MAX_ATTEMPTS} per {HANDSHAKE_WINDOW:?})"
+        );
         incoming.refuse();
         return Ok(None);
     }

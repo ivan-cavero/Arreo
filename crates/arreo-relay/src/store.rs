@@ -14,12 +14,12 @@
 //! opaque envelopes. Nothing here can read a user's traffic, and a schema test
 //! (`tests/directory.rs`) fails if a column ever suggests otherwise.
 
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 
 /// Current schema version. Bumped only alongside a migration below.
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -97,10 +97,102 @@ impl RelayStore {
              CREATE INDEX IF NOT EXISTS machine_account ON machine(account_id);
              CREATE INDEX IF NOT EXISTS machine_last_seen ON machine(last_seen_ms);",
         )?;
+
+        // v2 (T-0029): the account's root public key — the anchor the relay
+        // verifies a device certificate against — and the device registry, which
+        // is how a routed envelope's destination can be "known" (so an unknown
+        // one is a typed refusal rather than a guess). Both are metadata: a
+        // public key and a fingerprint, never a secret.
+        let version: u32 = conn
+            .query_row(
+                "SELECT value FROM meta WHERE key='schema_version'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .map(|v| v.parse().unwrap_or(0))
+            .unwrap_or(0);
+        if version < 2 {
+            if !has_column(conn, "account", "root_key")? {
+                conn.execute_batch("ALTER TABLE account ADD COLUMN root_key TEXT;")?;
+            }
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS relay_device(
+                   account_id TEXT NOT NULL,
+                   device_id TEXT NOT NULL,
+                   first_seen_ms INTEGER NOT NULL,
+                   last_seen_ms INTEGER NOT NULL,
+                   PRIMARY KEY (account_id, device_id));
+                 CREATE INDEX IF NOT EXISTS relay_device_seen ON relay_device(last_seen_ms);",
+            )?;
+        }
         conn.execute(
             "INSERT INTO meta(key, value) VALUES ('schema_version', ?1)
              ON CONFLICT(key) DO UPDATE SET value=excluded.value",
             [SCHEMA_VERSION.to_string()],
+        )?;
+        Ok(())
+    }
+
+    /// Record that a device authenticated, or refresh when it last did.
+    ///
+    /// `first_seen_ms` is written once: a device's first contact is the fact a
+    /// later task (presence, T-0031) wants, and an upsert that overwrote it
+    /// would lose it.
+    pub fn touch_device(
+        &self,
+        account_id: &str,
+        device_id: &str,
+        now_ms: i64,
+    ) -> Result<(), StoreError> {
+        let conn = self.lock()?;
+        conn.execute(
+            "INSERT INTO relay_device(account_id, device_id, first_seen_ms, last_seen_ms)
+             VALUES (?1, ?2, ?3, ?3)
+             ON CONFLICT(account_id, device_id) DO UPDATE SET last_seen_ms = excluded.last_seen_ms",
+            rusqlite::params![account_id, device_id, now_ms],
+        )?;
+        Ok(())
+    }
+
+    /// Has this device ever authenticated into this account?
+    pub fn device_known(&self, account_id: &str, device_id: &str) -> Result<bool, StoreError> {
+        let conn = self.lock()?;
+        let found: Option<i64> = conn
+            .query_row(
+                "SELECT 1 FROM relay_device WHERE account_id = ?1 AND device_id = ?2",
+                rusqlite::params![account_id, device_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(found.is_some())
+    }
+
+    /// The account's root public key, if the account is registered.
+    pub fn account_root(&self, account_id: &str) -> Result<Option<[u8; 32]>, StoreError> {
+        let conn = self.lock()?;
+        let key: Option<Option<String>> = conn
+            .query_row(
+                "SELECT root_key FROM account WHERE account_id = ?1",
+                rusqlite::params![account_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(key.flatten().and_then(|hex| parse_hex_32(&hex)))
+    }
+
+    /// Register (or re-key) an account. Called through [`crate::Directory`], so
+    /// there is one way to create an account rather than two that can drift.
+    pub(crate) fn set_account_root(
+        &self,
+        account_id: &str,
+        root_key_hex: &str,
+        now_ms: i64,
+    ) -> Result<(), StoreError> {
+        let conn = self.lock()?;
+        conn.execute(
+            "INSERT INTO account(account_id, created_at_ms, root_key) VALUES (?1, ?2, ?3)
+             ON CONFLICT(account_id) DO UPDATE SET root_key = excluded.root_key",
+            rusqlite::params![account_id, now_ms, root_key_hex],
         )?;
         Ok(())
     }
@@ -131,6 +223,32 @@ impl RelayStore {
     pub(crate) fn lock(&self) -> Result<MutexGuard<'_, Connection>, StoreError> {
         self.conn.lock().map_err(|_| StoreError::Poisoned)
     }
+}
+
+/// True when `table` has `column` (the v1→v2 migration adds one in place).
+fn has_column(conn: &Connection, table: &str, column: &str) -> Result<bool, StoreError> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        if row.get::<_, String>(1)? == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Parse a 64-character hex string into 32 bytes.
+fn parse_hex_32(text: &str) -> Option<[u8; 32]> {
+    if text.len() != 64 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (index, chunk) in text.as_bytes().chunks(2).enumerate() {
+        let hi = (chunk[0] as char).to_digit(16)?;
+        let lo = (chunk[1] as char).to_digit(16)?;
+        out[index] = (hi * 16 + lo) as u8;
+    }
+    Some(out)
 }
 
 #[cfg(test)]

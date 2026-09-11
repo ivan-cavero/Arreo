@@ -6,7 +6,7 @@
 //! under test are properties of the *transactions* — an in-process mock would
 //! assert nothing about the thing that can actually go wrong.
 
-use arreo_core::identity::{DeviceKey, VerifyingKey};
+use arreo_core::identity::{DeviceKey, RootKey, VerifyingKey};
 use arreo_core::mesh::directory::{
     DirectoryError, MachineId, Name, Presence, STALE_AFTER_SECS, TOMBSTONE_SECS,
 };
@@ -19,7 +19,10 @@ const ACCOUNT: &str = "acct-1";
 fn directory() -> Directory {
     let store = RelayStore::open_memory().expect("in-memory store");
     let directory = Directory::new(store);
-    directory.create_account(ACCOUNT, 1_000).expect("account");
+    let root = RootKey::generate().expect("entropy");
+    directory
+        .create_account(ACCOUNT, &root.public(), 1_000)
+        .expect("account");
     directory
 }
 
@@ -70,8 +73,14 @@ fn the_schema_holds_directory_metadata_and_nothing_else() {
         ],
         "the machine table's columns are a contract: adding one is a decision, not a detail"
     );
+    // v2 (T-0029) added the account's root public key: the anchor a device
+    // certificate is verified against. Still metadata — a public key, not a
+    // secret — and the denylist below still applies to it.
     let account_columns = directory.store().columns("account").expect("columns");
-    assert_eq!(account_columns, vec!["account_id", "created_at_ms"]);
+    assert_eq!(
+        account_columns,
+        vec!["account_id", "created_at_ms", "root_key"]
+    );
 
     // Nothing that would put a secret, an agent's state, or a device grant in
     // the relay. The column set above is the strong check; this is the readable
@@ -172,8 +181,9 @@ fn concurrent_claims_serialize_into_one_plain_name_and_n_minus_one_suffixed() {
     // One store per thread, so the serialization under test is SQLite's (the
     // file lock), not a mutex we hold in this process.
     let store = RelayStore::open(&path).expect("store");
+    let root = RootKey::generate().expect("entropy");
     Directory::new(store)
-        .create_account(ACCOUNT, 0)
+        .create_account(ACCOUNT, &root.public(), 0)
         .expect("account");
 
     let barrier = Arc::new(std::sync::Barrier::new(CLAIMANTS));

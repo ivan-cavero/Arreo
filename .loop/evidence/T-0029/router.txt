@@ -1,0 +1,54 @@
+T-0029 relay router — acceptance tests (real binary, real QUIC, real certs)
+2026-09-11T08:25:38Z
+
+== core protocol + trust decision ==
+test relay::tests::an_envelope_over_the_cap_cannot_be_encoded ... ok
+test relay::tests::a_truncated_or_oversized_envelope_is_refused_not_guessed ... ok
+test relay::tests::an_envelope_round_trips_and_the_payload_is_never_parsed ... ok
+test relay::tests::an_undecodable_certificate_is_refused ... ok
+test relay::tests::the_proof_is_independent_of_how_the_device_id_is_announced ... ok
+test relay::tests::auth_accepts_a_real_device_and_refuses_every_impostor ... ok
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 103 filtered out; finished in 0.15s
+
+== relay: router integration + directory + pairing + store ==
+test pairing::tests::status_reports_the_time_left_and_unknown_sessions_are_named ... ok
+test pairing::tests::a_session_carries_four_flights_once_each ... ok
+test pairing::tests::nonsense_requests_are_refused_without_touching_state ... ok
+test pairing::tests::a_session_id_is_single_use ... ok
+test store::tests::migrating_twice_is_a_no_op_and_reports_one_version ... ok
+test pairing::tests::frames_are_read_whole_and_oversized_ones_are_refused ... ok
+test pairing::tests::the_burn_memory_is_bounded_but_keeps_the_recent_ids ... ok
+test pairing::tests::the_socket_path_serves_the_same_lifecycle ... ok
+test pairing::tests::expiry_closes_the_window_and_retires_the_id ... ok
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.10s
+test an_unknown_flag_is_refused ... ok
+test the_binary_refuses_to_start_with_nothing_to_serve ... ok
+test the_binary_serves_the_mailbox_over_tcp ... ok
+test the_binary_serves_the_mailbox_over_a_unix_socket ... ok
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+test a_name_conflict_suffixes_and_says_so ... ok
+test discovery_resolves_known_machines_and_cannot_create_them ... ok
+test rename_is_atomic_and_refuses_a_collision_without_partial_state ... ok
+test a_tombstone_holds_the_name_for_its_machine ... ok
+test add_rename_remove_readd_leaves_a_directory_that_round_trips ... ok
+test an_expired_tombstone_releases_the_name ... ok
+test a_machine_enters_only_through_a_live_join_ticket ... ok
+test the_schema_holds_directory_metadata_and_nothing_else ... ok
+test stale_is_pruned_from_the_one_presence_rule_and_is_idempotent ... ok
+test concurrent_claims_serialize_into_one_plain_name_and_n_minus_one_suffixed ... ok
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s
+test a_foreign_certificate_is_refused ... ok
+test a_certificate_without_a_proof_is_refused ... ok
+test a_replayed_proof_is_refused ... ok
+test a_restart_keeps_the_account_and_still_admits_its_devices ... ok
+test a_stalled_peer_does_not_block_the_next_device ... ok
+test a_peer_that_keeps_failing_is_rate_limited ... ok
+test a_spoofed_sender_and_a_foreign_account_are_refused ... ok
+test an_unknown_account_is_refused ... ok
+test a_zero_length_payload_is_carried ... ok
+test an_unknown_destination_is_refused_by_name ... ok
+test an_oversized_envelope_ends_the_session_without_buffering_it ... ok
+test two_devices_exchange_opaque_bytes_through_the_relay ... ok
+test a_known_device_that_is_offline_is_reported_as_such ... ok
+test a_reconnecting_device_keeps_its_newer_session ... ok
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.49s

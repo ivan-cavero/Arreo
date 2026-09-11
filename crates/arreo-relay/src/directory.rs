@@ -118,15 +118,33 @@ impl Directory {
         &self.store
     }
 
-    /// Create (or return) an account.
-    pub fn create_account(&self, account_id: &str, now_ms: i64) -> Result<(), DirectoryFailure> {
-        let conn = self.store.lock()?;
-        conn.execute(
-            "INSERT INTO account(account_id, created_at_ms) VALUES (?1, ?2)
-             ON CONFLICT(account_id) DO NOTHING",
-            params![account_id, now_ms],
-        )?;
+    /// Create (or re-key) an account, registering the root key its devices'
+    /// certificates chain to.
+    ///
+    /// The root key is not optional: the relay authenticates a device by
+    /// verifying its certificate against this key, so an account without one
+    /// could never admit anybody. Making that a parameter is what stops an
+    /// account from existing in a state where it is registered but unusable.
+    pub fn create_account(
+        &self,
+        account_id: &str,
+        root_key: &arreo_core::identity::VerifyingKey,
+        now_ms: i64,
+    ) -> Result<(), DirectoryFailure> {
+        self.store
+            .set_account_root(account_id, &hex32(&root_key.to_bytes()), now_ms)?;
         Ok(())
+    }
+
+    /// The account's root public key, if the account is registered.
+    pub fn account_root(
+        &self,
+        account_id: &str,
+    ) -> Result<Option<arreo_core::identity::VerifyingKey>, DirectoryFailure> {
+        let Some(bytes) = self.store.account_root(account_id)? else {
+            return Ok(None);
+        };
+        Ok(arreo_core::identity::VerifyingKey::from_bytes(&bytes).ok())
     }
 
     /// Register a machine against an account, spending a join ticket.
@@ -509,6 +527,15 @@ impl Directory {
             tombstone_until_ms,
         })
     }
+}
+
+/// Lowercase hex, the spelling the store keeps.
+fn hex32(bytes: &[u8; 32]) -> String {
+    let mut out = String::with_capacity(64);
+    for byte in bytes {
+        out.push_str(&format!("{byte:02x}"));
+    }
+    out
 }
 
 /// The stale threshold in milliseconds, for callers that report ages rather

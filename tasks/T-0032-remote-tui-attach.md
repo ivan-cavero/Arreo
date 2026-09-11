@@ -4,7 +4,7 @@ title: Remote TUI attach — the existing TUI drives a pane on another machine
 phase: 2
 priority: 3
 status: proposed
-depends_on: [T-0015, T-0023, T-0029, T-0030]
+depends_on: [T-0015, T-0023, T-0029, T-0030, T-0050]
 scope:
   - crates/arreo-tui/src/client.rs
   - crates/arreo-tui/src/main.rs
@@ -72,3 +72,9 @@ cargo xtask e2e --slice relay
 cargo xtask e2e --slice relay --interactive-evidence
 cargo xtask e2e --slice tui
 ```
+
+## Re-scope (2026-09-11, during T-0029)
+
+`depends_on` gained **T-0050** (daemon relay client). This task drives a pane on another machine,
+which needs a daemon that is *connected to the relay* — the router (T-0029) routes, but nothing
+dials it yet, and that wiring touches `arreo-server` rather than the relay. T-0050 is that half.

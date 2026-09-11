@@ -1,0 +1,502 @@
+//! The relay router (T-0029): authenticate a device, then move its bytes.
+//!
+//! One sentence: a device completes the nonce handshake, is registered under
+//! `(account, device)`, and every envelope it sends is checked against that
+//! session and forwarded to its destination — or answered with a typed outcome
+//! — while the payload is never decoded.
+//!
+//! **What the relay can and cannot do**, because "routes bytes it cannot read"
+//! is a claim that has to be checkable:
+//! - It *can* read the header: account, sender, destination, sequence, kind.
+//!   That is what routing needs, and the schema deliberately has nowhere to put
+//!   pane text, agent state or a key (a test asserts the column set).
+//! - It *cannot* read the payload. [`RelayEnvelope::decode`] stops at the end of
+//!   the header and hands the rest on as bytes, so no relay-side type ever
+//!   holds a payload's meaning — and the integration test asserts that
+//!   pane-shaped content arrives byte-identical and appears nowhere on disk.
+//! - It does not *decide* identity: [`arreo_core::relay::verify_auth`] does, in
+//!   core, and the router only carries the result. That is what keeps the trust
+//!   decision in one reviewed function rather than spread across a socket loop.
+
+use crate::store::{RelayStore, StoreError};
+use arreo_core::identity::{DeviceId, VerifyingKey};
+use arreo_core::relay::{
+    decode_message, encode_message, encode_payload, fresh_nonce, read_envelope, read_frame,
+    verify_auth, write_frame, Auth, AuthReply, Hello, HelloReply, Outcome, RelayEnvelope,
+    RelayError, RelayHeader, RelayKind, MAX_HANDSHAKE_BYTES, RELAY_SENDER, RELAY_VERSION,
+};
+use arreo_core::transport::{accept_connection, Connection, Endpoint, HandshakeLimiter, QuicError};
+use std::collections::HashMap;
+use std::net::SocketAddr;
+use std::sync::{Arc, Mutex};
+use tokio::sync::mpsc;
+
+/// The address the relay serves on when none is given (loopback: the shipped
+/// posture is a self-hosted relay behind the operator's own network).
+pub const DEFAULT_LISTEN: &str = "127.0.0.1:8787";
+
+/// How many outbound items one connection may have queued before the relay
+/// treats it as not keeping up.
+///
+/// A device that stops reading must not make the relay buffer without bound —
+/// that is how one slow peer becomes everybody's problem. When the queue is
+/// full the destination counts as unreachable and the sender is told so.
+pub const OUTBOUND_QUEUE: usize = 64;
+
+/// The relay's failures, as the router reports them.
+#[derive(Debug, thiserror::Error)]
+pub enum RouterError {
+    #[error("relay store: {0}")]
+    Store(#[from] StoreError),
+    #[error("relay transport: {0}")]
+    Transport(#[from] QuicError),
+    #[error("relay protocol: {0}")]
+    Protocol(#[from] RelayError),
+}
+
+/// One authenticated session's identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Session {
+    pub account_id: String,
+    pub device_id: DeviceId,
+}
+
+impl Session {
+    /// The key every map in this module uses. One spelling, so a lookup cannot
+    /// miss because one side wrote `dev_<hex>` and the other the bare hex — the
+    /// defect T-0023 hit in the transport's resolver.
+    fn key(&self) -> (String, String) {
+        (self.account_id.clone(), self.device_id.as_str().to_string())
+    }
+}
+
+/// Something to write to a device.
+#[derive(Debug)]
+enum Outbound {
+    /// An envelope for this device.
+    Envelope(RelayEnvelope),
+    /// This device's report on one of its own envelopes.
+    Status { seq: u64, outcome: Outcome },
+}
+
+/// The live sessions, keyed by `(account, device)`.
+struct Live {
+    senders: HashMap<(String, String), (mpsc::Sender<Outbound>, u64)>,
+    next_token: u64,
+}
+
+/// The router: the store, the live sessions, and the handshake budget.
+pub struct Router {
+    store: RelayStore,
+    live: Mutex<Live>,
+    limiter: HandshakeLimiter,
+}
+
+impl Router {
+    #[must_use]
+    pub fn new(store: RelayStore) -> Self {
+        Self {
+            store,
+            live: Mutex::new(Live {
+                senders: HashMap::new(),
+                next_token: 1,
+            }),
+            limiter: HandshakeLimiter::default(),
+        }
+    }
+
+    #[must_use]
+    pub fn store(&self) -> &RelayStore {
+        &self.store
+    }
+
+    /// How many devices are connected right now (tests, and the operator's log).
+    #[must_use]
+    pub fn live_count(&self) -> usize {
+        self.lock_live().senders.len()
+    }
+
+    fn lock_live(&self) -> std::sync::MutexGuard<'_, Live> {
+        match self.live.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+
+    /// Register a session's outbound queue, returning the token that must be
+    /// used to deregister it.
+    ///
+    /// The token exists because a device may reconnect while its old connection
+    /// is still winding down: without it, the old connection's cleanup would
+    /// remove the *new* one's registration and silently make the device
+    /// unreachable.
+    fn register(&self, session: &Session, sender: mpsc::Sender<Outbound>) -> u64 {
+        let mut live = self.lock_live();
+        let token = live.next_token;
+        live.next_token += 1;
+        live.senders.insert(session.key(), (sender, token));
+        token
+    }
+
+    fn deregister(&self, session: &Session, token: u64) {
+        let mut live = self.lock_live();
+        if live
+            .senders
+            .get(&session.key())
+            .is_some_and(|(_, held)| *held == token)
+        {
+            live.senders.remove(&session.key());
+        }
+    }
+
+    /// The decision for one envelope, without sending it.
+    ///
+    /// Synchronous and free of I/O so the policy is testable without a socket,
+    /// and so there is exactly one place where "may this device send this, to
+    /// here" is answered. Delivery itself happens in [`read_loop`], with the
+    /// real payload — a `decide` that enqueued a placeholder would send the
+    /// envelope twice.
+    fn decide(&self, session: &Session, header: &RelayHeader) -> Decision {
+        // The account is the session's, never the wire's: a device cannot reach
+        // into another account by writing a different id in the header.
+        if header.account_id != session.account_id {
+            return Decision::Refuse(format!(
+                "session is for account {}, not {}",
+                session.account_id, header.account_id
+            ));
+        }
+        // The sender is the session's. This is the check that makes spoofing
+        // impossible rather than merely discouraged.
+        match DeviceId::parse(&header.src_device) {
+            Ok(claimed) if claimed == session.device_id => {}
+            Ok(claimed) => {
+                return Decision::Refuse(format!(
+                    "session is {}, not {}",
+                    session.device_id, claimed
+                ))
+            }
+            Err(e) => return Decision::Refuse(format!("malformed src_device: {e}")),
+        }
+        // A device sends frames; statuses are the relay's to originate.
+        if header.kind != RelayKind::Frame {
+            return Decision::Refuse("a device may not send status envelopes".to_string());
+        }
+        let dst = match DeviceId::parse(&header.dst) {
+            Ok(dst) => dst,
+            Err(e) => return Decision::Refuse(format!("malformed dst: {e}")),
+        };
+        // Known-but-offline and never-seen are different answers: the first is
+        // "try later" (and becomes a queue in T-0030), the second is a mistake
+        // the sender should see immediately.
+        match self.store.device_known(&session.account_id, dst.as_str()) {
+            Ok(true) => {}
+            Ok(false) => return Decision::NoSuchDevice,
+            Err(e) => return Decision::Refuse(format!("device registry lookup failed: {e}")),
+        }
+        let key = (session.account_id.clone(), dst.as_str().to_string());
+        match self.lock_live().senders.get(&key) {
+            Some((sender, _)) => Decision::Deliver(sender.clone()),
+            None => Decision::Offline,
+        }
+    }
+}
+
+/// The router's answer for one envelope.
+#[derive(Debug)]
+enum Decision {
+    /// Hand this envelope to the destination's queue.
+    Deliver(mpsc::Sender<Outbound>),
+    Offline,
+    NoSuchDevice,
+    Refuse(String),
+}
+
+/// Serve sessions until the endpoint closes.
+pub async fn serve(endpoint: Endpoint, router: Arc<Router>) -> Result<(), RouterError> {
+    loop {
+        // Only the accept is serialized; the peer-paced handshake runs in its
+        // own task, so one quiet peer cannot stop the next device connecting
+        // (the same split the daemon's transport uses, for the same reason).
+        let Some(connection) = accept_connection(&endpoint, &router.limiter).await? else {
+            // `accept_connection` logs the refused address itself (it is the only
+            // place that knows it); nothing to add here.
+            continue;
+        };
+        let router = Arc::clone(&router);
+        tokio::spawn(async move {
+            if let Err(e) = handle_connection(connection, router).await {
+                eprintln!("arreo-relay: session ended: {e}");
+            }
+        });
+    }
+}
+
+/// One device's session, start to finish.
+async fn handle_connection(connection: Connection, router: Arc<Router>) -> Result<(), RouterError> {
+    let peer = connection.remote_address();
+    let (mut send, mut recv) = connection
+        .accept_bi()
+        .await
+        .map_err(|e| RouterError::Transport(QuicError::Connect(e.to_string())))?;
+    let mut buf = Vec::new();
+
+    // Hello: who is calling, and is that account known at all? An unknown
+    // account is refused here, before any cryptography — the cheap answer.
+    let body = read_frame(&mut recv, &mut buf, MAX_HANDSHAKE_BYTES).await?;
+    let hello: Hello = decode_message(&body)?;
+    if hello.v != RELAY_VERSION {
+        return refuse_hello(
+            &mut send,
+            &connection,
+            format!("protocol version {} is not supported", hello.v),
+        )
+        .await;
+    }
+    let Some(root_bytes) = router.store.account_root(&hello.account_id)? else {
+        eprintln!(
+            "arreo-relay: refused {peer}: unknown account {}",
+            hello.account_id
+        );
+        return refuse_hello(
+            &mut send,
+            &connection,
+            format!("unknown account {}", hello.account_id),
+        )
+        .await;
+    };
+    let root = match VerifyingKey::from_bytes(&root_bytes) {
+        Ok(root) => root,
+        Err(e) => {
+            return refuse_hello(
+                &mut send,
+                &connection,
+                format!("account root key is unusable: {e}"),
+            )
+            .await
+        }
+    };
+
+    // Challenge: a fresh nonce, so a recorded handshake is worthless.
+    let nonce = fresh_nonce()?;
+    let challenge = HelloReply::Challenge {
+        v: RELAY_VERSION,
+        nonce: nonce.to_vec(),
+    };
+    write_frame(&mut send, &encode_message(&challenge)?).await?;
+
+    // Auth: the certificate and the proof of possession.
+    let body = read_frame(&mut recv, &mut buf, MAX_HANDSHAKE_BYTES).await?;
+    let auth: Auth = decode_message(&body)?;
+    let device = match verify_auth(&hello.account_id, &hello.device_id, &root, &nonce, &auth) {
+        Ok(device) => device,
+        Err(e) => {
+            eprintln!(
+                "arreo-relay: refused {peer} for account {}: {e}",
+                hello.account_id
+            );
+            return refuse_auth(&mut send, &connection, e.to_string()).await;
+        }
+    };
+
+    // A device that completed a handshake is not an enumeration attempt: forget
+    // its history, so a phone that reconnects after a real network drop is not
+    // punished for the retries that got it here. Refusals deliberately do *not*
+    // forgive — a peer that keeps failing is exactly who the budget is for.
+    router.limiter.forgive(peer.ip());
+    let session = Session {
+        account_id: device.account_id.clone(),
+        device_id: device.device_id.clone(),
+    };
+    router.store.touch_device(
+        &session.account_id,
+        session.device_id.as_str(),
+        crate::directory::now_ms(),
+    )?;
+    write_frame(
+        &mut send,
+        &encode_message(&AuthReply::Welcome {
+            v: RELAY_VERSION,
+            account_id: session.account_id.clone(),
+            device_id: session.device_id.display_id(),
+        })?,
+    )
+    .await?;
+    eprintln!(
+        "arreo-relay: {peer} authenticated as {} in account {}",
+        session.device_id, session.account_id
+    );
+
+    // From here the connection is two independent directions: a writer task
+    // owns the send half, and this task owns the read half.
+    let (outbound, mut queue) = mpsc::channel::<Outbound>(OUTBOUND_QUEUE);
+    let token = router.register(&session, outbound.clone());
+    let writer_session = session.clone();
+    let writer = tokio::spawn(async move {
+        while let Some(item) = queue.recv().await {
+            let frame = match item {
+                Outbound::Envelope(envelope) => envelope.encode(),
+                Outbound::Status { seq, outcome } => {
+                    status_envelope(&writer_session, seq, &outcome).and_then(|e| e.encode())
+                }
+            };
+            match frame {
+                Ok(bytes) => {
+                    if write_frame(&mut send, &bytes).await.is_err() {
+                        return;
+                    }
+                }
+                Err(e) => {
+                    eprintln!("arreo-relay: cannot encode an outbound message: {e}");
+                    return;
+                }
+            }
+        }
+    });
+
+    // Read envelopes until the device goes away.
+    let result = read_loop(&mut recv, &mut buf, &router, &session, &outbound).await;
+    router.deregister(&session, token);
+    drop(outbound);
+    let _ = writer.await;
+    eprintln!(
+        "arreo-relay: {} disconnected ({})",
+        session.device_id,
+        if result.is_ok() { "clean" } else { "error" }
+    );
+    result
+}
+
+/// The envelope read loop: validate, decide, deliver, report.
+async fn read_loop<R>(
+    recv: &mut R,
+    buf: &mut Vec<u8>,
+    router: &Arc<Router>,
+    session: &Session,
+    outbound: &mpsc::Sender<Outbound>,
+) -> Result<(), RouterError>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    loop {
+        let envelope = match read_envelope(recv, buf).await {
+            Ok(envelope) => envelope,
+            // The peer closing is the normal end of a session, not an error to
+            // shout about.
+            Err(RelayError::Transport(_)) => return Ok(()),
+            Err(e) => return Err(RouterError::Protocol(e)),
+        };
+        let seq = envelope.header.seq;
+
+        let outcome = match router.decide(session, &envelope.header) {
+            Decision::Deliver(destination) => {
+                match destination.try_send(Outbound::Envelope(envelope)) {
+                    Ok(()) => Outcome::Delivered,
+                    // The destination is connected but not keeping up; that is the
+                    // same answer as offline, and the honest one.
+                    Err(_) => Outcome::Offline,
+                }
+            }
+            Decision::Offline => Outcome::Offline,
+            Decision::NoSuchDevice => Outcome::NoSuchDevice,
+            Decision::Refuse(reason) => {
+                eprintln!(
+                    "arreo-relay: refused envelope from {}: {reason}",
+                    session.device_id
+                );
+                Outcome::Refused { reason }
+            }
+        };
+
+        // Every envelope gets a report, so a sender never has to guess whether
+        // its bytes went anywhere.
+        if outbound
+            .try_send(Outbound::Status { seq, outcome })
+            .is_err()
+        {
+            eprintln!(
+                "arreo-relay: {} is not reading its delivery reports; dropping one",
+                session.device_id
+            );
+        }
+    }
+}
+
+/// Finish a handshake with a refusal, and make sure the peer can read it.
+///
+/// Writing the frame is not enough: dropping the connection right afterwards
+/// can discard it, and the peer then reports "connection lost" instead of the
+/// reason the relay actually gave. So the stream is finished (which delivers
+/// what was written) and the connection is left open briefly for the peer to
+/// read and close — bounded, so a peer that never does cannot pin a task.
+async fn refuse_hello<S>(
+    send: &mut S,
+    connection: &Connection,
+    reason: String,
+) -> Result<(), RouterError>
+where
+    S: tokio::io::AsyncWrite + Unpin,
+{
+    let reply = HelloReply::Refused {
+        v: RELAY_VERSION,
+        reason,
+    };
+    let _ = write_frame(send, &encode_message(&reply)?).await;
+    // `shutdown` (not quinn's `finish`): the relay does not name the transport's
+    // types, and for a stream the two mean the same thing.
+    let _ = tokio::io::AsyncWriteExt::shutdown(send).await;
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(2), connection.closed()).await;
+    Ok(())
+}
+
+/// The same for the post-challenge stage, where the peer expects an [`AuthReply`].
+async fn refuse_auth<S>(
+    send: &mut S,
+    connection: &Connection,
+    reason: String,
+) -> Result<(), RouterError>
+where
+    S: tokio::io::AsyncWrite + Unpin,
+{
+    let reply = AuthReply::Refused {
+        v: RELAY_VERSION,
+        reason,
+    };
+    let _ = write_frame(send, &encode_message(&reply)?).await;
+    let _ = tokio::io::AsyncWriteExt::shutdown(send).await;
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(2), connection.closed()).await;
+    Ok(())
+}
+
+/// A status envelope from the relay itself.
+fn status_envelope(
+    session: &Session,
+    seq: u64,
+    outcome: &Outcome,
+) -> Result<RelayEnvelope, RelayError> {
+    Ok(RelayEnvelope {
+        header: RelayHeader {
+            v: RELAY_VERSION,
+            account_id: session.account_id.clone(),
+            src_device: RELAY_SENDER.to_string(),
+            dst: session.device_id.display_id(),
+            seq,
+            kind: RelayKind::Status,
+        },
+        payload: encode_payload(outcome)?,
+    })
+}
+
+/// A human-readable one-liner for the operator's log when the relay starts.
+#[must_use]
+pub fn describe_listen(addr: SocketAddr) -> String {
+    if addr.ip().is_loopback() {
+        format!("loopback only ({addr})")
+    } else {
+        format!(
+            "{addr} — reachable off this machine: the relay authenticates each device by \
+             verifying its certificate against the account's registered root key, and never \
+             reads what it routes, but anyone who can reach this port can open a session and be \
+             refused"
+        )
+    }
+}

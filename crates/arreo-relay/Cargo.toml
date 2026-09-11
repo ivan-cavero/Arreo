@@ -22,3 +22,7 @@ serde_json = "1"
 # product, one supply-chain entry, no second store style.
 rusqlite = { version = "0.31", features = ["bundled"] }
 thiserror = "2"
+# The router (T-0029) is async because the QUIC endpoint is: one task per
+# session, and live delivery is a channel per connected device. The transport
+# itself comes from arreo-core, so quinn is not named here.
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "time", "net"] }

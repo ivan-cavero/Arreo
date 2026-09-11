@@ -4,7 +4,7 @@ title: Relay e2e slice — routing, inbox, presence and remote attach as PASS/FA
 phase: 2
 priority: 4
 status: proposed
-depends_on: [T-0029, T-0030, T-0031, T-0032, T-0033]
+depends_on: [T-0029, T-0030, T-0031, T-0032, T-0033, T-0050]
 scope:
   - xtask/src/relay_slice.rs
   - xtask/src/main.rs
@@ -73,3 +73,9 @@ cargo xtask e2e --slice relay --weakened
 ```
 
 The `--weakened` run is expected to report the tamper/ciphertext checks as FAIL.
+
+## Re-scope (2026-09-11, during T-0029)
+
+`depends_on` gained **T-0050** (daemon relay client). This slice's whole premise is "two real
+daemons" exchanging traffic through a real relay; T-0029 proved the router with two real protocol
+clients and recorded the daemon half as T-0050, so the slice cannot run before it lands.

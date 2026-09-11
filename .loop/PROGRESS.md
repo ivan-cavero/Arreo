@@ -1,49 +1,45 @@
 ## State snapshot          ← REWRITTEN (not appended) at every checkpoint
-Task: T-0043 · machine directory (phase 2) — DONE, evidence recorded
-Where you are: directory landed (core rules + relay SQLite store + ADR 0012); all
-gates green on the final code
-Next step: **T-0029 (relay v0)** — p2, deps met (T-0018/T-0023/T-0025), and now
-the unambiguous head of the queue: it is the relay's router, which T-0044 needs
-(see the finding below). It also unblocks the largest cluster (T-0030, T-0031,
-T-0032, T-0033, T-0034, T-0035, and transitively T-0045..T-0047).
-Open workers: (none)
+Task: T-0029 · relay v0 router (phase 2) — DONE, evidence recorded; docs worker finishing
+Where you are: router landed and green (14 integration tests over the real binary, real QUIC,
+real certs); ADR 0013 written; T-0029 re-scoped and marked done; T-0050 created
+Next step: **T-0050 (daemon relay client)** — p2, and the recorded half of T-0029's criterion 4.
+It is the head of the queue: T-0032 and T-0034 now depend on it, and it is what makes the relay
+reachable by an actual machine. (T-0030 durable inbox is p2 and also ready; it is the other
+unblocking half for "offline is normal".)
+Open workers: RelayDocs (writing docs/relay-protocol.md + docs/relay-deploy.md; protocol spec
+landed, deploy guide pending) — integrate before committing
 Known broken: (none) · Parked: (none)
 Findings:
-- **A tombstone that keeps a row also keeps the UNIQUE index.** Holding a removed
-  name for its machine means the row stays, so `UNIQUE(account_id, name_key)`
-  kept holding it too — and an *expired* tombstone could never release the name
-  (the reclaim path hit a constraint violation). The fix is a three-state
-  `name_key` (live / unexpired tombstone / NULL = released) plus a release step
-  inside the claim transaction. Any "hold the row but free the key" policy needs
-  the same treatment.
-- **Boundary predicates must be asserted on both sides of the instant.** The
-  tombstone deadline is `until > now` (core) and `<= now` releases (relay); a test
-  that only checks "after expiry" would have passed with either convention. Pin
-  `until - 1` and `until` separately.
-- **A test can be self-contradictory and look like a code bug.** One draft test
-  had the owner reclaim its name *and* expected the name free after expiry — both
-  true statements, impossible in one directory. Splitting the scenario is what
-  made the real (tombstone) bug visible instead of hiding behind a rewrite.
-- **Rejecting is stronger than normalizing when the rule is ASCII.** NFC is the
-  identity over `[a-z0-9-]`, so validating the casefolded form needs no Unicode
-  crate — and refusing a confusable (`wоrkbox` with a Cyrillic `о`) is strictly
-  better than normalizing it, because it can never enter the directory at all.
-- **The task file's ADR number was already taken** (`0009` is device-identity).
-  Accepted ADRs are immutable, so the decision landed as 0012 and the task file
-  points there with the reason. Check the number before writing one.
-- **T-0044 was not actually ready, and the task file now says so.** Its `add`
-  verb completes an *account join*, but a `JoinTicket` (T-0043) exists only
-  in-process — nothing issues one over the wire, and the criterion's own
-  integration test needs "a loopback relay + daemon pair". Both need T-0029's
-  router, so T-0044's `depends_on` gained T-0029 with the reason written into the
-  file. The alternative was inventing an account-join transport inside a CLI task
-  — wrong file, wrong fence. (The same standard is why `status`'s trusted-device
-  count is specified as `null` until T-0046 rather than a fabricated 0.)
-- Ready-queue note: **T-0036 (signed releases, p1) is human-gated** — it needs a
-  `MINISIGN_SECRET_KEY` CI secret and a committed public key, neither of which an
-  agent may provision (and no fake secrets). It stays `proposed` until a human
-  creates the key; T-0043 was the highest-priority task whose deps were met and
-  which had no human prerequisite.
+- **A length prefix cannot be authenticated by the seal it precedes, and the same confusion bit
+  twice more in this task.** `RelayEnvelope::encode` writes its own prefix; the relay read through
+  the generic `read_frame` (which strips one) and handed `decode` a body it read as a size — the
+  relay saw a 1.6 GB frame and dropped the session. The core unit test missed it by calling
+  `decode` directly. Then the *same* mistake recurred inside a payload (`encode_message` prefixes,
+  `decode_message` does not). Both are now named: `read_envelope` + `RelayError::Incomplete` (the
+  one retryable case) for the outer frame, `encode_payload`/`decode_payload` for the inner value.
+  **Lesson: when two functions differ only by a prefix, name them so the wrong pairing is
+  unwritable** — a test that calls the inner function directly cannot catch the outer confusion.
+- **A refusal written and immediately abandoned is not a refusal.** Returning right after
+  `write_frame` dropped the connection before the peer read it, so the client reported "connection
+  lost" instead of the relay's reason. The refusal path now finishes the stream and holds the
+  connection briefly.
+- **Device ids compared as strings again.** The wire carries `dev_<hex>`, the certificate holds
+  bare hex — the same defect class T-0023 hit in the transport resolver. Parse to `DeviceId` and
+  compare values. This is now the third occurrence; treat any id comparison across a wire boundary
+  as suspect by default.
+- **A rate limiter will catch your own tests, and that is the protection working.** Four refusals
+  from one address tripped the handshake budget mid-test. The fix was to split those cases into
+  independent relays and *pin* the limiter's behavior in its own test — not to weaken it.
+- **A subagent can find a class of bug the parent is pattern-blind to** — worth remembering as a
+  reason to keep delegating docs and reviews rather than writing everything in one head.
+- **`check-targets` caught the new module immediately**: `arreo_core::relay::client` needs the QUIC
+  transport, so the module (and its re-export) is now `#[cfg(feature = "transport")]`. The lesson
+  from T-0023 holds: every new core module must keep a pure-Rust surface, or the gate loses meaning.
+- **Re-scope recorded, not silent:** T-0029's fence gained `crates/arreo-core/src/relay/**` (the
+  wire vocabulary must be Apache for T-0035's boundary), and "two real daemons" became "two real
+  protocol clients" with the daemon half split out as **T-0050**. T-0032 and T-0034 gained that
+  dependency. An account registry door (`arreo-relay account add`) was added because a relay with
+  no registered account refuses every device — the criteria assumed it existed.
 ## Event log               ← append-only; newest last; never rewrite
 - 2026-09-10 [turn 1] ledger created; repo at e489fac (docs only); T-0001 + T-0022 (AGENTS.md gardened) done
 - 2026-09-10 [turn 2] T-0002 PTY manager done+pushed (342606c; 9 tests); PROMPT.md v2 synced + ADR 0001 (ef6c595)
@@ -70,3 +66,4 @@ Findings:
 - 2026-09-11 [turn 22] T-0024 pairing done+pushed (f275056; SPAKE2+HMAC flow in core, single-use write-once mailbox in arreo-relay served over unix+TCP, `arreo pair` both sides, `pairing_failed` audit kind, ADR 0010, 6 three-process scenarios + 28 unit tests, evidence); 4 real defects fixed en route (premature burn, expiry race, invisible audit kind, unguarded unix socket breaking the Windows gate); T-0049 filed (CLI broken-pipe panic); gates all green (211 tests, vet 279, deny 4/4, check-targets PASS/SKIP, bench 6/6); remote == local
 - 2026-09-11 [turn 23] T-0023 remote transport done+pushed: Noise-KK (snow) inside QUIC (quinn), one bidi stream carrying the T-0013 msgpack frames; Noise static derived from the pinned ed25519 identity (ADR 0011); per-verb gate (`DeviceAuthority::check_verb`) in front of the *same* `serve_session` loop the unix socket runs; zero inbound ports by default (loopback test seam only). 15 core + 5 daemon tests over real streams/sockets; 6 real defects fixed (resolver id spelling, replay guard, pump request/response deadlock, impossible frame length, quiet-peer accept starvation, swallowed failure reason); `transport` feature gate keeps `check-targets` at PASS/SKIP; vet exemptions regenerated 279->336; 236 workspace tests, clippy/fmt clean, deny/audit green, bench 6/6, all five e2e slices green; evidence in `.loop/evidence/T-0023/`; remote == local
 - 2026-09-11 [turn 24] T-0043 machine directory done+pushed: `arreo_core::mesh` (MachineId/Name rules with ASCII-only rejection, presence thresholds, canonical sorted export, read-only DirectoryCache) + `arreo-relay` SQLite (single RelayStore connection/migration owner, account/machine tables, UNIQUE(account_id,name_key), tombstones, BEGIN IMMEDIATE claims) + ADR 0012 (task file said 0009, already taken — corrected); 10 directory acceptance tests (schema denylist, explicit-join ticket, suffix conflicts, 8-thread concurrent claims, rename atomicity, tombstone hold + expiry boundary, stale prune idempotence, export round-trip) + 5 core rule tests; 1 real defect fixed (expired tombstone could never release its name); 252 workspace tests, clippy/fmt clean, vet/deny/audit green, check-targets PASS/SKIP; evidence in `.loop/evidence/T-0043/`; remote == local
+- 2026-09-11 [turn 25] T-0029 relay v0 router done: Apache wire vocabulary + reference client in `arreo_core::relay` (framing, Hello/Challenge/Auth/Welcome, certificate + proof-of-possession auth, typed outcomes), AGPL router in `arreo-relay` (accept/handshake split, per-(account,device) live map, per-envelope validation, status reports, rate limiter), store v2 (account root key + relay_device registry), CLI `serve`/`account add` with the T-0024 pairing path preserved, ADR 0013; 6 core + 14 integration tests (real binary, real QUIC, real certs: opacity scan over state dir and logs, unknown account/foreign cert/no-proof/replayed-proof refusals, spoofed sender, foreign account, unknown vs offline destination, restart durability, stalled peer, reconnect token, zero-length payload, oversized frame, rate limit); 6 defects fixed (double length prefix in the envelope path, the same in a payload, lost refusal, string id comparison, no forgive-on-success, test tripped its own limiter); re-scoped with T-0050 created for the daemon half; 268 workspace tests, clippy/fmt clean, vet/deny/audit green, check-targets PASS/SKIP; evidence in `.loop/evidence/T-0029/`

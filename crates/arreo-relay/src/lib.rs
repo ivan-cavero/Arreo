@@ -10,8 +10,10 @@
 
 pub mod directory;
 pub mod pairing;
+pub mod router;
 pub mod store;
 
 pub use directory::{Directory, DirectoryFailure, JoinTicket};
 pub use pairing::{Mailbox, MAX_FRAME_BYTES, MAX_REMEMBERED_BURNS, READ_TIMEOUT};
+pub use router::{Router, RouterError, Session};
 pub use store::{RelayStore, StoreError, SCHEMA_VERSION};

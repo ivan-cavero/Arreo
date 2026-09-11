@@ -13,6 +13,7 @@ pub mod metrics;
 pub mod pairing;
 pub mod proto;
 pub mod pty;
+pub mod relay;
 pub mod state;
 #[cfg(feature = "sqlite")]
 pub mod store;
