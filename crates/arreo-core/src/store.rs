@@ -1166,6 +1166,54 @@ impl ExportFormat {
     }
 }
 
+/// An epoch-millisecond instant as RFC3339 UTC (`2026-09-11T09:30:00Z`).
+///
+/// **Why a formatter and not a date library.** `chrono` and `time` are
+/// dependencies for one conversion — days-to-civil, which is twenty lines of
+/// well-known arithmetic (Howard Hinnant's `civil_from_days`). A dependency
+/// that large, for a value that appears in one JSON field, is the scaffolding
+/// AGENTS.md forbids; and the arithmetic is exactly the kind of thing that can
+/// be tested against known instants, which the tests below do.
+///
+/// **Why RFC3339 for a script contract at all.** The audit ledger's rows carry
+/// `ts_ms` (an integer) because they are read by machines that compare numbers.
+/// A directory listing is read by humans and by scripts, and `as_of` answers
+/// "how stale is this" at a glance — which a millisecond count does not. The
+/// integer form travels beside it (`age_secs`) for anyone who wants to compare.
+#[must_use]
+pub fn rfc3339_ms(ms: i64) -> String {
+    let secs = ms.div_euclid(1000);
+    let millis = ms.rem_euclid(1000);
+    let days = secs.div_euclid(86_400);
+    let day_secs = secs.rem_euclid(86_400);
+    let (year, month, day) = civil_from_days(days);
+    let (hour, minute, second) = (day_secs / 3600, (day_secs % 3600) / 60, day_secs % 60);
+    let mut out = format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}");
+    if millis != 0 {
+        out.push_str(&format!(".{millis:03}"));
+    }
+    out.push('Z');
+    out
+}
+
+/// Days since 1970-01-01 to a civil `(year, month, day)`, proleptic Gregorian.
+///
+/// Hinnant's algorithm: shift the epoch to 0000-03-01 so leap days land at the
+/// end of the year, which makes the month lengths periodic and the whole
+/// conversion branch-free apart from the era adjustment.
+fn civil_from_days(days: i64) -> (i64, u32, u32) {
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let year = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    (if month <= 2 { year + 1 } else { year }, month, day)
+}
+
 /// One row as the export and `--json` readers see it. Field names are the
 /// contract a script parses, so they are snake_case and stable.
 #[must_use]
@@ -1293,4 +1341,42 @@ fn redact(prompt: &str) -> (String, bool) {
         );
     }
     (out.join("\n"), true)
+}
+
+#[cfg(test)]
+mod timestamp_tests {
+    use super::rfc3339_ms;
+
+    /// Known instants, including the ones a naive implementation gets wrong:
+    /// the epoch, a leap day, a century that is not a leap year, a negative
+    /// instant, and a millisecond remainder.
+    #[test]
+    fn rfc3339_matches_known_instants() {
+        assert_eq!(rfc3339_ms(0), "1970-01-01T00:00:00Z");
+        assert_eq!(rfc3339_ms(1_000), "1970-01-01T00:00:01Z");
+        assert_eq!(rfc3339_ms(1_500), "1970-01-01T00:00:01.500Z");
+        assert_eq!(rfc3339_ms(-1), "1969-12-31T23:59:59.999Z");
+        // 2000-02-29: a leap day in a leap century.
+        assert_eq!(rfc3339_ms(951_782_400_000), "2000-02-29T00:00:00Z");
+        // 2100-03-01: 2100 is *not* a leap year, so February has 28 days.
+        assert_eq!(rfc3339_ms(4_107_542_400_000), "2100-03-01T00:00:00Z");
+        // 2026-09-11T09:30:00Z, the day this was written.
+        assert_eq!(rfc3339_ms(1_789_119_000_000), "2026-09-11T09:30:00Z");
+    }
+
+    /// The conversion is monotonic over a span that crosses leap days, years and
+    /// the epoch: a formatter that is off by one day somewhere shows up here.
+    #[test]
+    fn rfc3339_is_monotonic_and_round_trips_through_days() {
+        let mut previous = String::new();
+        let mut ms = -100_000_000_000i64;
+        while ms < 100_000_000_000 {
+            let text = rfc3339_ms(ms);
+            if !previous.is_empty() {
+                assert!(text > previous, "{text} must follow {previous}");
+            }
+            previous = text;
+            ms += 3_600_000;
+        }
+    }
 }

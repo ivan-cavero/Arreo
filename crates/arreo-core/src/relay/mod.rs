@@ -51,6 +51,13 @@ pub mod client;
 #[cfg(feature = "transport")]
 pub use client::{Incoming, RelayClient, RelayReader, RelayWriter};
 
+/// The `[relay]` configuration file, and its one loader.
+///
+/// Ungated, like the protocol vocabulary: it is plain data with no transport in
+/// it, and both the daemon and the CLI need to read it (T-0044) — a build
+/// without QUIC still has a configuration file to parse.
+pub mod config;
+
 /// A live relay session: dial once, then hold a byte stream to each peer.
 ///
 /// Distinct from [`client`], which is the protocol and one connection's

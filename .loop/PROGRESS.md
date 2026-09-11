@@ -1,20 +1,24 @@
 ## State snapshot          ← REWRITTEN (not appended) at every checkpoint
-Task: T-0056 · directory over the wire — DONE; T-0044 may start (its join prerequisite now exists)
-Where you are: a machine asserts its own row in the account's directory on connect and on its
-presence cadence, and an account device reads the directory — both over the relay, both proven
-through the real binary. 390 tests. T-0044 is now startable (its join prerequisite exists).
-Next step: **T-0044 (`arreo machines`)** — the CLI half; its fence owns `crates/arreo-cli/src/machines.rs`
-and it needs a socket verb that proxies the daemon's `machines` request. Then T-0046 (per-machine trust).
+Task: T-0044 · `arreo machines` — read side DONE (list/status, JSON contract, cache, exit codes);
+`add` moved to T-0058 and `rename`/`remove` to T-0057, both filed with reasons in the task file
+Where you are: `arreo machines list|status` read the account's directory from the relay with the
+CLI's own paired identity (no daemon, no socket verb), print a versioned JSON contract or a
+non-contract table, and answer from a labelled cache when the relay is unreachable. 408 tests.
+Next step: **T-0057** (directory writes over the wire: rename/remove) then **T-0058** (`machines add`
+and the join handoff); both unblock the rest of T-0044. Then T-0046 (per-machine trust).
 Open workers: (none)
 Known broken: (none) · Parked: (none)
 Findings:
-- **A test that fails 1 in 6 fails in CI at the worst moment.** The daemon-log assertion raced the
-  thread collecting stderr; polled with a deadline, and proven stable over 6 group runs.
-- **The relay's directory identity is the machine's root key**, so a reconnecting machine refreshes
-  its row without re-claiming its name — a suffixed name survives a restart.
-- **The join proof is bound to the session nonce**: a correct proof on the wrong session is refused.
-- **A session's last frame was written and discarded** (T-0052) — dropping the channel aborts the pump.
-- **The registry is observability, not the mechanism** (T-0052). **The tick IS the latency budget.**
+- **An insertion between a `#[cfg]` attribute and the item it gates moves the gate.** `pub mod
+  config;` added before `pub mod session;` silently ungated the session (Windows check-targets went
+  red). Attribute-adjacent inserts need the attribute moved with the item.
+- **A cached row is never `online`**: liveness is the one claim a cache cannot substantiate, so it is
+  downgraded and flagged `unverified` rather than hoped to be old.
+- **The contract test is the schema.** Renaming a key or widening the presence enum turns the build
+  red — proved by doing it.
+- **`rfc3339` by hand (Hinnant), not `chrono`**: twenty lines against a dependency for one field.
+- **A test that fails 1 in 6 fails in CI at the worst moment** (T-0056). **The tick IS the latency
+  budget** (T-0052).
 ## Event log               ← append-only; newest last; never rewrite
 - 2026-09-10 [turn 1] ledger created; repo at e489fac (docs only); T-0001 + T-0022 (AGENTS.md gardened) done
 - 2026-09-10 [turn 2] T-0002 PTY manager done+pushed (342606c; 9 tests); PROMPT.md v2 synced + ADR 0001 (ef6c595)
@@ -68,3 +72,5 @@ Findings:
 - 2026-09-11 [turn 40] T-0052 revocation live cutoff done (daemon side; the relay-router half re-scoped to T-0046's propagation work): per-session self-re-validation on a 500 ms tick (no central sweeper, no cross-process signaling — a CLI revoke in another process is observed on the next tick), typed revocation error delivered before close, `LiveSessions` registry (one entry per device with a count, leak-tested over 1000 rounds), unchanged transcripts for unrevoked sessions. Two real bugs fixed en route: a session's final frame was written then discarded because dropping the channel aborts the pump (`serve_session` now shuts its write half down and pauses 300 ms, so every session end flushes), and the tick's interval is the whole latency budget (1 s tick measured 1.004 s; 500 ms measures ~0.5 s). Evidence `.loop/evidence/T-0052/`. 380 workspace tests, clippy/fmt clean, vet/deny/audit green, check-targets PASS/SKIP, 8 e2e slices green, bench 6/6; remote == local
 
 - 2026-09-11 [turn 41] T-0056 directory over the wire done: `join`/`machines`/`directory` kinds, the session's request/response path (reserve the seq, park the slot, *then* send — a fast reply must not race its waiter), the relay's directory handlers (a machine with a row refreshes presence without re-claiming its name; a new one claims through a ticket the relay mints), and the daemon asserting its own row on connect and on the presence cadence. The join proof is bound to the session nonce, so a recorded join is worthless in another session (tested by sending a correct proof on the wrong session). `arreo machines` (T-0044) is now startable; T-0050 landed the session machinery without the machine-registration half, which is why this became its own task. Files: core relay vocabulary + session API, relay router handlers, daemon relay client, docs/relay-protocol.md §4.2/§4.7/§8.4. Evidence `.loop/evidence/T-0056/`. 390 workspace tests, clippy/fmt clean, vet/deny/audit green, check-targets PASS/SKIP, 8 e2e slices green, bench 6/6
+
+- 2026-09-11 [turn 42] T-0044 `arreo machines` read side done (list/status, `--json` schema 1 with a contract test that fails on a renamed key or an out-of-enum value, an honest cache with `source:"cache"` + `unverified` + exit 4 off `--offline`, stable exit codes 0/2/3/4/5, docs/machines.md, hermetic test through the real CLI and a real relay). The CLI dials the relay with its own paired identity — no daemon, no socket verb. `[relay]` config moved to `arreo_core::relay::config` (the CLI must not depend on arreo-server; one parser). `add` → T-0058 and `rename`/`remove` → T-0057, each filed with its reason and named in `--help`; `--watch` waits for presence push. Found: inserting a module between a `#[cfg]` attribute and the item it gated moved the gate (Windows check-targets caught it). Evidence `.loop/evidence/T-0044/`. 408 workspace tests, clippy/fmt clean, vet/deny/audit green, check-targets PASS/SKIP, 8 e2e slices green, bench 6/6

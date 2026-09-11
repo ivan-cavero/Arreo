@@ -66,6 +66,11 @@ fn usage() -> ExitCode {
     eprintln!("      revoke <name|id>       (idempotent; the audit row names who and when)");
     eprintln!("  arreo pair [--role owner|viewer] [--ttl-secs N] [--mailbox ADDR] [--json]   (show a code; pins the device that types it)");
     eprintln!("  arreo pair --join \"four words\" --uri arreo://pair?... [--name N] [--json]   (this device joins)");
+    eprintln!("  arreo machines list [--json] [--all] [--offline] [--config PATH]");
+    eprintln!("  arreo machines status [<name>] [--json] [--offline]   (0 ok, 2 usage, 3 unknown machine, 4 relay unreachable, 5 conflict)");
+    eprintln!(
+        "      --json is the script contract (schema 1); the human table is not one and may change"
+    );
     eprintln!("      authorize --verb <read|send|...>   (the transport's own decision path)");
     ExitCode::from(2)
 }
@@ -117,9 +122,12 @@ fn main() -> ExitCode {
         Some("audit") => cmd_audit(&args[2..]),
         Some("devices") => cmd_devices(&args[2..]),
         Some("pair") => cmd_pair(&args[2..]),
+        Some("machines") => machines::run(&args[2..]),
         _ => usage(),
     }
 }
+
+mod machines;
 
 /// Minimal block_on (current-thread runtime: no extra threads for a CLI).
 mod rt {

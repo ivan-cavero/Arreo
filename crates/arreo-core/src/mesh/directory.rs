@@ -315,11 +315,21 @@ pub fn parse_export(text: &str) -> Option<Vec<MachineRow>> {
 }
 
 /// One machine as a *server* caches it.
+///
+/// The fields are the ones a *renderer* needs when the relay is unreachable
+/// (T-0044's `source: "cache"`): who it is, how alive it looked, when, what it
+/// spoke, and whether its name needed a suffix. Nothing here is derived — every
+/// value is what the relay said, stored as it said it, because a cache that
+/// computes its own presence would be a second presence rule (T-0043 has one).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CachedMachine {
     pub machine_id: MachineId,
     pub presence: Presence,
     pub last_seen_ms: i64,
+    #[serde(default)]
+    pub proto_version: u32,
+    #[serde(default)]
+    pub name_conflict: bool,
 }
 
 /// A server's read-only mirror of the directory.
@@ -358,6 +368,8 @@ impl DirectoryCache {
                     machine_id: row.machine_id.clone(),
                     presence: row.presence,
                     last_seen_ms: row.last_seen_ms,
+                    proto_version: row.proto_version,
+                    name_conflict: row.name_conflict,
                 },
             );
         }

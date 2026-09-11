@@ -1,0 +1,543 @@
+//! T-0044 acceptance tests: the real CLI, a real relay, a real directory.
+//!
+//! Nothing is mocked. `arreo-relay` runs as a child process (as a *binary*, never
+//! a linked crate: it is AGPL and this crate must not depend on it, T-0035), the
+//! CLI runs as a child process with its own identity directory, and the rows it
+//! prints were written into the relay's durable directory through the same wire
+//! RPC every other client uses (T-0056).
+//!
+//! The relay binary is located beside this test's own binary, so these tests need
+//! `cargo test --workspace` (which builds every binary) — the same requirement
+//! `crates/arreo-server/tests/relay_daemon.rs` has, and for the same reason.
+
+use arreo_core::identity::{DeviceCert, DeviceKey, Role, RootKey, VerifyingKey};
+use arreo_core::relay::join_proof_payload;
+use arreo_core::relay::session::RelaySession;
+use std::io::{BufRead, BufReader};
+use std::net::SocketAddr;
+use std::path::PathBuf;
+use std::process::{Child, Command, Stdio};
+use std::sync::mpsc;
+use std::time::Duration;
+
+fn binary(name: &str) -> PathBuf {
+    let path = PathBuf::from(env!("CARGO_BIN_EXE_arreo"))
+        .parent()
+        .expect("target dir")
+        .join(name);
+    assert!(
+        path.exists(),
+        "{} is missing — run `cargo test --workspace` (which builds every binary) first",
+        path.display()
+    );
+    path
+}
+
+/// A running relay, its state directory, and everything it has logged.
+struct Relay {
+    child: Child,
+    addr: SocketAddr,
+    state_dir: PathBuf,
+}
+
+impl Drop for Relay {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        let _ = std::fs::remove_dir_all(&self.state_dir);
+    }
+}
+
+impl Relay {
+    fn start(tag: &str) -> Self {
+        let state_dir = std::env::temp_dir().join(format!(
+            "arreo-cli-machines-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&state_dir);
+        std::fs::create_dir_all(&state_dir).expect("scratch state dir");
+        let mut child = Command::new(binary("arreo-relay"))
+            .args([
+                "serve",
+                "--listen",
+                "127.0.0.1:0",
+                "--state-dir",
+                &state_dir.display().to_string(),
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("the relay starts");
+
+        let stderr = child.stderr.take().expect("stderr is piped");
+        let (ready_tx, ready_rx) = mpsc::channel();
+        // The reader thread must keep draining stderr for the relay's whole
+        // life: dropping the pipe would kill it on its next log line (EPIPE),
+        // which reads like an authentication failure. Nothing here reads the
+        // log, so nothing here stores it.
+        std::thread::spawn(move || {
+            for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+                if let Some(rest) = line.split("router on ").nth(1) {
+                    if let Some(addr) = rest.split_whitespace().next() {
+                        if let Ok(addr) = addr.parse::<SocketAddr>() {
+                            let _ = ready_tx.send(addr);
+                        }
+                    }
+                }
+            }
+        });
+        let addr = ready_rx
+            .recv_timeout(Duration::from_secs(20))
+            .expect("the relay announces its address");
+        Self {
+            child,
+            addr,
+            state_dir,
+        }
+    }
+
+    fn register_account(&self, account_id: &str, root: &VerifyingKey) {
+        let output = Command::new(binary("arreo-relay"))
+            .args([
+                "account",
+                "add",
+                "--state-dir",
+                &self.state_dir.display().to_string(),
+                "--account",
+                account_id,
+                "--root-key",
+                &hex(&root.to_bytes()),
+            ])
+            .output()
+            .expect("the account command runs");
+        assert!(
+            output.status.success(),
+            "registering an account failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// Stop the relay without forgetting its state: the offline case is "the
+    /// relay is not answering", not "there is no relay".
+    fn stop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// One machine: a CLI identity directory plus the config naming the relay.
+struct Client {
+    dir: PathBuf,
+    config: PathBuf,
+}
+
+impl Client {
+    fn new(tag: &str, relay: &Relay, account: &str) -> Self {
+        let dir = std::env::temp_dir().join(format!(
+            "arreo-cli-machines-client-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let identity = dir.join("identity");
+        std::fs::create_dir_all(identity.join("devices")).expect("identity dir");
+        let config = dir.join("arreo.toml");
+        std::fs::write(
+            &config,
+            format!(
+                "[relay]\nenabled = true\naddr = \"{}\"\naccount = \"{account}\"\n",
+                relay.addr
+            ),
+        )
+        .expect("config");
+        Self { dir, config }
+    }
+
+    /// Write this client's device identity, the way `arreo pair --join` does:
+    /// `identity/device.key` and `identity/devices/<bare hex>.cert`.
+    fn identify(&self, root: &RootKey, key: &DeviceKey, name: &str, serial: u64) -> DeviceCert {
+        let identity = self.dir.join("identity");
+        std::fs::create_dir_all(identity.join("devices")).expect("identity dir");
+        key.save(&identity.join("device.key")).expect("device key");
+        let cert = DeviceCert::issue(root, &key.public(), name, Role::Owner, 1_000, serial);
+        cert.save(&identity.join("devices")).expect("certificate");
+        cert
+    }
+
+    fn run(&self, args: &[&str]) -> Out {
+        let output = Command::new(binary("arreo"))
+            .args(args)
+            // `identity_root()` is `$ARREO_IDENTITY_DIR/identity`, so the env
+            // var names the *base* directory (the same convention `arreo pair`
+            // and the daemon use).
+            .env("ARREO_IDENTITY_DIR", &self.dir)
+            .env("ARREO_CONFIG", &self.config)
+            .output()
+            .expect("the CLI runs");
+        Out::of(output)
+    }
+
+    /// Run with `--config` instead of the environment variable.
+    fn run_with_config(&self, args: &[&str]) -> Out {
+        let mut all: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+        all.push("--config".to_string());
+        all.push(self.config.display().to_string());
+        let refs: Vec<&str> = all.iter().map(String::as_str).collect();
+        let output = Command::new(binary("arreo"))
+            .args(&refs)
+            .env("ARREO_IDENTITY_DIR", &self.dir)
+            .env_remove("ARREO_CONFIG")
+            .output()
+            .expect("the CLI runs");
+        Out::of(output)
+    }
+}
+
+/// One run's outcome, with the streams kept apart.
+///
+/// Separately, not interleaved: `--json` writes the envelope to stdout while a
+/// warning may land on stderr, and a test that concatenated them would fail to
+/// parse a perfectly good answer (or worse, parse an interleaved one).
+struct Out {
+    code: i32,
+    stdout: String,
+    stderr: String,
+}
+
+impl Out {
+    fn of(output: std::process::Output) -> Self {
+        Self {
+            code: output.status.code().unwrap_or(-1),
+            stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+            stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+        }
+    }
+
+    /// Both streams, for "did anything say this".
+    fn all(&self) -> String {
+        format!("{}{}", self.stdout, self.stderr)
+    }
+
+    /// The JSON envelope from stdout.
+    fn json(&self) -> serde_json::Value {
+        serde_json::from_str(self.stdout.trim())
+            .unwrap_or_else(|e| panic!("stdout is not one JSON envelope ({e}): {}", self.stdout))
+    }
+}
+
+impl Drop for Client {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// Register a machine in the account through the wire, the way a machine's own
+/// daemon does (T-0056).
+async fn join_machine(session: &RelaySession, machine: &RootKey, account: &str, name: &str) {
+    let key = machine.public_hex();
+    let payload = join_proof_payload(session.nonce(), account, &key, name);
+    let request = arreo_core::relay::JoinRequest {
+        v: arreo_core::relay::RELAY_VERSION,
+        name: name.to_string(),
+        proto_version: arreo_core::proto::VERSION,
+        machine_key: key,
+        signature: machine.sign(&payload).to_bytes().to_vec(),
+    };
+    let reply = session
+        .join_machine(request)
+        .await
+        .expect("the relay answers");
+    assert_eq!(reply.refused, None, "the machine joins: {reply:?}");
+}
+
+/// The main path: `list --json`, the human table, `status`, and the exit codes.
+#[test]
+fn list_and_status_read_the_accounts_directory() {
+    let relay = Relay::start("read");
+    let root = RootKey::generate().expect("entropy");
+    relay.register_account("acct-1", &root.public());
+
+    let client = Client::new("read", &relay, "acct-1");
+    let key = DeviceKey::generate().expect("entropy");
+    client.identify(&root, &key, "laptop", 1);
+
+    // Two machines in the account, written the only way anything writes one.
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    runtime.block_on(async {
+        let session = RelaySession::dial(relay.addr, "acct-1", &key, &client_cert(&client))
+            .await
+            .expect("the client registers");
+        join_machine(
+            &session,
+            &RootKey::generate().expect("entropy"),
+            "acct-1",
+            "workbox",
+        )
+        .await;
+        join_machine(
+            &session,
+            &RootKey::generate().expect("entropy"),
+            "acct-1",
+            "pi",
+        )
+        .await;
+    });
+
+    // --json is the contract.
+    let out = client.run_with_config(&["machines", "list", "--json"]);
+    assert_eq!(out.code, 0, "a reachable relay is exit 0: {}", out.all());
+    let value = out.json();
+    assert_eq!(value["schema"], serde_json::json!(1));
+    assert_eq!(value["source"], serde_json::json!("relay"));
+    let names: Vec<&str> = value["machines"]
+        .as_array()
+        .expect("an array")
+        .iter()
+        .map(|m| m["name"].as_str().expect("name"))
+        .collect();
+    assert_eq!(
+        names,
+        vec!["pi", "workbox"],
+        "sorted by name, whatever order the relay used: {}",
+        out.all()
+    );
+    for machine in value["machines"].as_array().expect("array") {
+        assert_eq!(
+            machine["machine_id"].as_str().expect("id").len(),
+            32,
+            "the bare hex id is the machine id (one spelling): {machine}"
+        );
+        assert_eq!(machine["presence"], serde_json::json!("online"));
+        assert_eq!(machine["proto_version"], serde_json::json!(0));
+        assert!(machine["age_secs"].as_i64().is_some());
+    }
+
+    // The human table says the same thing, and is not the contract.
+    let table = client.run(&["machines", "list"]);
+    assert_eq!(table.code, 0, "{}", table.all());
+    assert!(table.stdout.contains("NAME"), "{}", table.all());
+    assert!(table.stdout.contains("workbox"), "{}", table.all());
+    assert!(
+        !table.all().contains("from cache"),
+        "a live read must not claim to be a cache: {}",
+        table.all()
+    );
+
+    // status <name>: the stable subset, and the honest `unknown` for the count
+    // T-0046 will provide.
+    let out = client.run(&["machines", "status", "workbox"]);
+    assert_eq!(out.code, 0, "{}", out.all());
+    assert!(out.stdout.contains("workbox"), "{}", out.all());
+    assert!(out.stdout.contains("online"), "{}", out.all());
+    assert!(
+        out.stdout.contains("trusted devices unknown"),
+        "the trusted-device count must say unknown, never a fabricated 0: {}",
+        out.all()
+    );
+
+    let out = client.run_with_config(&["machines", "status", "workbox", "--json"]);
+    assert_eq!(out.code, 0, "{}", out.all());
+    assert_eq!(out.json()["machines"].as_array().expect("array").len(), 1);
+
+    // Unknown machines are exit 3, and a name that is not a name is explained.
+    let out = client.run(&["machines", "status", "nosuch"]);
+    assert_eq!(out.code, 3, "{}", out.all());
+    assert!(out.stderr.contains("no machine named"), "{}", out.all());
+    let out = client.run(&["machines", "status", "NOT A NAME"]);
+    assert_eq!(out.code, 3, "{}", out.all());
+    assert!(out.stderr.contains("not a machine name"), "{}", out.all());
+
+    // The verbs whose transports do not exist yet refuse rather than pretend,
+    // and each names its own missing task.
+    for (verb, task) in [
+        ("rename", "T-0057"),
+        ("remove", "T-0057"),
+        ("add", "T-0058"),
+    ] {
+        let out = client.run(&["machines", verb]);
+        assert_eq!(out.code, 2, "`machines {verb}`: {}", out.all());
+        assert!(
+            out.stderr.contains(task),
+            "the refusal must name {task}: {}",
+            out.all()
+        );
+    }
+}
+
+/// The offline path: rows are still printed, labelled, and never silently
+/// promoted to `online`; `--offline` makes the same answer intentional.
+#[test]
+fn an_unreachable_relay_answers_from_the_cache_and_says_so() {
+    let mut relay = Relay::start("offline");
+    let root = RootKey::generate().expect("entropy");
+    relay.register_account("acct-1", &root.public());
+    let client = Client::new("offline", &relay, "acct-1");
+    let key = DeviceKey::generate().expect("entropy");
+    client.identify(&root, &key, "laptop", 1);
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    runtime.block_on(async {
+        let session = RelaySession::dial(relay.addr, "acct-1", &key, &client_cert(&client))
+            .await
+            .expect("the client registers");
+        join_machine(
+            &session,
+            &RootKey::generate().expect("entropy"),
+            "acct-1",
+            "workbox",
+        )
+        .await;
+    });
+
+    // First read fills the cache.
+    let out = client.run(&["machines", "list", "--json"]);
+    assert_eq!(out.code, 0, "{}", out.all());
+
+    relay.stop();
+
+    // Without --offline: the rows are printed, the source is honest, exit is 4.
+    let out = client.run(&["machines", "list", "--json"]);
+    assert_eq!(
+        out.code,
+        4,
+        "an unreachable relay is exit 4 even when rows are printed: {}",
+        out.all()
+    );
+    let value = out.json();
+    assert_eq!(value["source"], serde_json::json!("cache"));
+    let machines = value["machines"].as_array().expect("array");
+    assert_eq!(
+        machines.len(),
+        1,
+        "the cached row is still printed: {}",
+        out.all()
+    );
+    assert_eq!(machines[0]["name"], serde_json::json!("workbox"));
+    assert_ne!(
+        machines[0]["presence"],
+        serde_json::json!("online"),
+        "a cached row must never be presented as online: {}",
+        out.all()
+    );
+
+    // The table says where the rows came from, so a human is not misled either.
+    let table = client.run(&["machines", "list"]);
+    assert_eq!(table.code, 4, "{}", table.all());
+    assert!(
+        table.stdout.contains("from cache"),
+        "the table must say the rows are remembered: {}",
+        table.all()
+    );
+
+    // --offline: the same answer, on purpose, exit 0.
+    let out = client.run(&["machines", "list", "--json", "--offline"]);
+    assert_eq!(
+        out.code,
+        0,
+        "--offline is a choice, not a failure: {}",
+        out.all()
+    );
+    let value = out.json();
+    assert_eq!(value["source"], serde_json::json!("cache"));
+    assert_eq!(value["machines"].as_array().expect("array").len(), 1);
+
+    // And status names the row from the cache too.
+    let out = client.run(&["machines", "status", "workbox", "--offline"]);
+    assert_eq!(out.code, 0, "{}", out.all());
+    assert!(out.stdout.contains("from cache"), "{}", out.all());
+    assert!(
+        out.stdout.contains("unknown"),
+        "and never a fabricated count: {}",
+        out.all()
+    );
+}
+
+/// A relay that is not configured at all is exit 4 with a message that says
+/// which file was read — an operator is never left guessing why there is no
+/// directory.
+#[test]
+fn a_missing_relay_configuration_is_exit_4() {
+    let relay = Relay::start("noconfig");
+    let root = RootKey::generate().expect("entropy");
+    relay.register_account("acct-1", &root.public());
+    let client = Client::new("noconfig", &relay, "acct-1");
+    let key = DeviceKey::generate().expect("entropy");
+    client.identify(&root, &key, "laptop", 1);
+    std::fs::remove_file(&client.config).expect("remove config");
+
+    let output = Command::new(binary("arreo"))
+        .args(["machines", "list", "--json"])
+        .env("ARREO_IDENTITY_DIR", &client.dir)
+        .env_remove("ARREO_CONFIG")
+        .output()
+        .expect("the CLI runs");
+    let code = output.status.code().unwrap_or(-1);
+    let text = String::from_utf8_lossy(&output.stderr).to_string();
+    assert_eq!(
+        code, 4,
+        "no relay configured means the directory is unreachable: {text}"
+    );
+    assert!(text.contains("no relay is configured"), "{text}");
+
+    // The write verbs still refuse, before any of that.
+    let out = client.run(&["machines", "rename", "pi", "pi-2"]);
+    assert_eq!(out.code, 2, "{}", out.all());
+    assert!(out.stderr.contains("T-0057"), "{}", out.all());
+}
+
+/// A CLI with no paired identity cannot read the account, and says which file is
+/// missing instead of panicking or printing an empty list as if it were true.
+#[test]
+fn an_unpaired_client_is_told_what_is_missing() {
+    let relay = Relay::start("unpaired");
+    let root = RootKey::generate().expect("entropy");
+    relay.register_account("acct-1", &root.public());
+    let client = Client::new("unpaired", &relay, "acct-1");
+    // Deliberately no identify(): no device key, no certificate.
+
+    let out = client.run_with_config(&["machines", "list", "--json"]);
+    assert_eq!(out.code, 4, "{}", out.all());
+    assert!(
+        out.stderr.contains("device.key"),
+        "the message names the missing file: {}",
+        out.all()
+    );
+}
+
+/// The certificate this client's identity dir holds, loaded the way the CLI
+/// loads it (so the test cannot pass by holding a different object).
+fn client_cert(client: &Client) -> DeviceCert {
+    let identity = client.dir.join("identity");
+    let key = DeviceKey::load(&identity.join("device.key")).expect("device key");
+    let id = arreo_core::identity::DeviceId::from_key(&key.public());
+    let path = identity
+        .join("devices")
+        .join(format!("{}.cert", id.as_str()));
+    DeviceCert::load(&path).expect("certificate")
+}
+
+/// The config file the client writes must be one the *daemon's* loader also
+/// accepts: one parser, one answer (the CLI reads `arreo_core::relay::config`).
+#[test]
+fn the_test_config_is_one_the_shared_loader_accepts() {
+    let relay = Relay::start("config-shape");
+    let root = RootKey::generate().expect("entropy");
+    relay.register_account("acct-1", &root.public());
+    let client = Client::new("config-shape", &relay, "acct-1");
+    let settings = arreo_core::relay::config::load_config(&client.config)
+        .expect("the shared loader parses it")
+        .expect("and it enables the relay");
+    assert_eq!(settings.account, "acct-1");
+    assert_eq!(settings.addr, relay.addr);
+}

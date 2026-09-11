@@ -1,0 +1,61 @@
+# T-0044 evidence — `arreo machines` (read side)
+
+## 1. The real CLI against a real relay (JSON contract, table, status, exit codes, offline)
+
+$ cargo test -p arreo-cli --test machines
+
+test the_test_config_is_one_the_shared_loader_accepts ... ok
+test an_unpaired_client_is_told_what_is_missing ... ok
+test a_missing_relay_configuration_is_exit_4 ... ok
+test list_and_status_read_the_accounts_directory ... ok
+test an_unreachable_relay_answers_from_the_cache_and_says_so ... ok
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 20.43s
+
+## 2. The contract test is the checker (proved to fail)
+
+Renaming a key in the envelope makes the build red:
+  "last_seen" -> "lastSeenAt"   =>  schema 1 requires last_seen (additive-only)
+  presence -> "definitely-up"   =>  FAILED the_json_envelope_is_schema_1_with_closed_presence_values
+  (both restored; the check is what makes a script break a red build)
+
+## 3. Unit coverage (contract, cache honesty, exit codes, ages)
+
+test machines::tests::an_age_is_never_negative ... ok
+test machines::tests::ages_are_human ... ok
+test machines::tests::the_write_verbs_report_the_missing_transport ... ok
+test machines::tests::the_json_envelope_is_schema_1_with_closed_presence_values ... ok
+test machines::tests::a_cached_row_is_never_online ... ok
+test machines::tests::the_exit_codes_are_distinct ... ok
+test machines::tests::a_cached_envelope_is_labelled ... ok
+test machines::tests::usage_errors_are_exit_2 ... ok
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+## 4. The RFC3339 formatter (hand-rolled: no date dependency for one field)
+
+test store::timestamp_tests::rfc3339_matches_known_instants ... ok
+test store::timestamp_tests::rfc3339_is_monotonic_and_round_trips_through_days ... ok
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 125 filtered out; finished in 0.07s
+
+## 5. The shared [relay] configuration (one parser, daemon and CLI)
+
+test relay::config::tests::a_complete_section_loads_with_a_name ... ok
+test relay::config::tests::no_relay_means_none_however_it_is_said ... ok
+test relay::config::tests::an_incomplete_section_names_what_is_missing ... ok
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 124 filtered out; finished in 0.03s
+
+## 6. The full battery (final code)
+
+cargo test --workspace: 408 passed, 0 failed across 52 targets
+cargo clippy --workspace --all-targets -- -D warnings: 0 diagnostics
+cargo fmt --all -- --check: clean
+cargo vet --locked: Vetting Succeeded (336 exempted)
+cargo deny check: advisories ok, bans ok, licenses ok, sources ok
+cargo audit: no advisories
+cargo xtask check-targets: x86_64-unknown-linux-gnu PASS; x86_64-pc-windows-msvc SKIP (pure-Rust no-sqlite PASS)
+e2e slices: api green, compat green, lifecycle 2/2, persistence 3/3, enforcement passed, tui 18/18, theme 27/27, relay 14/14
+cargo xtask bench: 6/6 PASS
+
+Note: check-targets first FAILED for Windows after the [relay] config move — inserting
+pub mod config; between a #[cfg(feature = "transport")] attribute and the item it gated moved
+the gate onto config and off session. Fixed by declaring config ungated, before the
+attributed block; the gate is back on session and Windows passes the pure-Rust path.
