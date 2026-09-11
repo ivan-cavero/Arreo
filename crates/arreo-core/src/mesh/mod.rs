@@ -19,9 +19,11 @@
 //! types here have nowhere to put one.
 
 pub mod directory;
+pub mod trust;
 
 pub use directory::{
     default_machine_name, CachedMachine, DirectoryCache, DirectoryError, MachineId, MachineRow,
     Name, Presence, HEARTBEAT_SECS, JOIN_TICKET_SECS, NAME_MAX, ONLINE_WINDOW_SECS,
     STALE_AFTER_SECS, TOMBSTONE_SECS,
 };
+pub use trust::{denial_message, evaluate, TrustDenial, TrustRecord};

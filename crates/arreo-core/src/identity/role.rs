@@ -30,9 +30,21 @@ impl Role {
         }
     }
 
+    /// Parse a role name.
+    ///
+    /// **Two spellings, one value.** ROADMAP §4 names the roles
+    /// `viewer / operator / admin` and §3.7 says "roles (viewer/operator)
+    /// evaluated on the machine that owns the agents", while the certificate
+    /// this type was born with calls the same thing `owner` (ADR 0009). Accepting
+    /// both here is deliberate: the alternative is a second role type whose only
+    /// job is to be translated into this one, and a translation table is the
+    /// "one fact, two spellings" defect with a place to hide. `operator` is the
+    /// roadmap's word for what this value has always *meant* — holder of
+    /// [`Capability::Control`] — so both spellings parse to it and `as_str`
+    /// keeps printing `owner`, which is what the certificates on disk say.
     pub fn parse(text: &str) -> Result<Self, RoleError> {
         match text.trim().to_ascii_lowercase().as_str() {
-            "owner" => Ok(Self::Owner),
+            "owner" | "operator" => Ok(Self::Owner),
             "viewer" => Ok(Self::Viewer),
             other => Err(RoleError::Unknown(other.to_string())),
         }
@@ -197,7 +209,21 @@ mod tests {
     fn roles_parse_strictly() {
         assert_eq!(Role::parse("owner"), Ok(Role::Owner));
         assert_eq!(Role::parse(" VIEWER "), Ok(Role::Viewer));
-        assert!(matches!(Role::parse("admin"), Err(RoleError::Unknown(_))));
+        // The roadmap's word for the same role parses to the same value: one
+        // fact, one value, two spellings accepted at the door (§4 vs ADR 0009).
+        assert_eq!(
+            Role::parse("operator").expect("the roadmap's word"),
+            Role::Owner
+        );
+        assert_eq!(
+            Role::parse("  OPERATOR ").expect("trimmed and cased"),
+            Role::Owner
+        );
+        assert_eq!(Role::parse("owner"), Role::parse("operator"));
+        assert!(
+            matches!(Role::parse("admin"), Err(RoleError::Unknown(_))),
+            "admin is a Team-tier role (ROADMAP §4); v1 does not have it"
+        );
         assert!(matches!(Role::parse(""), Err(RoleError::Unknown(_))));
     }
 

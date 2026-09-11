@@ -24,7 +24,7 @@
 //! is flagged `redacted=1`. Field names survive (debuggable), key material
 //! never touches disk.
 
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use thiserror::Error;
 
 use crate::fixtures::scan_secrets;
@@ -37,7 +37,7 @@ pub enum SessionError {
     Json(#[from] serde_json::Error),
 }
 
-pub const SCHEMA_VERSION: u32 = 6;
+pub const SCHEMA_VERSION: u32 = 7;
 
 /// One pane's persisted record: how to respawn it + what it showed.
 #[derive(Debug, Clone, PartialEq)]
@@ -397,10 +397,147 @@ impl SessionStore {
                    ON metrics_series(pane, ts_ms);",
             )?;
         }
+        // v7: per-machine device trust (T-0046). A grant is keyed
+        // `(machine_id, device_id)`: the machine is part of the key, so a grant
+        // made on one machine is one row here and nothing at all on another —
+        // which is the model §3.7 asks for, expressed as a primary key rather
+        // than as a promise.
+        //
+        // The device id is stored in its canonical bare-hex form (the
+        // `DeviceId::as_str` spelling the certificate uses), because a table
+        // that accepted either spelling would let one device be two rows. The
+        // role is stored as text for the same reason the devices table does it:
+        // a reader can see what it says, and a migration never has to decode it.
+        if version < 7 {
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS machine_trust(
+                   machine_id TEXT NOT NULL, device_id TEXT NOT NULL,
+                   role TEXT NOT NULL, granted_at_ms INTEGER NOT NULL,
+                   granted_by TEXT NOT NULL, revoked_at_ms INTEGER,
+                   PRIMARY KEY (machine_id, device_id));
+                 CREATE INDEX IF NOT EXISTS machine_trust_device ON machine_trust(device_id);",
+            )?;
+        }
         conn.execute(
             "INSERT INTO meta(key, value) VALUES ('schema_version', ?1)
              ON CONFLICT(key) DO UPDATE SET value=excluded.value",
             [SCHEMA_VERSION.to_string()],
+        )?;
+        Ok(())
+    }
+
+    /// Every trust grant this machine holds (T-0046), including revoked ones.
+    ///
+    /// Revoked rows are returned rather than filtered: the callers that enforce
+    /// need to tell "never had a grant" from "had one and it was cut", and the
+    /// callers that display need to show both. Filtering here would make the
+    /// distinction unrepresentable at exactly the layer that has to state it.
+    pub fn trust_records(&self) -> Result<Vec<crate::mesh::TrustRecord>, SessionError> {
+        use crate::identity::{DeviceId, Role};
+        use crate::mesh::{MachineId, TrustRecord};
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT machine_id, device_id, role, granted_at_ms, granted_by, revoked_at_ms
+             FROM machine_trust ORDER BY machine_id, device_id",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, Option<i64>>(5)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (machine_id, device_id, role, granted_at_ms, granted_by, revoked_at_ms) = row?;
+            let bad = || SessionError::Sqlite(rusqlite::Error::InvalidQuery);
+            out.push(TrustRecord {
+                machine_id: MachineId::parse(&machine_id).map_err(|_| bad())?,
+                device_id: DeviceId::parse(&device_id).map_err(|_| bad())?,
+                role: Role::parse(&role).map_err(|_| bad())?,
+                granted_at_ms,
+                granted_by: DeviceId::parse(&granted_by).map_err(|_| bad())?,
+                revoked_at_ms,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Write (or replace) one grant.
+    ///
+    /// Replacing rather than inserting twice is what makes "grant again" mean
+    /// "grant again with this role, live now" — including re-granting a device
+    /// whose access was revoked, which is the ordinary way an operator undoes a
+    /// revocation. The `granted_by`/`granted_at_ms` of the new grant replace the
+    /// old ones; the audit log is where the history lives, not this row.
+    pub fn record_trust(&self, record: &crate::mesh::TrustRecord) -> Result<(), SessionError> {
+        let conn = self.lock()?;
+        conn.execute(
+            "INSERT INTO machine_trust(machine_id, device_id, role, granted_at_ms, granted_by,
+                                       revoked_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(machine_id, device_id) DO UPDATE SET
+               role=excluded.role, granted_at_ms=excluded.granted_at_ms,
+               granted_by=excluded.granted_by, revoked_at_ms=excluded.revoked_at_ms",
+            rusqlite::params![
+                record.machine_id.as_str(),
+                record.device_id.as_str(),
+                record.role.as_str(),
+                record.granted_at_ms,
+                record.granted_by.as_str(),
+                record.revoked_at_ms,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Revoke one grant. Returns whether a *live* grant was cut, so a caller can
+    /// tell "revoked" from "there was nothing to revoke" without a second read.
+    pub fn revoke_trust(
+        &self,
+        machine_id: &crate::mesh::MachineId,
+        device_id: &crate::identity::DeviceId,
+        at_ms: i64,
+    ) -> Result<bool, SessionError> {
+        let conn = self.lock()?;
+        let changed = conn.execute(
+            "UPDATE machine_trust SET revoked_at_ms = ?3
+             WHERE machine_id = ?1 AND device_id = ?2 AND revoked_at_ms IS NULL",
+            rusqlite::params![machine_id.as_str(), device_id.as_str(), at_ms],
+        )?;
+        Ok(changed > 0)
+    }
+
+    /// Has this machine's trust ledger ever been initialized (T-0046)?
+    ///
+    /// A one-way marker, and the reason it is stored rather than inferred: an
+    /// operator who revokes every device leaves a legitimately empty ledger, and
+    /// a backfill that ran again would silently restore the access that was just
+    /// taken away. Absent or unparsable reads as "not yet", which is the safe
+    /// direction — it backfills a machine that has never run this code, and a
+    /// marker anyone can clear by hand is a marker an operator can re-run.
+    pub fn trust_initialized(&self) -> Result<bool, SessionError> {
+        let conn = self.lock()?;
+        let value: Option<String> = conn
+            .query_row(
+                "SELECT value FROM meta WHERE key='trust_initialized'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(value.as_deref() == Some("1"))
+    }
+
+    /// Record that the trust ledger has been initialized, once and for all.
+    pub fn mark_trust_initialized(&self) -> Result<(), SessionError> {
+        let conn = self.lock()?;
+        conn.execute(
+            "INSERT INTO meta(key, value) VALUES ('trust_initialized', '1')
+             ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            [],
         )?;
         Ok(())
     }
@@ -1378,5 +1515,164 @@ mod timestamp_tests {
             previous = text;
             ms += 3_600_000;
         }
+    }
+}
+
+#[cfg(test)]
+mod trust_store_tests {
+    use crate::identity::{DeviceId, Role};
+    use crate::mesh::{MachineId, TrustRecord};
+    use crate::store::SessionStore;
+
+    fn scratch(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "arreo-trust-store-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        dir.join("store.db")
+    }
+
+    fn machine(hex: char) -> MachineId {
+        MachineId::parse(&hex.to_string().repeat(32)).expect("machine id")
+    }
+
+    fn device(hex: char) -> DeviceId {
+        DeviceId::parse(&hex.to_string().repeat(32)).expect("device id")
+    }
+
+    fn grant(on: &MachineId, to: &DeviceId, role: Role, by: &DeviceId) -> TrustRecord {
+        TrustRecord {
+            machine_id: on.clone(),
+            device_id: to.clone(),
+            role,
+            granted_at_ms: 1_000,
+            granted_by: by.clone(),
+            revoked_at_ms: None,
+        }
+    }
+
+    /// **The criterion T-0046 exists for.** A grant made on machine A leaves
+    /// machine B's grant set empty — not "present but unevaluated", exactly zero
+    /// rows — because the machine is part of the primary key.
+    #[test]
+    fn a_grant_on_one_machine_is_nothing_on_another() {
+        let store = SessionStore::open(&scratch("isolation")).expect("store");
+        let a = machine('a');
+        let b = machine('b');
+        let phone = device('1');
+
+        store
+            .record_trust(&grant(&a, &phone, Role::Owner, &device('2')))
+            .expect("grant on A");
+
+        let all = store.trust_records().expect("read");
+        assert_eq!(all.len(), 1, "one grant was made: {all:?}");
+        assert_eq!(all[0].machine_id, a);
+
+        let on_b: Vec<_> = all.iter().filter(|r| r.machine_id == b).collect();
+        assert!(
+            on_b.is_empty(),
+            "machine B must have no rows at all after A's grant: {on_b:?}"
+        );
+        // And the rule agrees: reading B's grant for that device finds nothing,
+        // which is a refusal rather than a permissive default.
+        let for_b = all
+            .iter()
+            .find(|r| r.machine_id == b && r.device_id == phone);
+        assert!(for_b.is_none());
+        assert!(crate::mesh::evaluate(for_b, crate::identity::role::Verb::Read).is_err());
+    }
+
+    /// Granting twice is a replacement, not a second row — including re-granting
+    /// a device whose access was revoked, which is how an operator undoes one.
+    #[test]
+    fn granting_again_replaces_and_revives() {
+        let store = SessionStore::open(&scratch("replace")).expect("store");
+        let on = machine('c');
+        let phone = device('3');
+        let operator = device('4');
+
+        store
+            .record_trust(&grant(&on, &phone, Role::Viewer, &operator))
+            .expect("first grant");
+        let mut upgraded = grant(&on, &phone, Role::Owner, &operator);
+        upgraded.granted_at_ms = 2_000;
+        store.record_trust(&upgraded).expect("re-grant");
+
+        let rows = store.trust_records().expect("read");
+        assert_eq!(rows.len(), 1, "one machine, one device, one row: {rows:?}");
+        assert_eq!(rows[0].role, Role::Owner);
+        assert_eq!(rows[0].granted_at_ms, 2_000);
+
+        // Revoke, then grant again: the row goes live, and the revoked stamp is
+        // cleared rather than left behind to make a live row look revoked.
+        assert!(store.revoke_trust(&on, &phone, 3_000).expect("revoke"));
+        let rows = store.trust_records().expect("read");
+        assert_eq!(rows[0].revoked_at_ms, Some(3_000));
+        assert!(!rows[0].is_live());
+
+        store
+            .record_trust(&grant(&on, &phone, Role::Owner, &operator))
+            .expect("re-grant after revoke");
+        let rows = store.trust_records().expect("read");
+        assert!(rows[0].is_live(), "a re-grant revives the row: {rows:?}");
+        assert_eq!(rows.len(), 1);
+    }
+
+    /// Revoking reports whether it cut something live, so a caller can say
+    /// "revoked" rather than "there was nothing to revoke" — and revoking twice
+    /// does not rewrite the first revocation's timestamp.
+    #[test]
+    fn revoking_is_idempotent_and_keeps_the_first_timestamp() {
+        let store = SessionStore::open(&scratch("revoke")).expect("store");
+        let on = machine('d');
+        let phone = device('5');
+        store
+            .record_trust(&grant(&on, &phone, Role::Owner, &device('6')))
+            .expect("grant");
+
+        assert!(store.revoke_trust(&on, &phone, 7_000).expect("revoke"));
+        assert!(
+            !store
+                .revoke_trust(&on, &phone, 9_000)
+                .expect("revoke again"),
+            "the second revoke cut nothing live"
+        );
+        let rows = store.trust_records().expect("read");
+        assert_eq!(
+            rows[0].revoked_at_ms,
+            Some(7_000),
+            "the first revocation is when access ended"
+        );
+
+        // Revoking a device that was never granted changes nothing and says so.
+        assert!(!store
+            .revoke_trust(&on, &device('7'), 9_000)
+            .expect("unknown device"));
+    }
+
+    /// A store on disk keeps its grants across a reopen — the row is durable
+    /// state, not a cache of the running process.
+    #[test]
+    fn grants_survive_a_reopen() {
+        let path = scratch("durable");
+        let on = machine('e');
+        let phone = device('8');
+        {
+            let store = SessionStore::open(&path).expect("store");
+            store
+                .record_trust(&grant(&on, &phone, Role::Viewer, &device('9')))
+                .expect("grant");
+        }
+        let store = SessionStore::open(&path).expect("reopen");
+        let rows = store.trust_records().expect("read");
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].machine_id, on);
+        assert_eq!(rows[0].device_id, phone);
+        assert_eq!(rows[0].role, Role::Viewer);
+        assert!(rows[0].is_live());
     }
 }

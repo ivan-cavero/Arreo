@@ -1,0 +1,53 @@
+# T-0046 evidence — per-machine device trust (model + store + ledger)
+
+Increment 1 of the task: the record, the durable table and the machine-local
+ledger, with 15 new tests and **no behaviour change** (nothing is wired into the
+session path yet, so nothing can regress while enforcement is built).
+
+## 1. The rule: every cell of the role x verb matrix, in both directions
+
+$ cargo test -p arreo-core --lib mesh::trust
+
+test mesh::trust::tests::a_record_round_trips_and_carries_its_machine ... ok
+test mesh::trust::tests::no_grant_is_refused_and_says_so_differently ... ok
+test mesh::trust::tests::the_recommended_role_is_the_one_that_works ... ok
+test mesh::trust::tests::a_revoked_grant_is_refused_even_for_observing ... ok
+test mesh::trust::tests::a_denial_names_the_machine_the_role_and_the_command ... ok
+test mesh::trust::tests::the_role_verb_matrix_is_asserted_cell_by_cell ... ok
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 132 filtered out; finished in 0.00s
+
+## 2. The store: a grant on A is exactly zero rows on B (schema v7)
+
+test store::trust_store_tests::grants_survive_a_reopen ... ok
+test store::trust_store_tests::a_grant_on_one_machine_is_nothing_on_another ... ok
+test store::trust_store_tests::revoking_is_idempotent_and_keeps_the_first_timestamp ... ok
+test store::trust_store_tests::granting_again_replaces_and_revives ... ok
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 134 filtered out; finished in 0.03s
+
+## 3. The machine-local ledger, and the one-time backfill
+
+test mesh::trust::tests::the_backfill_runs_once_and_does_not_undo_a_revocation ... ok
+test mesh::trust::tests::the_ledger_lists_only_its_own_rows ... ok
+test mesh::trust::tests::a_viewer_is_refused_control_and_a_revocation_reads_differently ... ok
+test mesh::trust::tests::the_machine_identity_comes_from_its_root_key ... ok
+test mesh::trust::tests::a_grant_here_is_not_a_grant_there_and_the_refusal_says_what_to_do ... ok
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 9 filtered out; finished in 0.05s
+
+## 4. The full battery (this increment)
+
+cargo test --workspace: 431 passed, 0 failed across 52 targets (+15)
+cargo clippy --workspace --all-targets -- -D warnings: 0 diagnostics
+cargo fmt --all -- --check: clean
+cargo vet --locked: Vetting Succeeded (336 exempted)
+cargo deny check: advisories ok, bans ok, licenses ok, sources ok
+cargo audit: no advisories
+cargo xtask check-targets: x86_64-unknown-linux-gnu PASS; x86_64-pc-windows-msvc SKIP (pure-Rust no-sqlite PASS)
+e2e slices: api green, compat green, lifecycle 2/2, persistence 3/3, enforcement passed, tui 18/18, theme 27/27, relay 14/14
+
+## 5. What is NOT yet in place (the rest of T-0046)
+
+- the ledger is not wired into SessionAuth::check, so a remote session is
+  still gated only by the certificate;
+- the boot backfill is not called yet, which is why wiring must come with it;
+- no socket verbs and no 'arreo machines trust' CLI verb;
+- no arreo-server/tests/trust.rs acceptance tests.

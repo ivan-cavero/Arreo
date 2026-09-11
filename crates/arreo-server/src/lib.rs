@@ -7,6 +7,7 @@ pub mod audit;
 pub mod daemon;
 pub mod devices;
 pub mod lifecycle;
+pub mod mesh;
 pub mod persist;
 pub mod protocol;
 pub mod relay_client;
@@ -18,6 +19,7 @@ pub use audit::{Actor, SessionAudit};
 pub use daemon::Daemon;
 pub use devices::{AuthorityError, DeviceAuthority, Layout};
 pub use lifecycle::{unit_file, unit_path, DrainReport, ServiceKind, SHUTDOWN_DEADLINE};
+pub use mesh::{GrantedDevice, LedgerError, SharedLedger, TrustLedger, TrustRefusal};
 pub use persist::{db_path_for, restore, snapshot, PersistError};
 pub use protocol::{AgentState, Message, PaneInfo, VERSION};
 pub use relay_client::{

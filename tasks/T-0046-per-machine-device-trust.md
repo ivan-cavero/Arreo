@@ -3,7 +3,7 @@ id: T-0046
 title: Per-machine device trust — a grant on A is not a grant on B
 phase: 2
 priority: 2
-status: proposed
+status: in-progress
 depends_on: [T-0018, T-0043, T-0044]
 scope:
   - crates/arreo-core/src/mesh/trust.rs
@@ -11,7 +11,7 @@ scope:
   - crates/arreo-server/src/mesh/trust.rs
   - crates/arreo-server/tests/trust.rs
   - crates/arreo-cli/src/machines.rs
-  - specs/adr/0010-per-machine-device-trust.md
+  - specs/adr/0019-per-machine-device-trust.md
   - .loop/evidence/T-0046/**
 ---
 
@@ -50,9 +50,12 @@ hope — and the fix for a refusal must be one obvious command.
 - [ ] Auditability: every grant, revoke and refusal appends an audit row (device, machine, action,
       timestamp) through T-0018's audit log; the rows are exportable and a test asserts none is
       silently missing.
-- [ ] `specs/adr/0010-per-machine-device-trust.md` records the decision and the rejected alternatives:
+- [ ] `specs/adr/0019-per-machine-device-trust.md` records the decision and the rejected alternatives:
       an account-wide trust list at the relay, A acting as trust broker, and auto-extend on first
       cross-machine attach (the convenience that would silently void the model).
+      **Fence corrected (2026-09-11): the number was 0010, which is
+      `0010-pairing-spake2.md` — this ADR could never have written that file without clobbering a
+      landed decision. Renumbered to 0019.**
 
 ## Notes
 
@@ -66,6 +69,37 @@ audit log through the device foreign key). Rejected: a single trust list owned b
 machine (drift), and trust-by-name (names are renameable directory metadata).
 Honest gaps: the pairing owner is the only `admin` in v1 with no separate admin UI, and team roles plus
 device-policy inheritance are out of scope (§4 ships viewer/operator first).
+
+## Progress (2026-09-11) — the model, landed and tested
+
+Three layers are in, with 15 tests and no behaviour change yet (nothing is wired, so nothing can
+regress while the rest is built):
+
+- `arreo-core/src/mesh/trust.rs` — `TrustRecord` keyed `(machine_id, device_id)`, the pure
+  role × verb rule (`evaluate`), and **one** denial builder that always names the machine, the role
+  needed and the exact `arreo machines trust …` command. Enumerates every cell of the matrix, in both
+  directions (a policy test that only asserts refusals passes with a function that refuses everything).
+- `arreo_core::store` schema **v7** — the `machine_trust` table, with `trust_records` /
+  `record_trust` / `revoke_trust` and a one-way `trust_initialized` marker. The machine is part of the
+  primary key, so "a grant on A is not a grant on B" is a key constraint rather than a promise; the
+  test asserts A's grant leaves B with **exactly zero rows**.
+- `arreo-server/src/mesh/trust.rs` — the machine-local `TrustLedger`: its identity comes from the root
+  key (the same `MachineId::from_key` the directory row uses, so there is one definition of "which
+  machine is this"), plus `backfill_once`, which grants every already-pinned device the default role
+  **once** — without it, an upgrade would lock out every device paired before this existed, and a
+  marker that could re-run would silently heal a deliberate "revoke everything".
+
+**Still to do in this task:** wire the ledger into `SessionAuth::check` (both gates: certificate, then
+this machine's grant) and run the backfill at boot before any session is served; the socket verbs and
+`arreo machines trust <device> [--machine] [--role] [--yes]`; `arreo devices revoke --machine`; the
+`arreo-server/tests/trust.rs` acceptance tests; and the ADR.
+
+**Decisions made while landing the model, for the ADR to record:** the grant reuses `Role` (accepting
+the roadmap's `operator` as a spelling of `Owner`, one value, no translation table) rather than
+inventing a trust-specific role enum; a *colliding* rename is refused while a *claim* gets the
+suffix (T-0057's precedent — an explicit request means the name); a refusal is built in one place; and
+an unreadable ledger is a *different* failure from a missing grant (the first is a store fault, the
+second a decision).
 
 ## Verification
 
