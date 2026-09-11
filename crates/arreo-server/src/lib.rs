@@ -8,6 +8,9 @@ pub mod devices;
 pub mod lifecycle;
 pub mod persist;
 pub mod protocol;
+pub mod transport;
+
+pub use arreo_core::transport::TEST_LISTEN_ENV;
 
 pub use daemon::Daemon;
 pub use devices::{AuthorityError, DeviceAuthority, Layout};

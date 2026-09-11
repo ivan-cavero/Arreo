@@ -1,0 +1,16 @@
+T-0023 remote transport — measured overhead (release, loopback, 8 vCPU, 2026-09-11T07:20:23Z)
+
+== T-0023 overhead (release) ==
+QUIC connect (transport):     3.006476ms
+QUIC + Noise handshake:       5.063194ms
+Noise adds:                   2.056718ms (1.6840959315823576x the QUIC connect)
+1 MB through the transport:   9.732935ms
+RSS, listener + 5 sessions:   22680 KB
+
+Method: a throwaway `cargo run --release` example (since deleted) that ran the
+real daemon plus a real loopback QUIC listener, then took the median of 20
+samples per figure. "QUIC connect" is connect + open stream with no Noise, so
+"QUIC + Noise" minus it is exactly the round trip the Noise-KK handshake adds.
+"1 MB" is a single 1 MB write through a live SecureChannel (the pump seals it in
+60 KB messages). RSS is /proc/self/status VmRSS with the listener plus five live
+sessions in the same process.

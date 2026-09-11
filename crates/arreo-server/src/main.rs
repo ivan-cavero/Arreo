@@ -58,6 +58,32 @@ async fn main() {
     let daemon = arreo_server::Daemon::new(&socket);
     let registry = daemon.registry();
     let socket_path = socket.clone();
+    let authority = std::sync::Arc::new(std::sync::Mutex::new(authority));
+
+    // Remote transport (T-0023). Shipped posture is zero inbound ports, so this
+    // listener exists only for the loopback test seam; the production remote
+    // path is the daemon dialling out to a relay (T-0029).
+    if let Some(addr) = arreo_server::transport::test_listen_addr() {
+        let authority = std::sync::Arc::clone(&authority);
+        let registry = std::sync::Arc::clone(&registry);
+        let db = arreo_server::db_path_for(&socket_path);
+        // The identity is loaded here, at the composition root, so a failure to
+        // read the root key is reported once and the daemon keeps serving the
+        // local socket either way.
+        match arreo_server::transport::server_identity() {
+            Ok(local) => {
+                match arreo_server::transport::listen_on(addr, local, authority, registry, db).await
+                {
+                    Ok(bound) => eprintln!(
+                        "arreo-server: remote transport listening on {bound} (test seam {})",
+                        arreo_server::transport::TEST_LISTEN_ENV
+                    ),
+                    Err(e) => eprintln!("arreo-server: remote transport unavailable: {e}"),
+                }
+            }
+            Err(e) => eprintln!("arreo-server: remote transport unavailable: {e}"),
+        }
+    }
 
     eprintln!("arreo-server: serving on {}", socket.display());
     tokio::select! {

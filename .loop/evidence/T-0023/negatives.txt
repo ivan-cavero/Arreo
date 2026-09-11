@@ -1,0 +1,28 @@
+T-0023 security negatives + daemon wiring — final code
+2026-09-11T07:33:54Z
+
+== core transport (real streams + real loopback QUIC) ==
+test transport::noise::tests::a_flipped_byte_in_the_handshake_prevents_a_session ... ok
+test transport::noise::tests::pinning_the_wrong_server_fails ... ok
+test transport::noise::tests::a_flipped_byte_in_a_transport_frame_is_never_delivered_as_plaintext ... ok
+test transport::noise::tests::a_replayed_handshake_flight_does_not_establish_a_session ... ok
+test transport::noise::tests::a_secure_channel_carries_bytes_both_ways ... ok
+test transport::noise::tests::the_responder_learns_the_device_id_it_authenticated ... ok
+test transport::noise::tests::an_unknown_device_is_refused_without_running_cryptography ... ok
+test transport::noise::tests::an_impossible_frame_length_is_refused_instead_of_waited_on ... ok
+test transport::quic::tests::a_peer_outside_its_budget_is_refused ... ok
+test transport::noise::tests::claiming_a_pinned_id_without_its_key_fails ... ok
+test transport::quic::tests::an_unpinned_device_never_reaches_the_noise_handshake ... ok
+test transport::quic::tests::a_quic_session_carries_the_noise_channel_over_the_wire ... ok
+test transport::quic::tests::a_non_arreo_peer_fails_at_the_application_protocol ... ok
+test transport::quic::tests::the_limiter_budgets_attempts_per_peer_and_recovers ... ok
+test transport::noise::tests::a_large_payload_survives_segmentation_and_reassembly ... ok
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 84 filtered out; finished in 1.25s
+
+== daemon wiring: per-verb gate, real pane over the transport ==
+test transport::tests::an_unpinned_device_gets_no_session ... ok
+test transport::tests::a_stalled_peer_does_not_block_the_listener ... ok
+test transport::tests::a_pinned_owner_may_drive ... ok
+test transport::tests::a_pinned_viewer_observes_is_refused_writes_and_is_recorded ... ok
+test transport::tests::a_remote_owner_drives_a_real_pane_and_resumes_the_stream ... ok
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.23s

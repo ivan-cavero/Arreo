@@ -204,6 +204,127 @@ impl RootKey {
     }
 }
 
+/// The X25519 view of an identity key: the same secret, used for the Noise
+/// handshake (T-0023).
+///
+/// **Why one key does both.** ROADMAP §3.3 says it plainly — "phone generates
+/// an ed25519 device keypair; server pins it; every later connection is
+/// Noise-KK mutual auth" — and there is exactly one pin per device. A second,
+/// separate transport key would mean a second thing to pair, pin, rotate and
+/// revoke, and every one of those is a place for the two to disagree (a rotated
+/// identity with a stale transport key is a device that authenticates as
+/// somebody it is not). So the Noise static is *derived*:
+///
+/// - public: `ed25519_pk.to_montgomery()` — the birational map, a library call
+/// - secret: the ed25519 expanded scalar (`SigningKey::to_scalar_bytes`), which
+///   X25519 clamps identically (both clear the low three bits, clear the top
+///   bit and set the second-highest), so scalar × B_montgomery is the same
+///   point as `to_montgomery()`. `identity::keys` tests assert that equality
+///   rather than assuming it.
+///
+/// This is the conversion libsodium ships (`crypto_sign_ed25519_*_to_curve25519`).
+/// `ed25519-dalek` documents that reusing a signing key for Diffie-Hellman is
+/// not recommended in general, and that is the right default — the exception
+/// here is that a *device* key signs nothing in this product (its Ed25519 half
+/// only identities it; the root key does the signing), so there is no
+/// signing oracle to combine with the DH half. The root key does sign, which is
+/// recorded as a known trade-off in ADR 0011; if device keys ever gain a signing
+/// role, the move is a signed prekey (bind a separate X25519 key with an Ed25519
+/// signature) rather than this derivation.
+#[cfg(feature = "transport")]
+pub struct NoiseStatic {
+    secret: [u8; 32],
+    public: [u8; 32],
+}
+
+#[cfg(feature = "transport")]
+impl std::fmt::Debug for NoiseStatic {
+    /// Never print the secret half.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NoiseStatic")
+            .field("public", &crate::identity::keys::hex(&self.public))
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(feature = "transport")]
+impl NoiseStatic {
+    /// The public half, as the peer needs it.
+    #[must_use]
+    pub fn public(&self) -> [u8; 32] {
+        self.public
+    }
+
+    /// The secret half. Crate-visible: only the transport's handshake may hold
+    /// it, and only for the length of a handshake.
+    #[must_use]
+    pub(crate) fn secret(&self) -> [u8; 32] {
+        self.secret
+    }
+}
+
+#[cfg(feature = "transport")]
+impl Zeroize for NoiseStatic {
+    fn zeroize(&mut self) {
+        self.secret.zeroize();
+    }
+}
+
+#[cfg(feature = "transport")]
+impl Drop for NoiseStatic {
+    fn drop(&mut self) {
+        self.secret.zeroize();
+    }
+}
+
+/// The X25519 public key of an identity (the peer side of [`NoiseStatic`]).
+#[must_use]
+#[cfg(feature = "transport")]
+pub fn noise_public_key(identity: &VerifyingKey) -> [u8; 32] {
+    identity.to_montgomery().to_bytes()
+}
+
+/// Derive the Noise static from an ed25519 signing key: the expanded scalar for
+/// the secret, the Montgomery image of the public key for the public half.
+#[cfg(feature = "transport")]
+fn noise_static_from(signing: &SigningKey) -> NoiseStatic {
+    let mut secret = signing.to_scalar_bytes();
+    // Clamp here as well as in X25519, so `secret` and `public` are consistent
+    // *as stored* (a caller that reads `secret()` must not have to know that
+    // X25519 will clamp later).
+    secret[0] &= 248;
+    secret[31] &= 127;
+    secret[31] |= 64;
+    NoiseStatic {
+        secret,
+        public: noise_public_key(&signing.verifying_key()),
+    }
+}
+
+impl DeviceKey {
+    #[cfg(feature = "transport")]
+    /// The Noise static this device authenticates with (see [`NoiseStatic`]).
+    #[must_use]
+    pub fn noise_static(&self) -> NoiseStatic {
+        noise_static_from(&self.signing)
+    }
+}
+
+impl RootKey {
+    #[cfg(feature = "transport")]
+    /// The Noise static the *server* authenticates with.
+    #[must_use]
+    pub fn noise_static(&self) -> NoiseStatic {
+        static_secret_of_root(&self.inner)
+    }
+}
+
+/// `RootKey` wraps a `DeviceKey`; this keeps the derivation in one place.
+#[cfg(feature = "transport")]
+fn static_secret_of_root(inner: &DeviceKey) -> NoiseStatic {
+    noise_static_from(&inner.signing)
+}
+
 /// Verify a signature without owning the key (the server does this for device
 /// signatures, clients for certs).
 #[must_use]
@@ -348,6 +469,70 @@ pub fn identity_root() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[cfg(feature = "transport")]
+    fn the_noise_static_is_the_same_point_the_public_key_maps_to() {
+        // The property the whole transport design rests on: a peer that derives
+        // our X25519 public key from our ed25519 identity key gets exactly the
+        // key our stored secret produces. Cross-checked against an independent
+        // computation (scalar x B_montgomery) rather than restating the
+        // implementation.
+        for seed in [[0u8; 32], [1u8; 32], [42u8; 32], [255u8; 32]] {
+            let key = DeviceKey::from_seed(seed);
+            let stat = key.noise_static();
+            assert_eq!(
+                stat.public(),
+                noise_public_key(&key.public()),
+                "derived public half disagrees with the identity key's image"
+            );
+            // Independent path: clamped scalar times the Montgomery basepoint.
+            let scalar = curve25519_dalek::scalar::Scalar::from_bytes_mod_order(stat.secret());
+            let from_scalar = curve25519_dalek::edwards::EdwardsPoint::mul_base(&scalar)
+                .to_montgomery()
+                .to_bytes();
+            assert_eq!(
+                from_scalar,
+                stat.public(),
+                "secret and public are not a pair"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "transport")]
+    fn two_identities_have_two_different_noise_statics() {
+        let a = DeviceKey::from_seed([3u8; 32]).noise_static();
+        let b = DeviceKey::from_seed([4u8; 32]).noise_static();
+        assert_ne!(a.public(), b.public());
+        assert_ne!(a.secret(), b.secret());
+    }
+
+    #[test]
+    #[cfg(feature = "transport")]
+    fn the_noise_static_never_prints_its_secret() {
+        let key = DeviceKey::from_seed([9u8; 32]);
+        let stat = key.noise_static();
+        let shown = format!("{stat:?}");
+        assert!(
+            !shown.contains(&hex(&stat.secret())),
+            "Debug leaked the Noise secret"
+        );
+        assert!(
+            shown.contains(&hex(&stat.public())),
+            "the public half is useful in logs"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "transport")]
+    fn the_root_key_has_a_noise_static_too() {
+        // The server authenticates with the same identity that signs device
+        // certificates, so a client pins one key and gets both.
+        let root = RootKey::from_seed([7u8; 32]);
+        let stat = root.noise_static();
+        assert_eq!(stat.public(), noise_public_key(&root.public()));
+    }
 
     fn scratch(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("arreo-identity-{tag}-{}", std::process::id()));

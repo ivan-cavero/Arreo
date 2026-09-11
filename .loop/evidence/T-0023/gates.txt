@@ -1,0 +1,17 @@
+T-0023 gate battery — final code, 2026-09-11T07:34:18Z
+
+== cargo test --workspace ==
+passed=236 failed=0
+
+== cargo clippy --workspace --all-targets -- -D warnings ==
+0
+(0 = clean)
+
+== cargo fmt --all -- --check ==
+clean
+
+== supply chain ==
+Vetting Succeeded (336 exempted)
+advisories ok, bans ok, licenses ok, sources ok
+0
+(0 = none)

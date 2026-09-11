@@ -1,0 +1,13 @@
+T-0023 handshake + replay/tamper transcripts
+2026-09-11T07:21:24Z
+
+--- replay refusal (the guard, not decryption, is what catches it) ---
+test transport::noise::tests::a_replayed_handshake_flight_does_not_establish_a_session ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 97 filtered out; finished in 0.02s
+
+--- tampered transport frame: zero plaintext bytes reach the peer ---
+test transport::noise::tests::a_flipped_byte_in_a_transport_frame_is_never_delivered_as_plaintext ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 97 filtered out; finished in 0.76s
+
+--- secret scan over the evidence directory ---
+no key material found

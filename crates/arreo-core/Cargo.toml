@@ -19,8 +19,23 @@ sha2 = "0.10"
 # and `curve25519-dalek` was already in the graph via ed25519-dalek.
 spake2 = "0.4"
 hmac = "0.12"
+# Remote transport (T-0023): QUIC via quinn carrying Noise-KK sessions (snow,
+# RustCrypto primitives). quinn is pure Rust and tokio-native; rustls is its
+# mandatory TLS 1.3 layer, pinned to the `ring` provider — no BoringSSL/OpenSSL
+# and no cmake, but note that `ring` does compile C and assembly, so a C
+# compiler is required for the *target*. rcgen mints the ephemeral certificate
+# TLS uses as a transport detail (the trust anchor is the Noise static key).
+#
+# All four are optional behind the `transport` feature so a build that does not
+# speak the remote path (a local-only daemon, the plugin host) drops the whole
+# tree — and so `check-targets` (T-0010) keeps a genuinely C-free surface to
+# type-check for foreign targets.
+quinn = { version = "0.11", optional = true }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"], optional = true }
+rcgen = { version = "0.13", optional = true }
+snow = { version = "0.9", optional = true }
 portable-pty = "0.9"
-tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "time", "io-util"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "time", "io-util", "net"] }
 anyhow = "1"
 thiserror = "2"
 serde = { version = "1", features = ["derive"] }
@@ -38,13 +53,22 @@ alacritty_terminal = "0.24"
 polling = "=3.7.0"
 
 [dev-dependencies]
+# The identity tests cross-check the noise derivation against curve25519-dalek
+# directly (an independent path, not a restatement of the implementation).
+curve25519-dalek = "4"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "time", "io-util"] }
 proptest = "1"
 
 [features]
-default = ["sqlite"]
+default = ["sqlite", "transport"]
 # SQLite rollup store (T-0006). The feature gate lets `check-targets` (T-0010)
 # verify all pure-Rust code for foreign targets without an SDK linker, while
 # `--no-default-features` skips the C build. CI (real OS runners) always
 # builds with default features — the store is never optional in product.
 sqlite = ["dep:rusqlite"]
+# Remote transport (T-0023): the Noise-QUIC path a paired device connects to.
+# On by default — the daemon and the phone both need it — but separable,
+# because a local-only build (and the plugin host) has no use for it, and
+# because `ring` is a C dependency: dropping this feature is what keeps a
+# pure-Rust surface available to `check-targets` for foreign targets.
+transport = ["dep:quinn", "dep:rustls", "dep:rcgen", "dep:snow"]

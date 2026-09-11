@@ -11,6 +11,9 @@
 //! (T-0002), engines/samplers sit behind Mutexes; slow clients block only
 //! their own task (100 ms attach polls, bounded wait polls).
 
+use arreo_core::identity::authority::DeviceAuthority;
+use arreo_core::identity::role::Verb;
+use arreo_core::identity::{DeviceId, VerifyingKey};
 use arreo_core::metrics::Sampler;
 use arreo_core::proto::codec::{self, CodecError};
 use arreo_core::proto::{AgentState, Message, PaneInfo, VERSION};
@@ -309,10 +312,94 @@ async fn read_message(
     }
 }
 
+/// Connection handler for the local Unix socket: Hello→Welcome, then verbs.
+async fn handle(stream: UnixStream, registry: Registry, db: PathBuf) -> Result<(), DaemonError> {
+    let (reader, writer) = stream.into_split();
+    // `None`: the local socket is same-machine and trusted, so no per-verb
+    // authorization gate applies. A remote peer always arrives with one (see
+    // [`SessionAuth`]).
+    serve_session(reader, writer, registry, db, None).await
+}
+
+/// The per-verb authorization gate for a session that arrived over the remote
+/// transport (T-0023).
+///
+/// The local socket is same-machine; a remote peer is not, so every verb it
+/// sends is checked before it reaches `dispatch`. The check is
+/// [`DeviceAuthority::check_verb`] — authenticate (pinned, not revoked, cert
+/// verifies under the root) *and* apply the role policy — because doing only
+/// half of that is exactly the mistake this type exists to make impossible.
+pub struct SessionAuth {
+    authority: Arc<Mutex<DeviceAuthority>>,
+    peer: VerifyingKey,
+    device: DeviceId,
+}
+
+impl SessionAuth {
+    /// `peer` is the key the Noise handshake authenticated, `device` the id it
+    /// announced; they are bound together by the handshake itself.
+    #[must_use]
+    pub fn new(
+        authority: Arc<Mutex<DeviceAuthority>>,
+        peer: VerifyingKey,
+        device: DeviceId,
+    ) -> Self {
+        Self {
+            authority,
+            peer,
+            device,
+        }
+    }
+
+    /// Record the session against the device's `last_seen` (best-effort: a
+    /// store failure must not refuse an otherwise valid session).
+    pub fn touch(&self) {
+        let mut authority = self.lock();
+        if let Err(e) = authority.touch(&self.device) {
+            eprintln!("daemon: cannot record last-seen for {}: {e}", self.device);
+        }
+    }
+
+    /// `Err` carries the refusal to send back; the verb never runs.
+    fn check(&self, message: &Message) -> Result<(), Message> {
+        let verb = verb_of(message);
+        let mut authority = self.lock();
+        authority.check_verb(&self.peer, verb).map_err(|denial| {
+            eprintln!("daemon: refusing {verb:?} for {}: {denial}", self.device);
+            Message::Error {
+                v: VERSION,
+                message: denial.to_string(),
+            }
+        })
+    }
+
+    /// The critical section is one in-memory lookup plus a certificate verify —
+    /// short and CPU-bound, so a plain mutex is the right tool; the store reads
+    /// behind it are the local SQLite sidecar.
+    fn lock(&self) -> std::sync::MutexGuard<'_, DeviceAuthority> {
+        match self.authority.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+}
+
 /// Connection handler: Hello→Welcome handshake, then verbs. Attach/Resume
 /// own the connection while streaming (v0 semantics, T-0009 F4).
-async fn handle(stream: UnixStream, registry: Registry, db: PathBuf) -> Result<(), DaemonError> {
-    let (mut reader, mut writer) = stream.into_split();
+///
+/// Generic over the byte stream so the local socket and the remote transport
+/// run *this* loop: one protocol implementation, two ways to reach it.
+pub(crate) async fn serve_session<R, W>(
+    mut reader: R,
+    mut writer: W,
+    registry: Registry,
+    db: PathBuf,
+    auth: Option<SessionAuth>,
+) -> Result<(), DaemonError>
+where
+    R: AsyncReadExt + Unpin,
+    W: AsyncWriteExt + Unpin,
+{
     let mut buf = Vec::new();
 
     // Handshake first: exactly one Hello, answered by Welcome or Error.
@@ -382,6 +469,16 @@ async fn handle(stream: UnixStream, registry: Registry, db: PathBuf) -> Result<(
             Ok(message) => message,
             Err(_) => return Ok(()),
         };
+        // Remote sessions are gated per verb, before anything acts on the
+        // message. A refusal is answered and the session stays usable — a
+        // viewer that tries `send` is told no, it does not lose its ability to
+        // observe.
+        if let Some(auth) = &auth {
+            if let Err(refusal) = auth.check(&message) {
+                write_message(&mut writer, &refusal).await?;
+                continue;
+            }
+        }
         // Streaming verbs own the connection until done.
         match &message {
             Message::Attach { id, from_line, .. } => {
@@ -423,6 +520,36 @@ async fn handle(stream: UnixStream, registry: Registry, db: PathBuf) -> Result<(
         if let Some(reply) = reply {
             write_message(&mut writer, &reply).await?;
         }
+    }
+}
+
+/// The policy verb a wire message maps to.
+///
+/// Exhaustive on purpose, like `role::required`: a `Message` added without a
+/// decision here is a compile error, never a silent allow. Server→client
+/// messages are mapped to `Admin` — a peer never sends them, so if one arrives
+/// the gate answers with the most privileged verb rather than guessing.
+fn verb_of(message: &Message) -> Verb {
+    match message {
+        Message::Hello { .. } => Verb::Hello,
+        // Topology and scrollback reads.
+        Message::Panes { .. } | Message::Snapshot { .. } | Message::Delta { .. } => Verb::Panes,
+        Message::Read { .. } => Verb::Read,
+        Message::Attach { .. } | Message::Resume { .. } => Verb::Attach,
+        Message::Wait { .. } => Verb::Wait,
+        Message::Metrics { .. } | Message::MetricsReq { .. } => Verb::Metrics,
+        // Driving the machine. `Resize` changes someone's terminal, so it
+        // belongs with the control verbs even though the policy enum has no
+        // separate name for it.
+        Message::Send { .. } | Message::Resize { .. } => Verb::Send,
+        Message::Spawn { .. } => Verb::Spawn,
+        Message::Split { .. } => Verb::Split,
+        Message::Kill { .. } => Verb::Kill,
+        Message::Welcome { .. }
+        | Message::Error { .. }
+        | Message::Ok { .. }
+        | Message::Exited { .. }
+        | Message::StateEvent { .. } => Verb::Admin,
     }
 }
 

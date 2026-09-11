@@ -1,19 +1,44 @@
-# .loop/PROGRESS.md
 ## State snapshot          ← REWRITTEN (not appended) at every checkpoint
-Task: T-0023 · Noise-QUIC remote transport (phase 2, priority 2)
-Why: Phase 2's identity half is done (T-0025 devices/certs/roles, T-0024 pairing that pins them), but a pinned device still has nothing to connect *to*: the daemon speaks only over the local unix socket, so "remote & security" (§4, the roadmap's differentiator) has no remote path. T-0023 is the transport that consumes `DeviceAuthority::authorize`/`check_verb` — the decision functions T-0025 shipped and tested for exactly this caller.
-Approach: per the task file — quinn (pure Rust, tokio-native, no OpenSSL/BoringSSL: protects the mobile core and the §5 size budget) carrying one bidi stream per session with the existing msgpack frames (ADR 0006), inside a Noise-KK handshake (snow) whose static key is the pinned device key; the local unix socket stays the same-machine default (a second path, never a rewrite). Loopback listener behind `ARREO_TRANSPORT_TEST_LISTEN=1` is the test seam. Slice wiring + tamper/replay negatives belong to T-0027.
-Deps: new crates `quinn` + `snow` and their trees. **Run all three supply-chain gates in the same commit that adds them** (`cargo vet --locked`, `cargo deny check`, `cargo audit`) — this cost two repairs already (T-0015's ratatui/paste, and the TUI deps never being exempted).
-Where you are: Phase 1 closed; Phase 2 queue drafted (cdafea9; T-0023..T-0049); T-0025 done+pushed (978569a); T-0024 done+pushed (f275056); HEAD == origin/main; tree clean
-Next step: read T-0023 → dep survey (quinn/snow fetch + the three gates) → frame-over-QUIC + Noise-KK tests → tamper/replay negatives → wire into the daemon behind `check_verb` → evidence → commit+push. Then T-0027 (the transport/pairing e2e slice that turns T-0023/T-0024's negatives into one command).
+Task: T-0023 · Noise-QUIC remote transport (phase 2) — DONE, evidence recorded
+Where you are: transport implemented and wired; all gates green on the final code
+Next step: T-0027 — the transport/pairing e2e slice (turns T-0023/T-0024's
+negatives into one command over real sockets). Then T-0026 (revocation) or
+T-0029 (relay v0), whichever the queue ranks next.
 Open workers: (none)
 Known broken: (none) · Parked: (none)
 Findings:
-- **The real-process test is what finds the bugs in a security flow.** T-0024's in-process unit tests were green while the actual `arreo pair` could not complete: `complete()` burned the mailbox session *before* the phone read its certificate. Two more real defects fell out of the same run (the relay expiring a session ahead of the server's own deadline; `arreo audit` never printing the event kind). Keep writing the three-process version for anything on the pairing/transport path.
-- **`cargo test -p <crate>` only builds that crate's own bins.** `arreo-cli`'s pairing tests spawn the `arreo-relay` *binary* (deliberately: that keeps the AGPL crate out of the CLI's dependency graph), so the relay needed a test target of its own referencing `CARGO_BIN_EXE_arreo-relay` — otherwise a fresh CI checkout has no relay to spawn. Anything spawning another package's binary inherits this rule.
-- **`xtask check-targets` earned its keep again**: unguarded `std::os::unix::net::UnixStream` in `arreo-core` broke the Windows target, and no Linux-only run would ever have noticed.
-- Perf data point: `xtask bench --panes 10` came in at 267 ms this run vs ~515-615 ms earlier the same day — the box's load varies enough that only the budgets (all 6 pass comfortably) are meaningful; do not read small deltas as regressions.
-- CLI-wide hazard filed as **T-0049**: every printing verb panics on a closed stdout pipe (`arreo pair | head -1` → Broken pipe, exit 101). It affects the xtask harnesses too.
+- **The handshake's first flight is replayable in principle — and decryption
+  cannot catch it.** KK's first message depends only on the responder's *static*
+  key, so a recorded flight authenticates against a fresh responder, which
+  answers it and reports a session with a device that is not there. No keys are
+  derivable (that needs the initiator's ephemeral secret), so nothing is readable
+  or forgeable — but the server believing in a session is worth refusing. That is
+  what `FlightGuard` does. Any future KK-based path needs the same guard; this is
+  a property of the pattern, not of this implementation.
+- **A stream framing prefix cannot be authenticated by the seal it precedes.**
+  The `u16` length is outside the AEAD by construction, so a rewritten length is
+  invisible to decryption. A length no seal can produce must fail fast
+  (`MAX_FRAME_BYTES`); a plausible-but-longer one is indistinguishable from a
+  frame still in flight and is bounded only by the transport's idle timeout.
+  Worth remembering for the relay's framing (T-0029/T-0030).
+- **`ring` compiles C, and that silently killed the portability gate's C-free
+  fallback.** Adding rustls/ring to `arreo-core` made `check-targets` FAIL (no
+  `lib.exe`) instead of SKIP, because the fallback build (`--no-default-features`
+  drops `sqlite`) still pulled the crypto tree. The transport deps are now behind
+  a default `transport` feature; `check-targets` is back to PASS/SKIP. Any future
+  C dependency in core must keep a feature-gated pure-Rust surface, or the gate
+  loses its meaning.
+- **`cargo vet regenerate exemptions` is the repair path** for a new dependency
+  tree (336 exemptions now, was 279); the registry imports (`isrg`,
+  `bytecode-alliance`) carry no audits for this tree. `cargo audit` is clean.
+- **A passing test can pass for the wrong reason.** The first tamper test ignored
+  a `timeout` result and asserted only "no plaintext arrived" — also true when
+  the read *times out*. It hid a real stall. Assertions on absence need a
+  companion assertion that the thing actually finished.
+- Perf data point: release, loopback — QUIC connect 3.0 ms, QUIC+Noise 5.1 ms
+  (Noise adds one round trip), 1 MB through the transport 9.7 ms, RSS 22.7 MB
+  with a listener plus five live sessions. The §5 budget (30 panes + 5 clients)
+  is 120 MB; the transport's share is in the low tens of MB.
 ## Event log               ← append-only; newest last; never rewrite
 - 2026-09-10 [turn 1] ledger created; repo at e489fac (docs only); T-0001 + T-0022 (AGENTS.md gardened) done
 - 2026-09-10 [turn 2] T-0002 PTY manager done+pushed (342606c; 9 tests); PROMPT.md v2 synced + ADR 0001 (ef6c595)
@@ -38,3 +63,4 @@ Findings:
 - 2026-09-11 [turn 20] T-0016 theming done+pushed (4075ad5; core engine, 5 built-ins, depth fallback proven by the bytes each terminal gets, /theme picker, 27-assertion slice) + adversarial fix 7772b1b (a broken theme file no longer hides the working ones); Phase 2 queue drafted (cdafea9; T-0023..T-0048 proposed) + Phase 1 exit recorded in PHASE-DONE.md with two human-gated items; remote == local
 - 2026-09-11 [turn 21] T-0025 device identity done+pushed (978569a; ed25519 certs + roles + durable authority + `arreo devices`, store v3, ADR 0009, 173 tests, evidence) — also repaired the two supply-chain gates T-0015 had left red (ratatui 0.30 drops unmaintained `paste`; vet exemptions regenerated); remote == local
 - 2026-09-11 [turn 22] T-0024 pairing done+pushed (f275056; SPAKE2+HMAC flow in core, single-use write-once mailbox in arreo-relay served over unix+TCP, `arreo pair` both sides, `pairing_failed` audit kind, ADR 0010, 6 three-process scenarios + 28 unit tests, evidence); 4 real defects fixed en route (premature burn, expiry race, invisible audit kind, unguarded unix socket breaking the Windows gate); T-0049 filed (CLI broken-pipe panic); gates all green (211 tests, vet 279, deny 4/4, check-targets PASS/SKIP, bench 6/6); remote == local
+- 2026-09-11 [turn 23] T-0023 remote transport done+pushed: Noise-KK (snow) inside QUIC (quinn), one bidi stream carrying the T-0013 msgpack frames; Noise static derived from the pinned ed25519 identity (ADR 0011); per-verb gate (`DeviceAuthority::check_verb`) in front of the *same* `serve_session` loop the unix socket runs; zero inbound ports by default (loopback test seam only). 15 core + 5 daemon tests over real streams/sockets; 6 real defects fixed (resolver id spelling, replay guard, pump request/response deadlock, impossible frame length, quiet-peer accept starvation, swallowed failure reason); `transport` feature gate keeps `check-targets` at PASS/SKIP; vet exemptions regenerated 279->336; 236 workspace tests, clippy/fmt clean, deny/audit green, bench 6/6, all five e2e slices green; evidence in `.loop/evidence/T-0023/`; remote == local
