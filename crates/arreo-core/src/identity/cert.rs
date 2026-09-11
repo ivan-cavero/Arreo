@@ -362,6 +362,12 @@ pub struct DeviceRecord {
     pub issued_at_ms: i64,
     pub last_seen_ms: Option<i64>,
     pub revoked: bool,
+    /// When the revocation happened, and who made the call (T-0026): the two
+    /// facts an operator asks for afterwards. `revoked_by` is a device id, or
+    /// [`crate::identity::revocation::LOCAL_CLI`] for an admin acting on this
+    /// machine's own socket. Both are `None` for a live device.
+    pub revoked_at_ms: Option<i64>,
+    pub revoked_by: Option<String>,
     /// Set when this key was rotated away, naming the device it became. The
     /// retirement has to be durable: the whole point of rotation is that the
     /// old key stops working *after a restart* too.
@@ -380,6 +386,8 @@ impl DeviceRecord {
             issued_at_ms: cert.payload.issued_at_ms,
             last_seen_ms: None,
             revoked: false,
+            revoked_at_ms: None,
+            revoked_by: None,
             retired_to: None,
         }
     }

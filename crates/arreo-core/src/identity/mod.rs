@@ -26,6 +26,7 @@ pub mod authority;
 pub use authority::{sidecar_db, AuthorityError, DeviceAuthority, Layout, VerbDenial};
 pub mod cert;
 pub mod keys;
+pub mod revocation;
 pub mod role;
 
 pub use cert::{
@@ -35,6 +36,7 @@ pub use cert::{
 pub use keys::{
     create_private_dir, identity_dir, identity_root, DeviceKey, KeyError, RootKey, IDENTITY_DIR_ENV,
 };
+pub use revocation::{authorized_role, may_connect, may_pin, Denied};
 pub use role::{Capability, Role, RoleError};
 
 /// The ed25519 public key type, re-exported so the server and CLI depend on

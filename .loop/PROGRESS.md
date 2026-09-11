@@ -1,41 +1,38 @@
 ## State snapshot          ← REWRITTEN (not appended) at every checkpoint
-Task: T-0051 · daemon relay wiring (phase 2) — DONE, evidence recorded
-Where you are: the daemon dials the relay, accepts peers, probes its configured peer, and two real
-daemons exchange a message through a real relay; 293 workspace tests
-Next step: **T-0032 (remote TUI attach)** — p3, and the natural continuation: the relay leg now
-carries protocol sessions, so the remaining work is the TUI driving a pane on a peer (the probe
-becomes an attach). T-0034 (the relay e2e slice) follows and depends on it.
-Also ready: T-0026 (revocation, p3 — and now valuable, since the relay and daemon both verify
-certificates), T-0031 (presence), T-0035 (AGPL boundary), T-0028, T-0040, T-0049. T-0044 is *still*
-blocked on the account-join RPC (recorded in its own note); T-0036 stays human-gated on minisign.
+Task: T-0026 · device revocation (phase 2) — DONE, evidence recorded
+Where you are: revocation is a durable, audited decision with one home; 306 workspace tests
+Next step: **T-0033 (audit log)** — p3, deps now met (T-0018, T-0026, T-0029): it extends the
+connection/action trail across machine and relay, and T-0032's "remote input is attributable"
+criterion needs its row shape. Then T-0032 (remote TUI attach) becomes reachable, and T-0052
+(the live-session cutoff this task split out) is a smaller independent piece.
+Also ready: T-0035 (AGPL boundary), T-0031 (presence), T-0028, T-0040, T-0049. T-0044 remains
+blocked on the account-join RPC (its own note); T-0036 stays human-gated on minisign.
 Open workers: (none)
 Known broken: (none) · Parked: (none)
 Findings:
-- **A flaky test pointed at a product weakness, not a test bug.** The two-daemon test failed
-  intermittently because A probed before B had reached the relay — and the probe ran *once per
-  session*, so a machine booting before its peer logged a failure and never tried again until its
-  own session dropped. The probe is now bounded-retry (5 attempts, doubling delays); stable across
-  repeated runs. Ask "is this flake hiding a one-shot assumption?" before reaching for a longer
-  timeout.
-- **One question, two answers — the same id-spelling class, in a new place.** `reload()` accepts a
-  certificate *file* with no store row, and `check_verb` authorizes through the index, so the gate
-  accepted such a device — but the daemon's handshake resolver asked `devices()`, which lists only
-  the store, and refused it before the gate ran. Fixed with `DeviceAuthority::device()` (the index,
-  the same source the gate uses) and pinned by a test. This is the fourth instance of a mismatch
-  across a boundary that keeps two spellings or two sources for one fact: treat them as suspect by
-  default.
-- **A second reader on the code paid for itself a fourth time.** The docs worker checked every claim
-  against the source and found: a test comment my own change had made false, an error naming the
-  identity directory instead of `device.key`, no log line for an attempt in progress (so "a log line
-  per attempt" was only true at its end), and the exact backoff arithmetic (the 30 s ceiling applies
-  to the base; jitter adds up to 25% on top, so the largest printed delay is ~37.5 s — now stated
-  precisely instead of rounded). All four became code fixes.
-- **The daemon's relay peer runs the same session loop as the local socket**, behind the same
-  per-verb gate, so the relay is a transport and not a second door. That is worth keeping true as
-  T-0032 adds attach — a second door would be a security bug, not a feature.
-- Bench flaked once more at 5/6 in a full battery and is reliably 6/6 when run settled (three
-  consecutive runs). The battery runs five e2e slices immediately before it, so the box is warm.
-  Same conclusion as last turn: read a lone FAIL after a full battery as load.
+- **The third "written but not rendered" defect.** `arreo audit` printed the coarse `kind` and never
+  the `action`, so a revocation appeared as `device_change` and `device.revoke` was invisible. T-0024
+  lost the event kind the same way. When adding an audit-shaped field, check the *renderer* in the
+  same commit — a row nobody can read is a row that did not happen.
+- **`cargo test -p <crate>` does not build other crates' binaries.** The revocation test spawns the
+  `arreo` CLI, so `cargo test -p arreo-server` ran a *stale* CLI and made an already-fixed renderer
+  look broken. T-0024 recorded this for `arreo-relay`; it now applies to `arreo` too. A test that
+  spawns another package's binary must say so at the top of its file.
+- **A `str.replace` that does not match is a silent no-op.** The store v4 migration silently did not
+  land and three more steps were built on top before a test caught the missing columns. Verify the
+  insertion (the grep was in the very output I read past).
+- **A failing target truncates the workspace test counts.** `cargo test --workspace` stops at the
+  first failing target, so the summary read `passed=5 failed=2` — which looks like a catastrophe
+  rather than "two tests in `arreo-cli`". Read a small `passed=N` as "aborted".
+- **One question, two answers — fifth occurrence, now pre-empted.** Revocation was decided in two
+  places (`authorize` and the transport resolver) and the pinning door spelled out a third variant.
+  `identity::revocation` now owns `may_connect`/`may_pin`, and all three doors call it. The *lookup*
+  doors are also named for their question: `device()` = authorized (index), `record()` = the durable
+  record including tombstones. Worth watching: this class keeps recurring at boundaries that keep two
+  spellings or two sources for one fact.
+- **A flaky-looking test was a real API ambiguity, not a bug.** My first re-pair test asked
+  `device()` for a revoked device's tombstone and got `None`; the API was right (it is the authorized
+  lookup) and the question was wrong. Naming the two doors fixed it — the same lesson as T-0051's.
 ## Event log               ← append-only; newest last; never rewrite
 - 2026-09-10 [turn 1] ledger created; repo at e489fac (docs only); T-0001 + T-0022 (AGENTS.md gardened) done
 - 2026-09-10 [turn 2] T-0002 PTY manager done+pushed (342606c; 9 tests); PROMPT.md v2 synced + ADR 0001 (ef6c595)
@@ -66,3 +63,4 @@ Findings:
 - 2026-09-11 [turn 26] T-0030 durable per-device inbox done: store v3 (`inbox` + `inbox_stats`), bounds (10k msgs / 64 MiB / 30-day TTL, all operator-settable with validation), oldest-first eviction before the write, lazy + hourly expiry with counted drops, exactly-once stated as at-least-once + consumer `(device, seq)` dedupe with ack advancing the cursor in one transaction, `drain`/`ack` kinds and `DrainReport`/`Queued` on the wire, drained envelopes replayed byte-for-byte so the relay never decodes a stored header, CLI `--inbox-ttl-days`/`--inbox-max-messages`/`--inbox-max-mb`; 11 inbox tests (incl. real `kill -9` → restart → drain) + 14 router tests; 2 real defects fixed (stale cached queue depth after expiry; test harness killing the child via a closed stderr pipe); docs extended by a worker (protocol §4.4/4.5, deploy §8) with the at-least-once caveat stated plainly; 283 workspace tests, clippy/fmt clean, vet/deny/audit green, check-targets PASS/SKIP, five e2e slices green, bench 6/6; evidence in `.loop/evidence/T-0030/`
 - 2026-09-11 [turn 27] T-0050 relay stream+session done (split from the original T-0050, which became T-0050+T-0051): `RelayClient::into_split`/`RelayWriter`/`RelayReader` in Apache core, `RelaySession` (peer multiplexing, delivery attribution, drain/ack, backoff policy) + `RelayStream` (AsyncRead+AsyncWrite over envelopes, 32 KiB chunking) in arreo-server, ADR 0014; 5 acceptance tests against the real relay binary (full Noise-KK session through the relay with a ciphertext scan over state dir and logs, 200 KB payload chunking, zero-length write, delivery failure ending the stream, refused registration carrying the relay's reason, vanished relay noticed in bounded time, backoff table); 3 real defects fixed (split-duplex never closed; peer's first chunks dropped before a stream existed; 35 s dead-relay detection -> 15 s idle timeout); 1 test deleted with its finding recorded (session overflow unreachable through the relay); 288 workspace tests, clippy/fmt clean, vet/deny/audit green, check-targets PASS/SKIP, five e2e slices green, bench 6/6; evidence in `.loop/evidence/T-0050/`
 - 2026-09-11 [turn 28] T-0051 daemon relay wiring done: `[relay]` config section (+`--config`/`$ARREO_CONFIG`), `own_identity` (the machine's existing paired cert — no new key), reconnect loop with a dialling line per attempt, drain-on-connect, peer accept through the same `serve_session`+per-verb gate as the local socket, bounded-retry probe of the configured peer, and `StreamFactory` for fresh streams per attempt; fixed a real two-door defect (`DeviceAuthority::device()` now reads the index the gate uses, so a file-pinned device is no longer refused by the handshake) and a one-shot-probe race; 4 two-daemon acceptance tests (message exchange with a plaintext scan of the relay's state+logs, both local sockets still serving, unreachable relay leaving the daemon serving, no config meaning no relay, incomplete config refused by name) + the T-0050 transport tests; 293 workspace tests, clippy/fmt clean, vet/deny/audit green, check-targets PASS/SKIP, five e2e slices green, bench 6/6 (isolated); evidence in `.loop/evidence/T-0051/`
+- 2026-09-11 [turn 29] T-0026 device revocation done (split: the live-session cutoff became T-0052): `arreo_core::identity::revocation` (one home for may-connect/may-pin, used by the authorization check, the transport resolver and the pinning door), store v4 (`devices.revoked_at`/`revoked_by` + `audit.action`), `arreo devices revoke <name|id>` idempotent with an audit row naming who and when, `devices list --revoked|--all` tombstones, re-pair refused for a burned key (a fresh key may take the name), the resolver now logs the real refusal reason; 7 acceptance tests through the real binaries (durable across kill -9, offline case, re-pair, ambiguous/unknown refs, live device unaffected) + 5 decision tests + 12 authority tests; fixed the third "written but not rendered" defect (audit action) and migrated two T-0025 tests to the new listing contract; 306 workspace tests, clippy/fmt clean, vet/deny/audit green, check-targets PASS/SKIP, five e2e slices green, bench 6/6; evidence in `.loop/evidence/T-0026/`

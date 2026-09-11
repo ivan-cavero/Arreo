@@ -44,6 +44,16 @@ pub fn sidecar_db(socket: &Path) -> PathBuf {
     PathBuf::from(path)
 }
 
+/// What a `revoke` call did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Revocation {
+    /// This call revoked the device.
+    Revoked,
+    /// It was already revoked; nothing changed, and no second audit row was
+    /// written.
+    AlreadyRevoked,
+}
+
 /// Where the authority keeps its material.
 #[derive(Debug, Clone)]
 pub struct Layout {
@@ -242,17 +252,16 @@ impl DeviceAuthority {
         public_key: &VerifyingKey,
     ) -> Result<DeviceCert, AuthorityError> {
         let device = DeviceId::from_key(public_key);
-        if let Some(existing) = self.store.devices()?.into_iter().find(|r| r.id == device) {
-            if existing.revoked || existing.retired_to.is_some() {
-                return Err(AuthorityError::NotActive {
-                    state: if existing.revoked {
-                        "revoked".to_string()
-                    } else {
-                        "rotated away".to_string()
-                    },
-                    device,
-                });
-            }
+        let existing = self.store.devices()?.into_iter().find(|r| r.id == device);
+        // The pinning door uses the *same* decision as the connecting door
+        // (T-0026): a burned key is never silently restored, and this is also
+        // what closes the "revoke, then re-pair the stolen key inside a live
+        // pairing window" hole — the pairing flow pins through here.
+        if let Err(denied) = crate::identity::revocation::may_pin(existing.as_ref()) {
+            return Err(AuthorityError::NotActive {
+                state: denied.reason().to_string(),
+                device,
+            });
         }
         check_pinnable(public_key)?;
         let serial = self.next_serial();
@@ -318,12 +327,37 @@ impl DeviceAuthority {
     }
 
     /// Revoke a device: durable, immediate for the next connection, audited.
-    pub fn revoke(&mut self, device: &DeviceId) -> Result<(), AuthorityError> {
-        let Some(mut record) = self.store.devices()?.into_iter().find(|r| r.id == *device) else {
+    /// Revoke a device, recording who did it and when.
+    ///
+    /// Returns whether *this* call is the one that revoked it, so the caller can
+    /// say "already revoked" honestly instead of claiming an action it did not
+    /// take. The commit happens before this returns, which is what makes the
+    /// CLI's success message a statement about durable state rather than about
+    /// an intention.
+    pub fn revoke(
+        &mut self,
+        device: &DeviceId,
+        revoked_by: &str,
+        now_ms: i64,
+    ) -> Result<Revocation, AuthorityError> {
+        if self
+            .store
+            .devices()?
+            .into_iter()
+            .find(|r| r.id == *device)
+            .is_none()
+        {
             return Err(CertError::NoCert(device.to_string()).into());
-        };
-        record.revoked = true;
-        self.store.upsert_device(&record)?;
+        }
+        let changed = self
+            .store
+            .revoke_device(device.as_str(), revoked_by, now_ms)?;
+        if !changed {
+            // Already revoked: no second audit row and no new timestamp — the
+            // interesting moment is the first one, and a log that records the
+            // same decision repeatedly says less than one that records it once.
+            return Ok(Revocation::AlreadyRevoked);
+        }
         // Removing the cert file keeps the pinned set honest; the store row is
         // what makes it durable.
         let _ = std::fs::remove_file(
@@ -331,9 +365,32 @@ impl DeviceAuthority {
                 .cert_dir
                 .join(format!("{}.cert", device.as_str())),
         );
-        self.audit(AuditKind::DeviceChange, device.as_str(), "revoked")?;
+        self.audit_revocation(device, revoked_by, now_ms)?;
         self.reload()?;
-        Ok(())
+        Ok(Revocation::Revoked)
+    }
+
+    /// The audit row for a revocation: who cut off whom, and when.
+    ///
+    /// Its own shape rather than a generic `DeviceChange`, because "a device was
+    /// revoked" is the event an operator goes looking for, and a row that says
+    /// only "something changed" is a row they have to read carefully to
+    /// understand.
+    fn audit_revocation(
+        &self,
+        target: &DeviceId,
+        revoked_by: &str,
+        now_ms: i64,
+    ) -> Result<(), AuthorityError> {
+        let event = crate::store::AuditEvent {
+            ts_ms: now_ms as u64,
+            device: revoked_by.to_string(),
+            agent: String::new(),
+            prompt: target.display_id(),
+        };
+        self.store
+            .audit_action("device.revoke", event)
+            .map_err(AuthorityError::from)
     }
 
     /// **The decision the transport calls.** A presented key is accepted only
@@ -341,18 +398,24 @@ impl DeviceAuthority {
     /// verifies under the root. Every refusal is audited before it returns.
     pub fn authorize(&mut self, presented: &VerifyingKey) -> Result<DeviceRecord, CertError> {
         let id = DeviceId::from_key(presented);
-        // Revocation/retirement live in the store, not only in the files.
+        // Revocation/retirement live in the store, not only in the files — and
+        // the *rule* lives in `identity::revocation`, so this door and the
+        // transport's resolver cannot drift apart (T-0026). The durable store is
+        // authoritative here because revocation is a fact the files do not carry.
         let durable = self.store.devices().unwrap_or_default();
         if let Some(record) = durable.iter().find(|r| r.id == id) {
-            if record.revoked {
-                self.note_refusal(&id, "revoked").ok();
-                return Err(CertError::Revoked(id.to_string()));
-            }
-            if let Some(replacement) = &record.retired_to {
-                self.note_refusal(&id, "rotated away").ok();
-                return Err(CertError::RotatedAway {
-                    device: id.to_string(),
-                    replaced_by: replacement.to_string(),
+            if let Err(denied) = crate::identity::revocation::may_connect(record) {
+                self.note_refusal(&id, denied.reason()).ok();
+                return Err(match denied {
+                    crate::identity::revocation::Denied::Revoked { .. } => {
+                        CertError::Revoked(id.to_string())
+                    }
+                    crate::identity::revocation::Denied::RotatedAway { replaced_by, .. } => {
+                        CertError::RotatedAway {
+                            device: id.to_string(),
+                            replaced_by: replaced_by.to_string(),
+                        }
+                    }
                 });
             }
         }
@@ -392,18 +455,38 @@ impl DeviceAuthority {
         Ok(())
     }
 
-    /// The record for one device, as **both** doors see it.
+    /// The record for one device **if it is authorized to connect**.
     ///
-    /// `devices()` lists the store, which is where issued and paired
-    /// certificates are recorded — but `reload()` deliberately also accepts a
-    /// certificate *file* with no store row ("a cert file with no record still
-    /// counts as a pinned device as long as the certificate verifies"), and
-    /// `check_verb` goes through the index, so it accepts those. A caller that
-    /// asked the store instead would refuse a device the gate would have
-    /// allowed: one question, one answer, so this reads the index.
+    /// This is the authorization door, and it is deliberately the index rather
+    /// than the store listing: `reload()` accepts a certificate *file* with no
+    /// store row, and `check_verb` goes through the same index, so a caller that
+    /// asked the store would refuse a device the gate would allow. One question,
+    /// one answer.
+    ///
+    /// **It returns `None` for a revoked or rotated device** — the index holds
+    /// only authorized devices (`from_records` drops the rest), which is exactly
+    /// the refusal the handshake wants. A caller that needs the *record* of a
+    /// revoked device — its `revoked_at_ms`, its `revoked_by`, its tombstone —
+    /// is asking a different question and must read [`DeviceAuthority::devices`]
+    /// instead. Naming the difference here because a lookup that silently means
+    /// "authorized" is a trap for the next reader (and for the next test).
     #[must_use]
     pub fn device(&self, id: &DeviceId) -> Option<DeviceRecord> {
         self.index.get(id).cloned()
+    }
+
+    /// The durable *record* of one device, including a revoked or rotated one.
+    ///
+    /// The counterpart to [`DeviceAuthority::device`]: that one answers "may this
+    /// device connect" (the index, authorized only), this one answers "what do we
+    /// know about it" (the store, tombstones included). Two questions, two names,
+    /// so a caller cannot get the wrong answer by picking the shorter name.
+    pub fn record(&self, id: &DeviceId) -> Result<Option<DeviceRecord>, AuthorityError> {
+        Ok(self
+            .store
+            .devices()?
+            .into_iter()
+            .find(|record| record.id == *id))
     }
 
     /// The role a device holds, or `None` if it is not (or no longer) pinned.
@@ -519,6 +602,44 @@ mod tests {
         std::fs::remove_dir_all(root).ok();
     }
 
+    /// A revoked device cannot be re-pinned: the pairing flow issues through
+    /// this door, so "revoke the stolen phone, then re-pair its key" fails at
+    /// the only place a certificate is minted.
+    #[test]
+    fn a_revoked_device_cannot_re_pair() {
+        let (layout, root) = scratch("re-pair");
+        let mut authority = DeviceAuthority::load(layout.clone()).expect("authority");
+        let device = key();
+        let cert = authority
+            .issue("pixel", Role::Owner, &device.public())
+            .expect("issue");
+        authority
+            .revoke(cert.device(), "local-cli", 2_000)
+            .expect("revoke");
+
+        // The same key, presented again through the pinning door.
+        match authority.issue("pixel again", Role::Owner, &device.public()) {
+            Err(AuthorityError::NotActive { state, .. }) => {
+                assert_eq!(state, "revoked", "the refusal names the state");
+            }
+            other => panic!("a revoked key must not be re-pinned: {other:?}"),
+        }
+        // And it is still revoked afterwards — the attempt changed nothing.
+        // (`devices()`, not `device()`: the latter is the *authorized* lookup and
+        // is right to return `None` for a revoked device.)
+        assert!(
+            authority.device(cert.device()).is_none(),
+            "a revoked device is not in the authorized set"
+        );
+        let record = authority
+            .record(cert.device())
+            .expect("record lookup")
+            .expect("the tombstone survives in the store");
+        assert!(record.revoked);
+        assert_eq!(record.revoked_at_ms, Some(2_000));
+        std::fs::remove_dir_all(root).ok();
+    }
+
     /// A certificate file with no store row is a pinned device — the module
     /// documents it, `reload` implements it, and both doors must agree.
     #[test]
@@ -584,7 +705,9 @@ mod tests {
             authority
                 .authorize(&device.public())
                 .expect("authorized before revocation");
-            authority.revoke(cert.device()).expect("revoke");
+            authority
+                .revoke(cert.device(), "local-cli", 12_345)
+                .expect("revoke");
             assert!(matches!(
                 authority.authorize(&device.public()),
                 Err(CertError::Revoked(_))
@@ -599,6 +722,50 @@ mod tests {
             other => panic!("revocation did not survive the restart: {other:?}"),
         }
         assert_eq!(restarted.role_of(&id), None, "a revoked device has no role");
+
+        // Who and when are durable too (T-0026): the question an operator asks
+        // afterwards is "who cut this off, and when", and a restart must not
+        // lose it.
+        let record = restarted
+            .store
+            .devices()
+            .expect("devices")
+            .into_iter()
+            .find(|record| record.id == id)
+            .expect("the revoked device keeps its tombstone");
+        assert_eq!(record.revoked_at_ms, Some(12_345));
+        assert_eq!(record.revoked_by.as_deref(), Some("local-cli"));
+
+        // A second revoke is idempotent and does not rewrite the first moment:
+        // the interesting timestamp is the one the decision was made.
+        assert_eq!(
+            restarted
+                .revoke(&id, "someone-else", 99_999)
+                .expect("revoke again"),
+            Revocation::AlreadyRevoked
+        );
+        let record = restarted
+            .store
+            .devices()
+            .expect("devices")
+            .into_iter()
+            .find(|record| record.id == id)
+            .expect("still there");
+        assert_eq!(
+            record.revoked_at_ms,
+            Some(12_345),
+            "the first moment stands"
+        );
+        assert_eq!(record.revoked_by.as_deref(), Some("local-cli"));
+
+        // The revocation is an audit row naming who and what.
+        let rows = restarted
+            .store
+            .audit_by_action("device.revoke", 10)
+            .expect("audit");
+        assert_eq!(rows.len(), 1, "one revocation, one row");
+        assert_eq!(rows[0].device, "local-cli");
+        assert_eq!(rows[0].prompt, id.display_id());
         std::fs::remove_dir_all(root).ok();
     }
 

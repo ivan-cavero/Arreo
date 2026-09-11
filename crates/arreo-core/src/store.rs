@@ -37,7 +37,7 @@ pub enum SessionError {
     Json(#[from] serde_json::Error),
 }
 
-pub const SCHEMA_VERSION: u32 = 3;
+pub const SCHEMA_VERSION: u32 = 4;
 
 /// One pane's persisted record: how to respawn it + what it showed.
 #[derive(Debug, Clone, PartialEq)]
@@ -68,6 +68,9 @@ pub struct StoredAudit {
     pub prompt: String,
     pub redacted: bool,
     pub kind: AuditKind,
+    /// The event's own name (`prompt`, `device.revoke`, …), which is what an
+    /// operator filters by; `kind` is the older, coarser classification.
+    pub action: String,
 }
 
 /// What an audit row is about. Refusals are auditable events in their own
@@ -188,6 +191,31 @@ impl SessionStore {
                 [],
             )?;
         }
+        // v4 (T-0026): *who* revoked and *when*, plus the audit action. A
+        // revocation that records only "revoked" cannot answer the question an
+        // operator actually asks afterwards ("who cut this device off, and
+        // when?"), and the answer has to be durable because the log outlives the
+        // person who made the call.
+        if version < 4 {
+            if !has_column(conn, "devices", "revoked_at")? {
+                conn.execute_batch(
+                    "ALTER TABLE devices ADD COLUMN revoked_at INTEGER;
+                     ALTER TABLE devices ADD COLUMN revoked_by TEXT;",
+                )?;
+            }
+            if !has_column(conn, "audit", "action")? {
+                // Existing rows predate actions: they are all prompt events,
+                // which is exactly what the default says.
+                conn.execute_batch(
+                    "ALTER TABLE audit ADD COLUMN action TEXT NOT NULL DEFAULT 'prompt';",
+                )?;
+            }
+        }
+        conn.execute(
+            "INSERT INTO meta(key, value) VALUES ('schema_version', ?1)
+             ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            [SCHEMA_VERSION.to_string()],
+        )?;
         Ok(())
     }
 
@@ -199,13 +227,18 @@ impl SessionStore {
         let conn = self.lock()?;
         conn.execute(
             "INSERT INTO devices(id, name, role, public_key, serial, issued_at_ms,
-                                 last_seen_ms, revoked, retired_to)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                                 last_seen_ms, revoked, retired_to, revoked_at, revoked_by)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
              ON CONFLICT(id) DO UPDATE SET
                name=excluded.name, role=excluded.role, public_key=excluded.public_key,
                serial=excluded.serial, issued_at_ms=excluded.issued_at_ms,
                last_seen_ms=excluded.last_seen_ms, revoked=excluded.revoked,
-               retired_to=excluded.retired_to",
+               retired_to=excluded.retired_to,
+               -- `COALESCE` on the way in: a later upsert of a still-revoked
+               -- device must not erase who revoked it and when. Losing that on a
+               -- routine `touch` (last_seen) would make the audit trail rot.
+               revoked_at=COALESCE(devices.revoked_at, excluded.revoked_at),
+               revoked_by=COALESCE(devices.revoked_by, excluded.revoked_by)",
             params![
                 device.id.as_str(),
                 device.name,
@@ -216,6 +249,8 @@ impl SessionStore {
                 device.last_seen_ms,
                 device.revoked as i64,
                 device.retired_to.as_ref().map(|id| id.as_str()),
+                device.revoked_at_ms,
+                device.revoked_by.as_deref(),
             ],
         )?;
         Ok(())
@@ -228,7 +263,7 @@ impl SessionStore {
         let conn = self.lock()?;
         let mut stmt = conn.prepare(
             "SELECT id, name, role, public_key, serial, issued_at_ms, last_seen_ms,
-                    revoked, retired_to
+                    revoked, retired_to, revoked_at, revoked_by
              FROM devices ORDER BY id",
         )?;
         let rows = stmt.query_map([], |row| {
@@ -242,12 +277,25 @@ impl SessionStore {
                 row.get::<_, Option<i64>>(6)?,
                 row.get::<_, i64>(7)?,
                 row.get::<_, Option<String>>(8)?,
+                row.get::<_, Option<i64>>(9)?,
+                row.get::<_, Option<String>>(10)?,
             ))
         })?;
         let mut out = Vec::new();
         for row in rows {
-            let (id, name, role, public_key, serial, issued_at_ms, last_seen_ms, revoked, retired) =
-                row?;
+            let (
+                id,
+                name,
+                role,
+                public_key,
+                serial,
+                issued_at_ms,
+                last_seen_ms,
+                revoked,
+                retired,
+                revoked_at_ms,
+                revoked_by,
+            ) = row?;
             let role = Role::parse(&role)
                 .map_err(|_| SessionError::Sqlite(rusqlite::Error::InvalidQuery))?;
             let id = DeviceId::parse(&id)
@@ -269,6 +317,8 @@ impl SessionStore {
                 issued_at_ms,
                 last_seen_ms,
                 revoked: revoked != 0,
+                revoked_at_ms,
+                revoked_by,
                 retired_to: match retired {
                     Some(text) => Some(
                         DeviceId::parse(&text)
@@ -281,13 +331,25 @@ impl SessionStore {
         Ok(out)
     }
 
-    /// Flip a device's revoked flag (T-0026 owns the propagation story; this
-    /// is the durable bit it needs).
-    pub fn set_device_revoked(&self, id: &str, revoked: bool) -> Result<bool, SessionError> {
+    /// Revoke a device, recording who did it and when — in one statement, so a
+    /// revocation can never be durable without its provenance.
+    ///
+    /// The `WHERE revoked = 0` is what makes the call *idempotent* and
+    /// self-describing: it reports whether this call is the one that revoked the
+    /// device, so a second run can say "already revoked" rather than pretending
+    /// to have done something. It also refuses to overwrite the original
+    /// timestamp, because the interesting moment is the first one.
+    pub fn revoke_device(
+        &self,
+        id: &str,
+        revoked_by: &str,
+        now_ms: i64,
+    ) -> Result<bool, SessionError> {
         let conn = self.lock()?;
         let changed = conn.execute(
-            "UPDATE devices SET revoked=?2 WHERE id=?1",
-            params![id, revoked as i64],
+            "UPDATE devices SET revoked = 1, revoked_at = ?3, revoked_by = ?2
+             WHERE id = ?1 AND revoked = 0",
+            params![id, revoked_by, now_ms],
         )?;
         Ok(changed > 0)
     }
@@ -408,6 +470,62 @@ impl SessionStore {
 
     /// Append a typed audit event. `kind` is what makes a refusal readable as
     /// a refusal in `arreo audit` rather than "a prompt that looks odd".
+    /// Write an audit row with an explicit `action`.
+    ///
+    /// `kind` classifies the row for the prompt-oriented readers that predate it
+    /// (T-0018); `action` names the event itself (`device.revoke`, `device.issue`)
+    /// so an operator can ask for exactly the event they mean. Two axes because
+    /// they answer different questions: "which stream is this row part of" and
+    /// "what happened".
+    pub fn audit_action(&self, action: &str, event: AuditEvent) -> Result<(), SessionError> {
+        let (prompt, redacted) = redact(&event.prompt);
+        let conn = self.lock()?;
+        conn.execute(
+            "INSERT INTO audit(ts_ms, device, agent, prompt, redacted, kind, action)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                event.ts_ms as i64,
+                event.device,
+                event.agent,
+                prompt,
+                redacted as i64,
+                AuditKind::DeviceChange.as_str(),
+                action,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Every row with a given action, newest first — the operator's "show me
+    /// every revocation" query.
+    pub fn audit_by_action(
+        &self,
+        action: &str,
+        limit: usize,
+    ) -> Result<Vec<StoredAudit>, SessionError> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT ts_ms, device, agent, prompt, redacted, kind, action FROM audit
+             WHERE action = ?1 ORDER BY ts_ms DESC, rowid DESC LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![action, limit as i64], |row| {
+            Ok(StoredAudit {
+                ts_ms: row.get::<_, i64>(0)? as u64,
+                device: row.get(1)?,
+                agent: row.get(2)?,
+                prompt: row.get(3)?,
+                redacted: row.get::<_, i64>(4)? != 0,
+                kind: AuditKind::parse(&row.get::<_, String>(5)?),
+                action: row.get(6)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
     pub fn audit_event(&self, kind: AuditKind, event: AuditEvent) -> Result<(), SessionError> {
         let (prompt, redacted) = redact(&event.prompt);
         let conn = self.lock()?;
@@ -430,7 +548,7 @@ impl SessionStore {
     pub fn audit_recent(&self, limit: usize) -> Result<Vec<StoredAudit>, SessionError> {
         let conn = self.lock()?;
         let mut stmt = conn.prepare(
-            "SELECT ts_ms, device, agent, prompt, redacted, kind FROM audit
+            "SELECT ts_ms, device, agent, prompt, redacted, kind, action FROM audit
              ORDER BY ts_ms DESC LIMIT ?1",
         )?;
         let rows = stmt.query_map(params![limit as i64], |row| {
@@ -441,6 +559,7 @@ impl SessionStore {
                 prompt: row.get(3)?,
                 redacted: row.get::<_, i64>(4)? != 0,
                 kind: AuditKind::parse(&row.get::<_, String>(5)?),
+                action: row.get(6)?,
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>()
@@ -460,6 +579,7 @@ impl SessionStore {
                     "prompt": event.prompt,
                     "redacted": event.redacted,
                     "kind": event.kind.as_str(),
+                    "action": event.action,
                 }))
                 .map_err(SessionError::Json)?,
             );

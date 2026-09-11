@@ -215,11 +215,33 @@ fn revocation_is_durable_and_immediate() {
     assert!(!ok, "re-issuing for a revoked device must fail: {out}");
     assert!(out.contains("revoked"), "{out}");
 
-    // The list shows the revocation rather than hiding it.
+    // The revocation is shown rather than hidden — but it is no longer part of
+    // the *live* listing (T-0026: "who can reach this machine" must not include
+    // a revoked device), so the tombstone is read back through `--revoked`, with
+    // the provenance the record now carries.
     let (ok, out) = scratch.run(&["devices", "list", "--json"]);
     assert!(ok, "{out}");
-    let value: serde_json::Value = serde_json::from_str(out.trim()).expect("json");
-    assert_eq!(value["devices"][0]["revoked"], serde_json::json!(true));
+    let live: serde_json::Value = serde_json::from_str(out.trim()).expect("json");
+    assert_eq!(
+        live["devices"].as_array().map(Vec::len),
+        Some(0),
+        "a revoked device is not in the live listing: {out}"
+    );
+
+    let (ok, out) = scratch.run(&["devices", "list", "--revoked", "--json"]);
+    assert!(ok, "{out}");
+    let tombs: serde_json::Value = serde_json::from_str(out.trim()).expect("json");
+    assert_eq!(tombs["devices"][0]["revoked"], serde_json::json!(true));
+    assert_eq!(
+        tombs["devices"][0]["revoked_by"],
+        serde_json::json!("local-cli")
+    );
+    assert!(
+        tombs["devices"][0]["revoked_at_ms"]
+            .as_i64()
+            .is_some_and(|at| at > 0),
+        "the tombstone is timestamped: {out}"
+    );
 }
 
 #[test]
@@ -378,10 +400,15 @@ fn bad_arguments_are_refused_with_a_usage_line() {
     ]);
     assert!(!ok, "{out}");
     assert!(out.contains("weak public key"), "{out}");
-    // Not a device id.
+    // Neither a device id nor a known name: refused, and the message says which
+    // of the two it looked for (T-0026 accepts a name, so "not a device id" is
+    // no longer the whole story).
     let (ok, out) = scratch.run(&["devices", "revoke", "nonsense"]);
     assert!(!ok, "{out}");
-    assert!(out.contains("not a device id"), "{out}");
+    assert!(
+        out.contains("no device is named") || out.contains("not a device id"),
+        "{out}"
+    );
     // Unknown subcommand.
     let (ok, out) = scratch.run(&["devices", "wibble"]);
     assert!(!ok, "{out}");

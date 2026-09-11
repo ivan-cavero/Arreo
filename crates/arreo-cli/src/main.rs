@@ -27,6 +27,8 @@ fn usage() -> ExitCode {
     eprintln!("  arreo server stop [--socket PATH]   (graceful: drain + exit 0)");
     eprintln!("  arreo audit [--limit N] [--socket PATH]   (append-only log, secrets redacted)");
     eprintln!("  arreo devices <id|list|issue|rotate|revoke|authorize> [--json] [--socket PATH]");
+    eprintln!("      list --revoked|--all   (live devices by default; tombstones with --revoked)");
+    eprintln!("      revoke <name|id>       (idempotent; the audit row names who and when)");
     eprintln!("  arreo pair [--role owner|viewer] [--ttl-secs N] [--mailbox ADDR] [--json]   (show a code; pins the device that types it)");
     eprintln!("  arreo pair --join \"four words\" --uri arreo://pair?... [--name N] [--json]   (this device joins)");
     eprintln!("      authorize --verb <read|send|...>   (the transport's own decision path)");
@@ -1047,9 +1049,15 @@ fn cmd_audit(rest: &[String]) -> ExitCode {
     match store.audit_recent(limit) {
         Ok(events) => {
             for event in events.iter().rev() {
+                // The *action* is what an operator greps for (`device.revoke`),
+                // and `kind` is the coarser classification. Printing only `kind`
+                // showed a revocation as "device_change", which is how T-0024
+                // lost the event kind and how T-0026 lost the action: a row that
+                // is written but not rendered is a row nobody can act on.
                 println!(
-                    "{} {:<14} {} {} {}{}",
+                    "{} {:<16} {:<16} {} {} {}{}",
                     event.ts_ms,
+                    event.action,
                     event.kind.as_str(),
                     event.device,
                     event.agent,
@@ -1077,6 +1085,14 @@ fn cmd_audit(rest: &[String]) -> ExitCode {
 ///   `rotate`    — move a device onto a new key (the old key stops working)
 ///   `revoke`    — refuse a device from now on (durable, audited)
 ///   `authorize` — ask the authority about a key (exit 0 = allowed)
+/// Which devices a listing shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeviceFilter {
+    Live,
+    Revoked,
+    All,
+}
+
 fn cmd_devices(rest: &[String]) -> ExitCode {
     let (socket, kept) = take_socket(rest);
     let mut json = false;
@@ -1094,10 +1110,22 @@ fn cmd_devices(rest: &[String]) -> ExitCode {
     };
     match sub {
         "id" => devices_id(json),
-        "list" => devices_list(&socket, json),
+        // `--revoked` shows the tombstones; `--all` shows both. The default is
+        // the live set, because that is the question "who can reach this machine
+        // right now" — and a revoked device appearing in it would be a lie.
+        "list" => {
+            let show = if args.iter().any(|arg| arg == "--revoked") {
+                DeviceFilter::Revoked
+            } else if args.iter().any(|arg| arg == "--all") {
+                DeviceFilter::All
+            } else {
+                DeviceFilter::Live
+            };
+            devices_list(&socket, json, show)
+        }
         "issue" => devices_issue(&socket, &args[1..], json),
         "rotate" => devices_rotate(&socket, &args[1..], json),
-        "revoke" => devices_revoke(&socket, &args[1..]),
+        "revoke" => devices_revoke(&socket, &args[1..], json),
         "authorize" => devices_authorize(&socket, &args[1..], json),
         other => {
             eprintln!("devices: unknown subcommand {other:?}");
@@ -1148,12 +1176,20 @@ fn devices_id(json: bool) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-fn devices_list(socket: &std::path::Path, json: bool) -> ExitCode {
+fn devices_list(socket: &std::path::Path, json: bool, show: DeviceFilter) -> ExitCode {
     let authority = match open_authority(socket) {
         Ok(authority) => authority,
         Err(code) => return code,
     };
-    let devices = authority.devices();
+    let all = authority.devices();
+    let devices: Vec<_> = match show {
+        // Tombstones are the point of `--revoked`: a revoked device keeps its
+        // row, so the operator can see what was cut off (and by whom) without
+        // reading the audit log.
+        DeviceFilter::Revoked => all.iter().filter(|d| d.revoked).cloned().collect(),
+        DeviceFilter::Live => all.iter().filter(|d| !d.revoked).cloned().collect(),
+        DeviceFilter::All => all,
+    };
     if json {
         let rows: Vec<serde_json::Value> = devices
             .iter()
@@ -1167,6 +1203,8 @@ fn devices_list(socket: &std::path::Path, json: bool) -> ExitCode {
                     "issued_at_ms": device.issued_at_ms,
                     "last_seen_ms": device.last_seen_ms,
                     "revoked": device.revoked,
+                    "revoked_at_ms": device.revoked_at_ms,
+                    "revoked_by": device.revoked_by,
                     "retired_to": device.retired_to.as_ref().map(arreo_core::identity::DeviceId::display_id),
                 })
             })
@@ -1182,7 +1220,13 @@ fn devices_list(socket: &std::path::Path, json: bool) -> ExitCode {
     }
     println!("root {}…", &authority.root_fingerprint()[..16]);
     if devices.is_empty() {
-        println!("no devices paired yet (pair one, or issue from a public key)");
+        println!(
+            "{}",
+            match show {
+                DeviceFilter::Revoked => "no revoked devices".to_string(),
+                _ => "no devices paired yet (pair one, or issue from a public key)".to_string(),
+            }
+        );
         return ExitCode::SUCCESS;
     }
     println!(
@@ -1191,7 +1235,12 @@ fn devices_list(socket: &std::path::Path, json: bool) -> ExitCode {
     );
     for device in devices {
         let status = if device.revoked {
-            "revoked".to_string()
+            // Who and when, in the place an operator looks first — the table.
+            match (&device.revoked_by, device.revoked_at_ms) {
+                (Some(by), Some(at)) => format!("revoked by {by} at {at}"),
+                (Some(by), None) => format!("revoked by {by}"),
+                _ => "revoked".to_string(),
+            }
         } else if let Some(replacement) = &device.retired_to {
             format!("rotated → {}", replacement.display_id())
         } else if device.last_seen_ms.is_some() {
@@ -1421,28 +1470,102 @@ fn devices_rotate(socket: &std::path::Path, args: &[String], json: bool) -> Exit
     }
 }
 
-fn devices_revoke(socket: &std::path::Path, args: &[String]) -> ExitCode {
+fn devices_revoke(socket: &std::path::Path, args: &[String], json: bool) -> ExitCode {
     let Some(raw) = args.first() else {
-        eprintln!("usage: arreo devices revoke <device-id>");
-        return ExitCode::from(2);
-    };
-    let Ok(device) = arreo_core::identity::DeviceId::parse(raw) else {
-        eprintln!("devices revoke: not a device id: {raw:?}");
+        eprintln!("usage: arreo devices revoke <name|id> [--json]");
         return ExitCode::from(2);
     };
     let mut authority = match open_authority(socket) {
         Ok(authority) => authority,
         Err(code) => return code,
     };
-    match authority.revoke(&device) {
-        Ok(()) => {
-            println!("revoked {}", device.display_id());
+    // A name or an id: an operator holding a phone says "the pixel", and one
+    // reading a log says the fingerprint. Both should work, and an ambiguous
+    // name must be refused rather than resolved to a guess.
+    let device = match parse_device_reference(&authority, raw) {
+        Ok(device) => device,
+        Err(e) => {
+            eprintln!("devices revoke: {e}");
+            return ExitCode::from(3);
+        }
+    };
+    // Who made the call: a device id when the operator runs this through a
+    // device session, or `local-cli` for the machine's own socket, which is the
+    // case this command serves today.
+    let revoker = arreo_core::identity::revocation::LOCAL_CLI;
+    let now = arreo_core::identity::authority::now_ms();
+    match authority.revoke(&device, revoker, now) {
+        Ok(arreo_core::identity::authority::Revocation::Revoked) => {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "revoked": true,
+                        "already": false,
+                        "device": device.display_id(),
+                        "by": revoker,
+                        "at_ms": now,
+                    })
+                );
+            } else {
+                println!("revoked {}", device.display_id());
+            }
+            ExitCode::SUCCESS
+        }
+        Ok(arreo_core::identity::authority::Revocation::AlreadyRevoked) => {
+            // Idempotent, and honest about it: exit 0 because the desired state
+            // holds, but say "already" so a script can tell the difference.
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "revoked": true,
+                        "already": true,
+                        "device": device.display_id(),
+                    })
+                );
+            } else {
+                println!("{} was already revoked", device.display_id());
+            }
             ExitCode::SUCCESS
         }
         Err(e) => {
             eprintln!("devices revoke: {e}");
             ExitCode::FAILURE
         }
+    }
+}
+
+/// Resolve a `<name|id>` reference to one device.
+///
+/// A name that matches more than one device is an error rather than a choice:
+/// revoking the wrong device is not a mistake an operator should be able to make
+/// by having two phones called "pixel".
+fn parse_device_reference(
+    authority: &arreo_core::identity::DeviceAuthority,
+    raw: &str,
+) -> Result<arreo_core::identity::DeviceId, String> {
+    if let Ok(id) = arreo_core::identity::DeviceId::parse(raw) {
+        return Ok(id);
+    }
+    let matches: Vec<_> = authority
+        .devices()
+        .into_iter()
+        .filter(|device| device.name == raw)
+        .collect();
+    match matches.len() {
+        1 => Ok(matches[0].id.clone()),
+        0 => Err(format!(
+            "no device is named {raw:?} (try `arreo devices list`)"
+        )),
+        n => Err(format!(
+            "{n} devices are named {raw:?}: revoke one by id ({})",
+            matches
+                .iter()
+                .map(|device| device.id.display_id())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
     }
 }
 

@@ -141,6 +141,21 @@ pub async fn serve(
     }
 }
 
+/// Say *why* a device was refused, using the store's record of it.
+///
+/// Best-effort and log-only: the refusal itself has already happened, and the
+/// authority's own `authorize` writes the audit row for the paths that go
+/// through it. This exists so the one path that cannot return a typed error (the
+/// resolver's `Option`) still tells the operator the truth.
+fn report_refusal(authority: &DeviceAuthority, device: &DeviceId) {
+    let record = authority.record(device).unwrap_or_default();
+    if let Some(record) = record {
+        if let Err(denied) = arreo_core::identity::revocation::may_connect(&record) {
+            eprintln!("arreo-server: refusing {}: {denied}", device.display_id());
+        }
+    }
+}
+
 /// The key pinned for `device`, or `None` if it is unknown, revoked or retired.
 ///
 /// Used both as the handshake resolver and as the post-handshake re-check — and
@@ -158,10 +173,15 @@ pub(crate) fn pinned_key(
     // The index, not the store listing: `check_verb` authorizes through the
     // index, and `reload` deliberately accepts a certificate file with no store
     // row. Asking the store here would refuse a device the gate would allow.
-    let record = authority.device(device)?;
-    if record.revoked || record.retired_to.is_some() {
+    let Some(record) = authority.device(device) else {
+        // The index holds only authorized devices, so a miss here is "unknown,
+        // revoked, or rotated away". The store can still tell which, and the
+        // difference is the whole point of a log line: an operator who revoked a
+        // phone must see *revoked*, not the misleading "not pinned" that a bare
+        // `None` produces (T-0026).
+        report_refusal(&authority, device);
         return None;
-    }
+    };
     let key = VerifyingKey::from_bytes(&record.public_key).ok()?;
     // The record's id must match the key it carries: the store is only trusted
     // once the two agree, the same rule the authority itself applies.
