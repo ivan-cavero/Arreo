@@ -392,6 +392,20 @@ impl DeviceAuthority {
         Ok(())
     }
 
+    /// The record for one device, as **both** doors see it.
+    ///
+    /// `devices()` lists the store, which is where issued and paired
+    /// certificates are recorded — but `reload()` deliberately also accepts a
+    /// certificate *file* with no store row ("a cert file with no record still
+    /// counts as a pinned device as long as the certificate verifies"), and
+    /// `check_verb` goes through the index, so it accepts those. A caller that
+    /// asked the store instead would refuse a device the gate would have
+    /// allowed: one question, one answer, so this reads the index.
+    #[must_use]
+    pub fn device(&self, id: &DeviceId) -> Option<DeviceRecord> {
+        self.index.get(id).cloned()
+    }
+
     /// The role a device holds, or `None` if it is not (or no longer) pinned.
     #[must_use]
     pub fn role_of(&self, device: &DeviceId) -> Option<Role> {
@@ -502,6 +516,40 @@ mod tests {
         assert_eq!(record.name, "pixel-7");
         assert_eq!(record.role, Role::Viewer);
         assert_eq!(authority.role_of(cert.device()), Some(Role::Viewer));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// A certificate file with no store row is a pinned device — the module
+    /// documents it, `reload` implements it, and both doors must agree.
+    #[test]
+    fn a_certificate_file_without_a_store_row_is_pinned_for_both_doors() {
+        let (layout, root) = scratch("file-only");
+        let device = key();
+        let mut authority = DeviceAuthority::load(layout.clone()).expect("authority");
+        // Write only the certificate *file*: no `issue`, so the store never
+        // learns of this device.
+        let account_root = RootKey::load_or_generate(&layout.root_key).expect("root");
+        let cert = DeviceCert::issue(
+            &account_root,
+            &device.public(),
+            "file-only",
+            Role::Owner,
+            1_000,
+            1,
+        );
+        cert.save(&layout.cert_dir).expect("save the certificate");
+        authority.reload().expect("reload");
+
+        // The verification door accepts it...
+        authority
+            .authorize(&device.public())
+            .expect("the index accepts a file-pinned device");
+        // ...and so does the lookup door the daemon's handshake uses.
+        let record = authority
+            .device(&DeviceId::from_key(&device.public()))
+            .expect("the lookup must agree with the verification door");
+        assert_eq!(record.name, "file-only");
+        assert!(!record.revoked);
         std::fs::remove_dir_all(root).ok();
     }
 

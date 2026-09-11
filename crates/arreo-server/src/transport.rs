@@ -143,18 +143,22 @@ pub async fn serve(
 
 /// The key pinned for `device`, or `None` if it is unknown, revoked or retired.
 ///
-/// Used both as the handshake resolver and as the post-handshake re-check.
-/// Returning `None` is what makes an unknown device cheap: the Noise handshake
-/// never starts.
-fn pinned_key(authority: &Arc<Mutex<DeviceAuthority>>, device: &DeviceId) -> Option<VerifyingKey> {
+/// Used both as the handshake resolver and as the post-handshake re-check — and
+/// by the relay session (T-0051), which authenticates peers the same way. One
+/// implementation, because a second one is a second answer to "is this device
+/// pinned".
+pub(crate) fn pinned_key(
+    authority: &Arc<Mutex<DeviceAuthority>>,
+    device: &DeviceId,
+) -> Option<VerifyingKey> {
     let authority = match authority.lock() {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
     };
-    let record = authority
-        .devices()
-        .into_iter()
-        .find(|record| record.id == *device)?;
+    // The index, not the store listing: `check_verb` authorizes through the
+    // index, and `reload` deliberately accepts a certificate file with no store
+    // row. Asking the store here would refuse a device the gate would allow.
+    let record = authority.device(device)?;
     if record.revoked || record.retired_to.is_some() {
         return None;
     }

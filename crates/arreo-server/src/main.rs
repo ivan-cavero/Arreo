@@ -1,6 +1,6 @@
 //! `arreo-server` daemon binary (T-0005 serve, T-0012 graceful shutdown).
 //!
-//! Usage: `arreo-server [--socket PATH]`. Default socket:
+//! Usage: `arreo-server [--socket PATH] [--config PATH]`. Default socket:
 //! `$XDG_RUNTIME_DIR/arreo.sock`, else `/tmp/arreo-<uid>.sock`.
 //!
 //! Shutdown (T-0012): SIGTERM/SIGINT stops accepting, flushes every pane's
@@ -13,6 +13,12 @@
 //! is a **loud exit**, not a regeneration — minting a new root would silently
 //! invalidate every paired device. The same authority is what the remote
 //! transport (T-0023) asks before accepting a peer.
+//!
+//! Relay (T-0051): `--config PATH` (or `$ARREO_CONFIG`) points at a TOML file
+//! whose `[relay]` section, when `enabled = true`, starts an outbound session to
+//! a relay. **Disabled is the default and costs nothing**: a self-hosted runtime
+//! must work with no relay at all, and the local socket API is unchanged whether
+//! or not the relay is on.
 
 use arreo_server::lifecycle::SHUTDOWN_DEADLINE;
 use std::path::PathBuf;
@@ -20,14 +26,20 @@ use std::path::PathBuf;
 #[tokio::main]
 async fn main() {
     let mut socket: Option<PathBuf> = None;
+    let mut config: Option<PathBuf> = None;
     let mut args = std::env::args().skip(1).peekable();
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--socket" => {
                 socket = args.next().map(PathBuf::from);
             }
+            "--config" => {
+                config = args.next().map(PathBuf::from);
+            }
             "--help" | "-h" => {
-                println!("usage: arreo-server [--socket PATH]");
+                println!("usage: arreo-server [--socket PATH] [--config PATH]");
+                println!("  --config  a TOML file whose [relay] section enables the relay session");
+                println!("            (or set ARREO_CONFIG); without one the relay stays off");
                 return;
             }
             other => {
@@ -59,6 +71,44 @@ async fn main() {
     let registry = daemon.registry();
     let socket_path = socket.clone();
     let authority = std::sync::Arc::new(std::sync::Mutex::new(authority));
+
+    // Relay (T-0051). A configuration that enables the relay but is incomplete
+    // is a loud exit rather than a silent no-op: an operator who asked for the
+    // remote path and quietly did not get it has a bug they cannot see.
+    let config_path = config.or_else(|| std::env::var_os("ARREO_CONFIG").map(PathBuf::from));
+    if let Some(path) = config_path {
+        match arreo_server::load_config(&path) {
+            Ok(Some(settings)) => match arreo_server::own_identity() {
+                Ok((device, cert)) => {
+                    let context = arreo_server::RelayContext {
+                        authority: std::sync::Arc::clone(&authority),
+                        registry: std::sync::Arc::clone(&registry),
+                        db: arreo_server::db_path_for(&socket_path),
+                        device: std::sync::Arc::new(device),
+                        cert: std::sync::Arc::new(cert),
+                    };
+                    eprintln!(
+                        "arreo-server: relay enabled for account {} via {}",
+                        settings.account, settings.addr
+                    );
+                    tokio::spawn(arreo_server::relay_client::run(settings, context));
+                }
+                Err(e) => {
+                    eprintln!("arreo-server: relay enabled but this machine has no identity: {e}");
+                    eprintln!(
+                        "arreo-server: pair this machine first (arreo pair), or set \
+                         enabled = false"
+                    );
+                    std::process::exit(1);
+                }
+            },
+            Ok(None) => {}
+            Err(e) => {
+                eprintln!("arreo-server: relay configuration is unusable: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
 
     // Remote transport (T-0023). Shipped posture is zero inbound ports, so this
     // listener exists only for the loopback test seam; the production remote

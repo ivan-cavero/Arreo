@@ -1,0 +1,30 @@
+T-0051 daemon relay wiring — acceptance tests (two real daemons, one real relay)
+2026-09-11T09:30:05Z
+
+test an_incomplete_relay_configuration_is_refused ... ok
+test no_configuration_means_no_relay ... ok
+test two_daemons_exchange_a_message_through_the_relay ... ok
+test a_relay_failure_leaves_the_local_daemon_serving ... ok
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 10.29s
+
+== the transport underneath (T-0050) ==
+test the_backoff_is_exponential_capped_and_jittered ... ok
+test a_refused_registration_carries_the_relays_reason ... ok
+test a_delivery_failure_ends_the_stream ... ok
+test two_devices_hold_a_noise_session_through_the_relay ... ok
+test a_session_reports_when_its_relay_disappears ... ok
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 20.20s
+
+== the authority's two doors agree ==
+test identity::authority::tests::a_broken_root_key_stops_the_authority_instead_of_minting_a_new_one ... ok
+test identity::authority::tests::every_certificate_gets_a_fresh_serial ... ok
+test identity::authority::tests::issuing_pins_a_device_and_authorizes_it ... ok
+test identity::authority::tests::an_unknown_key_is_refused_and_audited ... ok
+test identity::authority::tests::a_certificate_file_without_a_store_row_is_pinned_for_both_doors ... ok
+test identity::authority::tests::a_weak_public_key_is_never_pinned ... ok
+test identity::authority::tests::revocation_is_durable_across_a_restart ... ok
+test identity::authority::tests::a_tampered_store_row_cannot_add_a_device ... ok
+test identity::authority::tests::the_store_holds_no_private_key_material ... ok
+test identity::authority::tests::rotation_replaces_the_key_and_survives_a_restart ... ok
+test identity::authority::tests::roles_bite_at_the_authorization_point ... ok
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 100 filtered out; finished in 0.63s

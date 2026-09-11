@@ -412,7 +412,7 @@ async fn a_session_reports_when_its_relay_disappears() {
     let root = RootKey::generate().expect("entropy");
     relay.register_account("acct-1", &root.public());
     let (key, cert) = device(&root, "alice", 1);
-    let mut session = RelaySession::dial(relay.addr, "acct-1", &key, &cert)
+    let session = RelaySession::dial(relay.addr, "acct-1", &key, &cert)
         .await
         .expect("alice registers");
 

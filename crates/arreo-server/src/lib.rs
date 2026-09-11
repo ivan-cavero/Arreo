@@ -18,4 +18,7 @@ pub use devices::{AuthorityError, DeviceAuthority, Layout};
 pub use lifecycle::{unit_file, unit_path, DrainReport, ServiceKind, SHUTDOWN_DEADLINE};
 pub use persist::{db_path_for, restore, snapshot, PersistError};
 pub use protocol::{AgentState, Message, PaneInfo, VERSION};
-pub use relay_client::{backoff_delay, RelaySession, RelayStream, SessionError};
+pub use relay_client::{
+    backoff_delay, load_config, own_identity, RelayContext, RelaySession, RelaySettings,
+    RelayStream, SessionError,
+};

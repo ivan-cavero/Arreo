@@ -50,6 +50,10 @@
     to unreachable — an honest "could not break it" finding, not a tested path. It stays because the
     alternative to a bound is unbounded memory, and the alternative to failing loudly is a silent
     gap in a byte stream that the layer above cannot detect.
+  - **The backoff ceiling applies to the base, and jitter is added on top.** The delay is
+    `min(base · 2^attempt, 30 s)` plus up to 25% of it, so the largest printed delay is about
+    37.5 s rather than exactly 30 s. Stated because "capped at 30 s" would be wrong in the one
+    number an operator might time.
   - **The idle timeout is 15 s** (down from QUIC's 30 s default) so a relay that vanished is noticed
     in seconds: keep-alives hold a live connection open, and the idle timer is what catches the
     dead one. A shorter timeout trades a little robustness on a badly lossy link for a bounded

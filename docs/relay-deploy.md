@@ -444,7 +444,361 @@ delivery is reported to the sender on its own stream, not to the operator. The
 per-device counters in `inbox_stats` are the operator's record of the queue
 (§8.2).
 
-## 12. What v1 does not do, in the operator's terms
+## 12. The daemon's side: dialling the relay
+
+Everything above is the relay. This section is the other half: what
+`arreo-server` — the daemon that owns the panes — does with a relay, what it
+needs before it will dial, and what it says while doing it. The code is
+`crates/arreo-server/src/relay_client.rs` (the session) and the `[relay]` wiring
+in `crates/arreo-server/src/main.rs`.
+
+One sentence: the daemon dials out, authenticates with the device certificate it
+already holds, and then serves protocol sessions to peers over the relay exactly
+as it serves them over its local socket — no inbound port, no second identity,
+and no change to the local API.
+
+### 12.1 What the daemon does with the relay
+
+Five things, on every session, in order:
+
+1. **It dials out.** `RelaySession::dial(addr, account, device_key, cert)`
+   connects to the relay at `addr` and registers this device for `account`.
+   Nothing listens on the daemon's side: the shipped posture is zero inbound
+   ports, and the relay's address is the only thing it needs to be able to
+   reach.
+2. **It authenticates with its own device certificate.** The identity is the
+   machine's own — `identity/device.key` plus `identity/devices/<id>.cert`, the
+   pair `arreo pair` left behind — so the relay authenticates the identity the
+   machine already presents, with no second key and no second pin. The
+   certificate's file name is the **bare** hex device id
+   (`identity/devices/<32 hex>.cert`), not the `dev_`-prefixed form used in logs
+   and on the command line.
+3. **It drains what was queued.** On connect the session drains its inbox from
+   the start, so "the machine was off" and "the machine is on" are the same path
+   (T-0030, §8): everything the relay queued while the daemon was away arrives
+   here.
+4. **It accepts peers.** A peer that connects to this daemon through the relay
+   gets a byte stream, and the daemon hands that stream to the **same**
+   `serve_session` loop the local socket runs, behind the same per-verb gate:
+   `DeviceAuthority::check_verb` decides each verb from the peer's role. A relay
+   peer therefore has exactly the permissions it would have locally — a viewer
+   cannot send, and a device that is not pinned never gets past the handshake.
+5. **It probes the configured peer.** If `peer` is set, the daemon opens a
+   session to it and asks one question — `Hello`/`Welcome`, then `Panes` — and
+   logs the count the peer reports.
+
+The probe is deliberately read-only: it asks for the pane *list* and attaches to
+nothing, so a boot-time probe cannot change the peer's machine. It runs **once
+per relay session**, not once per peer connection, so a reconnect probes again.
+
+### 12.2 The configuration file
+
+The daemon's flags are `arreo-server [--socket PATH] [--config PATH]`, and
+`--config` may be replaced by the `$ARREO_CONFIG` environment variable. If both
+are set, `--config` wins. **With neither, the relay is off and nothing about it
+is logged**: a self-hosted runtime must work with no relay at all.
+
+The file is TOML, and only the `[relay]` section is read:
+
+```toml
+[relay]
+enabled = true
+addr = "10.0.0.1:8787"
+account = "acct-1"
+peer = "dev_9f2c4a1b7d3e50618c4f2a9b6d0e7138"
+```
+
+| Key | Type | Default | Rules |
+| --- | --- | --- | --- |
+| `enabled` | boolean | `false` | the only switch. `false`, a file with no `[relay]` section, and a file that does not exist are all "no relay", and all silent |
+| `addr` | string, `IP:PORT` | none | **required when `enabled = true`**; must parse as a socket address (`10.0.0.1:8787`, `[::1]:8787`) |
+| `account` | string | none | **required when `enabled = true`**; must not be blank, and is sent to the relay verbatim |
+| `peer` | string, device id | none | optional; a device id in either spelling (`dev_<hex>` or the bare `<hex>`) — the machine this daemon opens a session to and probes |
+
+A file that *enables* the relay but is incomplete is a **loud exit**, not a
+silent no-op: an operator who asked for the remote path must not quietly fail to
+get it. The process exits 1 with
+
+```text
+arreo-server: relay configuration is unusable: the [relay] section of /etc/arreo/relay.toml is incomplete: [relay] enabled without `addr`
+```
+
+The four incomplete reasons, verbatim:
+
+```text
+[relay] enabled without `addr`
+`addr` is not an IP:PORT address: <error>
+[relay] enabled without `account`
+`peer` is not a device id: <error>
+```
+
+An unreadable or unparseable file is refused the same way, with the same exit
+code, prefixed `cannot read <path>: ` or `cannot parse <path>: `.
+
+Two things that are easy to get wrong:
+
+- **A `--config` path that does not exist is "no relay", silently.** A missing
+  file is one of the three "off" cases, so a typo in the path looks exactly like
+  a relay that never dials: nothing is logged, and nothing is dialled.
+- **Unknown keys are ignored.** Neither the file nor the section rejects extra
+  keys, so `enable = true` (a typo for `enabled`) leaves the relay off without a
+  word.
+
+### 12.3 The logs, step by step
+
+The daemon writes everything to **stderr**, one line per event, prefixed
+`arreo-server:`. Nothing about the relay is written while the relay is off.
+
+At startup, once the configuration has been accepted and the relay task started:
+
+```text
+arreo-server: relay enabled for account acct-1 via 10.0.0.1:8787
+```
+
+The dial itself is silent — there is no "dialling" line, and an attempt in
+progress says nothing. Every attempt then ends in exactly one outcome line:
+
+```text
+arreo-server: relay session up as dev_1a2b3c4d5e6f708192a3b4c5d6e7f809 (account acct-1, relay 10.0.0.1:8787)
+arreo-server: relay registration failed (10.0.0.1:8787): the relay refused the session: unknown account acct-1
+```
+
+When a peer authenticates to this daemon, and when the probe gets its answer:
+
+```text
+arreo-server: relay peer dev_9f2c4a1b7d3e50618c4f2a9b6d0e7138 authenticated
+arreo-server: relay peer dev_9f2c4a1b7d3e50618c4f2a9b6d0e7138 reports 1 pane(s)
+```
+
+And every attempt — successful or not — is followed by its retry delay, after a
+session that ended has said so:
+
+```text
+arreo-server: relay session ended; reconnecting
+arreo-server: retrying the relay in 250ms
+```
+
+The full set:
+
+| Line | What it means |
+| --- | --- |
+| `relay enabled for account <id> via <addr>` | the configuration was accepted; printed once, at boot, before the task starts |
+| `relay session up as dev_<hex> (account <id>, relay <addr>)` | the relay accepted this device's certificate and the session is live |
+| `relay session ended; reconnecting` | the session stopped; a reconnect follows |
+| `relay registration failed (<addr>): <error>` | the attempt failed. `<error>` is the relay's own reason (`the relay refused the session: <reason>`), a transport failure, or a timeout |
+| `retrying the relay in <delay>` | the delay before the next attempt (§12.4) |
+| `relay peer dev_<hex> authenticated` | a peer completed the handshake and is pinned; its session now runs the local protocol, gated per verb |
+| `relay peer dev_<hex> refused: <error>` | the peer's handshake failed — most often `the peer announced an identity that is not pinned` |
+| `relay peer dev_<hex> is not pinned; refusing` | the post-handshake re-check failed |
+| `relay peer dev_<hex> session error: <error>` | the peer's protocol session ended with an error |
+| `relay peer dev_<hex> reports <n> pane(s)` | the probe's answer |
+| `cannot reach dev_<hex> through the relay: <error>` | the probe could not open a session — typically `the relay could not deliver: the peer is offline` |
+| `cannot probe dev_<hex>: it is not pinned on this machine` | the configured `peer` is not pinned here, so there is nothing to authenticate it against |
+| `relay peer dev_<hex> did not answer: <error>` / `… did not answer within 15s` | the peer accepted the session but the pane list did not come back in time |
+| `cannot drain the relay inbox: <error>` | the post-connect drain failed; the session carries on |
+| `relay inbox reported <n> dropped and <m> expired message(s) since the last drain` | the relay dropped or expired queued messages for this device (§8.4); printed only when either is non-zero |
+| `relay write failed: <error>` | the outbound half of the session died |
+| `relay session ended: <error>` | the inbound half died — a malformed envelope, an unsupported version, a broken connection |
+| `daemon: refusing <Verb> for dev_<hex>: <reason>` | a relay peer asked for a verb its role does not hold; the same gate, and the same line, as a local client |
+
+And the boot lines around it, which decide whether the relay starts at all:
+
+| Line | What it means |
+| --- | --- |
+| `device authority ready (root <hex>…, <n> device(s))` | the authority loaded; the relay needs it |
+| `serving on <path>` | the local socket is up; the relay dials beside it, not instead of it |
+| `device identity unavailable: <error>` / `refusing to serve without a device authority (…)` | fatal, exit 1 — and it happens before the relay is even considered |
+| `relay enabled but this machine has no identity: <error>` / `pair this machine first (arreo pair), or set enabled = false` | fatal, exit 1: the relay was asked for but `identity/device.key` or its certificate is missing |
+| `relay configuration is unusable: <error>` | fatal, exit 1: the configuration enables the relay but cannot be used |
+| `unknown flag <flag>` | a usage error, exit 2 |
+
+### 12.4 The reconnect policy
+
+The loop is: dial, serve, and on **any** ending wait, then try again. The wait
+is exponential with a ceiling, plus jitter:
+
+| Policy | Value |
+| --- | --- |
+| base | `250 ms` |
+| growth | doubled per attempt |
+| ceiling | `30 s` |
+| jitter | up to **25%**, added *after* the ceiling is applied |
+
+So the delays are 250 ms, 500 ms, 1 s, 2 s, 4 s, 8 s, 16 s, 30 s, 30 s, …, and
+the printed value is the jittered one — at the ceiling that is up to about
+37.5 s, so `retrying the relay in 37.4s` is not a bug. The attempt counter
+resets to zero as soon as a session comes up.
+
+Two properties worth knowing:
+
+- **A *refused* registration is retried on the same schedule, not tightly.** A
+  bad certificate or an unregistered account will not fix itself by being
+  presented again sooner, so the refusal is logged with the relay's own reason
+  and the daemon backs off exactly as it would for an absent relay. This is also
+  why a misconfigured account does not hammer the relay.
+- **The local socket is unaffected throughout.** The relay is a task beside the
+  daemon: dialling, failing, retrying and reconnecting never stop the local
+  socket from serving, and the acceptance tests assert exactly that — a relay
+  that cannot be reached leaves the local API working and the reason in the log.
+
+A reconnect is a **new session**, not a resumed one. A new stream to the peer
+and a new Noise handshake follow, and nothing queued in the previous session
+resumes: the write path logs `relay write failed`, a stream's reader gets the
+recorded reason as an error rather than a silent gap, and the session's closure
+starts the next attempt. What the *relay* queued for this device is the
+exception, and it is drained at the start of the new session (§12.1).
+
+### 12.5 A worked two-machine example
+
+Two machines in one account (`acct-1`), one relay. Machine **A** probes; machine
+**B** serves. Both must be paired — each needs `identity/devices/<id>.cert`, and
+an unpaired machine is a loud exit (§12.2) — and each must have the other
+pinned, because a relay peer is authenticated by the same authority that gates
+the local socket.
+
+```console
+# 1. On the machine that holds the account identity (B, the one that pairs the
+#    others): the account's root public key, for the relay's registration (§5).
+$ arreo devices list --json | jq -r .root
+4c1f8d3a9b0e77c2...
+
+# 2. On the relay host: run the router, then register the account.
+$ arreo-relay serve --listen 127.0.0.1:8787 --state-dir /srv/arreo-relay
+arreo-relay: state /srv/arreo-relay/relay.db
+arreo-relay: inbox retention 30 day(s), bounds 10000 message(s) / 64 MiB per device
+arreo-relay: router on 127.0.0.1:8787 — loopback only (127.0.0.1:8787)
+
+$ arreo-relay account add --state-dir /srv/arreo-relay --account acct-1 \
+    --root-key 4c1f8d3a9b0e77c2...
+registered account acct-1 with root key 4c1f8d3a9b0e77c2...
+
+# 3. On B: its own device id, which A must pin.
+$ arreo devices id
+device dev_9f2c4a1b7d3e50618c4f2a9b6d0e7138 key b41e...
+(key file: /home/dev/.local/share/arreo/identity/device.key)
+pin it on the server with: arreo devices issue --name <name> --role <owner|viewer> --key b41e...
+
+# 4. On A: pin B. A's own certificate came from pairing, which pinned A on B,
+#    so this is the one direction left to do by hand.
+$ arreo devices issue --socket /run/arreo/arreo.sock \
+    --name machine-b --role owner --key b41e...
+issued dev_9f2c4a1b7d3e50618c4f2a9b6d0e7138 (machine-b) for owner as owner — serial 1
+```
+
+```console
+# 5. A's configuration: it probes B, so it names B.
+$ cat /etc/arreo/relay.toml
+[relay]
+enabled = true
+addr = "10.0.0.1:8787"
+account = "acct-1"
+peer = "dev_9f2c4a1b7d3e50618c4f2a9b6d0e7138"
+
+# 6. B's configuration: it only serves, so it has no `peer`.
+$ cat /etc/arreo/relay.toml
+[relay]
+enabled = true
+addr = "10.0.0.1:8787"
+account = "acct-1"
+```
+
+```console
+# 7. Start B first: it must already be connected when A's probe runs, because
+#    the relay routes only to a device with a live session.
+$ arreo-server --socket /run/arreo/arreo.sock --config /etc/arreo/relay.toml
+arreo-server: device authority ready (root 4c1f8d3a9b0e77c2…, 1 device(s))
+arreo-server: relay enabled for account acct-1 via 10.0.0.1:8787
+arreo-server: serving on /run/arreo/arreo.sock
+arreo-server: relay session up as dev_9f2c4a1b7d3e50618c4f2a9b6d0e7138 (account acct-1, relay 10.0.0.1:8787)
+
+# 8. Give B something to report, so the probe's answer is not a zero.
+$ arreo spawn build /bin/sh -c "sleep 600" --socket /run/arreo/arreo.sock
+
+# 9. Start A.
+$ arreo-server --socket /run/arreo/arreo.sock --config /etc/arreo/relay.toml
+arreo-server: device authority ready (root 8d2a4e6f0b1c3d5a…, 1 device(s))
+arreo-server: relay enabled for account acct-1 via 10.0.0.1:8787
+arreo-server: serving on /run/arreo/arreo.sock
+arreo-server: relay session up as dev_1a2b3c4d5e6f708192a3b4c5d6e7f809 (account acct-1, relay 10.0.0.1:8787)
+arreo-server: relay peer dev_9f2c4a1b7d3e50618c4f2a9b6d0e7138 reports 1 pane(s)
+```
+
+The line to wait for on A is `relay peer dev_<hex> reports <n> pane(s)`: it means
+the relay carried a session, the Noise handshake completed over it, and B
+answered the daemon protocol. On B the matching line is
+`relay peer dev_<hex> authenticated`. On the relay's own stderr you see the other
+half — a session per machine, and no payload:
+
+```text
+arreo-relay: 127.0.0.1:53412 authenticated as dev_1a2b3c4d5e6f708192a3b4c5d6e7f809 in account acct-1
+arreo-relay: 127.0.0.1:53414 authenticated as dev_9f2c4a1b7d3e50618c4f2a9b6d0e7138 in account acct-1
+```
+
+Two notes on the example:
+
+- **A's `root` is not the account root.** The `root` in the boot line is *this
+  machine's* authority root, and a machine that was paired — rather than the one
+  that did the pairing — has a root of its own: `arreo devices issue` signs the
+  peer's certificate with that root, while the relay only ever verifies the
+  certificate chain of the account registered at it. Pinning a peer locally and
+  registering an account at the relay are two different acts.
+- **Start the serving machine first.** If A's probe runs before B is connected,
+  the relay answers `offline` and A logs
+  `cannot reach dev_9f2c… through the relay: … the peer is offline`. Because the
+  probe runs once per session, it is not retried until A's own relay session
+  ends and is re-established — so either start B first, or restart A after B is
+  up.
+
+### 12.6 Troubleshooting
+
+| Symptom | Likely cause | What to check |
+| --- | --- | --- |
+| exit 1, `relay configuration is unusable: … incomplete: …` | the `[relay]` section enables the relay but is missing a required key | `addr` and `account` are both required when `enabled = true` (§12.2) |
+| exit 1, `relay enabled but this machine has no identity: cannot read …` | the machine is not paired: no `identity/device.key`, or no certificate under `identity/devices/` | pair this machine (`arreo pair`), or set `enabled = false` |
+| `relay registration failed (<addr>): the relay refused the session: unknown account <id>` | the account is not registered at the relay, or the root key there is not the one that signed this machine's certificate | `arreo-relay account add --state-dir … --account <id> --root-key <hex>` (§5); re-registering replaces the key and invalidates every device under the old one |
+| `relay registration failed (<addr>): …` repeating, with a growing `retrying the relay in …` | the relay is unreachable — not running, wrong address, or UDP is blocked | the relay's `router on <addr>` line (§10), the `addr` in the config, and UDP reachability between the hosts (§9.2) |
+| `relay peer dev_<hex> refused: the peer announced an identity that is not pinned` | the connecting peer is not pinned on this machine | `arreo devices list --socket …` here, and pin the peer's key with `arreo devices issue … --key <hex>` |
+| `cannot probe dev_<hex>: it is not pinned on this machine` | the configured `peer` is not pinned here | pin the peer before starting the daemon, as in §12.5 |
+| `cannot reach dev_<hex> through the relay: … the peer is offline` | the peer is not connected to the relay — the relay routes only to a live session | start the peer's daemon with its own `[relay]` section; a machine that only serves must still be connected |
+| `relay peer dev_<hex> did not answer within 15s` | the peer's session was accepted but the pane list did not arrive | the peer's own log: did it authenticate this machine, and is it still serving? |
+| `relay peer dev_<hex> reports 0 pane(s)` | not a failure: the peer has no panes | the probe asks for the list only and attaches to nothing (§12.1) |
+| nothing about the relay in the log at all | the relay is off — no `--config`, no `$ARREO_CONFIG`, a missing file, no `[relay]` section, `enabled = false`, or a misspelled key | the config file actually named by `--config`/`$ARREO_CONFIG`, and its `enabled` spelling (§12.2) |
+| `daemon: refusing Send for dev_<hex>: …` on the serving machine | the peer's role does not hold that verb | the role the peer was pinned with (`--role owner` or `--role viewer`) |
+
+### 12.7 What the daemon's relay leg does not do
+
+- **The probe is a pane *count*, not an attach.** It asks `Panes` and logs the
+  number; it does not open a pane, stream its output or send input. Remote
+  attach is T-0032.
+- **The probe runs once per relay session.** A probe that fails — the peer
+  offline, the peer silent — is not retried until the relay session ends and is
+  re-established, and there is no command that asks for it again.
+- **The relay leg carries protocol sessions, not per-pane bytes.** A peer that
+  reaches this daemon gets the daemon's own socket API over the relay stream,
+  and every verb is gated by the peer's role. Nothing here forwards a pane's raw
+  output to a peer that has not been granted the verb for it.
+- **A peer must be pinned on this machine.** The handshake resolves the peer's
+  announced id through the authority's index — the same door the per-verb gate
+  uses, so the two agree — and an id that resolves to nothing is refused before
+  any cryptography runs. The supported way to pin a peer is `arreo devices
+  issue` (or pairing): it writes the certificate *and* the store row, and the
+  store row is what carries the facts a certificate file does not — revocation
+  and retirement. A certificate file written by hand is a state no product
+  command produces; the file is read, but the durable record is missing.
+- **This machine must be paired.** The relay authenticates it with
+  `identity/devices/<id>.cert`, so a machine without one is a loud exit rather
+  than a machine that quietly has no remote path (§12.2).
+- **A reconnect loses the Noise session.** A new stream and a new handshake
+  follow, and anything queued in the previous session fails loudly instead of
+  resuming (§12.4). The relay's inbox is the part that does carry over, and it
+  is drained at the start of the new session.
+- **`peer` is optional, but serving still needs a connection.** A machine that
+  only serves its peers needs no `peer` — but it must still be connected to the
+  relay, because the relay routes only to a device with a live session. There is
+  no push wakeup: a machine that is not connected cannot be reached through the
+  relay at all.
+
+## 13. What v1 does not do, in the operator's terms
 
 These are real gaps, not configuration:
 
@@ -459,8 +813,8 @@ These are real gaps, not configuration:
   envelope is dropped — it is not committed to the inbox. A sender that needs
   that case covered must retry.
 - **No push wakeup.** A queued message waits for the device to reconnect and
-  drain. The relay cannot wake a sleeping phone, and wiring the daemon side to
-  the relay is T-0050.
+  drain. The relay cannot wake a sleeping phone, and the daemon drains when it
+  reconnects (§12).
 - **A queue is not a promise.** Inside the bounds a message waits for its TTL; a
   full queue evicts oldest-first, and a message past the TTL expires. Both are
   counted (`dropped_total`/`expired_total`) and reported on the next drain, but
@@ -479,7 +833,7 @@ These are real gaps, not configuration:
 - **The relay does not encrypt.** It carries payload bytes without reading them,
   and while a message is queued it keeps those bytes in `relay.db` for up to the
   retention window, but it does not make them unreadable. End-to-end
-  confidentiality is the daemons' Noise session (T-0023) and wiring the daemon
-  side to the relay is T-0050; a client that sends plaintext gives the relay
+  confidentiality is the daemons' Noise session (T-0023), which the daemon now
+  runs over the relay (§12); a client that sends plaintext gives the relay
   plaintext.
 - **QUIC/UDP only** (§9.3), and there is no global connection cap.

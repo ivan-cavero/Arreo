@@ -1,38 +1,41 @@
 ## State snapshot          ← REWRITTEN (not appended) at every checkpoint
-Task: T-0050 · relay stream and session (phase 2) — DONE, evidence recorded
-Where you are: the transport half of the daemon's relay path landed and green — a byte stream over
-relay envelopes, carrying T-0023's Noise channel unchanged, proven against the real relay binary
-Next step: **T-0051 (daemon relay wiring)** — p2, deps met, and the direct continuation: config
-section, boot task, pane traffic, the two-real-daemon e2e and the deploy docs. It is the last step
-before T-0032 (remote TUI attach) and T-0034 (the relay slice) become reachable.
+Task: T-0051 · daemon relay wiring (phase 2) — DONE, evidence recorded
+Where you are: the daemon dials the relay, accepts peers, probes its configured peer, and two real
+daemons exchange a message through a real relay; 293 workspace tests
+Next step: **T-0032 (remote TUI attach)** — p3, and the natural continuation: the relay leg now
+carries protocol sessions, so the remaining work is the TUI driving a pane on a peer (the probe
+becomes an attach). T-0034 (the relay e2e slice) follows and depends on it.
+Also ready: T-0026 (revocation, p3 — and now valuable, since the relay and daemon both verify
+certificates), T-0031 (presence), T-0035 (AGPL boundary), T-0028, T-0040, T-0049. T-0044 is *still*
+blocked on the account-join RPC (recorded in its own note); T-0036 stays human-gated on minisign.
 Open workers: (none)
 Known broken: (none) · Parked: (none)
 Findings:
-- **"Recorded" is not "reported", again — this time in a stream.** The first `RelayStream` gave each
-  direction a task over one duplex; a caller that stopped reading left the read task blocked inside a
-  `write_all`, so a stream that had already recorded its failure could never tell anyone. The read
-  direction is now polled straight off its channel (no task, no buffer) and only the write direction
-  keeps a duplex. Same class as T-0023's swallowed error and T-0030's stale counter: ask who
-  *observes* the failure, not who writes it down.
-- **`tokio::io::split` does not close the underlying stream.** Splitting a duplex keeps it alive
-  behind an `Arc`, so dropping one half leaves the other end open and the peer waits forever on a
-  stream that is already dead. Close the direction explicitly, or do not split.
-- **A test premise can be wrong in an interesting way.** I wrote a slow-peer test, and it failed for a
-  reason worth more than the test: the relay's per-connection queue is the same size as the session's
-  per-peer bound, and QUIC flow control means the relay cannot deliver faster than the local consumer
-  drains — so through the relay, the session's own overflow branch is close to unreachable. I deleted
-  the test and recorded it as a "could not break it" finding rather than claiming coverage.
-- **A vanished relay took 35 s to notice** (QUIC's default idle timeout), which would have delayed
-  every reconnect by half a minute. The client endpoint's idle timeout is now 15 s; keep-alives hold
-  a live connection open, and the idle timer is what catches the dead one. Measured before and after.
-- **Bench flaked once at 5/6 and could not be reproduced** (3 clean runs, and one in isolation right
-  after). The battery runs the five e2e slices immediately before bench, so the box is warm; every
-  budget has a large margin except `sampler_sweep_30panes_ms` (61-91 ms against 300 ms), which is the
-  plausible flake. Read a lone FAIL after a full battery as load, not regression — and if it recurs
-  when bench runs cold, that is a harness bug worth a task.
-- **The fence grew by one file** (`crates/arreo-core/src/transport/quic.rs`) for the idle timeout:
-  the criterion "a relay that is simply absent costs bounded retries" needs the connection to notice,
-  and that constant lives in the shared client endpoint.
+- **A flaky test pointed at a product weakness, not a test bug.** The two-daemon test failed
+  intermittently because A probed before B had reached the relay — and the probe ran *once per
+  session*, so a machine booting before its peer logged a failure and never tried again until its
+  own session dropped. The probe is now bounded-retry (5 attempts, doubling delays); stable across
+  repeated runs. Ask "is this flake hiding a one-shot assumption?" before reaching for a longer
+  timeout.
+- **One question, two answers — the same id-spelling class, in a new place.** `reload()` accepts a
+  certificate *file* with no store row, and `check_verb` authorizes through the index, so the gate
+  accepted such a device — but the daemon's handshake resolver asked `devices()`, which lists only
+  the store, and refused it before the gate ran. Fixed with `DeviceAuthority::device()` (the index,
+  the same source the gate uses) and pinned by a test. This is the fourth instance of a mismatch
+  across a boundary that keeps two spellings or two sources for one fact: treat them as suspect by
+  default.
+- **A second reader on the code paid for itself a fourth time.** The docs worker checked every claim
+  against the source and found: a test comment my own change had made false, an error naming the
+  identity directory instead of `device.key`, no log line for an attempt in progress (so "a log line
+  per attempt" was only true at its end), and the exact backoff arithmetic (the 30 s ceiling applies
+  to the base; jitter adds up to 25% on top, so the largest printed delay is ~37.5 s — now stated
+  precisely instead of rounded). All four became code fixes.
+- **The daemon's relay peer runs the same session loop as the local socket**, behind the same
+  per-verb gate, so the relay is a transport and not a second door. That is worth keeping true as
+  T-0032 adds attach — a second door would be a security bug, not a feature.
+- Bench flaked once more at 5/6 in a full battery and is reliably 6/6 when run settled (three
+  consecutive runs). The battery runs five e2e slices immediately before it, so the box is warm.
+  Same conclusion as last turn: read a lone FAIL after a full battery as load.
 ## Event log               ← append-only; newest last; never rewrite
 - 2026-09-10 [turn 1] ledger created; repo at e489fac (docs only); T-0001 + T-0022 (AGENTS.md gardened) done
 - 2026-09-10 [turn 2] T-0002 PTY manager done+pushed (342606c; 9 tests); PROMPT.md v2 synced + ADR 0001 (ef6c595)
@@ -62,3 +65,4 @@ Findings:
 - 2026-09-11 [turn 25] T-0029 relay v0 router done: Apache wire vocabulary + reference client in `arreo_core::relay` (framing, Hello/Challenge/Auth/Welcome, certificate + proof-of-possession auth, typed outcomes), AGPL router in `arreo-relay` (accept/handshake split, per-(account,device) live map, per-envelope validation, status reports, rate limiter), store v2 (account root key + relay_device registry), CLI `serve`/`account add` with the T-0024 pairing path preserved, ADR 0013; 6 core + 14 integration tests (real binary, real QUIC, real certs: opacity scan over state dir and logs, unknown account/foreign cert/no-proof/replayed-proof refusals, spoofed sender, foreign account, unknown vs offline destination, restart durability, stalled peer, reconnect token, zero-length payload, oversized frame, rate limit); 6 defects fixed (double length prefix in the envelope path, the same in a payload, lost refusal, string id comparison, no forgive-on-success, test tripped its own limiter); re-scoped with T-0050 created for the daemon half; 268 workspace tests, clippy/fmt clean, vet/deny/audit green, check-targets PASS/SKIP; evidence in `.loop/evidence/T-0029/`
 - 2026-09-11 [turn 26] T-0030 durable per-device inbox done: store v3 (`inbox` + `inbox_stats`), bounds (10k msgs / 64 MiB / 30-day TTL, all operator-settable with validation), oldest-first eviction before the write, lazy + hourly expiry with counted drops, exactly-once stated as at-least-once + consumer `(device, seq)` dedupe with ack advancing the cursor in one transaction, `drain`/`ack` kinds and `DrainReport`/`Queued` on the wire, drained envelopes replayed byte-for-byte so the relay never decodes a stored header, CLI `--inbox-ttl-days`/`--inbox-max-messages`/`--inbox-max-mb`; 11 inbox tests (incl. real `kill -9` → restart → drain) + 14 router tests; 2 real defects fixed (stale cached queue depth after expiry; test harness killing the child via a closed stderr pipe); docs extended by a worker (protocol §4.4/4.5, deploy §8) with the at-least-once caveat stated plainly; 283 workspace tests, clippy/fmt clean, vet/deny/audit green, check-targets PASS/SKIP, five e2e slices green, bench 6/6; evidence in `.loop/evidence/T-0030/`
 - 2026-09-11 [turn 27] T-0050 relay stream+session done (split from the original T-0050, which became T-0050+T-0051): `RelayClient::into_split`/`RelayWriter`/`RelayReader` in Apache core, `RelaySession` (peer multiplexing, delivery attribution, drain/ack, backoff policy) + `RelayStream` (AsyncRead+AsyncWrite over envelopes, 32 KiB chunking) in arreo-server, ADR 0014; 5 acceptance tests against the real relay binary (full Noise-KK session through the relay with a ciphertext scan over state dir and logs, 200 KB payload chunking, zero-length write, delivery failure ending the stream, refused registration carrying the relay's reason, vanished relay noticed in bounded time, backoff table); 3 real defects fixed (split-duplex never closed; peer's first chunks dropped before a stream existed; 35 s dead-relay detection -> 15 s idle timeout); 1 test deleted with its finding recorded (session overflow unreachable through the relay); 288 workspace tests, clippy/fmt clean, vet/deny/audit green, check-targets PASS/SKIP, five e2e slices green, bench 6/6; evidence in `.loop/evidence/T-0050/`
+- 2026-09-11 [turn 28] T-0051 daemon relay wiring done: `[relay]` config section (+`--config`/`$ARREO_CONFIG`), `own_identity` (the machine's existing paired cert — no new key), reconnect loop with a dialling line per attempt, drain-on-connect, peer accept through the same `serve_session`+per-verb gate as the local socket, bounded-retry probe of the configured peer, and `StreamFactory` for fresh streams per attempt; fixed a real two-door defect (`DeviceAuthority::device()` now reads the index the gate uses, so a file-pinned device is no longer refused by the handshake) and a one-shot-probe race; 4 two-daemon acceptance tests (message exchange with a plaintext scan of the relay's state+logs, both local sockets still serving, unreachable relay leaving the daemon serving, no config meaning no relay, incomplete config refused by name) + the T-0050 transport tests; 293 workspace tests, clippy/fmt clean, vet/deny/audit green, check-targets PASS/SKIP, five e2e slices green, bench 6/6 (isolated); evidence in `.loop/evidence/T-0051/`
