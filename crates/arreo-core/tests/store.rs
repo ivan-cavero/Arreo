@@ -7,7 +7,7 @@
 //! — the foreign-target portability gate — must not try to compile this file.
 #![cfg(feature = "sqlite")]
 
-use arreo_core::store::{AuditEvent, SessionStore, StoredPane};
+use arreo_core::store::{AuditEvent, AuditKind, SessionStore, StoredPane};
 
 fn panes(n: usize) -> Vec<StoredPane> {
     (0..n)
@@ -39,11 +39,16 @@ fn save_and_restore_round_trip() {
 fn audit_log_redacts_secrets_but_keeps_shape() {
     let store = SessionStore::open_memory().expect("open");
     store
-        .audit(AuditEvent {
-            ts_ms: 1_700_000_000_000,
+        .record(&AuditEvent {
             device: "phone".to_string(),
             agent: "pane-1".to_string(),
             prompt: "deploy with OPENAI_API_KEY=sk-abc123XYZ4567890abcdef now".to_string(),
+            ..AuditEvent::new(
+                arreo_core::store::actions::PROMPT,
+                AuditKind::Prompt,
+                arreo_core::store::AuditOutcome::Ok,
+                1_700_000_000_000,
+            )
         })
         .expect("audit");
     let events = store.audit_recent(10).expect("recent");
@@ -66,11 +71,16 @@ fn audit_log_is_append_only() {
     let store = SessionStore::open_memory().expect("open");
     for i in 0..3 {
         store
-            .audit(AuditEvent {
-                ts_ms: 1_700_000_000_000 + i,
+            .record(&AuditEvent {
                 device: "cli".to_string(),
                 agent: "pane-0".to_string(),
                 prompt: format!("command-{i}"),
+                ..AuditEvent::new(
+                    arreo_core::store::actions::PROMPT,
+                    AuditKind::Prompt,
+                    arreo_core::store::AuditOutcome::Ok,
+                    1_700_000_000_000 + i,
+                )
             })
             .expect("audit");
     }
@@ -158,15 +168,16 @@ fn v2_database_migrates_to_v3_keeping_its_audit_rows() {
     );
     // And the new kinds write/read alongside it.
     store
-        .audit_event(
-            arreo_core::store::AuditKind::AuthReject,
-            arreo_core::store::AuditEvent {
-                ts_ms: 2000,
-                device: "dev_new".into(),
-                agent: String::new(),
-                prompt: "no certificate".into(),
-            },
-        )
+        .record(&arreo_core::store::AuditEvent {
+            device: "dev_new".into(),
+            prompt: "no certificate".into(),
+            ..arreo_core::store::AuditEvent::new(
+                arreo_core::store::actions::AUTH_REJECT,
+                arreo_core::store::AuditKind::AuthReject,
+                arreo_core::store::AuditOutcome::Refused,
+                2000,
+            )
+        })
         .expect("reject row");
     let rows = store.audit_recent(10).expect("audit reads back");
     assert_eq!(rows[0].kind, arreo_core::store::AuditKind::AuthReject);

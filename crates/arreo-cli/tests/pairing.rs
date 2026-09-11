@@ -387,11 +387,13 @@ fn a_wrong_code_leaves_no_trace_on_the_phone_and_burns_the_session() {
         "a failed pairing pinned a device"
     );
 
-    // The failure is an auditable event: exactly one pairing_failed row, and it
-    // says what went wrong.
+    // The failure is an auditable event: exactly one `pairing.failed` row, and it
+    // says what went wrong. (The action name, not the older coarse kind: T-0033
+    // made `action` the column an operator greps for, and `pairing.failed` is the
+    // same event under its finer name.)
     let audit = audit_text(&scenario);
     assert!(
-        audit.contains("pairing_failed"),
+        audit.contains("pairing.failed"),
         "no pairing failure in the audit log: {audit}"
     );
     assert!(
@@ -399,7 +401,7 @@ fn a_wrong_code_leaves_no_trace_on_the_phone_and_burns_the_session() {
         "the audit row does not name the cause: {audit}"
     );
     assert_eq!(
-        audit.matches("pairing_failed").count(),
+        audit.matches("pairing.failed").count(),
         1,
         "a wrong code wrote the wrong number of rows: {audit}"
     );
@@ -444,7 +446,7 @@ fn an_unanswered_pairing_expires_instead_of_hanging() {
     // generic refusal, and nothing was pinned by it.
     let audit = audit_text(&scenario);
     assert!(
-        audit.contains("pairing_failed"),
+        audit.contains("pairing.failed"),
         "the expired attempt was not audited as a pairing failure: {audit}"
     );
     assert!(
@@ -452,7 +454,7 @@ fn an_unanswered_pairing_expires_instead_of_hanging() {
         "the audit row does not say why: {audit}"
     );
     assert_eq!(
-        audit.matches("pairing_failed").count(),
+        audit.matches("pairing.failed").count(),
         1,
         "an expired pairing wrote the wrong number of rows: {audit}"
     );

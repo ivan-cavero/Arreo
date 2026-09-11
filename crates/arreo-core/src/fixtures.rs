@@ -271,28 +271,90 @@ fn coalesce(events: Vec<Event>) -> Vec<Event> {
     out
 }
 
+/// The prefixes whose tokens are secret-shaped, and the shortest run after a
+/// prefix that is worth calling a token.
+///
+/// Shared by the scanner and the masker on purpose: when the two disagreed about
+/// what a token is, the scanner flagged a line the masker left alone — a secret
+/// on disk beside `redacted = 1`. One definition, two callers.
+pub const TOKEN_PREFIXES: [(&str, &str); 5] = [
+    ("sk-", "api key (sk- prefix)"),
+    ("AKIA", "aws access key id"),
+    ("ghp_", "github token"),
+    ("gho_", "github oauth token"),
+    ("xox", "slack token"),
+];
+pub const MIN_TOKEN_RUN: usize = 8;
+
+/// The earliest secret-shaped token in `line`: where it starts, how long it is
+/// (prefix included), and the label the scan reports it under.
+///
+/// A token runs from its prefix to the first character that cannot be part of
+/// one — whitespace or punctuation — so a quoted or bracketed token is still a
+/// token. A prefix followed by too short a run is not one: `ask-me` contains
+/// `sk-`, and flagging it would have masked a word nobody would call a secret.
+pub fn find_token(line: &str) -> Option<(usize, usize, &'static str)> {
+    let mut best: Option<(usize, usize, &'static str)> = None;
+    for (prefix, label) in TOKEN_PREFIXES {
+        let mut from = 0;
+        while let Some(rel) = line[from..].find(prefix) {
+            let at = from + rel;
+            let run = token_run_len(&line[at + prefix.len()..]);
+            if prefix.len() + run >= MIN_TOKEN_RUN {
+                if best.is_none_or(|(seen, _, _)| at < seen) {
+                    best = Some((at, prefix.len() + run, label));
+                }
+                break;
+            }
+            from = at + prefix.len();
+        }
+    }
+    best
+}
+
+/// How long the token run starting at `rest` is: up to the first character that
+/// cannot appear in a token.
+fn token_run_len(rest: &str) -> usize {
+    rest.find(|c: char| {
+        c.is_whitespace() || matches!(c, '"' | '\'' | '`' | ',' | ';' | ')' | ']' | '}' | '>')
+    })
+    .unwrap_or(rest.len())
+}
+
 /// Flag secret-shaped content. Returns human-readable findings (empty = clean).
 /// Patterns: `sk-`/`AKIA`/`ghp_`/`xox` token prefixes, `BEGIN .* PRIVATE KEY`,
 /// `api[_-]?key` assignments with long values, AWS secret-shaped 40-char
 /// base64 after `aws_secret`, generic `password = <long>` assignments.
+///
+/// A token is defined by [`find_token`], the same function the
+/// masker uses: a prefix followed by a long enough run. The scanner and the
+/// masker must agree, or a flagged line goes to disk unmasked.
 #[must_use]
 pub fn scan_secrets(text: &str) -> Vec<String> {
     let mut findings = Vec::new();
     for (i, line) in text.lines().enumerate() {
         let n = i + 1;
-        let mut check = |needle: &str, label: &str| {
-            if line.contains(needle) {
-                findings.push(format!("line {n}: possible {label}"));
+        let mut tokens = 0;
+        let mut rest = line;
+        while let Some((at, len, label)) = find_token(rest) {
+            // One finding per token, not one per line: a line with two secrets
+            // is two things an operator wants to see.
+            findings.push(format!("line {n}: possible {label}"));
+            rest = &rest[at + len..];
+            tokens += 1;
+            if tokens > 8 {
+                break;
             }
-        };
-        check("sk-", "api key (sk- prefix)");
-        check("AKIA", "aws access key id");
-        check("ghp_", "github token");
-        check("gho_", "github oauth token");
-        check("xox", "slack token");
-        check("BEGIN PRIVATE KEY", "private key block");
-        check("BEGIN RSA PRIVATE KEY", "private key block");
-        check("BEGIN OPENSSH PRIVATE KEY", "private key block");
+        }
+        for needle in [
+            "BEGIN PRIVATE KEY",
+            "BEGIN RSA PRIVATE KEY",
+            "BEGIN OPENSSH PRIVATE KEY",
+        ] {
+            if line.contains(needle) {
+                findings.push(format!("line {n}: possible private key block"));
+            }
+        }
         let lower = line.to_lowercase();
         for key in [
             "api_key",

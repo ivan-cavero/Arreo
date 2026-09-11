@@ -118,13 +118,19 @@ impl PaneEntry {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .feed(note.as_bytes(), now_ms());
-        // Audit (you get told — `arreo audit` shows it).
+        // Audit (you get told — `arreo audit` shows it). The daemon is the
+        // actor: no session made this decision, the sweeper did.
         if let Ok(store) = arreo_core::store::SessionStore::open(db) {
-            let _ = store.audit(arreo_core::store::AuditEvent {
-                ts_ms: now_ms(),
+            let _ = store.record(&arreo_core::store::AuditEvent {
                 device: "daemon".to_string(),
                 agent: id.to_string(),
-                prompt: format!("[enforce] {label} budget breached"),
+                prompt: format!("{label} budget breached"),
+                ..arreo_core::store::AuditEvent::new(
+                    arreo_core::store::actions::ENFORCE_BREACH,
+                    arreo_core::store::AuditKind::Unknown,
+                    arreo_core::store::AuditOutcome::Ok,
+                    now_ms(),
+                )
             });
         }
         // Kill switch (only when configured — default is notify-only).
@@ -217,6 +223,10 @@ impl Daemon {
         let listener = UnixListener::bind(&self.socket)?;
         // Boot restore BEFORE serving: crash survivors reappear with history.
         self.restore_boot().await;
+        // Tell the operator if the audit log has grown past what they should
+        // notice. A warning and never a prune: the trail is append-only, and a
+        // log that deletes itself to stay small is not a log (T-0033).
+        crate::audit::warn_if_large(&self.db);
         // Enforcement sweeper (T-0019): 1 s tick over guarded panes —
         // breach → state event + audit + policy kill. Unattached panes are
         // covered too (attach loops only see their own pane).
@@ -333,6 +343,9 @@ pub struct SessionAuth {
     authority: Arc<Mutex<DeviceAuthority>>,
     peer: VerifyingKey,
     device: DeviceId,
+    /// The peer's network address, when there is one: the local socket has none,
+    /// and a remote session's is truncated before it reaches the log.
+    address: Option<std::net::SocketAddr>,
 }
 
 impl SessionAuth {
@@ -348,7 +361,31 @@ impl SessionAuth {
             authority,
             peer,
             device,
+            address: None,
         }
+    }
+
+    /// Attach the peer's address, for the audit trail. Separate from `new`
+    /// because the local socket legitimately has none, and a constructor that
+    /// took an `Option` would invite passing `None` where an address exists.
+    #[must_use]
+    pub fn with_peer_address(mut self, address: std::net::SocketAddr) -> Self {
+        self.address = Some(address);
+        self
+    }
+
+    /// The device this session authenticated as — the identity every audit row
+    /// for it carries.
+    #[must_use]
+    pub fn device_id(&self) -> &DeviceId {
+        &self.device
+    }
+
+    /// The peer's address, when the session arrived over a network (the local
+    /// Unix socket has none).
+    #[must_use]
+    pub fn peer(&self) -> Option<std::net::SocketAddr> {
+        self.address
     }
 
     /// Record the session against the device's `last_seen` (best-effort: a
@@ -401,6 +438,29 @@ where
     W: AsyncWriteExt + Unpin,
 {
     let mut buf = Vec::new();
+    // The audit trail for this session: the identity comes from the gate, so a
+    // remote action is attributed to the device that took it (T-0033) and a local
+    // one to the operator.
+    let audit = crate::audit::SessionAudit::new(
+        db.clone(),
+        match &auth {
+            Some(auth) => crate::audit::Actor {
+                device: auth.device_id().to_string(),
+                peer: auth
+                    .peer()
+                    .map(|addr| arreo_core::store::truncate_peer(&addr)),
+            },
+            None => crate::audit::Actor::local(),
+        },
+    );
+    if auth.is_some() {
+        audit.record(
+            arreo_core::store::actions::SESSION_CONNECT,
+            arreo_core::store::AuditOutcome::Ok,
+            "",
+            None,
+        );
+    }
 
     // Handshake first: exactly one Hello, answered by Welcome or Error.
     // Bounded by timeout: pre-v1 JSONL clients (`{...}\n`) would otherwise
@@ -464,10 +524,13 @@ where
         Err(_) => return Ok(()),
     }
 
-    loop {
+    // The read loop runs until the client goes away; the reason it ended is
+    // worth recording, so the exit is a `break` carrying it rather than a bare
+    // `return` that would leave the session with a connect row and no end.
+    let ended_because = loop {
         let message = match read_message(&mut reader, &mut buf).await {
             Ok(message) => message,
-            Err(_) => return Ok(()),
+            Err(e) => break e.to_string(),
         };
         // Remote sessions are gated per verb, before anything acts on the
         // message. A refusal is answered and the session stays usable — a
@@ -478,6 +541,18 @@ where
                 write_message(&mut writer, &refusal).await?;
                 continue;
             }
+        }
+        // Record what the verb is about to do, with the acting identity. After
+        // the gate (a refused verb is not an action taken) and before the work
+        // (so a crash mid-verb still leaves the intent on record).
+        if let Some(row) = audited(&message) {
+            audit.record_with_prompt(
+                row.action,
+                arreo_core::store::AuditOutcome::Ok,
+                &row.agent,
+                &row.prompt,
+                None,
+            );
         }
         // Streaming verbs own the connection until done.
         match &message {
@@ -495,7 +570,7 @@ where
             }
             _ => {}
         }
-        let reply = dispatch(&message, &registry, &db).await;
+        let reply = dispatch(&message, &registry).await;
         // Persistence: spawn/kill/split mutate the registry — snapshot after
         // them so the DB always reflects the current topology. Async task
         // (never blocks the connection); failures logged, never fatal.
@@ -520,6 +595,61 @@ where
         if let Some(reply) = reply {
             write_message(&mut writer, &reply).await?;
         }
+    };
+    // The session is over. Recorded with the reason, so the trail reads as a
+    // session with a beginning, some actions, and an end rather than a set of
+    // rows that stops.
+    if auth.is_some() {
+        audit.record_with_prompt(
+            arreo_core::store::actions::SESSION_DISCONNECT,
+            arreo_core::store::AuditOutcome::Ok,
+            "",
+            "",
+            Some(&ended_because),
+        );
+    }
+    Ok(())
+}
+
+/// One auditable action a verb performs.
+struct Audited {
+    action: &'static str,
+    /// What it acted on.
+    agent: String,
+    /// Content worth keeping (a prompt). Empty for actions with no content.
+    prompt: String,
+}
+
+/// The audit row a verb deserves, or `None` for verbs that are not actions.
+///
+/// Reads and listings are deliberately absent: an audit trail that records every
+/// poll is a trail nobody reads, and the interesting question ("who *did*
+/// something") is answered by the writes. `attach` is included because taking a
+/// stream of someone's terminal output is a decision worth recording.
+fn audited(message: &Message) -> Option<Audited> {
+    let pane = |id: &String| Audited {
+        action: arreo_core::store::actions::ATTACH,
+        agent: id.clone(),
+        prompt: String::new(),
+    };
+    match message {
+        Message::Attach { id, .. } | Message::Resume { id, .. } => Some(pane(id)),
+        Message::Send { id, data, .. } => Some(Audited {
+            action: arreo_core::store::actions::SEND,
+            agent: id.clone(),
+            prompt: data.clone(),
+        }),
+        Message::Spawn { id, program, .. } => Some(Audited {
+            action: arreo_core::store::actions::SPAWN,
+            agent: id.clone(),
+            prompt: program.clone(),
+        }),
+        Message::Split { id, new_id, .. } => Some(Audited {
+            action: arreo_core::store::actions::SPLIT,
+            agent: id.clone(),
+            prompt: new_id.clone(),
+        }),
+        _ => None,
     }
 }
 
@@ -596,22 +726,9 @@ fn not_found(id: &str) -> Message {
     }
 }
 
-/// Append one audit row for a sent prompt (best-effort: failures logged).
-fn audit_send(db: &Path, id: &str, data: &str) {
-    if let Ok(store) = arreo_core::store::SessionStore::open(db) {
-        let now = now_ms();
-        let _ = store.audit(arreo_core::store::AuditEvent {
-            ts_ms: now,
-            device: "cli".to_string(),
-            agent: id.to_string(),
-            prompt: data.to_string(),
-        });
-    }
-}
-
 /// One-shot verbs. Returns `None` when the verb streams instead (handled by
 /// the caller). Every arm checks the version first — loud, never silent.
-async fn dispatch(message: &Message, registry: &Registry, db: &Path) -> Option<Message> {
+async fn dispatch(message: &Message, registry: &Registry) -> Option<Message> {
     match message {
         Message::Spawn {
             v,
@@ -720,10 +837,9 @@ async fn dispatch(message: &Message, registry: &Registry, db: &Path) -> Option<M
                 Some(entry) => match entry.pane.send(data.as_bytes()) {
                     Ok(()) => {
                         entry.pump(now_ms());
-                        // Audit every prompt (device="cli" pre-auth; device
-                        // certs land with pairing). Redaction happens inside
-                        // `audit()` — key material never touches disk.
-                        audit_send(db, id, data);
+                        // The prompt row is written by the *session* loop, which
+                        // knows which device acted (T-0033); dispatch has no
+                        // identity, and "cli" was a lie for a remote device.
                         Some(Message::Ok { v: VERSION })
                     }
                     Err(e) => Some(Message::Error {

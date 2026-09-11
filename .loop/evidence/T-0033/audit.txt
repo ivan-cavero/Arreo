@@ -1,0 +1,96 @@
+# T-0033 evidence — the machine audit trail
+
+Every command below was run against the final code on this turn. The scenario
+output comes from a real `arreo-server` on a real socket (the probe directory is
+`/tmp/auditprobe2`, torn down afterwards); the test runs are the acceptance
+tests that ship with the task.
+
+## 1. The trail, end to end (a real daemon, the real CLI)
+
+### setup: a fresh daemon on /tmp/auditprobe2/s.sock (identity dir /tmp/auditprobe2)
+$ ARREO_IDENTITY_DIR=/tmp/auditprobe2 arreo-server --socket /tmp/auditprobe2/s.sock
+
+### 1. the scripted sequence: spawn -> send (with a live secret) -> attach
+$ arreo spawn pane-a /bin/sh -c 'sleep 30'
+spawned pane-a
+$ arreo send pane-a 'export GITHUB_TOKEN=ghp_AAAABBBBCCCCDDDDEEEEFFFF'
+$ arreo send pane-a 'echo hello'
+
+### 2. the read-back ($ arreo audit) — note the [redacted] marker
+1789127476853 spawn                  ok       local-cli        pane-a       -                  -                        /bin/sh
+1789127476937 send                   ok       local-cli        pane-a       -                  -                        [redacted] export GITHUB_TOKEN=[REDACTED:token]
+1789127476960 send                   ok       local-cli        pane-a       -                  -                        echo hello
+
+### 3. the same tail as JSON ($ arreo audit --json --limit 3)
+{"count":3,"rows":[{"action":"spawn","agent":"pane-a","detail":null,"device":"local-cli","kind":"unknown","outcome":"ok","peer":null,"prompt":"/bin/sh","redacted":false,"ts_ms":1789127476853},{"action":"send","agent":"pane-a","detail":null,"device":"local-cli","kind":"prompt","outcome":"ok","peer":null,"prompt":"export GITHUB_TOKEN=[REDACTED:token]","redacted":true,"ts_ms":1789127476937},{"action":"send","agent":"pane-a","detail":null,"device":"local-cli","kind":"prompt","outcome":"ok","peer":null,"prompt":"echo hello","redacted":false,"ts_ms":1789127476960}]}
+
+### 4. export, filtered to the send rows ($ arreo audit export --format json --action send)
+[
+  {
+    "action": "send",
+    "agent": "pane-a",
+    "detail": null,
+    "device": "local-cli",
+    "kind": "prompt",
+    "outcome": "ok",
+    "peer": null,
+    "prompt": "export GITHUB_TOKEN=[REDACTED:token]",
+    "redacted": true,
+    "ts_ms": 1789127476937
+  },
+  {
+    "action": "send",
+    "agent": "pane-a",
+    "detail": null,
+    "device": "local-cli",
+    "kind": "prompt",
+    "outcome": "ok",
+    "peer": null,
+    "prompt": "echo hello",
+    "redacted": false,
+    "ts_ms": 1789127476960
+  }
+]
+
+### 5. the redaction scan over every file SQLite writes, and over the export
+  s.sock.db           4096 bytes  secret present: False  marker present: False
+  s.sock.db-wal     160712 bytes  secret present: False  marker present: True
+  s.sock.db-shm      32768 bytes  secret present: False  marker present: False
+$ arreo audit export --format jsonl | grep -c ghp_
+0
+  (0 = the export carries no live secret)
+
+### 6. pruning is explicit and records itself ($ arreo audit prune --before <far future>)
+pruned 3 row(s) older than 9999999999999
+$ arreo audit  # only the prune row survives
+1789127477115 audit.prune            ok       local-cli                     -                  before_ms=9999999999999 removed=3 removed 3 row(s) older than 9999999999999
+
+## 2. What the daemon records about a session (real transport, real handshake)
+
+### A remote session's rows: the daemon test that drives the real transport
+$ cargo test -p arreo-server --test audit
+test a_refused_connection_is_recorded_as_refused ... ok
+test a_session_leaves_the_actions_it_took_on_record ... ok
+test a_prompt_is_redacted_in_the_real_log ... ok
+test the_readback_carries_the_review_fields_and_nothing_sensitive ... ok
+test the_trail_replays_in_write_order ... ok
+test a_remote_send_is_attributed_to_the_device_that_made_it ... ok
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.60s
+
+### Refusal is on record: connect with an unpinned key
+test a_refused_connection_is_recorded_as_refused ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 5 filtered out; finished in 0.07s
+
+### Revocation: durable, audited, and refused on the next connection
+test the_schema_records_who_revoked_and_the_audit_action ... ok
+test a_revoked_device_is_refused_on_its_next_connection ... ok
+test a_revoked_key_cannot_be_re_pinned ... ok
+test a_device_revoked_while_offline_is_refused_when_it_returns ... ok
+test a_live_device_keeps_working_while_another_is_revoked ... ok
+test revoking_an_unknown_or_ambiguous_device_fails_clearly ... ok
+test a_revocation_is_durable_and_visible_in_the_audit_log ... ok
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.25s
+
+### The live-pin / live-revoke asymmetry fix (unit)
+test identity::authority::tests::a_live_pin_and_a_live_revocation_both_take_effect_without_a_restart ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 117 filtered out; finished in 0.06s

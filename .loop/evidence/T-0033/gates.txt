@@ -1,0 +1,97 @@
+# T-0033 gates — the full battery, run against the final code this turn
+#
+# The workspace, clippy and fmt runs below were repeated after the last source
+# edit (the token definition moved from `store` to `fixtures` so the C-free
+# cross-target pass compiles without the sqlite feature, and the new core test
+# file gained its `#![cfg(feature = "sqlite")]` gate). The numbers are from that
+# final run; the e2e slices and the bench follow it.
+
+## cargo test --workspace
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.66s
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.27s
+test result: ok. 118 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.13s
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.24s
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.50s
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.27s
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.15s
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.62s
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.21s
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 12.37s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.10s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.43s
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.41s
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.31s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.35s
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.59s
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.09s
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.19s
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.83s
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 20.10s
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 10.12s
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.38s
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+TOTAL: 326 passed, 0 failed across 43 targets
+
+## cargo clippy --workspace --all-targets -- -D warnings
+(no output = zero warnings)
+exit=0
+
+## cargo fmt --all -- --check
+clean
+
+## cargo vet --locked
+Vetting Succeeded (336 exempted)
+
+## cargo deny check
+advisories ok, bans ok, licenses ok, sources ok
+
+## cargo audit
+    Updating crates.io index
+    Scanning Cargo.lock for vulnerabilities (343 crate dependencies)
+
+## cargo xtask check-targets
+check-targets: x86_64-unknown-linux-gnu PASS
+check-targets: x86_64-pc-windows-msvc SKIP (pure-Rust (arreo-core, no sqlite) PASS; C deps need SDK (lib.exe) — CI covers)
+check-targets: 1 pass, 1 skip (CI matrix is authority for skipped)
+
+## cargo audit (full tail)
+      Loaded 1243 security advisories (from /home/dev/.cargo/advisory-db)
+    Scanning Cargo.lock for vulnerabilities (343 crate dependencies)
+
+## e2e slices (cargo xtask e2e --slice <name>)
+api: all verbs green over the real socket
+lifecycle: 2 passed, 0 failed
+persistence: 3 passed, 0 failed
+tui: 17 passed, 0 failed
+theme: 27 passed, 0 failed
+
+## cargo xtask bench (isolated; run alone after the box settled)
+     Running `target/debug/xtask bench`
+bench: 10 panes in 290.453955ms (budgets: perf-budget.toml)
+  [PASS] server_rss_10panes_mb    actual      13 MB  target ≤ 100 MB  
+  [PASS] per_pane_hot_kb          actual     211 KB  target ≤ 3072 KB 
+  [PASS] detection_latency_ms     actual       0 ms  target ≤ 200 ms  
+  [PASS] sampler_sweep_30panes_ms actual      61 ms  target ≤ 300 ms  
+  [PASS] vt_feed_1byte_ms         actual       0 ms  target ≤ 50 ms   
+  [PASS] replay_determinism       actual          0  target 0         

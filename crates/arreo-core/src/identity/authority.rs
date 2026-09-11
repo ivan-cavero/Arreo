@@ -312,7 +312,9 @@ impl DeviceAuthority {
         );
         self.audit(
             AuditKind::DeviceChange,
-            device.as_str(),
+            crate::store::actions::DEVICE_ROTATE,
+            crate::store::AuditOutcome::Ok,
+            device,
             &format!(
                 "rotated to {}",
                 retired
@@ -382,15 +384,22 @@ impl DeviceAuthority {
         revoked_by: &str,
         now_ms: i64,
     ) -> Result<(), AuthorityError> {
+        // `device` is the *subject* on every row — the device the row is about —
+        // so "everything about this device" is always the same one-column query.
+        // Who *did* it goes in `detail`, because the alternative (the actor in
+        // `device`, the subject in `prompt`) makes one column mean two things
+        // depending on the action, which is the trap this schema exists to avoid.
         let event = crate::store::AuditEvent {
-            ts_ms: now_ms as u64,
-            device: revoked_by.to_string(),
-            agent: String::new(),
-            prompt: target.display_id(),
+            device: target.display_id(),
+            detail: Some(format!("revoked by {revoked_by}")),
+            ..crate::store::AuditEvent::new(
+                crate::store::actions::DEVICE_REVOKE,
+                AuditKind::DeviceChange,
+                crate::store::AuditOutcome::Ok,
+                now_ms as u64,
+            )
         };
-        self.store
-            .audit_action("device.revoke", event)
-            .map_err(AuthorityError::from)
+        self.store.record(&event).map_err(AuthorityError::from)
     }
 
     /// **The decision the transport calls.** A presented key is accepted only
@@ -467,12 +476,59 @@ impl DeviceAuthority {
     /// only authorized devices (`from_records` drops the rest), which is exactly
     /// the refusal the handshake wants. A caller that needs the *record* of a
     /// revoked device — its `revoked_at_ms`, its `revoked_by`, its tombstone —
-    /// is asking a different question and must read [`DeviceAuthority::devices`]
+    /// is asking a different question and must read [`DeviceAuthority::record`]
     /// instead. Naming the difference here because a lookup that silently means
     /// "authorized" is a trap for the next reader (and for the next test).
-    #[must_use]
-    pub fn device(&self, id: &DeviceId) -> Option<DeviceRecord> {
-        self.index.get(id).cloned()
+    ///
+    /// **Both directions of staleness are covered, because the index is a
+    /// snapshot and the store is the authority.** A device *revoked* while this
+    /// process runs is refused at once (the store's flag is read on every
+    /// lookup), and a device *pinned* while it runs is usable at once (a miss
+    /// reloads once). Before this, revocation took effect immediately and pinning
+    /// silently required a restart — an asymmetry that showed up as an
+    /// unexplained handshake refusal for a device that had just been issued.
+    ///
+    /// The reload goes through the same trust path as boot (`reload` verifies
+    /// every certificate against the root and drops anything that fails), so a
+    /// store row still cannot authorize a device on its own — the property the
+    /// "a tampered store row cannot add a device" test pins. A certificate file
+    /// with no store row stays usable, which is the other property pinned by test
+    /// (asking the store for a *row* rather than for a *withdrawal* would have
+    /// closed that door).
+    pub fn device(&mut self, id: &DeviceId) -> Option<DeviceRecord> {
+        // The index is a snapshot, and another process can change the durable
+        // facts under it while this one runs — `arreo devices revoke` is a
+        // separate command against the same store. So the store gets the last
+        // word on revocation and retirement, the two things the certificates
+        // themselves do not carry: without this, a device revoked by an operator
+        // while the daemon ran would keep its key and stay accepted, because the
+        // boot-time index still listed it.
+        //
+        // A store read on every lookup is the same cost the role gate already
+        // pays (`role_of` reads it per verb), against a table with a handful of
+        // rows, on a path that has already paid for QUIC and Noise.
+        let withdrawn = self
+            .record(id)
+            .ok()
+            .flatten()
+            .is_some_and(|record| record.revoked || record.retired_to.is_some());
+        if !withdrawn {
+            if let Some(record) = self.index.get(id) {
+                return Some(record.clone());
+            }
+            // A miss reloads once, because the other direction of staleness is
+            // just as real: a device pinned by another process (an operator
+            // running `arreo devices issue`) exists on disk and not in an index
+            // built at boot, so pinning one used to require a restart while
+            // revoking took effect immediately. `reload` verifies every
+            // certificate against the root, so a store row still cannot
+            // authorize a device on its own — and a *certificate file with no
+            // store row* stays usable, which is the door this must not close.
+            if self.reload().is_ok() {
+                return self.index.get(id).cloned();
+            }
+        }
+        None
     }
 
     /// The durable *record* of one device, including a revoked or rotated one.
@@ -507,7 +563,9 @@ impl DeviceAuthority {
         self.store.upsert_device(&record)?;
         self.audit(
             AuditKind::DeviceChange,
-            record.id.as_str(),
+            crate::store::actions::DEVICE_ISSUE,
+            crate::store::AuditOutcome::Ok,
+            &record.id,
             &format!("issued {} for {}", record.role.as_str(), record.name),
         )?;
         self.reload()?;
@@ -518,23 +576,57 @@ impl DeviceAuthority {
     /// the audit log: "someone tried and got it wrong" is exactly what an
     /// operator wants to see, and `auth_reject` would read as a connection.
     pub fn audit_pairing_failure(&self, session: &str, reason: &str) -> Result<(), AuthorityError> {
-        self.audit(AuditKind::PairingFailed, session, reason)
+        // A pairing failure names a *session*, not a device (there is no device
+        // yet — that is why it failed), so it takes the string form directly.
+        self.store.record(&AuditEvent {
+            device: session.to_string(),
+            prompt: reason.to_string(),
+            ..AuditEvent::new(
+                crate::store::actions::PAIRING_FAILED,
+                AuditKind::PairingFailed,
+                crate::store::AuditOutcome::Refused,
+                now_ms() as u64,
+            )
+        })?;
+        Ok(())
     }
 
     fn note_refusal(&self, device: &DeviceId, reason: &str) -> Result<(), AuthorityError> {
-        self.audit(AuditKind::AuthReject, device.as_str(), reason)
+        self.audit(
+            AuditKind::AuthReject,
+            crate::store::actions::AUTH_REJECT,
+            crate::store::AuditOutcome::Refused,
+            device,
+            reason,
+        )
     }
 
-    fn audit(&self, kind: AuditKind, device: &str, note: &str) -> Result<(), AuthorityError> {
-        self.store.audit_event(
-            kind,
-            AuditEvent {
-                ts_ms: now_ms() as u64,
-                device: device.to_string(),
-                agent: String::new(),
-                prompt: note.to_string(),
-            },
-        )?;
+    /// One row: an action with an outcome, so a review can tell what was *asked*
+    /// from what *resulted*.
+    ///
+    /// The outcome is a parameter rather than a constant, because the callers are
+    /// not all refusals: issuing and rotating a certificate succeed, and a row
+    /// that recorded them as `refused` would be worse than no row — an operator
+    /// reading "device.issue refused" would go looking for a failure that never
+    /// happened. (That is exactly the bug this parameter fixed.)
+    /// `device` is stored in its **display form** (`dev_<hex>`), the spelling the
+    /// CLI prints and an operator greps for. The bare fingerprint is what the
+    /// certificates use internally, and a log that mixed the two would make
+    /// "show me everything about this device" a two-pattern search — the same
+    /// two-spellings hazard this codebase has already paid for repeatedly.
+    fn audit(
+        &self,
+        kind: AuditKind,
+        action: &str,
+        outcome: crate::store::AuditOutcome,
+        device: &DeviceId,
+        note: &str,
+    ) -> Result<(), AuthorityError> {
+        self.store.record(&AuditEvent {
+            device: device.display_id(),
+            prompt: note.to_string(),
+            ..AuditEvent::new(action, kind, outcome, now_ms() as u64)
+        })?;
         Ok(())
     }
 }
@@ -758,15 +850,67 @@ mod tests {
         );
         assert_eq!(record.revoked_by.as_deref(), Some("local-cli"));
 
-        // The revocation is an audit row naming who and what.
+        // The revocation is an audit row naming what and who: `device` is the
+        // subject (so "everything about this device" is one query on one
+        // column), and the actor is in `detail`.
         let rows = restarted
             .store
             .audit_by_action("device.revoke", 10)
             .expect("audit");
         assert_eq!(rows.len(), 1, "one revocation, one row");
-        assert_eq!(rows[0].device, "local-cli");
-        assert_eq!(rows[0].prompt, id.display_id());
+        assert_eq!(rows[0].device, id.display_id());
+        assert!(
+            rows[0]
+                .detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains("revoked by local-cli")),
+            "the row names the actor: {:?}",
+            rows[0].detail
+        );
         std::fs::remove_dir_all(root).ok();
+    }
+
+    /// A device pinned **while this process is running** is usable without a
+    /// restart, and revoking one takes effect immediately too.
+    ///
+    /// The two halves must agree: revocation was always live (it is a store flag
+    /// read on every decision), but a *new* device existed only on disk until a
+    /// reload, so pinning one required restarting the daemon — a real asymmetry
+    /// that a remote session surfaced as an unexplained handshake refusal.
+    #[test]
+    fn a_live_pin_and_a_live_revocation_both_take_effect_without_a_restart() {
+        let (layout, root) = scratch("live");
+        let mut authority = DeviceAuthority::load(layout.clone()).expect("authority");
+        let device = key();
+        let id = DeviceId::from_key(&device.public());
+
+        // Not pinned yet — refused, as it should be.
+        assert!(authority.device(&id).is_none(), "nothing is pinned yet");
+
+        // Pinned by a *second* handle, the way another process (or a test)
+        // running `arreo devices issue` against the same store would.
+        let mut other = DeviceAuthority::load(layout.clone()).expect("second authority");
+        let cert = other
+            .issue("phone", Role::Owner, &device.public())
+            .expect("issue");
+
+        // The first handle sees it without reloading by hand.
+        assert!(
+            authority.device(cert.device()).is_some(),
+            "a device pinned while the process runs must be usable"
+        );
+        assert!(authority.authorize(&device.public()).is_ok());
+
+        // And a revocation reaches it just as directly.
+        other
+            .revoke(cert.device(), "local-cli", 7_000)
+            .expect("revoke");
+        assert!(
+            authority.device(cert.device()).is_none(),
+            "the revoked device is no longer authorized"
+        );
+        assert!(authority.authorize(&device.public()).is_err());
+        let _ = root;
     }
 
     #[test]

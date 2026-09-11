@@ -129,7 +129,11 @@ pub async fn serve(
                 );
                 return;
             };
-            let auth = SessionAuth::new(Arc::clone(&authority), peer, session.device.clone());
+            // The peer's address goes into the audit trail (truncated at write),
+            // so "who connected, from where" answers "where" as a network rather
+            // than a location history.
+            let auth = SessionAuth::new(Arc::clone(&authority), peer, session.device.clone())
+                .with_peer_address(connection.remote_address());
             auth.touch();
             eprintln!("arreo-server: remote session from {}", session.device);
 
@@ -166,7 +170,9 @@ pub(crate) fn pinned_key(
     authority: &Arc<Mutex<DeviceAuthority>>,
     device: &DeviceId,
 ) -> Option<VerifyingKey> {
-    let authority = match authority.lock() {
+    // Mutable: a miss reloads once, so a device pinned while this process runs
+    // is usable without a restart (see `DeviceAuthority::device`).
+    let mut authority = match authority.lock() {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
     };

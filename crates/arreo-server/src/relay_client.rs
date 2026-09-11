@@ -1017,6 +1017,8 @@ async fn serve_peer(stream: RelayStream, context: &RelayContext, announced: Devi
         eprintln!("arreo-server: relay peer {device} is not pinned; refusing");
         return;
     };
+    // A relay peer has no direct address of its own — what the daemon sees is
+    // the relay, which is the honest thing to record.
     let auth = crate::daemon::SessionAuth::new(Arc::clone(&authority), key, device.clone());
     auth.touch();
     eprintln!("arreo-server: relay peer {device} authenticated");

@@ -4,6 +4,7 @@
 
 use arreo_core::proto::codec;
 use arreo_core::proto::{AgentState, Message, VERSION};
+use arreo_core::store::{audit_json, AuditQuery, ExportFormat, SessionStore, StoredAudit};
 use std::future::Future;
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -25,7 +26,15 @@ fn usage() -> ExitCode {
     eprintln!("  arreo metrics <id> [--socket PATH]   (pane query; --pid <PID> samples locally)");
     eprintln!("  arreo service install|uninstall|status [--socket PATH]");
     eprintln!("  arreo server stop [--socket PATH]   (graceful: drain + exit 0)");
-    eprintln!("  arreo audit [--limit N] [--socket PATH]   (append-only log, secrets redacted)");
+    eprintln!(
+        "  arreo audit [--limit N] [--json] [--socket PATH]   (append-only log, secrets redacted)"
+    );
+    eprintln!(
+        "      columns: ts_ms action outcome device agent peer detail prompt   (tail, newest last)"
+    );
+    eprintln!("  arreo audit export [--format jsonl|json] [--since MS] [--until MS] [--action NAME] [--out PATH|-]");
+    eprintln!("      MS is Unix milliseconds; --out - (the default) is stdout");
+    eprintln!("  arreo audit prune --before MS   (never automatic; says how many rows went)");
     eprintln!("  arreo devices <id|list|issue|rotate|revoke|authorize> [--json] [--socket PATH]");
     eprintln!("      list --revoked|--all   (live devices by default; tombstones with --revoked)");
     eprintln!("      revoke <name|id>       (idempotent; the audit row names who and when)");
@@ -1013,54 +1022,79 @@ async fn cmd_pane_metrics(rest: &[String]) -> ExitCode {
     }
 }
 
-/// `arreo audit [--limit N]`: print the append-only audit log (newest last).
-/// Reads the sidecar DB directly (no daemon round-trip — the log outlives
+/// `arreo audit [--limit N] [--json]`: print the append-only audit log (newest
+/// last). Reads the sidecar DB directly (no daemon round-trip — the log outlives
 /// the daemon by design). Secrets are already redacted at write time.
+///
+/// Subcommands (T-0033):
+///   `export` — a filtered window as jsonl/json, to stdout or a file
+///   `prune`  — delete rows older than an explicit bound (never automatic)
 fn cmd_audit(rest: &[String]) -> ExitCode {
     let (socket, kept) = take_socket(rest);
     let mut limit = 50usize;
+    let mut json = false;
     let mut i = 0;
     while i < kept.len() {
         match kept[i].as_str() {
             "--limit" if i + 1 < kept.len() => {
-                limit = kept[i + 1].parse().unwrap_or(50).max(1);
+                limit = match kept[i + 1].parse() {
+                    Ok(n) => n,
+                    Err(_) => {
+                        eprintln!("audit: --limit wants a number, got {:?}", kept[i + 1]);
+                        return ExitCode::from(2);
+                    }
+                };
                 i += 2;
             }
-            _ => {
-                eprintln!("usage: arreo audit [--limit N] [--socket PATH]");
+            "--json" => {
+                json = true;
+                i += 1;
+            }
+            // A subcommand reads the same store, so it is dispatched only after
+            // `--socket` has been peeled off above.
+            "export" => return audit::cmd_export(socket, &kept[i + 1..]),
+            "prune" => return audit::cmd_prune(socket, &kept[i + 1..]),
+            other => {
+                eprintln!("audit: unknown argument {other:?}");
+                eprintln!("usage: arreo audit [--limit N] [--json] [--socket PATH]");
+                eprintln!("       arreo audit export [--format jsonl|json] [--since MS] [--until MS] [--action NAME] [--out PATH|-] [--socket PATH]");
+                eprintln!("       arreo audit prune --before MS [--socket PATH]");
                 return ExitCode::from(2);
             }
         }
     }
-    let mut db = socket.into_os_string();
-    db.push(".db");
-    let db = PathBuf::from(db);
-    if !db.exists() {
-        eprintln!("audit: no log yet (no prompts sent through this daemon)");
-        return ExitCode::SUCCESS;
-    }
-    let store = match arreo_core::store::SessionStore::open(&db) {
-        Ok(store) => store,
-        Err(e) => {
-            eprintln!("audit: {e}");
-            return ExitCode::FAILURE;
+    let store = match audit::open(&socket) {
+        Ok(Some(store)) => store,
+        Ok(None) => {
+            // No log yet is an empty log, not a broken one: the message is on
+            // stderr, and `--json` still answers in the shape it promises.
+            if json {
+                println!("{}", audit::json_object(&[]));
+            }
+            return ExitCode::SUCCESS;
         }
+        Err(code) => return code,
     };
+    if json {
+        return audit::print_json(&store, limit);
+    }
     match store.audit_recent(limit) {
         Ok(events) => {
             for event in events.iter().rev() {
                 // The *action* is what an operator greps for (`device.revoke`),
-                // and `kind` is the coarser classification. Printing only `kind`
-                // showed a revocation as "device_change", which is how T-0024
-                // lost the event kind and how T-0026 lost the action: a row that
-                // is written but not rendered is a row nobody can act on.
+                // and it replaced the coarser `kind` column here (T-0033): a
+                // revocation printed as "device_change" is how T-0024 lost the
+                // event kind and how T-0026 lost the action — a row that is
+                // written but not rendered is a row nobody can act on.
                 println!(
-                    "{} {:<16} {:<16} {} {} {}{}",
+                    "{} {:<22} {:<8} {:<16} {:<12} {:<18} {:<24} {}{}",
                     event.ts_ms,
                     event.action,
-                    event.kind.as_str(),
+                    event.outcome.as_str(),
                     event.device,
                     event.agent,
+                    event.peer.as_deref().unwrap_or("-"),
+                    event.detail.as_deref().unwrap_or("-"),
                     if event.redacted { "[redacted] " } else { "" },
                     event.prompt.lines().next().unwrap_or("")
                 );
@@ -1070,6 +1104,277 @@ fn cmd_audit(rest: &[String]) -> ExitCode {
         Err(e) => {
             eprintln!("audit: {e}");
             ExitCode::FAILURE
+        }
+    }
+}
+
+/// The `arreo audit` subcommands that read or trim the same sidecar log.
+mod audit {
+    use super::{audit_json, AuditQuery, ExportFormat, SessionStore, StoredAudit};
+    use std::path::{Path, PathBuf};
+    use std::process::ExitCode;
+
+    /// The store behind the daemon socket, or `None` when nothing has ever been
+    /// logged there.
+    ///
+    /// A missing DB is not an error: "no prompts have gone through this daemon
+    /// yet" is a valid answer to "show me the log". Each verb decides how to say
+    /// so — the tail explains, `--json` and `export` still print an empty result
+    /// a script can parse. The file is never created here: `SessionStore::open`
+    /// would create and migrate it, and a read must not write.
+    pub(super) fn open(socket: &Path) -> Result<Option<SessionStore>, ExitCode> {
+        let mut db = socket.to_path_buf().into_os_string();
+        db.push(".db");
+        let db = PathBuf::from(db);
+        if !db.exists() {
+            eprintln!("audit: no log yet (no prompts sent through this daemon)");
+            return Ok(None);
+        }
+        SessionStore::open(&db).map(Some).map_err(|e| {
+            eprintln!("audit: {e}");
+            ExitCode::FAILURE
+        })
+    }
+
+    /// A Unix-millisecond bound. Non-numeric is a usage error: a typo'd filter
+    /// that silently means "no filter" is how an export quietly stops being the
+    /// window someone asked for.
+    fn parse_ms(flag: &str, value: &str) -> Result<u64, ExitCode> {
+        value.parse::<u64>().map_err(|_| {
+            eprintln!("audit: {flag} wants Unix milliseconds, got {value:?}");
+            ExitCode::from(2)
+        })
+    }
+
+    /// `arreo audit [--json]`: the tail as one JSON object, each row in the
+    /// export's own shape so the two cannot disagree.
+    ///
+    /// Same rows as the human table — the newest `limit`, oldest first — rather
+    /// than `audit_query`'s first `limit` rows of all history: `--limit` on this
+    /// verb has always meant "the tail", and a `--json` that silently showed a
+    /// different window than the table next to it would be a trap.
+    pub(super) fn print_json(store: &SessionStore, limit: usize) -> ExitCode {
+        match store.audit_recent(limit) {
+            Ok(mut events) => {
+                events.reverse();
+                println!("{}", json_object(&events));
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("audit: {e}");
+                ExitCode::FAILURE
+            }
+        }
+    }
+
+    /// `{"count":N,"rows":[…]}` — the shape `--json` prints, so a row read here
+    /// and a row read from an export are the same object.
+    pub(super) fn json_object(events: &[StoredAudit]) -> serde_json::Value {
+        let rows: Vec<serde_json::Value> = events.iter().map(audit_json).collect();
+        serde_json::json!({
+            "count": rows.len(),
+            "rows": rows,
+        })
+    }
+
+    /// What an export of zero rows looks like, in each format. Mirrors the
+    /// store's own rendering of an empty window (what `audit_export` returns for
+    /// a filter that matches nothing), so a log that does not exist yet and a
+    /// window with no rows produce the same bytes.
+    fn empty_export(format: ExportFormat) -> String {
+        match format {
+            ExportFormat::Jsonl => String::new(),
+            ExportFormat::Json => "[]\n".to_string(),
+        }
+    }
+
+    /// Write the export where `--out` asked: stdout for `-` (and for no flag at
+    /// all), a file otherwise — and a file write names the path it wrote, because
+    /// a silent success on a typo'd path is an export the operator does not have.
+    fn emit(out: Option<&str>, text: &str, format: ExportFormat) -> ExitCode {
+        match out {
+            None | Some("-") => {
+                print!("{text}");
+                ExitCode::SUCCESS
+            }
+            Some(path) => match std::fs::write(path, text) {
+                Ok(()) => {
+                    println!("exported {} ({})", path, format.as_str());
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("audit export: {path}: {e}");
+                    ExitCode::FAILURE
+                }
+            },
+        }
+    }
+
+    /// The value that follows a flag, or a usage error naming the flag. A
+    /// trailing `--out` with nothing after it is a mistake, and saying so beats
+    /// reporting the flag the user *did* mean as an unknown argument.
+    fn value<'a>(rest: &'a [String], i: usize, flag: &str) -> Result<&'a str, ExitCode> {
+        rest.get(i).map(String::as_str).ok_or_else(|| {
+            eprintln!("audit: {flag} needs a value");
+            ExitCode::from(2)
+        })
+    }
+
+    /// `arreo audit export [--format jsonl|json] [--since MS] [--until MS]
+    /// [--action NAME] [--out PATH|-]`.
+    pub(super) fn cmd_export(socket: PathBuf, rest: &[String]) -> ExitCode {
+        let mut format = ExportFormat::Jsonl;
+        let mut since: Option<u64> = None;
+        let mut until: Option<u64> = None;
+        let mut action: Option<String> = None;
+        let mut out: Option<String> = None;
+        let mut i = 0;
+        while i < rest.len() {
+            match rest[i].as_str() {
+                "--format" => {
+                    let raw = match value(rest, i + 1, "--format") {
+                        Ok(raw) => raw,
+                        Err(code) => return code,
+                    };
+                    match ExportFormat::parse(raw) {
+                        Some(parsed) => format = parsed,
+                        None => {
+                            eprintln!("audit export: --format wants jsonl or json, got {raw:?}");
+                            return ExitCode::from(2);
+                        }
+                    }
+                    i += 2;
+                }
+                "--since" => {
+                    let raw = match value(rest, i + 1, "--since") {
+                        Ok(raw) => raw,
+                        Err(code) => return code,
+                    };
+                    match parse_ms("--since", raw) {
+                        Ok(ms) => since = Some(ms),
+                        Err(code) => return code,
+                    }
+                    i += 2;
+                }
+                "--until" => {
+                    let raw = match value(rest, i + 1, "--until") {
+                        Ok(raw) => raw,
+                        Err(code) => return code,
+                    };
+                    match parse_ms("--until", raw) {
+                        Ok(ms) => until = Some(ms),
+                        Err(code) => return code,
+                    }
+                    i += 2;
+                }
+                "--action" => {
+                    action = match value(rest, i + 1, "--action") {
+                        Ok(raw) => Some(raw.to_string()),
+                        Err(code) => return code,
+                    };
+                    i += 2;
+                }
+                "--out" => {
+                    out = match value(rest, i + 1, "--out") {
+                        Ok(raw) => Some(raw.to_string()),
+                        Err(code) => return code,
+                    };
+                    i += 2;
+                }
+                other => {
+                    eprintln!("audit export: unknown argument {other:?}");
+                    eprintln!("usage: arreo audit export [--format jsonl|json] [--since MS] [--until MS] [--action NAME] [--out PATH|-] [--socket PATH]");
+                    return ExitCode::from(2);
+                }
+            }
+        }
+        let store = match open(&socket) {
+            Ok(Some(store)) => store,
+            // A log that does not exist holds no rows in the window: emit the
+            // empty export rather than nothing, so `--format json | jq` works on
+            // a machine that has never logged anything.
+            Ok(None) => return emit(out.as_deref(), &empty_export(format), format),
+            Err(code) => return code,
+        };
+        // The filters are passed through as given: the export is a *view* of the
+        // log, so the same window twice must be byte-identical, and anything the
+        // CLI added on top would break that. The limit is a real bound, not
+        // `usize::MAX`: an export means the whole window, and `i64::MAX` says so
+        // without leaning on SQLite's negative-LIMIT-means-unlimited quirk.
+        let query = AuditQuery {
+            since_ms: since,
+            until_ms: until,
+            action,
+            limit: i64::MAX as usize,
+        };
+        let text = match store.audit_export(&query, format) {
+            Ok(text) => text,
+            Err(e) => {
+                eprintln!("audit export: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+        emit(out.as_deref(), &text, format)
+    }
+
+    /// `arreo audit prune --before MS`: delete rows older than the bound.
+    ///
+    /// `--before` is required. Nothing prunes the log on a timer — an
+    /// append-only log that quietly deletes itself is not an audit log — so a
+    /// prune with no bound is a mistake, and this refuses to guess one.
+    pub(super) fn cmd_prune(socket: PathBuf, rest: &[String]) -> ExitCode {
+        // `--socket` was already peeled off by `cmd_audit`, so `rest` is just
+        // this subcommand's own flags.
+        let mut before: Option<u64> = None;
+        let mut i = 0;
+        while i < rest.len() {
+            match rest[i].as_str() {
+                "--before" => {
+                    let raw = match value(rest, i + 1, "--before") {
+                        Ok(raw) => raw,
+                        Err(code) => return code,
+                    };
+                    match parse_ms("--before", raw) {
+                        Ok(ms) => before = Some(ms),
+                        Err(code) => return code,
+                    }
+                    i += 2;
+                }
+                other => {
+                    eprintln!("audit prune: unknown argument {other:?}");
+                    eprintln!("usage: arreo audit prune --before MS [--socket PATH]");
+                    return ExitCode::from(2);
+                }
+            }
+        }
+        let Some(before_ms) = before else {
+            eprintln!(
+                "audit prune: --before MS is required (nothing prunes the log automatically)"
+            );
+            eprintln!("usage: arreo audit prune --before MS [--socket PATH]");
+            return ExitCode::from(2);
+        };
+        let store = match open(&socket) {
+            Ok(Some(store)) => store,
+            // Nothing was ever logged, so nothing was older than the bound. The
+            // count still prints: a script reads this line, and "the log does not
+            // exist" and "the log had nothing to drop" are the same answer.
+            Ok(None) => {
+                println!("pruned 0 row(s) older than {before_ms}");
+                return ExitCode::SUCCESS;
+            }
+            Err(code) => return code,
+        };
+        let now_ms = arreo_core::identity::authority::now_ms().max(0) as u64;
+        match store.audit_prune(before_ms, now_ms) {
+            Ok(removed) => {
+                println!("pruned {removed} row(s) older than {before_ms}");
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("audit prune: {e}");
+                ExitCode::FAILURE
+            }
         }
     }
 }

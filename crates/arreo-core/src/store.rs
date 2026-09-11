@@ -37,7 +37,7 @@ pub enum SessionError {
     Json(#[from] serde_json::Error),
 }
 
-pub const SCHEMA_VERSION: u32 = 4;
+pub const SCHEMA_VERSION: u32 = 5;
 
 /// One pane's persisted record: how to respawn it + what it showed.
 #[derive(Debug, Clone, PartialEq)]
@@ -50,13 +50,151 @@ pub struct StoredPane {
     pub scrollback: Vec<String>,
 }
 
+/// The outcome half of an audit row: what a review reads to tell an intention
+/// from a result. `ok | refused | expired` is deliberately small — an audit row
+/// that needs a taxonomy to interpret is a row nobody reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuditOutcome {
+    /// The action was carried out.
+    Ok,
+    /// It was refused, and the reason is in the row's `detail`.
+    Refused,
+    /// Something the machine was holding ran out of time (T-0030's inbox drops).
+    Expired,
+}
+
+impl AuditOutcome {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::Refused => "refused",
+            Self::Expired => "expired",
+        }
+    }
+
+    /// An unrecognized value reads as `Ok` rather than an error: the log is
+    /// append-only and must stay readable by an older binary.
+    #[must_use]
+    pub fn parse(text: &str) -> Self {
+        match text {
+            "refused" => Self::Refused,
+            "expired" => Self::Expired,
+            _ => Self::Ok,
+        }
+    }
+}
+
+/// The actions this product writes, as constants.
+///
+/// A vocabulary, not free strings: the writers, the CLI's filters and the docs
+/// all name the same events, and a typo in one of them would silently produce a
+/// row that no query finds. (The relay's own actions live in T-0053.)
+pub mod actions {
+    /// A device (or the local operator) opened a session.
+    pub const SESSION_CONNECT: &str = "session.connect";
+    /// A session ended, with why in `detail`.
+    pub const SESSION_DISCONNECT: &str = "session.disconnect";
+    /// A client attached to a pane's stream.
+    pub const ATTACH: &str = "attach";
+    /// Input was sent to a pane.
+    pub const SEND: &str = "send";
+    /// A pane was spawned.
+    pub const SPAWN: &str = "spawn";
+    /// A pane was split.
+    pub const SPLIT: &str = "split";
+    /// A device was pinned (issued a certificate).
+    pub const DEVICE_ISSUE: &str = "device.issue";
+    /// A device was moved onto a new key.
+    pub const DEVICE_ROTATE: &str = "device.rotate";
+    /// A device was revoked (T-0026).
+    pub const DEVICE_REVOKE: &str = "device.revoke";
+    /// A connection was refused before any work happened.
+    pub const AUTH_REJECT: &str = "auth.reject";
+    /// A pairing attempt that produced no certificate (T-0024).
+    pub const PAIRING_FAILED: &str = "pairing.failed";
+    /// A prompt was sent to an agent (the original T-0018 row).
+    pub const PROMPT: &str = "prompt";
+    /// Old rows, and rows whose action an older schema did not record.
+    pub const UNKNOWN: &str = "unknown";
+    /// An operator pruned the log.
+    pub const PRUNE: &str = "audit.prune";
+    /// A resource budget was breached and the daemon acted on it (T-0019).
+    pub const ENFORCE_BREACH: &str = "enforce.breach";
+}
+
 /// One audit row (prompt already redacted on write).
+///
+/// One struct and one writer, because the same event was previously written by
+/// three methods (`audit`, `audit_event`, `audit_action`) that each filled a
+/// different subset of the columns — which is how `action` came to be missing
+/// from two of them.
 #[derive(Debug, Clone, PartialEq)]
 pub struct AuditEvent {
     pub ts_ms: u64,
+    /// The event's own name, from [`actions`].
+    pub action: String,
+    /// The coarse classification the prompt-oriented readers predate; kept
+    /// because existing tooling filters on it.
+    pub kind: AuditKind,
+    pub outcome: AuditOutcome,
+    /// The device the row is **about** — always the subject, never the actor, so
+    /// one column answers "what happened to this device" for every action.
+    /// [`crate::identity::revocation::LOCAL_CLI`] and `daemon` appear for the
+    /// machine's own operator and its background work.
     pub device: String,
+    /// What it acted on (a pane id, an agent name). Empty when the action has no
+    /// object.
     pub agent: String,
+    /// The human-readable content: a prompt, a reason, a description. Redacted on
+    /// write by the secret scan.
     pub prompt: String,
+    /// The peer's address, **truncated at write** (see [`truncate_peer`]).
+    pub peer: Option<String>,
+    /// Anything else worth keeping that is not the prompt: a count, a serial, a
+    /// protocol version — and, where the actor is not the subject (a revocation
+    /// names who performed it), who did it.
+    pub detail: Option<String>,
+}
+
+impl AuditEvent {
+    /// The common case: an action with an outcome, everything else unset.
+    #[must_use]
+    pub fn new(action: &str, kind: AuditKind, outcome: AuditOutcome, now_ms: u64) -> Self {
+        Self {
+            ts_ms: now_ms,
+            action: action.to_string(),
+            kind,
+            outcome,
+            device: String::new(),
+            agent: String::new(),
+            prompt: String::new(),
+            peer: None,
+            detail: None,
+        }
+    }
+}
+
+/// Truncate a peer address so the log cannot become a location history.
+///
+/// ROADMAP §4's threat model includes a compromised cloud and a stolen phone, so
+/// a full-address trail is a record of where someone was; a /24 (IPv4) or /48
+/// (IPv6) still answers the question the log is for — "did this come from a
+/// network I recognize". Truncation happens **at write**, not at export: a flag
+/// someone forgets is a leak, while a value never stored cannot leak.
+#[must_use]
+pub fn truncate_peer(peer: &std::net::SocketAddr) -> String {
+    match peer.ip() {
+        std::net::IpAddr::V4(v4) => {
+            let octets = v4.octets();
+            format!("{}.{}.{}.0/24", octets[0], octets[1], octets[2])
+        }
+        std::net::IpAddr::V6(v6) => {
+            // The first three 16-bit groups are the /48.
+            let groups = v6.segments();
+            format!("{:x}:{:x}:{:x}::/48", groups[0], groups[1], groups[2])
+        }
+    }
 }
 
 /// Audited event as read back (adds the redaction flag).
@@ -71,6 +209,12 @@ pub struct StoredAudit {
     /// The event's own name (`prompt`, `device.revoke`, …), which is what an
     /// operator filters by; `kind` is the older, coarser classification.
     pub action: String,
+    /// `ok | refused | expired` — what a review reads to tell intent from result.
+    pub outcome: AuditOutcome,
+    /// The peer's network, truncated at write.
+    pub peer: Option<String>,
+    /// Anything that is not the prompt: a count, a serial, a version.
+    pub detail: Option<String>,
 }
 
 /// What an audit row is about. Refusals are auditable events in their own
@@ -210,6 +354,23 @@ impl SessionStore {
                     "ALTER TABLE audit ADD COLUMN action TEXT NOT NULL DEFAULT 'prompt';",
                 )?;
             }
+        }
+        // v5 (T-0033): the audit trail grows from "what was typed" to "what
+        // happened, to whom, and how it ended" — an action's outcome, the peer's
+        // (truncated) network, and a free-form detail for counts and versions.
+        if version < 5 {
+            if !has_column(conn, "audit", "outcome")? {
+                conn.execute_batch(
+                    "ALTER TABLE audit ADD COLUMN outcome TEXT NOT NULL DEFAULT 'ok';
+                     ALTER TABLE audit ADD COLUMN peer TEXT;
+                     ALTER TABLE audit ADD COLUMN detail TEXT;",
+                )?;
+            }
+            // History: every existing row is an action that happened, so `ok` is
+            // the honest default — and the prompt rows keep their meaning.
+            conn.execute_batch(
+                "UPDATE audit SET action = 'prompt' WHERE action = 'prompt' OR action IS NULL;",
+            )?;
         }
         conn.execute(
             "INSERT INTO meta(key, value) VALUES ('schema_version', ?1)
@@ -464,36 +625,84 @@ impl SessionStore {
 
     /// Append one audit event (redacting secret-shaped content first).
     /// There is deliberately NO update/delete API — append-only by construction.
-    pub fn audit(&self, event: AuditEvent) -> Result<(), SessionError> {
-        self.audit_event(AuditKind::Prompt, event)
-    }
-
-    /// Append a typed audit event. `kind` is what makes a refusal readable as
-    /// a refusal in `arreo audit` rather than "a prompt that looks odd".
-    /// Write an audit row with an explicit `action`.
+    /// Append one audit row. **The** writer: the schema has one shape, so it has
+    /// one method, and a field cannot go missing because a caller used a variant
+    /// that filled a different subset of the columns.
     ///
-    /// `kind` classifies the row for the prompt-oriented readers that predate it
-    /// (T-0018); `action` names the event itself (`device.revoke`, `device.issue`)
-    /// so an operator can ask for exactly the event they mean. Two axes because
-    /// they answer different questions: "which stream is this row part of" and
-    /// "what happened".
-    pub fn audit_action(&self, action: &str, event: AuditEvent) -> Result<(), SessionError> {
+    /// Redaction happens here, before the write, which is what makes "no flag can
+    /// un-redact" true: the secret scan runs on the way in, and the peer address
+    /// is truncated on the way in, so neither the plaintext nor the full address
+    /// ever reaches the file.
+    pub fn record(&self, event: &AuditEvent) -> Result<(), SessionError> {
         let (prompt, redacted) = redact(&event.prompt);
+        let peer = event.peer.as_deref().map(redact_peer_text);
         let conn = self.lock()?;
         conn.execute(
-            "INSERT INTO audit(ts_ms, device, agent, prompt, redacted, kind, action)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT INTO audit(ts_ms, device, agent, prompt, redacted, kind, action,
+                               outcome, peer, detail)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 event.ts_ms as i64,
                 event.device,
                 event.agent,
                 prompt,
                 redacted as i64,
-                AuditKind::DeviceChange.as_str(),
-                action,
+                event.kind.as_str(),
+                event.action,
+                event.outcome.as_str(),
+                peer,
+                event.detail,
             ],
         )?;
         Ok(())
+    }
+
+    /// Audit rows, newest last (the order a review reads them in), filtered.
+    ///
+    /// `since_ms`/`until_ms` bound the window; `action` narrows to one event
+    /// name. Ordered by `(ts_ms, rowid)` rather than `ts_ms` alone: a clock that
+    /// steps backwards (NTP, a suspended VM) must not reorder history, and the
+    /// rowid is the only monotonic thing the table has.
+    pub fn audit_query(&self, query: &AuditQuery) -> Result<Vec<StoredAudit>, SessionError> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT ts_ms, device, agent, prompt, redacted, kind, action, outcome, peer, detail
+             FROM audit
+             WHERE (?1 IS NULL OR ts_ms >= ?1)
+               AND (?2 IS NULL OR ts_ms <= ?2)
+               AND (?3 IS NULL OR action = ?3)
+             ORDER BY ts_ms ASC, rowid ASC
+             LIMIT ?4",
+        )?;
+        let rows = stmt.query_map(
+            params![
+                query.since_ms.map(clamp_ms),
+                query.until_ms.map(clamp_ms),
+                query.action.as_deref(),
+                clamp_limit(query.limit),
+            ],
+            read_audit_row,
+        )?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// Newest audit rows first (operator reads the tail), limited.
+    pub fn audit_recent(&self, limit: usize) -> Result<Vec<StoredAudit>, SessionError> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT ts_ms, device, agent, prompt, redacted, kind, action, outcome, peer, detail
+             FROM audit ORDER BY ts_ms DESC, rowid DESC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit as i64], read_audit_row)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
     }
 
     /// Every row with a given action, newest first — the operator's "show me
@@ -503,90 +712,218 @@ impl SessionStore {
         action: &str,
         limit: usize,
     ) -> Result<Vec<StoredAudit>, SessionError> {
-        let conn = self.lock()?;
-        let mut stmt = conn.prepare(
-            "SELECT ts_ms, device, agent, prompt, redacted, kind, action FROM audit
-             WHERE action = ?1 ORDER BY ts_ms DESC, rowid DESC LIMIT ?2",
-        )?;
-        let rows = stmt.query_map(params![action, limit as i64], |row| {
-            Ok(StoredAudit {
-                ts_ms: row.get::<_, i64>(0)? as u64,
-                device: row.get(1)?,
-                agent: row.get(2)?,
-                prompt: row.get(3)?,
-                redacted: row.get::<_, i64>(4)? != 0,
-                kind: AuditKind::parse(&row.get::<_, String>(5)?),
-                action: row.get(6)?,
-            })
-        })?;
-        let mut out = Vec::new();
-        for row in rows {
-            out.push(row?);
+        self.audit_query(&AuditQuery {
+            action: Some(action.to_string()),
+            ..AuditQuery::all(limit)
+        })
+    }
+
+    /// Export the audit log, oldest first, as JSON lines or a JSON array.
+    ///
+    /// The same filters as [`SessionStore::audit_query`], and the same rows: the
+    /// export is a *view*, never a second source of truth, so an export of one
+    /// window twice is byte-identical.
+    pub fn audit_export(
+        &self,
+        query: &AuditQuery,
+        format: ExportFormat,
+    ) -> Result<String, SessionError> {
+        let events = self.audit_query(query)?;
+        let values: Vec<serde_json::Value> = events.iter().map(audit_json).collect();
+        match format {
+            ExportFormat::Jsonl => {
+                let mut out = String::new();
+                for value in &values {
+                    out.push_str(&serde_json::to_string(value).map_err(SessionError::Json)?);
+                    out.push('\n');
+                }
+                Ok(out)
+            }
+            ExportFormat::Json => {
+                let array = serde_json::Value::Array(values);
+                let mut out = serde_json::to_string_pretty(&array).map_err(SessionError::Json)?;
+                out.push('\n');
+                Ok(out)
+            }
         }
-        Ok(out)
     }
 
-    pub fn audit_event(&self, kind: AuditKind, event: AuditEvent) -> Result<(), SessionError> {
-        let (prompt, redacted) = redact(&event.prompt);
+    /// How many rows the log holds, and roughly how many bytes — the numbers the
+    /// size guard reports.
+    pub fn audit_size(&self) -> Result<(u64, u64), SessionError> {
         let conn = self.lock()?;
-        conn.execute(
-            "INSERT INTO audit(ts_ms, device, agent, prompt, redacted, kind)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![
-                event.ts_ms as i64,
-                event.device,
-                event.agent,
-                prompt,
-                redacted as i64,
-                kind.as_str(),
-            ],
+        let (rows, bytes): (i64, i64) = conn.query_row(
+            "SELECT COUNT(*), COALESCE(SUM(LENGTH(device) + LENGTH(agent) + LENGTH(prompt)
+                                          + LENGTH(action) + COALESCE(LENGTH(peer), 0)
+                                          + COALESCE(LENGTH(detail), 0)), 0)
+             FROM audit",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
-        Ok(())
+        Ok((rows.max(0) as u64, bytes.max(0) as u64))
     }
 
-    /// Newest audit rows first (operator reads the tail), limited.
-    pub fn audit_recent(&self, limit: usize) -> Result<Vec<StoredAudit>, SessionError> {
-        let conn = self.lock()?;
-        let mut stmt = conn.prepare(
-            "SELECT ts_ms, device, agent, prompt, redacted, kind, action FROM audit
-             ORDER BY ts_ms DESC LIMIT ?1",
-        )?;
-        let rows = stmt.query_map(params![limit as i64], |row| {
-            Ok(StoredAudit {
-                ts_ms: row.get::<_, i64>(0)? as u64,
-                device: row.get(1)?,
-                agent: row.get(2)?,
-                prompt: row.get(3)?,
-                redacted: row.get::<_, i64>(4)? != 0,
-                kind: AuditKind::parse(&row.get::<_, String>(5)?),
-                action: row.get(6)?,
-            })
+    /// Delete rows older than `before_ms`, returning how many went.
+    ///
+    /// **Never automatic.** Nothing in this product prunes the audit log on a
+    /// timer: an append-only log that quietly deletes itself is not an audit log,
+    /// and the whole point of §4's trail is that it outlives the session that
+    /// wrote it. The operator asks, and the prune is itself recorded — a deletion
+    /// the log does not mention would be the one hole in it.
+    pub fn audit_prune(&self, before_ms: u64, now_ms: u64) -> Result<u64, SessionError> {
+        let removed = {
+            let conn = self.lock()?;
+            conn.execute(
+                "DELETE FROM audit WHERE ts_ms < ?1 AND action != ?2",
+                params![clamp_ms(before_ms), actions::PRUNE],
+            )? as u64
+        };
+        // Recorded after the delete, and excluded from it, so the prune row
+        // always survives the prune that wrote it.
+        self.record(&AuditEvent {
+            ts_ms: now_ms,
+            action: actions::PRUNE.to_string(),
+            kind: AuditKind::Unknown,
+            outcome: AuditOutcome::Ok,
+            device: crate::identity::revocation::LOCAL_CLI.to_string(),
+            agent: String::new(),
+            prompt: format!("removed {removed} row(s) older than {before_ms}"),
+            peer: None,
+            detail: Some(format!("before_ms={before_ms} removed={removed}")),
         })?;
-        rows.collect::<Result<Vec<_>, _>>()
-            .map_err(SessionError::Sqlite)
+        Ok(removed)
+    }
+}
+
+/// A millisecond bound as SQLite's signed integer, clamped.
+///
+/// Timestamps are `u64` in Rust and `i64` in SQLite, and a naive `as i64` turns
+/// `u64::MAX` — the natural "everything" bound — into `-1`, which matches
+/// nothing: a prune asked to remove everything would silently remove nothing.
+/// Clamping is the honest conversion, because the two ranges agree everywhere
+/// below the epoch-plus-292-million-years point where a millisecond timestamp
+/// stops being meaningful anyway.
+fn clamp_ms(value: u64) -> i64 {
+    value.min(i64::MAX as u64) as i64
+}
+
+/// A row limit as SQLite's signed integer, clamped.
+///
+/// The mirror of [`clamp_ms`] and for the same reason: `usize::MAX as i64` is
+/// `-1`, and SQLite reads a negative `LIMIT` as "no limit" — so the value that
+/// most clearly means "everything" would take a code path nobody intended.
+fn clamp_limit(limit: usize) -> i64 {
+    limit.min(i64::MAX as usize) as i64
+}
+
+/// What to read out of the audit log.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuditQuery {
+    pub since_ms: Option<u64>,
+    pub until_ms: Option<u64>,
+    pub action: Option<String>,
+    pub limit: usize,
+}
+
+impl AuditQuery {
+    /// Everything, capped at `limit`.
+    #[must_use]
+    pub fn all(limit: usize) -> Self {
+        Self {
+            since_ms: None,
+            until_ms: None,
+            action: None,
+            limit,
+        }
+    }
+}
+
+/// How an export is written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExportFormat {
+    /// One JSON object per line — what a log pipeline eats.
+    Jsonl,
+    /// A JSON array, pretty-printed — what a human reads.
+    Json,
+}
+
+impl ExportFormat {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Jsonl => "jsonl",
+            Self::Json => "json",
+        }
     }
 
-    /// Export the audit log as JSON lines (for `arreo audit` / compliance).
-    pub fn audit_export(&self) -> Result<String, SessionError> {
-        let events = self.audit_recent(usize::MAX / 2)?;
-        let mut out = String::new();
-        for event in events.iter().rev() {
-            out.push_str(
-                &serde_json::to_string(&serde_json::json!({
-                    "ts_ms": event.ts_ms,
-                    "device": event.device,
-                    "agent": event.agent,
-                    "prompt": event.prompt,
-                    "redacted": event.redacted,
-                    "kind": event.kind.as_str(),
-                    "action": event.action,
-                }))
-                .map_err(SessionError::Json)?,
-            );
-            out.push('\n');
+    pub fn parse(text: &str) -> Option<Self> {
+        match text {
+            "jsonl" => Some(Self::Jsonl),
+            "json" => Some(Self::Json),
+            _ => None,
         }
-        Ok(out)
     }
+}
+
+/// One row as the export and `--json` readers see it. Field names are the
+/// contract a script parses, so they are snake_case and stable.
+#[must_use]
+pub fn audit_json(event: &StoredAudit) -> serde_json::Value {
+    serde_json::json!({
+        "ts_ms": event.ts_ms,
+        "action": event.action,
+        "kind": event.kind.as_str(),
+        "outcome": event.outcome.as_str(),
+        "device": event.device,
+        "agent": event.agent,
+        "prompt": event.prompt,
+        "redacted": event.redacted,
+        "peer": event.peer,
+        "detail": event.detail,
+    })
+}
+
+/// Read one audit row. Shared by every reader so a new column cannot be filled
+/// in one query and left empty in another.
+fn read_audit_row(row: &rusqlite::Row<'_>) -> Result<StoredAudit, rusqlite::Error> {
+    Ok(StoredAudit {
+        ts_ms: row.get::<_, i64>(0)? as u64,
+        device: row.get(1)?,
+        agent: row.get(2)?,
+        prompt: row.get(3)?,
+        redacted: row.get::<_, i64>(4)? != 0,
+        kind: AuditKind::parse(&row.get::<_, String>(5)?),
+        action: row.get(6)?,
+        outcome: AuditOutcome::parse(&row.get::<_, String>(7)?),
+        peer: row.get(8)?,
+        detail: row.get(9)?,
+    })
+}
+
+/// Truncate a peer that arrives as text (already-stored values, or a caller that
+/// has the address in string form).
+#[must_use]
+pub fn redact_peer_text(peer: &str) -> String {
+    match peer.parse::<std::net::SocketAddr>() {
+        Ok(addr) => truncate_peer(&addr),
+        // Not an address: keep the shape but drop anything that looks specific.
+        Err(_) => peer.to_string(),
+    }
+}
+
+/// Mask every secret-shaped token in the line.
+fn mask_tokens(line: &str) -> (String, bool) {
+    let mut out = String::with_capacity(line.len());
+    let mut rest = line;
+    let mut masked = false;
+    while let Some((at, len, _)) = crate::fixtures::find_token(rest) {
+        out.push_str(&rest[..at]);
+        out.push_str("[REDACTED:token]");
+        rest = &rest[at + len..];
+        masked = true;
+    }
+    out.push_str(rest);
+    (out, masked)
 }
 
 /// Redact secret-shaped substrings, keeping field names for debugging.
@@ -603,32 +940,28 @@ fn redact(prompt: &str) -> (String, bool) {
         .lines()
         .map(|line| {
             let mut line = line.to_string();
-            // sk-/AKIA/ghp_/gho_/xox tokens: mask long token-ish runs.
-            for token in line
-                .split_whitespace()
-                .map(str::to_string)
-                .collect::<Vec<_>>()
-            {
-                if (token.starts_with("sk-")
-                    || token.starts_with("AKIA")
-                    || token.starts_with("ghp_")
-                    || token.starts_with("gho_")
-                    || token.starts_with("xox"))
-                    && token.len() > 8
-                {
-                    line = line.replace(&token, "[REDACTED:token]");
-                    redacted_any = true;
-                }
+            // sk-/AKIA/ghp_/gho_/xox tokens, wherever they sit in the line.
+            let (masked, did) = mask_tokens(&line);
+            if did {
+                line = masked;
+                redacted_any = true;
             }
             // KEY=VALUE assignments: mask values longer than 8 chars.
             for sep in ['=', ':'] {
                 if let Some(pos) = line.find(sep) {
                     let (key, value) = line.split_at(pos + 1);
                     let value = value.trim();
-                    if !value.is_empty() && value.len() >= 8 && key.to_lowercase().contains("key")
-                        || key.to_lowercase().contains("secret")
-                        || key.to_lowercase().contains("password")
-                        || key.to_lowercase().contains("passwd")
+                    // Two named cases rather than one chained condition:
+                    // `a && b && c || d` reads as "all three, or d", which
+                    // quietly stopped the length rule from applying to the
+                    // secret/password branches.
+                    let lower = key.to_lowercase();
+                    let names_a_secret = ["secret", "password", "passwd"]
+                        .iter()
+                        .any(|word| lower.contains(word));
+                    let long_enough = !value.is_empty() && value.len() >= 8;
+                    if !value.is_empty()
+                        && (names_a_secret || (long_enough && lower.contains("key")))
                     {
                         line = format!("{key}[REDACTED:value]");
                         redacted_any = true;
@@ -644,10 +977,19 @@ fn redact(prompt: &str) -> (String, bool) {
             line
         })
         .collect();
-    // If the scan flagged something but no rule masked it, be conservative:
-    // flag redacted and mask the flagged lines' long runs.
+    // The scan flagged something and no rule claimed it. Storing the line as it
+    // arrived would make `redacted = 1` a statement about the scanner rather
+    // than about the bytes, and a row that says "redacted" while holding the
+    // secret is worse than either extreme. So the fallback is the safe one.
     if !redacted_any {
-        return (prompt.to_string(), true);
+        return (
+            prompt
+                .lines()
+                .map(|_| "[REDACTED:secret]".to_string())
+                .collect::<Vec<_>>()
+                .join("\n"),
+            true,
+        );
     }
     (out.join("\n"), true)
 }

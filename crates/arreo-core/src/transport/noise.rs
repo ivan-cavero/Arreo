@@ -145,7 +145,10 @@ pub struct SecureChannel {
     io: DuplexStream,
     remote: [u8; 32],
     role: Role,
-    pump: JoinHandle<()>,
+    /// `Option` so `shutdown` can take the handle and await it, while `Drop`
+    /// aborts whatever is left: a `JoinHandle` cannot be moved out of a type
+    /// that implements `Drop`, and both behaviours are needed.
+    pump: Option<JoinHandle<()>>,
     /// Why the pump stopped, when it stopped for a reason. The consumer reads
     /// this exactly once, at the EOF that follows, so "the peer's bytes were
     /// tampered with" arrives as a typed `Decrypt` instead of a bare
@@ -262,9 +265,50 @@ impl SecureChannel {
     }
 
     /// Close the channel and stop the pump.
-    pub async fn shutdown(self) {
-        drop(self.io);
-        let _ = self.pump.await;
+    /// Hand over everything written so far, then close.
+    ///
+    /// The graceful counterpart to [`Drop`]: it closes the caller's end of the
+    /// duplex, which is the pump's signal to seal and write whatever is still
+    /// buffered, and then waits for the pump to finish. A caller that simply
+    /// drops a channel gives up that guarantee — the close is immediate and
+    /// anything the pump had not yet put on the wire goes with it.
+    ///
+    /// This cannot deadlock on a live peer: the pump stops as soon as the
+    /// consumer's end is gone and its outbound buffers are drained, because
+    /// there is nobody left to deliver incoming bytes to.
+    pub async fn shutdown(mut self) {
+        // Closing the write half is the signal; the whole channel is finished
+        // with, so the read half is not held open for a reply. (Moving `io` out
+        // would be the obvious spelling, but a type with `Drop` cannot have its
+        // fields moved — hence `Drop` taking the pump, and this taking the
+        // handle.)
+        let _ = tokio::io::AsyncWriteExt::shutdown(&mut self.io).await;
+        if let Some(pump) = self.pump.take() {
+            let _ = pump.await;
+        }
+    }
+}
+
+/// Dropping a channel closes it.
+///
+/// **Why this is not just tidiness.** The pump owns the raw stream, and a
+/// `JoinHandle` does not abort its task when the handle is dropped — so without
+/// this, dropping a `SecureChannel` left the pump running and the connection
+/// open. The peer then noticed only at the transport's idle timeout (15 s), which
+/// meant a daemon kept a vanished client's session alive for that long and wrote
+/// its "session ended" row a quarter-minute after it ended.
+///
+/// **The contract, stated because the two behaviours differ:** a *dropped*
+/// channel is a *closed* channel — buffered ciphertext that has not reached the
+/// wire is discarded, which is what makes the close prompt. A caller whose last
+/// write must land calls [`SecureChannel::shutdown`], which closes the caller's
+/// end and waits for the pump to finish delivering. This is the same shape as
+/// half-closing a socket: closing is immediate, flushing is explicit.
+impl Drop for SecureChannel {
+    fn drop(&mut self) {
+        if let Some(pump) = self.pump.take() {
+            pump.abort();
+        }
     }
 }
 
@@ -466,7 +510,7 @@ where
         io: ours,
         remote: expected_remote,
         role,
-        pump,
+        pump: Some(pump),
         failure,
     })
 }
@@ -621,6 +665,16 @@ async fn pump<S>(
         if raw_eof && plain_eof {
             return;
         }
+        // The **consumer is gone**: its end of the duplex is closed and there is
+        // nothing left to hand it (`to_peer` was drained above, and a
+        // non-empty `to_consumer` would have `continue`d). Waiting for the peer
+        // to close too would keep the connection — and the session on the other
+        // side — alive until the transport's idle timeout, which is exactly the
+        // quarter-minute delay this branch removed (a client that exits is a
+        // session that ended).
+        if plain_eof {
+            return;
+        }
 
         tokio::select! {
             result = raw_r.read(&mut raw_read_buf), if !raw_eof => {
@@ -765,6 +819,10 @@ mod tests {
         let writer = tokio::spawn(async move {
             let _ = client.write_all(&payload).await;
             let _ = client.flush().await;
+            // `shutdown`, not a bare drop: a dropped channel is closed
+            // immediately and discards what the pump had not yet put on the
+            // wire, which for a megabyte is most of it. Flushing is explicit.
+            client.shutdown().await;
         });
         let mut got = vec![0u8; expected.len()];
         tokio::time::timeout(EXCHANGE_TIMEOUT, server.read_exact(&mut got))

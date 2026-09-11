@@ -1,38 +1,46 @@
 ## State snapshot          ← REWRITTEN (not appended) at every checkpoint
-Task: T-0026 · device revocation (phase 2) — DONE, evidence recorded
-Where you are: revocation is a durable, audited decision with one home; 306 workspace tests
-Next step: **T-0033 (audit log)** — p3, deps now met (T-0018, T-0026, T-0029): it extends the
-connection/action trail across machine and relay, and T-0032's "remote input is attributable"
-criterion needs its row shape. Then T-0032 (remote TUI attach) becomes reachable, and T-0052
-(the live-session cutoff this task split out) is a smaller independent piece.
-Also ready: T-0035 (AGPL boundary), T-0031 (presence), T-0028, T-0040, T-0049. T-0044 remains
-blocked on the account-join RPC (its own note); T-0036 stays human-gated on minisign.
+Task: T-0033 · machine audit log (phase 2) — DONE, evidence recorded
+Where you are: the daemon's trail answers who connected, from where, what they did and what was
+refused, with one writer, one row per action, and redaction at write. 326 workspace tests.
+Next step: **T-0032 (remote TUI attach)** — p3, unblocked now that the audit row shape exists (a
+remote action is attributed to the acting device, proven over the real transport). Then T-0035
+(AGPL boundary), T-0031 (presence), T-0028, T-0040, T-0049. T-0053 is the relay's own audit table
+(the half split out of T-0033 this turn); T-0052 is the live-session cutoff split from T-0026.
+T-0044 stays blocked on the account-join RPC (its own note); T-0036 stays human-gated on minisign.
 Open workers: (none)
 Known broken: (none) · Parked: (none)
 Findings:
-- **The third "written but not rendered" defect.** `arreo audit` printed the coarse `kind` and never
-  the `action`, so a revocation appeared as `device_change` and `device.revoke` was invisible. T-0024
-  lost the event kind the same way. When adding an audit-shaped field, check the *renderer* in the
-  same commit — a row nobody can read is a row that did not happen.
-- **`cargo test -p <crate>` does not build other crates' binaries.** The revocation test spawns the
-  `arreo` CLI, so `cargo test -p arreo-server` ran a *stale* CLI and made an already-fixed renderer
-  look broken. T-0024 recorded this for `arreo-relay`; it now applies to `arreo` too. A test that
-  spawns another package's binary must say so at the top of its file.
-- **A `str.replace` that does not match is a silent no-op.** The store v4 migration silently did not
-  land and three more steps were built on top before a test caught the missing columns. Verify the
-  insertion (the grep was in the very output I read past).
-- **A failing target truncates the workspace test counts.** `cargo test --workspace` stops at the
-  first failing target, so the summary read `passed=5 failed=2` — which looks like a catastrophe
-  rather than "two tests in `arreo-cli`". Read a small `passed=N` as "aborted".
-- **One question, two answers — fifth occurrence, now pre-empted.** Revocation was decided in two
-  places (`authorize` and the transport resolver) and the pinning door spelled out a third variant.
-  `identity::revocation` now owns `may_connect`/`may_pin`, and all three doors call it. The *lookup*
-  doors are also named for their question: `device()` = authorized (index), `record()` = the durable
-  record including tombstones. Worth watching: this class keeps recurring at boundaries that keep two
-  spellings or two sources for one fact.
-- **A flaky-looking test was a real API ambiguity, not a bug.** My first re-pair test asked
-  `device()` for a revoked device's tombstone and got `None`; the API was right (it is the authorized
-  lookup) and the question was wrong. Naming the two doors fixed it — the same lesson as T-0051's.
+- **A flagged secret was stored unmasked.** The scan matched a token prefix anywhere in a line while
+  the masker matched only a whitespace-delimited word *beginning* with it, so
+  `GITHUB_TOKEN=ghp_...` was flagged, left intact and written with `redacted = 1` — a live token on
+  disk beside a flag claiming it was redacted. The scanner and the masker now share one definition
+  (`fixtures::find_token`), and the regression test scans *every* file SQLite writes (`.db`, `-wal`,
+  `-shm`): a scan of the main file alone passed whether or not redaction ran.
+- **One column, two meanings, again.** `device` held the actor for `device.revoke` and the subject
+  for `device.issue`/`device.rotate`; it is now always the subject (the actor of a revocation is in
+  `detail`), and the log uses one spelling per device (`dev_<hex>`) so "everything about this
+  device" is one query. This is the sixth occurrence of the two-spellings/one-fact class — treat it
+  as suspect by default.
+- **An outcome baked in as a constant lied.** `AuditOutcome::Refused` was hardcoded in the
+  authority's audit helper, so issuing and rotating certificates were recorded as refusals. An
+  outcome must be a parameter; a row that sends an operator looking for a failure that never
+  happened is worse than no row.
+- **A pinned device needed a restart; a revoked one did not.** The authority's index is a boot-time
+  snapshot. `DeviceAuthority::device` now reloads once on a miss (a device pinned while the daemon
+  ran) and gives the store the last word on revocation (so a device revoked by *another* process is
+  refused at once — the handshake resolver reads that index). Both doors it must not close are
+  pinned by test: a store row cannot authorize a device on its own, and a cert file with no store
+  row still can.
+- **A dropped `SecureChannel` did not close.** A `JoinHandle` does not abort its task on drop, so
+  the pump kept the connection open and the peer noticed only at the 15 s QUIC idle timeout. `Drop`
+  aborts the pump; `shutdown()` is the graceful close. Consequence for callers: a *dropped* channel
+  discards what the pump had not flushed — flush explicitly (the 1 MB test now does).
+- **A test that scans a file must scan the WAL.** `std::fs::read(<db>)` missed the rows still in the
+  write-ahead log, which made both a positive and a negative assertion vacuous. Assert the scan can
+  see a row it knows is there before trusting it about a row it hopes is not.
+- **`u64::MAX as i64` is `-1`, and SQLite reads a negative bound as "no limit".** The values that
+  most clearly mean "everything" were the ones taking an unintended path. Clamp every
+  Rust-to-SQLite conversion.
 ## Event log               ← append-only; newest last; never rewrite
 - 2026-09-10 [turn 1] ledger created; repo at e489fac (docs only); T-0001 + T-0022 (AGENTS.md gardened) done
 - 2026-09-10 [turn 2] T-0002 PTY manager done+pushed (342606c; 9 tests); PROMPT.md v2 synced + ADR 0001 (ef6c595)
@@ -64,3 +72,5 @@ Findings:
 - 2026-09-11 [turn 27] T-0050 relay stream+session done (split from the original T-0050, which became T-0050+T-0051): `RelayClient::into_split`/`RelayWriter`/`RelayReader` in Apache core, `RelaySession` (peer multiplexing, delivery attribution, drain/ack, backoff policy) + `RelayStream` (AsyncRead+AsyncWrite over envelopes, 32 KiB chunking) in arreo-server, ADR 0014; 5 acceptance tests against the real relay binary (full Noise-KK session through the relay with a ciphertext scan over state dir and logs, 200 KB payload chunking, zero-length write, delivery failure ending the stream, refused registration carrying the relay's reason, vanished relay noticed in bounded time, backoff table); 3 real defects fixed (split-duplex never closed; peer's first chunks dropped before a stream existed; 35 s dead-relay detection -> 15 s idle timeout); 1 test deleted with its finding recorded (session overflow unreachable through the relay); 288 workspace tests, clippy/fmt clean, vet/deny/audit green, check-targets PASS/SKIP, five e2e slices green, bench 6/6; evidence in `.loop/evidence/T-0050/`
 - 2026-09-11 [turn 28] T-0051 daemon relay wiring done: `[relay]` config section (+`--config`/`$ARREO_CONFIG`), `own_identity` (the machine's existing paired cert — no new key), reconnect loop with a dialling line per attempt, drain-on-connect, peer accept through the same `serve_session`+per-verb gate as the local socket, bounded-retry probe of the configured peer, and `StreamFactory` for fresh streams per attempt; fixed a real two-door defect (`DeviceAuthority::device()` now reads the index the gate uses, so a file-pinned device is no longer refused by the handshake) and a one-shot-probe race; 4 two-daemon acceptance tests (message exchange with a plaintext scan of the relay's state+logs, both local sockets still serving, unreachable relay leaving the daemon serving, no config meaning no relay, incomplete config refused by name) + the T-0050 transport tests; 293 workspace tests, clippy/fmt clean, vet/deny/audit green, check-targets PASS/SKIP, five e2e slices green, bench 6/6 (isolated); evidence in `.loop/evidence/T-0051/`
 - 2026-09-11 [turn 29] T-0026 device revocation done (split: the live-session cutoff became T-0052): `arreo_core::identity::revocation` (one home for may-connect/may-pin, used by the authorization check, the transport resolver and the pinning door), store v4 (`devices.revoked_at`/`revoked_by` + `audit.action`), `arreo devices revoke <name|id>` idempotent with an audit row naming who and when, `devices list --revoked|--all` tombstones, re-pair refused for a burned key (a fresh key may take the name), the resolver now logs the real refusal reason; 7 acceptance tests through the real binaries (durable across kill -9, offline case, re-pair, ambiguous/unknown refs, live device unaffected) + 5 decision tests + 12 authority tests; fixed the third "written but not rendered" defect (audit action) and migrated two T-0025 tests to the new listing contract; 306 workspace tests, clippy/fmt clean, vet/deny/audit green, check-targets PASS/SKIP, five e2e slices green, bench 6/6; evidence in `.loop/evidence/T-0026/`
+
+- 2026-09-11 [turn 30] T-0033 machine audit log done (split: the relay's own table became T-0053): store v5 (`audit.action/outcome/peer/detail`, one `AuditEvent` struct, one writer, `actions` vocabulary, `audit_query`/`audit_recent`/`audit_by_action`/`audit_export`/`audit_size`/`audit_prune`), peer truncation at write (IPv4 /24, IPv6 /48), redaction at write, `arreo audit` tail + `--json` + `export --format jsonl|json` + explicit `prune --before`, the daemon's `SessionAudit` (connect/disconnect for remote sessions; attach/send/spawn/split; nothing for reads), a 100 MiB boot warning that never prunes, `docs/audit.md`. Five defects fixed in the same pass: a flagged token stored unmasked (scan/mask now share one definition of a token), `device.issue`/`device.rotate` audited as `refused`, `u64::MAX`/`usize::MAX` meaning "everything" by accident, the `device` column holding the actor for revoke but the subject for issue (now always the subject, actor in `detail`, one spelling per device), and the pin-requires-restart / revoke-is-live asymmetry. Also: a dropped `SecureChannel` now closes (was a 15 s idle-timeout delay before the session's end was written) and the new core test file is gated on `sqlite` so the C-free cross-target pass stays green. 326 workspace tests, clippy/fmt clean, vet/deny/audit green, check-targets PASS/SKIP, 5 e2e slices green, bench 6/6; evidence in `.loop/evidence/T-0033/`; remote == local
