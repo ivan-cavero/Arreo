@@ -11,11 +11,15 @@
 //! Compatibility story:
 //! - T-0014 cut the daemon over: JSONL is gone, one framing (MessagePack).
 //!   The compat types were deleted with it — no dual-stack to maintain.
-//! - `negotiate(server, client_wants)`: reject-only-for-incompatible in v0
-//!   (exact match required); N−1 window logic lands with v1.
+//! - `negotiate(server, client_wants)`: the N−1 window (T-0028, ADR 0017) —
+//!   accept the highest version common to `[server-1, server]`, echo it in
+//!   `Welcome.v`, refuse anything outside with a typed error naming the range.
 
 pub mod codec;
 pub mod message;
 
-pub use codec::negotiate;
+pub use codec::{
+    classify_op, decode_op_for_error, frame_body_len, negotiate, CodecError, Direction,
+    MAX_FRAME_BYTES, MIN_VERSION,
+};
 pub use message::{AgentState, Message, PaneInfo, VERSION};

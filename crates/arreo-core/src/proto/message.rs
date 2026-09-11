@@ -4,11 +4,15 @@
 //! reject-or-adapt per the negotiation rule. New variants MUST be appended
 //! (never renumbered) and new fields MUST be `#[serde(default)]`-optional —
 //! that is the whole N−1 mechanism, enforced by the compat test in
-//! `tests/proto.rs`.
+//! `tests/proto.rs` and the rules in ADR 0017 (T-0028).
 
 use serde::{Deserialize, Serialize};
 
 /// Protocol version we speak.
+///
+/// Bumped exactly when a change cannot honor the append-only discipline below;
+/// the N−1 window (`codec::negotiate`) keeps the previous version working, and
+/// anything older is refused rather than guessed at.
 pub const VERSION: u32 = 0;
 
 /// Pane liveness (mirrors the daemon registry view).

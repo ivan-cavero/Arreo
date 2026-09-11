@@ -306,9 +306,43 @@ async fn read_message(
     buf: &mut Vec<u8>,
 ) -> Result<Message, DaemonError> {
     loop {
-        if let Ok((message, consumed)) = codec::decode_frame(buf) {
-            buf.drain(..consumed);
-            return Ok(message);
+        match codec::decode_frame(buf) {
+            Ok((message, consumed)) => {
+                buf.drain(..consumed);
+                return Ok(message);
+            }
+            Err(codec::CodecError::Truncated { .. }) => {}
+            Err(_) => {
+                // The typed decode failed on a complete frame: this is either
+                // garbage or a newer version's variant. Classify from the `op`
+                // tag before deciding (T-0028, ADR 0017) — a request is refused
+                // loudly with the connection left open, an event is ignored and
+                // counted, and only a frame with no tag at all is garbage.
+                if let Ok(len) = codec::frame_body_len(buf) {
+                    if buf.len() >= 4 + len {
+                        let body = &buf[4..4 + len];
+                        let outcome = match codec::classify_op(body) {
+                            Some(codec::Direction::Request) => {
+                                let op = op_tag(body);
+                                break_unknown_request(op)
+                            }
+                            Some(codec::Direction::Event) => {
+                                count_unknown_event();
+                                None
+                            }
+                            None => {
+                                break_garbage_frame();
+                                None
+                            }
+                        };
+                        buf.drain(..4 + len);
+                        if let Some(message) = outcome {
+                            return Ok(message);
+                        }
+                        continue;
+                    }
+                }
+            }
         }
         let mut chunk = [0u8; 8192];
         let n = reader.await_reader(&mut chunk).await?;
@@ -321,6 +355,44 @@ async fn read_message(
         buf.extend_from_slice(&chunk[..n]);
     }
 }
+
+/// The `op` tag for an error message, or `"unknown"` when the frame has none.
+fn op_tag(body: &[u8]) -> String {
+    // `classify_op` already found the tag shape; this re-reads it for the
+    // message text. A second parse that fails means the frame changed under us,
+    // which cannot happen — but `unknown` is still the honest fallback.
+    codec::decode_op_for_error(body).unwrap_or_else(|| "unknown".to_string())
+}
+
+/// An unknown client→server request becomes a typed `Error` naming the op, and
+/// the connection stays open so the client can report it — never a hang, never
+/// a silent discard of a state-mutating message.
+fn break_unknown_request(op: String) -> Option<Message> {
+    Some(Message::Error {
+        v: VERSION,
+        message: format!("unknown request {op:?} (server speaks protocol {VERSION})"),
+    })
+}
+
+/// An unknown server→client event is ignored and counted, never fatal: killing
+/// the session over news it does not understand would make every server
+/// addition a breaking change.
+fn count_unknown_event() {
+    UNKNOWN_EVENTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// A complete frame with no `op` tag at all is not a newer version, it is
+/// garbage: counted separately so the compat counters never launder corrupt
+/// input into "a version we do not speak".
+fn break_garbage_frame() {
+    GARBAGE_FRAMES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Unknown server→client events ignored so far (T-0028: ignored *and counted*).
+static UNKNOWN_EVENTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Complete frames with no `op` tag refused so far.
+static GARBAGE_FRAMES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Connection handler for the local Unix socket: Hello→Welcome, then verbs.
 async fn handle(stream: UnixStream, registry: Registry, db: PathBuf) -> Result<(), DaemonError> {
@@ -488,6 +560,16 @@ where
                 .await?;
             }
             Err(e @ CodecError::Version { .. }) => {
+                // Refused, never partial (T-0028): the refusal is on the audit
+                // trail and no session exists past this return. The audit row
+                // is written before the Error frame so a client that disconnects
+                // on reading it cannot take the record with it.
+                audit.record(
+                    arreo_core::store::actions::AUTH_REJECT,
+                    arreo_core::store::AuditOutcome::Refused,
+                    "",
+                    Some(&e.to_string()),
+                );
                 write_message(
                     &mut writer,
                     &Message::Error {
@@ -539,6 +621,21 @@ where
         if let Some(auth) = &auth {
             if let Err(refusal) = auth.check(&message) {
                 write_message(&mut writer, &refusal).await?;
+                continue;
+            }
+        }
+        // An unknown request that survived the read loop's classification (a
+        // newer version's verb) is answered here, not dispatched: the session
+        // stays open so the client can report the refusal, and no audit row is
+        // written because no action was taken. (Unknown *events* never reach
+        // this loop — the reader ignores and counts them.)
+        if let Message::Error { .. } = &message {
+            // `read_message` only synthesizes `Error` for unknown requests, so
+            // any `Error` arriving here as a *request* is that refusal coming
+            // back around: answer it and keep the session open.
+            let message = message.clone();
+            if message_text(&message).starts_with("unknown request ") {
+                write_message(&mut writer, &message).await?;
                 continue;
             }
         }
@@ -680,6 +777,13 @@ fn verb_of(message: &Message) -> Verb {
         | Message::Ok { .. }
         | Message::Exited { .. }
         | Message::StateEvent { .. } => Verb::Admin,
+    }
+}
+
+fn message_text(message: &Message) -> &str {
+    match message {
+        Message::Error { message, .. } => message,
+        _ => "",
     }
 }
 

@@ -13,6 +13,7 @@ mod api_slice;
 mod bench;
 mod chaos;
 mod check_targets;
+mod compat_slice;
 mod demo;
 mod enforcement_slice;
 mod harness;
@@ -56,6 +57,7 @@ fn e2e(rest: &[String]) -> ExitCode {
     match slice {
         Some("chaos") => chaos::run(rest),
         Some("api") => api_slice::run(rest),
+        Some("compat") => compat_slice::run(rest),
         Some("state") => adapters_check::run(rest),
         Some("lifecycle") => lifecycle_slice::run(rest),
         Some("enforcement") => enforcement_slice::run(rest),
@@ -64,7 +66,7 @@ fn e2e(rest: &[String]) -> ExitCode {
         Some("theme") => theme_slice::run(rest),
         Some("relay") => relay_slice::run(rest),
         Some(other) => {
-            eprintln!("xtask e2e: unknown slice {other:?} (have: chaos, api, lifecycle, persistence, state, enforcement, tui, theme)");
+            eprintln!("xtask e2e: unknown slice {other:?} (have: chaos, api, compat, lifecycle, persistence, state, enforcement, tui, theme)");
             ExitCode::from(2)
         }
         None => stub("e2e", rest),

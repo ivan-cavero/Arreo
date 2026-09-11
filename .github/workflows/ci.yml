@@ -63,5 +63,7 @@ jobs:
         run: cargo run -p xtask -- e2e --slice tui
       - name: "theme (T-0016 — depth fallback proven by the bytes each terminal gets)"
         run: cargo run -p xtask -- e2e --slice theme
+      - name: "compat (T-0028 — N−1 window, both directions)"
+        run: cargo run -p xtask -- e2e --slice compat
       - name: xtask stubs
         run: cargo xtask e2e

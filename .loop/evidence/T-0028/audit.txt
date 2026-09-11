@@ -1,0 +1,53 @@
+# T-0028 evidence — the protocol N−1 window
+
+## 1. The rules table (ADR 0017)
+
+| Rule | Input | Outcome |
+| --- | --- | --- |
+| window | server N, offers ∩ [N−1, N] nonempty | agree on highest common, echo in Welcome.v (downgrade never silent) |
+| window | offers outside [N−1, N], or empty | typed Error naming offers + range, then close |
+| (a) unknown request | op the server does not know | typed Error naming the op, connection stays open |
+| (b) unknown event | op the client does not know | ignored and counted, never fatal |
+| (c) new #[serde(default)] field | known op, extra field | silent downgrade (serde skips it) |
+| (d) renamed/removed field, renumbered variant | known op, changed shape | decode fails → classified → refused per (a)/(b) |
+| (e) gap > 1 | v2 against v0 | refuse (deferred update, §3.13) |
+
+## 2. Both directions' transcripts (the compat slice)
+
+$ cargo xtask e2e --slice compat
+
+compat[matrix]: test an_unknown_field_on_a_known_op_still_decodes ... ok
+compat[matrix]: test negotiate_is_a_window_not_a_match ... ok
+compat[matrix]: test shared_verbs_decode_identically_through_the_window ... ok
+compat[matrix]: test garbage_has_no_op_and_is_not_a_version ... ok
+compat[matrix]: test every_v0_verb_classifies_to_its_side ... ok
+compat[matrix]: test an_unknown_op_defaults_to_request ... ok
+compat[matrix]: test the_frame_budget_is_enforced_before_allocation ... ok
+compat[matrix]: test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+compat[daemon]: test an_unknown_request_is_refused_and_the_session_survives ... ok
+compat[daemon]: test a_v0_client_keeps_working_for_shared_verbs ... ok
+compat[daemon]: test a_client_outside_the_window_is_refused_loudly ... ok
+compat[daemon]: test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.62s
+compat: N−1 window green in both directions (matrix + live daemon)
+
+## 3. The unshared-verb refusal (unknown request, session survives)
+
+A hand-framed v1 verb (op teleport) against the live daemon: typed Error
+naming the op, then a shared verb (panes) works on the same connection.
+
+## 4. The bench line (1 MB budget holds)
+
+test one_mb_delta_within_budget ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 9 filtered out; finished in 0.04s
+
+## 5. The full battery (final code)
+
+cargo test --workspace: 357 passed, 0 failed across 47 targets
+cargo clippy --workspace --all-targets -- -D warnings: 0 diagnostics
+cargo fmt --all -- --check: clean
+cargo vet --locked: Vetting Succeeded (336 exempted)
+cargo deny check: advisories ok, bans ok, licenses ok, sources ok
+cargo audit: 343 crate dependencies, no advisories
+cargo xtask check-targets: x86_64-unknown-linux-gnu PASS; x86_64-pc-windows-msvc SKIP (pure-Rust no-sqlite PASS)
+e2e slices: api green, compat green, lifecycle 2/2, persistence 3/3, tui 17/17, theme 27/27, relay 14/14
+cargo xtask bench: 6/6 PASS
