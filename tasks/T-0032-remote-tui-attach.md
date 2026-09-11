@@ -65,7 +65,11 @@ lost session and not duplicated output.
       `perf-budget.toml`.
 - [x] Remote input is attributable: every remote `send` carries the device id and lands as an
       audit row on the machine that owns the pane (device, pane, timestamp, redacted; T-0033 owns
-      the schema); a device without operator permission gets a typed error and no keystroke.
+      the schema); a device without operator permission gets a typed error and no keystroke. Both
+      halves are asserted against a real relay: the slice checks the peer's audit trail names the
+      client device, and `crates/arreo-tui/tests/remote.rs` connects as a `viewer`, reads
+      successfully, is refused a `send` with a typed `Error`, and shows the marker never reached the
+      pane and no `send` row exists.
 - [x] Local-first stays intact and failures are loud: `--slice tui` stays green with no transcript
       change; an unreachable relay is a typed error plus a visible "waiting for relay" state.
 - [x] **Interactive evidence (§10.2):** scripted PTY drives the real `arreo-tui` binary

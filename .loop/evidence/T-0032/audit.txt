@@ -27,6 +27,11 @@ relay: 14 passed, 0 failed
 
 ## 2. The client against a real relay (in-process acceptance tests)
 
+Three tests: remote/local decode parity, cursor-owned resume, and a viewer's
+refusal — the last of which is the other half of "remote input is attributable"
+(attribution says who acted; authorization says whether they may, and both are
+decided on the machine that owns the pane).
+
 $ cargo test -p arreo-tui --test remote
 test the_client_reaches_a_remote_daemon_and_sees_the_same_pane ... ok
 test resume_from_the_cursor_replays_without_duplication_or_gaps ... ok
@@ -63,3 +68,10 @@ test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fini
 │                          ││                                                                                          │
 │                          ││                                                                                          │
 
+### The viewer refusal, appended (final code)
+
+$ cargo test -p arreo-tui --test remote
+test the_client_reaches_a_remote_daemon_and_sees_the_same_pane ... ok
+test a_viewer_is_refused_with_a_typed_error_and_no_keystroke ... ok
+test resume_from_the_cursor_replays_without_duplication_or_gaps ... ok
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.57s

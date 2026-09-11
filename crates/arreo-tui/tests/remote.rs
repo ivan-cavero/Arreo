@@ -118,10 +118,11 @@ struct Fixture {
     account: String,
     /// The peer machine's device id — what the client attaches to.
     peer: DeviceId,
-    /// The peer's key, which the client pins as its server key. Kept so a future
-    /// test can compare the pin against the peer's own certificate.
-    #[allow(dead_code)]
+    /// The peer's key, which the client pins as its server key.
     peer_key: DeviceKey,
+    /// The account root, so a test can issue another device its certificate the
+    /// way the product does (a role is a property of the certificate).
+    root: RootKey,
     base: PathBuf,
 }
 
@@ -198,7 +199,7 @@ impl Fixture {
         std::fs::create_dir_all(client_key_path.parent().expect("parent")).expect("client dir");
         let client_key = DeviceKey::generate().expect("entropy");
         client_key.save(&client_key_path).expect("client key");
-        pin(&socket, &peer_dir, "tui", &client_key.public());
+        pin(&socket, &peer_dir, "tui", &client_key.public(), Role::Owner);
 
         let config = base.join("peer.toml");
         std::fs::write(
@@ -240,6 +241,7 @@ impl Fixture {
             account,
             peer,
             peer_key,
+            root,
             base,
         }
     }
@@ -247,6 +249,44 @@ impl Fixture {
     /// The client's identity directory (what `--identity` names).
     fn client_dir(&self) -> PathBuf {
         self.base.join("client").join("identity")
+    }
+
+    /// A second client identity, pinned on the peer with `role`.
+    ///
+    /// The peer's daemon is already running, which is the ordinary case for an
+    /// operator granting access later — and the reason `DeviceAuthority::device`
+    /// reloads on a miss (T-0033).
+    fn viewer(&self, role: Role) -> (DeviceId, PathBuf) {
+        let key = DeviceKey::generate().expect("entropy");
+        let cert = DeviceCert::issue(&self.root, &key.public(), "viewer", role, 1_000, 9);
+        let dir = self.base.join(format!("viewer-{}", cert.device().as_str()));
+        std::fs::create_dir_all(dir.join("devices")).expect("viewer dir");
+        key.save(&dir.join("device.key")).expect("viewer key");
+        cert.save(&dir.join("devices")).expect("viewer certificate");
+        std::fs::write(
+            dir.join("server.key"),
+            format!("{}\n", hex(self.peer_key.public().to_bytes())),
+        )
+        .expect("pinned server key");
+        pin(
+            &self.peer_socket(),
+            &self.base.join("peer"),
+            "viewer",
+            &key.public(),
+            role,
+        );
+        (cert.device().clone(), dir)
+    }
+
+    /// A target pointing at the peer, as `identity`.
+    fn target_for(&self, identity: &Path) -> Target {
+        Target::remote(
+            self.relay_addr,
+            &self.account,
+            &self.peer.display_id(),
+            identity,
+        )
+        .expect("the identity is complete")
     }
 
     /// The peer's local socket, for the parity control run.
@@ -300,7 +340,18 @@ fn hex(bytes: [u8; 32]) -> String {
 }
 
 /// Pin a device on a machine's store, through the product's own door.
-fn pin(socket: &Path, identity_dir: &Path, name: &str, key: &arreo_core::identity::VerifyingKey) {
+///
+/// The role is the *store's* answer to "what may this device do" — the
+/// certificate carries one too, but the authority decides through the store row,
+/// so a test that wants a viewer must pin one (pinning an owner and issuing a
+/// viewer certificate would test the wrong thing).
+fn pin(
+    socket: &Path,
+    identity_dir: &Path,
+    name: &str,
+    key: &arreo_core::identity::VerifyingKey,
+    role: Role,
+) {
     let output = Command::new(binary("arreo"))
         .args([
             "devices",
@@ -310,7 +361,7 @@ fn pin(socket: &Path, identity_dir: &Path, name: &str, key: &arreo_core::identit
             "--name",
             name,
             "--role",
-            "owner",
+            role.as_str(),
             "--key",
             &hex(key.to_bytes()),
         ])
@@ -537,5 +588,76 @@ async fn resume_from_the_cursor_replays_without_duplication_or_gaps() {
         transcript.len() > cursor,
         "the resumed read must extend the transcript: cursor={cursor} transcript={}",
         transcript.len()
+    );
+}
+
+/// A device without operator permission gets a typed error and no keystroke —
+/// over the relay, where the decision is the peer daemon's and not the relay's.
+///
+/// This is the other half of "remote input is attributable": attribution says
+/// *who* acted, authorization says whether they may. Both are decided on the
+/// machine that owns the pane, which is what makes a relay-routed session no
+/// more privileged than a local one.
+#[tokio::test]
+async fn a_viewer_is_refused_with_a_typed_error_and_no_keystroke() {
+    let fixture = Fixture::start("viewer");
+    let pane = fixture.pane("guarded", "printf 'guarded-output\\n'; sleep 60");
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    let (viewer_id, viewer_dir) = fixture.viewer(Role::Viewer);
+    let mut viewer = Client::connect_to(&fixture.target_for(&viewer_dir))
+        .await
+        .expect("a viewer may connect: the refusal is per verb, not per session");
+
+    // A read is allowed: a viewer is meant to see.
+    let lines = read_lines(&mut viewer, &pane, 0).await;
+    assert!(
+        lines.join("\n").contains("guarded-output"),
+        "a viewer may read the pane: {lines:?}"
+    );
+
+    // A write is refused, and the refusal is *typed* — an error the caller can
+    // act on, not a dropped message and not a silent success.
+    let reply = viewer
+        .call(&Message::Send {
+            v: VERSION,
+            id: pane.clone(),
+            data: "echo not-allowed\n".to_string(),
+        })
+        .await
+        .expect("the session answers");
+    match reply {
+        Message::Error { message, .. } => assert!(
+            !message.trim().is_empty(),
+            "the refusal must say why: {message:?}"
+        ),
+        other => panic!("a viewer's send must be refused with a typed error, got {other:?}"),
+    }
+
+    // And no keystroke reached the pane: the marker the refused send would have
+    // echoed is not in the pane's scrollback.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let after = read_lines(&mut viewer, &pane, 0).await;
+    assert!(
+        !after.join("\n").contains("not-allowed"),
+        "the refused send must not have reached the pane: {after:?}"
+    );
+
+    // The peer's own record shows the session and the refusal, and no send.
+    let audit = Command::new(binary("arreo"))
+        .args(["audit", "--limit", "50", "--socket"])
+        .arg(fixture.peer_socket())
+        .env("ARREO_IDENTITY_DIR", fixture.base.join("peer"))
+        .output()
+        .expect("audit runs");
+    let audit = String::from_utf8_lossy(&audit.stdout).to_string();
+    assert!(
+        audit.contains(&viewer_id.display_id()),
+        "the viewer's session is attributed to its device: {audit}"
+    );
+    let sends: Vec<&str> = audit.lines().filter(|l| l.contains(" send ")).collect();
+    assert!(
+        sends.is_empty(),
+        "a refused send is not a send that happened: {sends:?}"
     );
 }
