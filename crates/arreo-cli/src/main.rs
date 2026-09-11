@@ -64,7 +64,11 @@ fn usage() -> ExitCode {
     eprintln!("  arreo devices <id|list|issue|rotate|revoke|authorize> [--json] [--socket PATH]");
     eprintln!("      list --revoked|--all   (live devices by default; tombstones with --revoked)");
     eprintln!("      revoke <name|id>       (idempotent; the audit row names who and when)");
-    eprintln!("  arreo pair [--role owner|viewer] [--ttl-secs N] [--mailbox ADDR] [--json]   (show a code; pins the device that types it)");
+    eprintln!("  arreo pair [--role owner|viewer] [--ttl-secs N] [--mailbox ADDR] [--config PATH] [--json]");
+    eprintln!(
+        "      show a code; pins the device that types it. With a [relay] section configured, the"
+    );
+    eprintln!("      invite also names the account and relay, so `arreo machines add` can register the new");
     eprintln!("  arreo pair --join \"four words\" --uri arreo://pair?... [--name N] [--json]   (this device joins)");
     eprintln!("  arreo machines list [--json] [--all] [--offline] [--config PATH]");
     eprintln!("  arreo machines status [<name>] [--json] [--offline]   (0 ok, 2 usage, 3 unknown machine, 4 relay unreachable, 5 conflict)");
@@ -2280,10 +2284,15 @@ fn cmd_pair(rest: &[String]) -> ExitCode {
     let mut ttl_secs: u64 = arreo_core::pairing::flow::DEFAULT_TTL.as_secs();
     let mut mailbox: Option<String> = None;
     let mut json = false;
+    let mut config: Option<PathBuf> = None;
 
     let mut i = 0;
     while i < kept.len() {
         match kept[i].as_str() {
+            "--config" if i + 1 < kept.len() => {
+                config = Some(PathBuf::from(&kept[i + 1]));
+                i += 2;
+            }
             "--join" if i + 1 < kept.len() => {
                 join_code = Some(kept[i + 1].clone());
                 i += 2;
@@ -2345,7 +2354,7 @@ fn cmd_pair(rest: &[String]) -> ExitCode {
             ExitCode::from(2)
         }
         (Some(code), Some(uri)) => cmd_pair_phone(&code, &uri, name, json),
-        (None, None) => cmd_pair_server(&socket, name, role, ttl_secs, mailbox, json),
+        (None, None) => cmd_pair_server(&socket, name, role, ttl_secs, mailbox, json, config),
     }
 }
 
@@ -2365,6 +2374,7 @@ fn cmd_pair_server(
     ttl_secs: u64,
     mailbox: Option<String>,
     json: bool,
+    config: Option<PathBuf>,
 ) -> ExitCode {
     use arreo_core::pairing::flow::PairingServer;
     use arreo_core::pairing::{MailboxAddr, PairingError};
@@ -2395,7 +2405,21 @@ fn cmd_pair_server(
             return ExitCode::FAILURE;
         }
     };
-    let mut server = match PairingServer::begin(&root, addr, ttl) {
+    // The directory hint (T-0058): this machine's account and relay, so the
+    // machine it admits knows where to register itself. Absent when this machine
+    // is not on a relay — an ordinary pairing, unchanged.
+    //
+    // A configuration that is present but *incomplete* is a loud error rather
+    // than a silent `None`: an operator who enabled the relay and then admitted a
+    // machine that joins nothing would have a bug they cannot see.
+    let directory = match directory_hint(config.as_deref()) {
+        Ok(hint) => hint,
+        Err(message) => {
+            eprintln!("pair: {message}");
+            return ExitCode::from(2);
+        }
+    };
+    let mut server = match PairingServer::begin(&root, addr, ttl, directory) {
         Ok(server) => server,
         Err(e) => {
             eprintln!("pair: {e}");
@@ -2495,30 +2519,42 @@ fn pair_failed(
     ExitCode::FAILURE
 }
 
-fn cmd_pair_phone(code_text: &str, uri: &str, name: Option<String>, json: bool) -> ExitCode {
+/// Why a phone half of a pairing did not finish, split by what the caller can
+/// do about it: a usage error is the human's flag, a failure is the exchange.
+enum PairError {
+    Usage(String),
+    Failed(String),
+}
+
+/// The phone half of a pairing, start to finish: parse, exchange, and persist
+/// what came back.
+///
+/// **Extracted for T-0058.** `arreo pair --join` and `arreo machines add` are the
+/// same exchange — the second one just keeps going afterwards and asserts a
+/// directory row. Two copies of this flow would be two places for the
+/// persist-only-on-success rule (and the key-reuse rule, and the pinned-server
+/// rule) to drift, and this is security-critical code where a drift is a hole.
+fn join_pairing(
+    code_text: &str,
+    uri: &str,
+    name: Option<String>,
+) -> Result<
+    (
+        arreo_core::pairing::flow::PairedDevice,
+        arreo_core::pairing::Invite,
+    ),
+    PairError,
+> {
     use arreo_core::pairing::flow::PairingPhone;
     use arreo_core::pairing::{Code, Invite};
 
-    let code = match Code::parse(code_text) {
-        Ok(code) => code,
-        Err(e) => {
-            eprintln!("pair: {e}");
-            return ExitCode::from(2);
-        }
-    };
-    let invite = match Invite::parse_uri(uri) {
-        Ok(invite) => invite,
-        Err(e) => {
-            eprintln!("pair: {e}");
-            return ExitCode::from(2);
-        }
-    };
+    let code = Code::parse(code_text).map_err(|e| PairError::Usage(e.to_string()))?;
+    let invite = Invite::parse_uri(uri).map_err(|e| PairError::Usage(e.to_string()))?;
     // The dev box default is the machine's own hostname; a phone passes
     // --name. Either way the server may override it.
     let label = name.unwrap_or_else(default_device_name);
     let Some(label) = sanitize_device_name(&label) else {
-        eprintln!("pair: the device name is empty");
-        return ExitCode::from(2);
+        return Err(PairError::Usage("the device name is empty".into()));
     };
 
     // An existing keypair is reused (re-pairing the same device keeps its
@@ -2530,65 +2566,81 @@ fn cmd_pair_phone(code_text: &str, uri: &str, name: Option<String>, json: bool) 
         Err(arreo_core::identity::KeyError::Missing { .. }) => {
             match arreo_core::identity::DeviceKey::generate() {
                 Ok(key) => (key, true),
-                Err(e) => {
-                    eprintln!("pair: {e}");
-                    return ExitCode::FAILURE;
-                }
+                Err(e) => return Err(PairError::Failed(e.to_string())),
             }
         }
         Err(e) => {
-            eprintln!("pair: cannot read {path}: {e}", path = key_path.display());
-            return ExitCode::FAILURE;
+            return Err(PairError::Failed(format!(
+                "cannot read {}: {e}",
+                key_path.display()
+            )))
         }
     };
 
-    let phone = match PairingPhone::join(&invite, &code, key, &label) {
-        Ok(phone) => phone,
-        Err(e) => {
-            eprintln!("pair: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
-    let paired = match phone.await_cert() {
-        Ok(paired) => paired,
-        Err(e) => {
-            eprintln!("pair: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
+    let phone = PairingPhone::join(&invite, &code, key, &label)
+        .map_err(|e| PairError::Failed(e.to_string()))?;
+    let paired = phone
+        .await_cert()
+        .map_err(|e| PairError::Failed(e.to_string()))?;
 
     // Success is the only moment anything is written.
     if generated {
-        if let Err(e) = paired.key.save(&key_path) {
-            eprintln!("pair: paired, but cannot save the device key: {e}");
-            return ExitCode::FAILURE;
-        }
+        paired.key.save(&key_path).map_err(|e| {
+            PairError::Failed(format!("paired, but cannot save the device key: {e}"))
+        })?;
     }
     let cert = &paired.cert;
     let cert_dir = arreo_core::identity::identity_root().join("devices");
-    let cert_path = match cert.save(&cert_dir) {
-        Ok(path) => path,
-        Err(e) => {
-            eprintln!("pair: paired, but cannot save the certificate: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
+    let cert_path = cert
+        .save(&cert_dir)
+        .map_err(|e| PairError::Failed(format!("paired, but cannot save the certificate: {e}")))?;
     // Pin the server's key so later connections can verify its certificates
     // without the invite (public material — no secret here).
     let server_key_path = arreo_core::identity::identity_root().join("server.key");
     let pinned = arreo_core::identity::identity_root();
-    if let Err(e) = arreo_core::identity::keys::create_private_dir(&pinned).and_then(|()| {
-        std::fs::write(&server_key_path, format!("{}\n", invite.server_key)).map_err(|e| {
-            arreo_core::identity::KeyError::Io {
-                path: server_key_path.clone(),
-                detail: e.to_string(),
-            }
+    arreo_core::identity::keys::create_private_dir(&pinned)
+        .and_then(|()| {
+            std::fs::write(&server_key_path, format!("{}\n", invite.server_key)).map_err(|e| {
+                arreo_core::identity::KeyError::Io {
+                    path: server_key_path.clone(),
+                    detail: e.to_string(),
+                }
+            })
         })
-    }) {
-        eprintln!("pair: paired, but cannot save the server key: {e}");
-        return ExitCode::FAILURE;
-    }
+        .map_err(|e| PairError::Failed(format!("paired, but cannot save the server key: {e}")))?;
 
+    // The path is part of the result: a caller that prints it is telling the
+    // operator which file to keep, and one that cannot must not print it.
+    PAIRED_CERT_PATH.with(|cell| cell.set(Some(cert_path)));
+    Ok((paired, invite))
+}
+
+thread_local! {
+    /// Where the certificate of the last successful pairing went. A
+    /// thread-local because the pairing path is synchronous and single-threaded
+    /// (this binary's `rt::block_on` and this flow are both blocking); it exists
+    /// so the *success message* can name the file without the flow function
+    /// growing a second return value that every caller has to carry.
+    static PAIRED_CERT_PATH: std::cell::Cell<Option<std::path::PathBuf>> =
+        const { std::cell::Cell::new(None) };
+}
+
+fn cmd_pair_phone(code_text: &str, uri: &str, name: Option<String>, json: bool) -> ExitCode {
+    let (paired, invite) = match join_pairing(code_text, uri, name) {
+        Ok(pair) => pair,
+        Err(PairError::Usage(message)) => {
+            eprintln!("pair: {message}");
+            return ExitCode::from(2);
+        }
+        Err(PairError::Failed(message)) => {
+            eprintln!("pair: {message}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let cert = &paired.cert;
+    let cert_path = PAIRED_CERT_PATH
+        .with(|cell| cell.take())
+        .unwrap_or_default();
     if json {
         println!(
             "{}",
@@ -2610,6 +2662,35 @@ fn cmd_pair_phone(code_text: &str, uri: &str, name: Option<String>, json: bool) 
         println!("certificate: {}", cert_path.display());
     }
     ExitCode::SUCCESS
+}
+
+/// The account and relay a joining machine should register itself with
+/// (T-0058), read from this machine's `[relay]` configuration.
+///
+/// `Ok(None)` is "this machine is not on a relay" (no path given, no file, or
+/// the section disables it) — an ordinary pairing. `Err` is a configuration that
+/// was given and is wrong: the operator must see that, because the alternative
+/// is admitting a machine that silently joins nothing.
+fn directory_hint(
+    config: Option<&std::path::Path>,
+) -> Result<Option<arreo_core::pairing::flow::DirectoryHint>, String> {
+    let Some(path) = config
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("ARREO_CONFIG").map(PathBuf::from))
+    else {
+        return Ok(None);
+    };
+    match arreo_core::relay::config::load_config(&path) {
+        Ok(Some(settings)) => Ok(Some(arreo_core::pairing::flow::DirectoryHint {
+            account: settings.account,
+            relay: settings.addr.to_string(),
+        })),
+        Ok(None) => Ok(None),
+        Err(e) => Err(format!(
+            "the configuration at {} cannot be used, so the invite cannot name an account: {e}",
+            path.display()
+        )),
+    }
 }
 
 /// The server's identity key path (its root key — one identity per server).

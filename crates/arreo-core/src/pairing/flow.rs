@@ -84,6 +84,28 @@ pub struct Invite {
     /// Hex of the server's identity public key (its root key).
     pub server_key: String,
     pub ttl: Duration,
+    /// The account and relay the joining machine should register itself with,
+    /// when the machine that issued this invite belongs to one (T-0058).
+    ///
+    /// **Why the invite carries it.** `arreo machines add` is how a *new*
+    /// machine joins an account, so the joining machine cannot read the
+    /// coordinates out of its own configuration — it has none yet. The machine
+    /// that admits it does, and this is the only channel between them. `None`
+    /// means an ordinary pairing (a phone attaching to a server that is not on
+    /// the relay), which is what every invite before T-0058 was.
+    pub directory: Option<DirectoryHint>,
+}
+
+/// Where a joining machine should register itself (T-0058).
+///
+/// Both halves are public metadata: an account id and a relay address. No key
+/// travels here — the certificate that follows is what authorizes anything.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirectoryHint {
+    /// The account id, as the relay knows it.
+    pub account: String,
+    /// The relay's QUIC address, `host:port`.
+    pub relay: String,
 }
 
 impl Invite {
@@ -94,13 +116,23 @@ impl Invite {
     /// anything that renders a QR".
     #[must_use]
     pub fn uri(&self) -> String {
-        format!(
+        let mut uri = format!(
             "arreo://pair?v=1&mb={}&s={}&k={}&ttl={}",
             percent_encode(&self.mailbox.as_str()),
             percent_encode(&self.session),
             percent_encode(&self.server_key),
             self.ttl.as_secs()
-        )
+        );
+        // Additive: a URI without these is the pairing-only invite every
+        // version before T-0058 produced, and still parses.
+        if let Some(directory) = &self.directory {
+            uri.push_str(&format!(
+                "&a={}&r={}",
+                percent_encode(&directory.account),
+                percent_encode(&directory.relay)
+            ));
+        }
+        uri
     }
 
     /// Parse an invite URI. Strict: a missing or malformed field is refused
@@ -146,11 +178,33 @@ impl Invite {
             })
             .transpose()?
             .unwrap_or(DEFAULT_TTL.as_secs());
+        // Both or neither: a half-filled directory hint would send the joining
+        // machine looking for an account on a relay it was never told about.
+        let directory = match (fields.get("a"), fields.get("r")) {
+            (Some(account), Some(relay)) => {
+                if account.trim().is_empty() || relay.trim().is_empty() {
+                    return Err(PairingError::BadInvite(
+                        "the invite names an account and a relay, but one of them is empty".into(),
+                    ));
+                }
+                Some(DirectoryHint {
+                    account: account.clone(),
+                    relay: relay.clone(),
+                })
+            }
+            (None, None) => None,
+            _ => {
+                return Err(PairingError::BadInvite(
+                    "the invite names only one of the account and the relay".into(),
+                ))
+            }
+        };
         Ok(Self {
             session,
             mailbox,
             server_key,
             ttl: Duration::from_secs(ttl_secs.max(1)),
+            directory,
         })
     }
 
@@ -223,10 +277,15 @@ impl PairingServer {
     /// `server_identity` is the server's public key — the same key that signs
     /// device certificates, so the code authenticates the machine the phone is
     /// about to trust.
+    /// `directory` is the account and relay the *joining* machine should
+    /// register itself with (T-0058), or `None` for an ordinary pairing. The
+    /// issuer is the only side that can know it: it holds the account root, and
+    /// the joining machine has no configuration yet.
     pub fn begin(
         server_identity: &RootKey,
         mailbox: MailboxAddr,
         ttl: Duration,
+        directory: Option<DirectoryHint>,
     ) -> Result<Self, PairingError> {
         let session = random_session()?;
         let code = Code::random()?;
@@ -235,6 +294,7 @@ impl PairingServer {
             mailbox,
             server_key: server_identity.public_hex(),
             ttl,
+            directory,
         };
         let mailbox_client = MailboxClient::new(invite.mailbox.clone());
         mailbox_client.open(&invite.session, ttl + MAILBOX_GRACE)?;
@@ -609,6 +669,47 @@ mod tests {
             mailbox: test_mailbox(),
             server_key: RootKey::from_seed([5u8; 32]).public_hex(),
             ttl: Duration::from_secs(300),
+            directory: None,
+        }
+    }
+
+    /// The directory hint (T-0058) is additive: an invite without one still
+    /// round-trips, and a half-filled one is refused rather than guessed at.
+    #[test]
+    fn the_directory_hint_round_trips_and_is_all_or_nothing() {
+        let plain = invite();
+        assert_eq!(
+            Invite::parse_uri(&plain.uri()).expect("parses"),
+            plain,
+            "an invite with no directory hint is what every pre-T-0058 invite was"
+        );
+
+        let hinted = Invite {
+            directory: Some(DirectoryHint {
+                account: "acct-1".to_string(),
+                relay: "203.0.113.7:443".to_string(),
+            }),
+            ..plain.clone()
+        };
+        let uri = hinted.uri();
+        assert!(uri.contains("&a=acct-1"), "{uri}");
+        assert_eq!(
+            Invite::parse_uri(&uri).expect("parses"),
+            hinted,
+            "the joining machine learns the account and relay from the invite"
+        );
+
+        // Only one of the two: refused. A joining machine sent looking for an
+        // account on a relay it was not told about would fail much later, with a
+        // message about a connection rather than about the invite.
+        for broken in [
+            uri.replace("&r=203.0.113.7%3A443", ""),
+            uri.replace("a=acct-1", "a="),
+        ] {
+            assert!(
+                Invite::parse_uri(&broken).is_err(),
+                "{broken} must be refused, not half-read"
+            );
         }
     }
 

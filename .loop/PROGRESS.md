@@ -1,22 +1,25 @@
 ## State snapshot          ← REWRITTEN (not appended) at every checkpoint
-Task: T-0057 · directory writes over the wire (rename/remove/stale) — DONE; T-0044's rename+remove
-criteria landed with it. Only `add` (T-0058) is left of T-0044.
-Where you are: the relay applies the directory's rules for rename, tombstone and the stale prune;
-`arreo machines rename|remove [--stale] [--force]` go through the real CLI, and a write for another
-account's machine is refused with the same sentence an unknown id gets. 411 tests.
-Next step: **T-0058** (`machines add` and the join handoff — it needs an ADR choosing how the invite
-carries the account and the machine). Then T-0046 (per-machine trust).
+Task: T-0058 · the machine join handoff — DONE. T-0044 (`arreo machines`) is now DONE across
+T-0044 + T-0057 + T-0058; T-0046 (`arreo machines trust`, per-machine device trust) is unblocked.
+Where you are: `arreo machines add <code> --uri <invite>` takes a machine that has never seen the
+account into it — the admitting machine issues (it holds the account root, the only key the relay
+accepts), the joining machine registers its own row. 416 tests.
+Next step: **T-0046 (per-machine device trust)** — its deps are all done now; the relay-side half of
+T-0052's revocation also waits on it. Then T-0045 (cross-server attach) and T-0048 (OSS launch).
 Open workers: (none)
 Known broken: (none) · Parked: (none)
 Findings:
-- **A rename conflict is refused, not suffixed** — the suffix rule belongs to claims; the task's first
-  draft was wrong and `Directory::rename` was right.
-- **An id unique across accounts needs an ownership check**, and the refusal must be the same one an
-  unknown id gets, or it becomes an oracle.
-- **A row's tombstone is a fact about the row, not about liveness**: deriving the flag from presence
-  hid every fresh tombstone.
-- **Refusing a flag beats ignoring it** (`--json`/`--offline` on writes). **Don't invent a default the
-  other side does not have** (T-0044).
+- **Read the auth check before designing the handoff.** The relay verifies a device certificate
+  against the *account root*, so only a machine holding that root can admit — the design followed from
+  that line, not from preference.
+- **A stale claim in a task file is drift.** T-0044's T-0056 note predicted a socket verb that was not
+  needed; corrected on landing rather than left as a plausible-sounding plan.
+- **One bench reading under host contention is not a code signal** — 307 ms vs a 300 ms budget, then
+  71 ms on an isolated re-run; the metric is wall-clock, the host shares CPUs.
+- **The phone half was extracted, not copied** (`join_pairing`): security-critical flow, one place for
+  persist-only-on-success to live.
+- **A flag belongs to one verb or none** — `refuse_unused`. **Don't invent a default the other side
+  does not have** (T-0044).
 ## Event log               ← append-only; newest last; never rewrite
 - 2026-09-10 [turn 1] ledger created; repo at e489fac (docs only); T-0001 + T-0022 (AGENTS.md gardened) done
 - 2026-09-10 [turn 2] T-0002 PTY manager done+pushed (342606c; 9 tests); PROMPT.md v2 synced + ADR 0001 (ef6c595)
@@ -76,3 +79,5 @@ Findings:
 - 2026-09-11 [turn 42, follow-up] T-0044 correction: the CLI no longer invents a configuration default (`$XDG_CONFIG_HOME/arreo/arreo.toml`) that the daemon does not have — one fact ("this machine's relay config") with two sources is the defect class this project keeps finding. No path named is exit 2 naming `--config`/`ARREO_CONFIG`; a path with no `[relay]` section is exit 4 naming the file. Battery re-run on the final code: 408 workspace tests / 0 failed (52 targets), clippy/fmt clean, vet 336 exempted, deny 4/4, audit 0, check-targets PASS/SKIP, 8 slices green, bench 6/6
 
 - 2026-09-11 [turn 43] T-0057 directory writes over the wire done: `rename`/`remove`/`stale` kinds, the session's three write requests on the same reserve-park-then-send path, the relay applying T-0043's rules itself (a colliding rename refused with both names untouched; a removal a tombstone that holds the name; the prune exactly the stale set, idempotent), an account-ownership check so a foreign `machine_id` is refused with the same sentence an unknown id gets, and the CLI verbs `machines rename|remove [--stale] [--force]` (an online machine needs `--force`; `--json`/`--offline` are refused rather than ignored). T-0044's rename/remove criteria landed here; only `add` (T-0058) is left. Found: the tombstone flag was derived from presence and hid every fresh tombstone — it comes from the row's `tombstone_until_ms` now, and the cache mirrors that field. Evidence `.loop/evidence/T-0057/`. 411 workspace tests, clippy/fmt clean, vet/deny/audit green, check-targets PASS/SKIP, 8 e2e slices green, bench 6/6
+
+- 2026-09-11 [turn 44] T-0058 machine join handoff done, and with it T-0044 (`arreo machines` complete across T-0044+T-0057+T-0058). `arreo machines add <code> --uri <invite>` runs on the machine being admitted: the invite (extended additively with `a=`/`r=`, absent = an ordinary pairing) carries the account and the relay because the joining machine has no configuration to read; the SPAKE2 exchange is the same one `arreo pair --join` runs (`join_pairing`, extracted so the persist-only-on-success rule lives once); the machine then asserts its OWN directory row under its own root key. ADR 0018 records the decision and four rejected alternatives. The design came from reading `Router::handle_connection` — the relay verifies a device certificate against the ACCOUNT ROOT, so only a machine holding it can admit, which is why the handoff is two acts by two machines. Evidence `.loop/evidence/T-0058/`. 416 workspace tests, clippy/fmt clean, vet/deny/audit green, check-targets PASS/SKIP, 8 e2e slices green, bench 6/6 (one contended reading re-run clean). Corrected T-0044's stale T-0056 note (it predicted a socket verb the reads did not need)

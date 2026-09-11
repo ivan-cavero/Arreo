@@ -3,7 +3,7 @@ id: T-0044
 title: "`arreo machines` — list/add/rename/remove/status with a stable script contract"
 phase: 2
 priority: 2
-status: in-progress
+status: done
 depends_on: [T-0043, T-0029, T-0056, T-0057, T-0058]
 scope:
   - crates/arreo-cli/src/main.rs
@@ -40,7 +40,7 @@ citizens, not SSH bookmarks".
 - [x] Offline behavior is honest: with the relay unreachable, `list`/`status` print cached rows with
       `"source":"cache"` and per-row ages, warn once on stderr and exit 4; `--offline` makes that
       intentional (exit 0, `"source":"cache"`); a cached row is never printed as `online`.
-- [ ] **(moved to T-0058)** `add` only completes a join: it admits a machine that displayed an `arreo pair` code (single-use,
+- [x] **(landed in T-0058)** `add` only completes a join: it admits a machine that displayed an `arreo pair` code (single-use,
       5 min), takes the name from `--name` or the joining side, and prints the granted name (plain or
       the T-0043 suffix) plus the machine fingerprint; it never accepts an arbitrary host/port and
       never silently renames an existing machine.
@@ -90,13 +90,6 @@ Re-scoping the fence instead was considered and rejected: extending this task's 
 `crates/arreo-core/src/relay/**` and `crates/arreo-relay/src/router.rs` would have made one task
 own three layers, and the two new tasks are each independently verifiable.
 
-## Verification
-
-```console
-cargo test -p arreo-cli --test machines
-cargo fmt --all -- --check
-```
-
 ## Re-scope (2026-09-11, during T-0043's landing)
 
 **`depends_on` gained T-0029, and the reason is a real prerequisite, not a
@@ -125,15 +118,20 @@ is a transport, not a CLI verb. T-0050 landed the daemon's session machinery wit
 machine-registration half, so the missing piece was filed and built as T-0056 —
 `join`/`machines`/`directory` kinds, the session's request/response path, the relay's
 directory handlers, and the daemon asserting its own row on connect and on the presence
-cadence. T-0044 is therefore **startable**: `add` completes a join through the daemon's own
-relay session and the CLI reads the directory through it (`arreo machines list` needs a
-socket verb that proxies to the daemon's `machines` request). T-0056 did deliberately *not*
-add a CLI verb: the fence here owns `crates/arreo-cli/src/machines.rs`, and a verb written
-there would have been this task's work done under another task's id.
+cadence. T-0056 did deliberately *not* add a CLI verb: the fence here owns
+`crates/arreo-cli/src/machines.rs`, and a verb written there would have been this task's
+work done under another task's id.
 
-`status <name>`'s trusted-device count already declares itself `null` until
-T-0046, which is the honest pattern; this note applies the same standard to the
-join path rather than shipping a stubbed `add`.
+**What the reads turned out to need, corrected on landing (2026-09-11).** This note first
+predicted a socket verb proxying the daemon's `machines` request. It was not needed: the CLI
+holds the same device identity the daemon does, so it dials the relay itself — no daemon in
+the path, no new protocol surface, and a hermetic test (see the landing notes). Two further
+pieces also had to be split out rather than built here, both filed with their reasons in the
+re-scope above: the directory's **write** verbs (T-0057) and the **join handoff** (T-0058).
+
+`status <name>`'s trusted-device count declares itself `null` until T-0046, which is the
+honest pattern; that note applied the same standard to the join path rather than shipping a
+stubbed `add` — and it held: `add` refused with a named reason until T-0058 could build it.
 
 ## Landing notes (2026-09-11)
 

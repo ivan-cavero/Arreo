@@ -15,7 +15,7 @@ use arreo_core::relay::join_proof_payload;
 use arreo_core::relay::session::RelaySession;
 use std::io::{BufRead, BufReader};
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
 use std::time::Duration;
@@ -38,6 +38,7 @@ struct Relay {
     child: Child,
     addr: SocketAddr,
     state_dir: PathBuf,
+    mailbox: Option<PathBuf>,
 }
 
 impl Drop for Relay {
@@ -50,6 +51,24 @@ impl Drop for Relay {
 
 impl Relay {
     fn start(tag: &str) -> Self {
+        Self::start_with(tag, None)
+    }
+
+    /// A relay that also serves the pairing mailbox, which is what one process
+    /// running both jobs looks like on a self-hosted box (T-0024 + T-0029 in one
+    /// binary). `add` needs both halves: the mailbox carries the pairing flights,
+    /// the router carries the directory write that follows.
+    fn start_with_mailbox(tag: &str) -> Self {
+        let mailbox = std::env::temp_dir().join(format!(
+            "arreo-cli-machines-{tag}-{}-{:?}-mailbox.sock",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_file(&mailbox);
+        Self::start_with(tag, Some(mailbox))
+    }
+
+    fn start_with(tag: &str, mailbox: Option<PathBuf>) -> Self {
         let state_dir = std::env::temp_dir().join(format!(
             "arreo-cli-machines-{tag}-{}-{:?}",
             std::process::id(),
@@ -57,14 +76,18 @@ impl Relay {
         ));
         let _ = std::fs::remove_dir_all(&state_dir);
         std::fs::create_dir_all(&state_dir).expect("scratch state dir");
-        let mut child = Command::new(binary("arreo-relay"))
-            .args([
-                "serve",
-                "--listen",
-                "127.0.0.1:0",
-                "--state-dir",
-                &state_dir.display().to_string(),
-            ])
+        let mut command = Command::new(binary("arreo-relay"));
+        command.args([
+            "serve",
+            "--listen",
+            "127.0.0.1:0",
+            "--state-dir",
+            &state_dir.display().to_string(),
+        ]);
+        if let Some(mailbox) = &mailbox {
+            command.arg("--pairing-socket").arg(mailbox);
+        }
+        let mut child = command
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
@@ -94,6 +117,7 @@ impl Relay {
             child,
             addr,
             state_dir,
+            mailbox,
         }
     }
 
@@ -118,6 +142,13 @@ impl Relay {
         );
     }
 
+    /// The pairing mailbox this relay serves, if any.
+    fn mailbox(&self) -> &Path {
+        self.mailbox
+            .as_deref()
+            .expect("this relay was started with a mailbox")
+    }
+
     /// Stop the relay without forgetting its state: the offline case is "the
     /// relay is not answering", not "there is no relay".
     fn stop(&mut self) {
@@ -134,9 +165,29 @@ fn hex(bytes: &[u8]) -> String {
 struct Client {
     dir: PathBuf,
     config: PathBuf,
+    /// Whether this machine has a `[relay]` configuration at all. A joining
+    /// machine does not: learning the account and relay is what `add` is for.
+    configured: bool,
 }
 
 impl Client {
+    /// A machine with no configuration and no identity: what a machine being
+    /// admitted looks like before it runs `add`.
+    fn new_bare(tag: &str) -> Self {
+        let dir = std::env::temp_dir().join(format!(
+            "arreo-cli-machines-client-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("identity")).expect("identity dir");
+        Self {
+            config: dir.join("arreo.toml"),
+            dir,
+            configured: false,
+        }
+    }
+
     fn new(tag: &str, relay: &Relay, account: &str) -> Self {
         let dir = std::env::temp_dir().join(format!(
             "arreo-cli-machines-client-{tag}-{}-{:?}",
@@ -155,7 +206,11 @@ impl Client {
             ),
         )
         .expect("config");
-        Self { dir, config }
+        Self {
+            dir,
+            config,
+            configured: true,
+        }
     }
 
     /// Write this client's device identity, the way `arreo pair --join` does:
@@ -170,16 +225,28 @@ impl Client {
     }
 
     fn run(&self, args: &[&str]) -> Out {
-        let output = Command::new(binary("arreo"))
+        let mut command = Command::new(binary("arreo"));
+        command
             .args(args)
             // `identity_root()` is `$ARREO_IDENTITY_DIR/identity`, so the env
             // var names the *base* directory (the same convention `arreo pair`
             // and the daemon use).
-            .env("ARREO_IDENTITY_DIR", &self.dir)
-            .env("ARREO_CONFIG", &self.config)
-            .output()
-            .expect("the CLI runs");
-        Out::of(output)
+            .env("ARREO_IDENTITY_DIR", &self.dir);
+        if self.configured {
+            command.env("ARREO_CONFIG", &self.config);
+        } else {
+            command.env_remove("ARREO_CONFIG");
+        }
+        Out::of(command.output().expect("the CLI runs"))
+    }
+
+    /// `--config` (or nothing at all, for a machine that has none).
+    fn config_args(&self) -> Vec<String> {
+        if self.configured {
+            vec!["--config".to_string(), self.config.display().to_string()]
+        } else {
+            Vec::new()
+        }
     }
 
     /// Run with `--config` instead of the environment variable.
@@ -233,6 +300,71 @@ impl Out {
 impl Drop for Client {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// The admitting machine's `arreo pair`, with its stdout read line by line.
+///
+/// The reader is kept alive on purpose: dropping the read end of a child's
+/// stdout pipe makes the child's next `println!` fail, and a test that closed it
+/// would be measuring its own harness.
+struct PairingServer {
+    child: Child,
+    lines: std::io::BufReader<std::process::ChildStdout>,
+}
+
+impl PairingServer {
+    fn start(admitting: &Client, relay: &Relay) -> Self {
+        let mut command = Command::new(binary("arreo"));
+        command
+            .args(["pair", "--json", "--ttl-secs", "30"])
+            .args(admitting.config_args())
+            .args(["--mailbox", &relay.mailbox().display().to_string()])
+            .arg("--socket")
+            .arg(admitting.dir.join("arreo.sock"))
+            .env("ARREO_IDENTITY_DIR", &admitting.dir);
+        if admitting.configured {
+            command.env_remove("ARREO_CONFIG");
+        }
+        let mut child = command
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("the admitting machine shows a code");
+        let stdout = child.stdout.take().expect("stdout is piped");
+        Self {
+            child,
+            lines: std::io::BufReader::new(stdout),
+        }
+    }
+
+    /// The JSON invite the admitting machine prints before it blocks.
+    fn invite(&mut self) -> serde_json::Value {
+        let mut line = String::new();
+        self.lines
+            .read_line(&mut line)
+            .expect("the admitting machine keeps talking");
+        assert!(!line.is_empty(), "it stopped printing early");
+        serde_json::from_str(line.trim())
+            .unwrap_or_else(|e| panic!("the invite is not JSON ({e}): {line}"))
+    }
+
+    /// The JSON result it prints once the joining machine is in.
+    fn result(&mut self) -> serde_json::Value {
+        let mut line = String::new();
+        self.lines
+            .read_line(&mut line)
+            .expect("the admitting machine keeps talking");
+        assert!(!line.is_empty(), "it stopped printing early");
+        serde_json::from_str(line.trim())
+            .unwrap_or_else(|e| panic!("the result is not JSON ({e}): {line}"))
+    }
+}
+
+impl Drop for PairingServer {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
     }
 }
 
@@ -355,13 +487,11 @@ fn list_and_status_read_the_accounts_directory() {
     assert_eq!(out.code, 3, "{}", out.all());
     assert!(out.stderr.contains("not a machine name"), "{}", out.all());
 
-    // The verbs whose transports do not exist yet refuse rather than pretend,
-    // and each names its own missing task.
-    // `add`'s transport does not exist yet: it refuses rather than pretending,
-    // and names the task that will bring it.
+    // `add` needs a code and an invite; with neither it says which is missing
+    // rather than dialing anything (the whole handoff is tested separately).
     let out = client.run(&["machines", "add"]);
     assert_eq!(out.code, 2, "`machines add`: {}", out.all());
-    assert!(out.stderr.contains("T-0058"), "{}", out.all());
+    assert!(out.stderr.contains("pairing code"), "{}", out.all());
 }
 
 /// The offline path: rows are still printed, labelled, and never silently
@@ -585,6 +715,223 @@ fn rename_and_remove_write_the_directory_and_never_leave_partial_state() {
         "an unreachable relay means the write did not happen: {}",
         out.all()
     );
+}
+
+/// The whole point (T-0058): a machine that has never seen this account joins it
+/// with one command, and the account can see it afterwards.
+///
+/// Three real processes: the relay (router **and** pairing mailbox), the
+/// admitting machine's `arreo pair`, and the joining machine's
+/// `arreo machines add`. Nothing is stubbed, because the claim under test is
+/// exactly the handoff between them.
+#[test]
+fn add_takes_a_new_machine_into_the_account() {
+    let relay = Relay::start_with_mailbox("add");
+    let root = RootKey::generate().expect("entropy");
+    relay.register_account("acct-1", &root.public());
+
+    // The admitting machine: it holds the account root (the only key that can
+    // issue a certificate the relay will verify) and it knows the relay.
+    let adm = Client::new("add-admitter", &relay, "acct-1");
+    adm.identify(
+        &root,
+        &DeviceKey::generate().expect("entropy"),
+        "admitting",
+        1,
+    );
+    root.save(&adm.dir.join("identity").join("root.key"))
+        .expect("the account root key belongs to the admitting machine");
+
+    // It shows a code. The invite must carry the account and the relay, or the
+    // joining machine has nowhere to register.
+    let mut pairing = PairingServer::start(&adm, &relay);
+    let invite = pairing.invite();
+    let code = invite["code"].as_str().expect("code").to_string();
+    let uri = invite["uri"].as_str().expect("uri").to_string();
+    let parsed = arreo_core::pairing::Invite::parse_uri(&uri).expect("the invite parses");
+    assert_eq!(
+        parsed.directory.as_ref().map(|d| d.account.as_str()),
+        Some("acct-1"),
+        "the admitting machine's [relay] section must reach the invite: {uri}"
+    );
+    assert_eq!(
+        parsed.directory.as_ref().map(|d| d.relay.as_str()),
+        Some(relay.addr.to_string().as_str()),
+        "{uri}"
+    );
+
+    // The joining machine: a fresh identity directory, no configuration, no
+    // relay of its own — everything it needs is in the invite.
+    let joined = Client::new_bare("add-joiner");
+    let out = joined.run(&["machines", "add", &code, "--uri", &uri, "--name", "the-pi"]);
+    assert_eq!(out.code, 0, "joining must succeed: {}", out.all());
+    let text = out.all();
+    assert!(
+        text.contains("the-pi"),
+        "the granted name is reported: {text}"
+    );
+    assert!(
+        text.contains("joined as"),
+        "the device it is now known as: {text}"
+    );
+
+    // It has an identity now — the claim `add` makes about the machine.
+    let identity = joined.dir.join("identity");
+    assert!(
+        identity.join("device.key").exists(),
+        "a device key was saved"
+    );
+    let cert = client_cert(&joined);
+    assert_eq!(cert.name(), "the-pi");
+    assert!(
+        identity.join("server.key").exists(),
+        "the server key is pinned"
+    );
+
+    // And the account can see the machine, read by an independent third device.
+    let reader_key = DeviceKey::generate().expect("entropy");
+    let reader_cert = DeviceCert::issue(
+        &root,
+        &reader_key.public(),
+        "reader",
+        Role::Viewer,
+        1_000,
+        7,
+    );
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let listed = runtime.block_on(async {
+        let session = RelaySession::dial(relay.addr, "acct-1", &reader_key, &reader_cert)
+            .await
+            .expect("the reader registers");
+        session.machines(false).await.expect("the relay answers")
+    });
+    assert_eq!(
+        listed.machines.len(),
+        1,
+        "the joining machine asserted its own row: {:?}",
+        listed.machines
+    );
+    assert_eq!(listed.machines[0].name.as_str(), "the-pi");
+    // The row is keyed by the *joining* machine's own root key: it registered
+    // itself, rather than the admitting machine registering it.
+    // The machine's own key, durable: `add` must persist it, or the row it just
+    // wrote would be keyed by a key that vanishes with the process.
+    let root_path = identity.join("root.key");
+    assert!(root_path.exists(), "the joined machine's key was saved");
+    let joined_root = RootKey::load_or_generate(&root_path).expect("joined root key");
+    assert_eq!(
+        listed.machines[0].machine_id,
+        arreo_core::mesh::MachineId::from_key(&joined_root.public()),
+        "the machine asserted its own identity, not one assigned to it"
+    );
+    assert_ne!(
+        listed.machines[0].machine_id,
+        arreo_core::mesh::MachineId::from_key(&root.public()),
+        "and it is not the admitting machine"
+    );
+
+    let result = pairing.result();
+    assert_eq!(result["paired"], serde_json::json!(true), "{result}");
+    assert_eq!(result["name"], serde_json::json!("the-pi"));
+}
+
+/// A colliding name is suffixed, not refused: T-0043's rule for a *claim*, and
+/// the joining machine is told which name it actually got.
+#[test]
+fn add_reports_the_name_the_relay_actually_granted() {
+    let relay = Relay::start_with_mailbox("add-collide");
+    let root = RootKey::generate().expect("entropy");
+    relay.register_account("acct-1", &root.public());
+    let adm = Client::new("add-collide-admitter", &relay, "acct-1");
+    adm.identify(
+        &root,
+        &DeviceKey::generate().expect("entropy"),
+        "admitting",
+        1,
+    );
+    root.save(&adm.dir.join("identity").join("root.key"))
+        .expect("root key");
+
+    // A machine already holds "workbox", registered the ordinary way.
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let seed_key = DeviceKey::generate().expect("entropy");
+    let seed_cert = DeviceCert::issue(&root, &seed_key.public(), "seed", Role::Owner, 1_000, 2);
+    runtime.block_on(async {
+        let session = RelaySession::dial(relay.addr, "acct-1", &seed_key, &seed_cert)
+            .await
+            .expect("the seed registers");
+        join_machine(
+            &session,
+            &RootKey::generate().expect("entropy"),
+            "acct-1",
+            "workbox",
+        )
+        .await;
+    });
+
+    let mut pairing = PairingServer::start(&adm, &relay);
+    let invite = pairing.invite();
+    let code = invite["code"].as_str().expect("code").to_string();
+    let uri = invite["uri"].as_str().expect("uri").to_string();
+
+    let joined = Client::new_bare("add-collide-joiner");
+    let out = joined.run(&["machines", "add", &code, "--uri", &uri, "--name", "workbox"]);
+    assert_eq!(out.code, 0, "{}", out.all());
+    let text = out.all();
+    assert!(
+        text.contains("workbox-2"),
+        "the granted name is the suffixed one, and it is reported: {text}"
+    );
+    assert!(
+        text.contains("was taken"),
+        "and the reason is stated, so the operator is not left guessing: {text}"
+    );
+    let _ = pairing.result();
+}
+
+/// An invite with no account or relay cannot join anything, and says so before
+/// it burns the pairing session.
+#[test]
+fn add_refuses_an_invite_that_names_no_account() {
+    let relay = Relay::start_with_mailbox("add-noaccount");
+    let root = RootKey::generate().expect("entropy");
+    relay.register_account("acct-1", &root.public());
+    // An admitting machine with **no** relay configuration: its invite is an
+    // ordinary pairing invite.
+    let adm = Client::new_bare("add-noaccount-admitter");
+    root.save(&adm.dir.join("identity").join("root.key"))
+        .expect("root key");
+    adm.identify(
+        &root,
+        &DeviceKey::generate().expect("entropy"),
+        "admitting",
+        1,
+    );
+
+    let mut pairing = PairingServer::start(&adm, &relay);
+    let invite = pairing.invite();
+    let code = invite["code"].as_str().expect("code").to_string();
+    let uri = invite["uri"].as_str().expect("uri").to_string();
+    assert!(
+        !uri.contains("&a="),
+        "no relay configured means no directory hint: {uri}"
+    );
+
+    let joined = Client::new_bare("add-noaccount-joiner");
+    let out = joined.run(&["machines", "add", &code, "--uri", &uri]);
+    assert_eq!(
+        out.code,
+        4,
+        "there is nothing to join, and the machine is told why: {}",
+        out.all()
+    );
+    assert!(out.stderr.contains("names no account"), "{}", out.all());
 }
 
 /// A relay that is not configured at all is exit 4 with a message that says

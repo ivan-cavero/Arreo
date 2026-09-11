@@ -9,6 +9,7 @@ arreo machines list   [--json] [--all] [--offline] [--config PATH]
 arreo machines status [<name>] [--json] [--offline] [--config PATH]
 arreo machines rename <old> <new> [--config PATH]
 arreo machines remove <name> [--stale] [--force] [--config PATH]
+arreo machines add    <pairing-code> --uri <invite> [--name N]
 ```
 
 Both verbs read the relay **directly** with this machine's paired device
@@ -136,10 +137,50 @@ tombstone expires. The output says until when. Two things make it deliberate:
 than accepted and ignored: the write verbs print one line, which is not a
 contract, and a write cannot answer from memory.
 
-## Not implemented yet
+## Joining: `add`
 
-`add <pairing-code>` — the join handoff. A row is claimed by a signature the
-machine makes over its own key, and a four-word pairing code authenticates a
-pairing *session*, not a machine: it carries neither the key nor the account's
-coordinates. Deciding how the invite carries those is T-0058. `machines add`
-refuses with exit 2 and names the reason.
+```console
+# on the machine that already belongs (it holds the account root):
+arreo pair --config /etc/arreo/arreo.toml       # prints a code and an invite
+
+# on the machine being admitted (no configuration needed):
+arreo machines add "four word phrase" --uri 'arreo://pair?v=1&…' --name the-pi
+```
+
+`add` runs on the machine being **admitted**, and it is the last piece of
+"machines are first-class citizens": one code, one invite, and the machine is in
+the account. The invite carries the account and the relay because the joining
+machine has no configuration to read — it is joining *because* it has none, and
+the machine that admits it is the only party that knows both. The reasoning, and
+the alternatives rejected, are in
+[ADR 0018](../specs/adr/0018-machine-join-handoff.md).
+
+What happens, in order:
+
+1. The SPAKE2 pairing exchange — the same one `arreo pair --join` runs — issues
+   this machine a **certificate** signed by the account root. Only a machine that
+   holds that root can issue one the relay will accept, which is why the
+   admitting side must be a machine that already belongs.
+2. The certificate and its device key are saved, and the admitting machine's key
+   is pinned. Nothing is written until the certificate verifies.
+3. The machine connects to the relay and asserts **its own** directory row, under
+   **its own** root key. Being admitted and being registered are two different
+   things, and only the second makes it visible to the account.
+
+It prints the device it is now known as, the granted name, and its machine id.
+If the name was live for another machine, T-0043's rule gives the deterministic
+suffix and `add` says so — the granted name is what is true.
+
+Refusals, and what they mean:
+
+| Exit | Situation |
+| --- | --- |
+| 2 | no code, no `--uri`, a malformed invite, or a flag that belongs to another verb |
+| 4 | the invite names no account and relay (the admitting machine had no `[relay]` configuration), or the relay named in it cannot be reached |
+| 5 | the relay would not register the machine (a name the rule rejects) |
+| 1 | the pairing exchange itself failed — a wrong or expired code, or an unreachable mailbox |
+
+A machine that is admitted but cannot reach the relay keeps its certificate and
+is told so; run `arreo machines add` again with a fresh code once the relay is
+reachable. Pairing codes are single-use (T-0024), so re-joining always takes a new
+one.

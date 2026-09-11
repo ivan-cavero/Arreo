@@ -36,11 +36,6 @@ pub const CONFLICT: u8 = 5;
 /// build rather than a surprise.
 pub const SCHEMA: u32 = 1;
 
-fn fail(code: u8, message: &str) -> ExitCode {
-    eprintln!("machines: {message}");
-    ExitCode::from(code)
-}
-
 /// Dispatch `arreo machines <verb>`.
 pub fn run(rest: &[String]) -> ExitCode {
     let Some(verb) = rest.first().map(String::as_str) else {
@@ -52,17 +47,7 @@ pub fn run(rest: &[String]) -> ExitCode {
         "status" => crate::rt::block_on(status(args)),
         "rename" => crate::rt::block_on(rename(args)),
         "remove" => crate::rt::block_on(remove(args)),
-        // Named with the reason rather than answered with a stub: a verb that
-        // looks implemented and silently does nothing is worse than one that
-        // says what is missing. `add` needs the account handoff the pairing
-        // protocol does not carry yet (T-0058).
-        "add" => fail(
-            USAGE,
-            "`machines add` is not implemented yet: a row is claimed by a signature the machine \
-             makes over its own key, and the pairing code carries neither that key nor the \
-             account's coordinates — deciding the handoff is T-0058. Run `machines add` on the \
-             joining machine once T-0058 lands",
-        ),
+        "add" => crate::rt::block_on(add(args)),
         other => {
             eprintln!("machines: unknown verb {other:?}");
             usage()
@@ -75,6 +60,7 @@ fn usage() -> ExitCode {
     eprintln!("       arreo machines status [<name>] [--json] [--offline] [--config PATH]");
     eprintln!("       arreo machines rename <old> <new> [--config PATH]");
     eprintln!("       arreo machines remove <name> [--stale] [--force] [--config PATH]");
+    eprintln!("       arreo machines add <pairing-code> --uri <invite> [--name N]");
     eprintln!();
     eprintln!(
         "  --json     the script contract (schema {SCHEMA}); the human table is NOT one and may"
@@ -84,10 +70,13 @@ fn usage() -> ExitCode {
     eprintln!("  --offline  never contact the relay; answer from the last known rows (exit 0)");
     eprintln!("  --config   the file with the [relay] section (also $ARREO_CONFIG)");
     eprintln!("  --stale    remove every machine the presence rule calls stale (T-0043's rule)");
+    eprintln!(
+        "  --uri      (add) the invite the admitting machine printed: it carries the mailbox,"
+    );
+    eprintln!("             the session, its key, and the account and relay to join");
     eprintln!("  --force    tombstone a machine that is answering right now (asks once otherwise)");
     eprintln!();
-    eprintln!("not yet implemented: add <pairing-code> [--name N]   (the join handoff, T-0058)");
-    eprintln!();
+
     eprintln!(
         "exit codes: {OK} ok · {USAGE} usage · {UNKNOWN_MACHINE} unknown machine · \
          {UNREACHABLE} relay unreachable · {CONFLICT} name conflict or trust refusal"
@@ -103,6 +92,11 @@ struct Options {
     stale: bool,
     force: bool,
     config: Option<PathBuf>,
+    /// `--name`: the name to use, for the one verb that takes a name as a flag
+    /// rather than positionally (`add`, where the positional is the code).
+    name_flag: Option<String>,
+    /// `--uri`: the pairing invite (`add` only).
+    uri: Option<String>,
     /// The positional argument, when the verb takes one — or, for `rename`,
     /// the first of the two.
     name: Option<String>,
@@ -117,6 +111,8 @@ fn parse(verb: &str, args: &[String], allow_name: bool) -> Result<Options, ExitC
         stale: false,
         force: false,
         config: None,
+        name_flag: None,
+        uri: None,
         name: None,
         second: None,
     };
@@ -130,6 +126,16 @@ fn parse(verb: &str, args: &[String], allow_name: bool) -> Result<Options, ExitC
             "--force" => options.force = true,
             "--config" if i + 1 < args.len() => {
                 options.config = Some(PathBuf::from(&args[i + 1]));
+                i += 2;
+                continue;
+            }
+            "--name" if i + 1 < args.len() => {
+                options.name_flag = Some(args[i + 1].clone());
+                i += 2;
+                continue;
+            }
+            "--uri" if i + 1 < args.len() => {
+                options.uri = Some(args[i + 1].clone());
                 i += 2;
                 continue;
             }
@@ -468,6 +474,9 @@ async fn list(args: &[String]) -> ExitCode {
         Ok(options) => options,
         Err(code) => return code,
     };
+    if let Err(code) = refuse_unused(&options, "list") {
+        return code;
+    }
     let now = now_ms();
     let answer = match read(&options).await {
         Ok(answer) => answer,
@@ -496,6 +505,9 @@ async fn status(args: &[String]) -> ExitCode {
         Ok(options) => options,
         Err(code) => return code,
     };
+    if let Err(code) = refuse_unused(&options, "status") {
+        return code;
+    }
     let now = now_ms();
     let answer = match read(&options).await {
         Ok(answer) => answer,
@@ -535,6 +547,24 @@ async fn status(args: &[String]) -> ExitCode {
     ExitCode::from(OK)
 }
 
+/// Refuse a flag this verb does not read.
+///
+/// The parser knows every flag; a verb reads a subset. Accepting one and
+/// ignoring it is the failure mode this guards: the caller believes something
+/// happened. Every verb that does not read `--name`/`--uri` calls this.
+fn refuse_unused(options: &Options, verb: &str) -> Result<(), ExitCode> {
+    for (present, flag) in [
+        (options.name_flag.is_some(), "--name"),
+        (options.uri.is_some(), "--uri"),
+    ] {
+        if present {
+            eprintln!("machines {verb}: {flag} belongs to another verb");
+            return Err(usage());
+        }
+    }
+    Ok(())
+}
+
 /// A flag that only makes sense for the read verbs, if the caller passed one.
 ///
 /// `--json` is the read verbs' contract (the write verbs print one line, which is
@@ -548,6 +578,171 @@ fn read_only_flag(options: &Options) -> Option<&'static str> {
         Some("--offline")
     } else {
         None
+    }
+}
+
+/// `arreo machines add <pairing-code> --uri <invite>`: join an account.
+///
+/// This runs on the machine being **admitted** — the one that has no identity
+/// yet — which is why the invite carries the account and relay (T-0058): it
+/// cannot read them from its own configuration, and the machine that admits it
+/// (holding the account root, which is the only key that can issue a certificate
+/// the relay will accept) is the one that put them there. The exchange is the
+/// same SPAKE2 pairing `arreo pair --join` runs; what `add` does afterwards is
+/// assert this machine's own directory row (T-0056) and report what the
+/// directory granted.
+async fn add(args: &[String]) -> ExitCode {
+    let options = match parse("add", args, true) {
+        Ok(options) => options,
+        Err(code) => return code,
+    };
+    // The positional is the code here, and the name travels as a flag — so the
+    // slots the other verbs use positionally must be empty, and saying which one
+    // is extra beats reading the wrong word as a code.
+    if options.second.is_some() {
+        eprintln!(
+            "machines add: too many arguments (usage: machines add <pairing-code> --uri <invite>)"
+        );
+        return usage();
+    }
+    let Some(code) = options.name.clone() else {
+        eprintln!("machines add: needs the pairing code the admitting machine displayed");
+        return usage();
+    };
+    let Some(uri) = options.uri.clone() else {
+        eprintln!(
+            "machines add: needs --uri (the invite the admitting machine printed, which carries \
+             the mailbox, the session and its key)"
+        );
+        return usage();
+    };
+    if let Some(flag) = read_only_flag(&options) {
+        eprintln!(
+            "machines add: {flag} belongs to the read verbs; joining must reach the admitting \
+             machine"
+        );
+        return ExitCode::from(USAGE);
+    }
+
+    // The pairing exchange, and the certificate. Only success writes anything.
+    let (paired, invite) = match crate::join_pairing(&code, &uri, options.name_flag.clone()) {
+        Ok(pair) => pair,
+        Err(crate::PairError::Usage(message)) => {
+            eprintln!("machines add: {message}");
+            return usage();
+        }
+        Err(crate::PairError::Failed(message)) => {
+            eprintln!("machines add: {message}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let Some(directory) = invite.directory else {
+        eprintln!(
+            "machines add: this invite names no account and relay, so there is nothing to join \
+             (the admitting machine printed it without a [relay] configuration). Ask it to run \
+             `arreo pair` again, with its relay configured, or use `arreo pair --join` for an \
+             ordinary pairing"
+        );
+        return ExitCode::from(UNREACHABLE);
+    };
+    let addr: std::net::SocketAddr = match directory.relay.parse() {
+        Ok(addr) => addr,
+        Err(e) => {
+            eprintln!(
+                "machines add: the invite names the relay as {:?}, which is not an IP:PORT \
+                 address: {e}",
+                directory.relay
+            );
+            return ExitCode::from(USAGE);
+        }
+    };
+
+    // Register with the relay using the identity just issued, then assert this
+    // machine's row under its **own** root key: the row is keyed by a key this
+    // machine holds (T-0056), so being admitted and being registered are two
+    // distinct things and only the second makes it visible to the account.
+    let session = match arreo_core::relay::session::RelaySession::dial(
+        addr,
+        &directory.account,
+        &paired.key,
+        &paired.cert,
+    )
+    .await
+    {
+        Ok(session) => session,
+        Err(e) => {
+            eprintln!(
+                "machines add: joined the account's devices, but cannot reach the relay at \
+                 {addr} to register this machine: {e}"
+            );
+            return ExitCode::from(UNREACHABLE);
+        }
+    };
+    let root = match arreo_core::identity::RootKey::load_or_generate(&crate::root_key_path()) {
+        Ok(root) => root,
+        Err(e) => {
+            eprintln!("machines add: cannot read this machine's key: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let fingerprint = arreo_core::mesh::MachineId::from_key(&root.public());
+    let requested = options
+        .name_flag
+        .clone()
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or_else(arreo_core::mesh::default_machine_name);
+    let machine_key = root.public_hex();
+    let payload = arreo_core::relay::join_proof_payload(
+        session.nonce(),
+        &session.account(),
+        &machine_key,
+        &requested,
+    );
+    let request = arreo_core::relay::JoinRequest {
+        v: arreo_core::relay::RELAY_VERSION,
+        name: requested.clone(),
+        proto_version: arreo_core::proto::VERSION,
+        machine_key,
+        signature: root.sign(&payload).to_bytes().to_vec(),
+    };
+    match session.join_machine(request).await {
+        Ok(reply) => match (reply.refused, reply.granted) {
+            (Some(reason), _) => {
+                eprintln!("machines add: the relay would not register this machine: {reason}");
+                ExitCode::from(CONFLICT)
+            }
+            (None, Some(row)) => {
+                let granted = row.name.as_str();
+                if granted == requested {
+                    println!(
+                        "joined as {} ({granted})",
+                        paired.cert.device().display_id()
+                    );
+                } else {
+                    // T-0043's rule: the name was live for another machine, so
+                    // this one got the deterministic suffix. Saying so is what
+                    // keeps "why is my machine called workbox-2" from being a
+                    // mystery — and the granted name is what is true, never the
+                    // one that was asked for.
+                    println!(
+                        "joined as {} ({granted} — {requested:?} was taken, so the relay added \
+                         the suffix)",
+                        paired.cert.device().display_id()
+                    );
+                }
+                println!("machine:  {granted}");
+                println!("id:       {}", fingerprint.as_str());
+                ExitCode::from(OK)
+            }
+            (None, None) => {
+                eprintln!("machines add: the relay answered a join without a row");
+                ExitCode::from(CONFLICT)
+            }
+        },
+        Err(e) => {
+            eprintln!("machines add: the relay did not answer: {e}");
+            ExitCode::from(UNREACHABLE)
+        }
     }
 }
 
@@ -642,6 +837,9 @@ async fn rename(args: &[String]) -> ExitCode {
         Ok(options) => options,
         Err(code) => return code,
     };
+    if let Err(code) = refuse_unused(&options, "rename") {
+        return code;
+    }
     let (Some(old), Some(new)) = (options.name.clone(), options.second.clone()) else {
         eprintln!("machines rename: needs the current name and the new one");
         return usage();
@@ -697,6 +895,9 @@ async fn remove(args: &[String]) -> ExitCode {
         Ok(options) => options,
         Err(code) => return code,
     };
+    if let Err(code) = refuse_unused(&options, "remove") {
+        return code;
+    }
     if let Some(flag) = read_only_flag(&options) {
         eprintln!(
             "machines remove: {flag} belongs to the read verbs; a write must reach the relay"
@@ -1017,30 +1218,74 @@ mod tests {
         assert_eq!(row.age_secs(25_000), 5);
     }
 
-    /// The verb whose transport does not exist yet says so and exits 2 — a stub
-    /// that looked implemented would be the dishonest answer — and the two verbs
-    /// that *are* implemented refuse `--json` rather than accepting a flag that
-    /// would do nothing.
+    /// A flag a verb does not read is refused, never accepted and ignored: the
+    /// caller would otherwise believe something happened.
     #[test]
-    fn only_add_is_still_missing_and_json_is_refused_where_it_is_not_a_contract() {
-        assert_eq!(
-            run(&["add".to_string()]),
-            ExitCode::from(USAGE),
-            "`machines add` must refuse rather than pretend"
-        );
+    fn a_flag_belongs_to_one_verb_or_none() {
+        // `--json` is the read verbs' contract; the write verbs print one line.
         for verb in ["rename", "remove"] {
-            let code = run(&[verb.to_string(), "--json".to_string()]);
             assert_eq!(
-                code,
+                run(&[verb.to_string(), "--json".to_string()]),
                 ExitCode::from(USAGE),
                 "`machines {verb} --json` claims a contract this verb does not have"
             );
         }
-        // `rename` with one name is a usage error, and it does not reach the
-        // network (a unit test has no relay, so reaching it would hang).
+        // `--uri` is `add`'s alone.
+        for verb in ["list", "status", "rename", "remove"] {
+            assert_eq!(
+                run(&[
+                    verb.to_string(),
+                    "--uri".to_string(),
+                    "arreo://pair?v=1".to_string()
+                ]),
+                ExitCode::from(USAGE),
+                "`machines {verb} --uri` is another verb's flag"
+            );
+        }
+        // `--name` is `add`'s; `rename` takes its names positionally.
         assert_eq!(
-            run(&["rename".to_string(), "one".to_string()]),
+            run(&[
+                "rename".to_string(),
+                "old".to_string(),
+                "new".to_string(),
+                "--name".to_string(),
+                "nope".to_string()
+            ]),
             ExitCode::from(USAGE)
+        );
+    }
+
+    /// `add` needs a code *and* an invite, and says which is missing rather than
+    /// dialing anything: a unit test has no relay, so a missing check would hang
+    /// rather than fail.
+    #[test]
+    fn add_asks_for_the_code_and_the_invite() {
+        assert_eq!(run(&["add".to_string()]), ExitCode::from(USAGE));
+        assert_eq!(
+            run(&["add".to_string(), "four words".to_string()]),
+            ExitCode::from(USAGE),
+            "a code without an invite cannot find the admitting machine"
+        );
+        assert_eq!(
+            run(&[
+                "add".to_string(),
+                "four words".to_string(),
+                "--uri".to_string(),
+                "not an invite".to_string()
+            ]),
+            ExitCode::from(USAGE),
+            "a malformed invite is refused before any exchange"
+        );
+        assert_eq!(
+            run(&[
+                "add".to_string(),
+                "four words".to_string(),
+                "extra".to_string(),
+                "--uri".to_string(),
+                "arreo://pair?v=1".to_string()
+            ]),
+            ExitCode::from(USAGE),
+            "one code, one invite, nothing else"
         );
     }
 

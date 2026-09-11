@@ -1,0 +1,76 @@
+# T-0058 evidence — the machine join handoff (`arreo machines add`)
+
+## 1. Three real processes: the relay (router + pairing mailbox), the admitting
+##    machine's `arreo pair`, the joining machine's `arreo machines add`
+
+$ cargo test -p arreo-cli --test machines
+
+test an_unpaired_client_is_told_what_is_missing ... ok
+test the_test_config_is_one_the_shared_loader_accepts ... ok
+test a_missing_relay_configuration_is_exit_4 ... ok
+test add_refuses_an_invite_that_names_no_account ... ok
+test add_takes_a_new_machine_into_the_account ... ok
+test add_reports_the_name_the_relay_actually_granted ... ok
+test list_and_status_read_the_accounts_directory ... ok
+test rename_and_remove_write_the_directory_and_never_leave_partial_state ... ok
+test an_unreachable_relay_answers_from_the_cache_and_says_so ... ok
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 21.11s
+
+## 2. The invite carries the hint, and the row belongs to the joining machine
+
+The [relay] section reaches the invite URI (&a=&r=), the joining machine
+asserts its OWN row (keyed by its own root key, not the admitting machine's),
+and a colliding name comes back suffixed with the reason stated.
+
+## 3. Both halves proved to fail when their code is removed
+
+error: command not found: add
+Removing the directory-row assertion from :
+  add_takes_a_new_machine_into_the_account FAILED
+    -> 'the joining machine asserted its own row: []'
+Removing the directory hint from the invite (pair emits none):
+  add_takes_a_new_machine_into_the_account FAILED
+    -> 'the admitting machine's [relay] section must reach the invite'
+Both restored.
+
+## 4. The pairing flow it reuses is unchanged from the outside
+
+$ cargo test -p arreo-cli --test pairing
+test a_phone_that_arrives_after_the_window_is_told_so ... ok
+test pairing_reports_useful_errors_for_bad_arguments ... ok
+test a_wrong_code_leaves_no_trace_on_the_phone_and_burns_the_session ... ok
+test two_real_processes_pair_with_a_four_word_code ... ok
+test an_unanswered_pairing_expires_instead_of_hanging ... ok
+test sessions_are_isolated_from_each_other ... ok
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.54s
+
+## 5. The invite's new fields are additive
+
+test pairing::flow::tests::a_partial_or_bad_invite_is_refused ... ok
+test pairing::flow::tests::the_directory_hint_round_trips_and_is_all_or_nothing ... ok
+test pairing::flow::tests::the_invite_uri_round_trips_and_carries_no_code ... ok
+test result: ok. 21 passed; 0 failed; 0 ignored; 0 measured; 107 filtered out; finished in 0.14s
+
+## 6. The full battery (final code)
+
+cargo test --workspace: 416 passed, 0 failed across 52 targets
+cargo clippy --workspace --all-targets -- -D warnings: 0 diagnostics
+cargo fmt --all -- --check: clean
+cargo vet --locked: Vetting Succeeded (336 exempted)
+cargo deny check: advisories ok, bans ok, licenses ok, sources ok
+cargo audit: no advisories
+cargo xtask check-targets: x86_64-unknown-linux-gnu PASS; x86_64-pc-windows-msvc SKIP (pure-Rust no-sqlite PASS)
+e2e slices: api green, compat green, lifecycle 2/2, persistence 3/3, enforcement passed, tui 18/18, theme 27/27, relay 14/14
+cargo xtask bench: 6/6 PASS (13 MB RSS, 211 KB/pane, 0 ms detection, 71 ms sweep, 0 ms feed, 0 determinism)
+
+## 7. One bench reading under host contention, and why it is not a code signal
+
+A first bench run immediately after the slices reported sampler_sweep_30panes_ms
+= 307 ms against a 300 ms budget (and 730 ms for the whole 10-pane setup, vs
+385-488 ms in every prior run). The host is shared: load average 7.3 with
+unrelated processes (clickhouse, orca-ide, other checkouts) at 10-27% CPU.
+An isolated re-run under the same load average returned 71 ms - inside the
+65-83 ms band of every previous run. The metric is a wall-clock sweep over
+30 panes, so it measures contention as well as code; the confirming re-run is
+the number recorded above. T-0058 touches the pairing flow and the invite URI,
+nothing on the sampler path.
