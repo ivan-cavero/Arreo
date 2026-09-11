@@ -474,26 +474,44 @@ fn a_missing_relay_configuration_is_exit_4() {
     let client = Client::new("noconfig", &relay, "acct-1");
     let key = DeviceKey::generate().expect("entropy");
     client.identify(&root, &key, "laptop", 1);
+    // A configuration that names no relay (the file is gone, so the section is
+    // not there) is exit 4: the directory is unreachable and the machine says so.
     std::fs::remove_file(&client.config).expect("remove config");
-
-    let output = Command::new(binary("arreo"))
-        .args(["machines", "list", "--json"])
-        .env("ARREO_IDENTITY_DIR", &client.dir)
-        .env_remove("ARREO_CONFIG")
-        .output()
-        .expect("the CLI runs");
-    let code = output.status.code().unwrap_or(-1);
-    let text = String::from_utf8_lossy(&output.stderr).to_string();
+    let out = client.run_with_config(&["machines", "list", "--json"]);
     assert_eq!(
-        code, 4,
-        "no relay configured means the directory is unreachable: {text}"
+        out.code,
+        4,
+        "no relay configured means the directory is unreachable: {}",
+        out.all()
     );
-    assert!(text.contains("no relay is configured"), "{text}");
+    assert!(
+        out.stderr.contains("no relay is configured"),
+        "{}",
+        out.all()
+    );
+    assert!(
+        out.stderr.contains(&client.config.display().to_string()),
+        "and names the file it read: {}",
+        out.all()
+    );
 
     // The write verbs still refuse, before any of that.
     let out = client.run(&["machines", "rename", "pi", "pi-2"]);
     assert_eq!(out.code, 2, "{}", out.all());
     assert!(out.stderr.contains("T-0057"), "{}", out.all());
+
+    // And with no configuration named at all, the CLI asks for one instead of
+    // guessing a path: exit 2 (usage), naming both ways to supply it.
+    let output = Command::new(binary("arreo"))
+        .args(["machines", "list"])
+        .env("ARREO_IDENTITY_DIR", &client.dir)
+        .env_remove("ARREO_CONFIG")
+        .output()
+        .expect("the CLI runs");
+    assert_eq!(output.status.code().unwrap_or(-1), 2);
+    let text = String::from_utf8_lossy(&output.stderr).to_string();
+    assert!(text.contains("--config"), "{text}");
+    assert!(text.contains("ARREO_CONFIG"), "{text}");
 }
 
 /// A CLI with no paired identity cannot read the account, and says which file is

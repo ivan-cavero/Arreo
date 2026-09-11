@@ -78,12 +78,18 @@ device key.
 
 ## Configuration
 
-`--config PATH`, else `$ARREO_CONFIG`, else
-`$XDG_CONFIG_HOME/arreo/arreo.toml` (falling back to `~/.config/…`). The file is
-the same one the daemon reads, parsed by the same code
-(`arreo_core::relay::config`) — the dependency rule forbids the CLI depending on
-`arreo-server`, and a second parser would be a second answer to "what is a valid
-`[relay]` section".
+`--config PATH`, else `$ARREO_CONFIG` — and deliberately **no default path**,
+for the same reason the daemon has none: a CLI that invented its own
+`$XDG_CONFIG_HOME/arreo/arreo.toml` would be a second answer to "which file is
+this machine's relay configuration". The file is the same one the daemon reads,
+parsed by the same code (`arreo_core::relay::config`) — the dependency rule
+forbids the CLI depending on `arreo-server`, and a second parser would be a
+second answer to "what is a valid `[relay]` section".
+
+No configuration at all is exit 2 (the operator has to name the file). A
+configuration that names no relay — an absent file at the path given, no
+`[relay]` section, or `enabled = false` — is exit 4: the directory is
+unreachable and the machine knows why.
 
 ```toml
 [relay]

@@ -87,8 +87,7 @@ fn usage() -> ExitCode {
     eprintln!("             change at any time — parse --json, never the table");
     eprintln!("  --all      include names whose machines are gone (tombstoned)");
     eprintln!("  --offline  never contact the relay; answer from the last known rows (exit 0)");
-    eprintln!("  --config   the file with the [relay] section (also $ARREO_CONFIG, then");
-    eprintln!("             $XDG_CONFIG_HOME/arreo/arreo.toml)");
+    eprintln!("  --config   the file with the [relay] section (also $ARREO_CONFIG)");
     eprintln!();
     eprintln!();
     eprintln!("not yet implemented (the directory's write side over the wire is T-0057):");
@@ -401,8 +400,15 @@ fn paired_identity() -> Result<
     Ok((key, cert))
 }
 
-/// The configuration file to read: `--config`, then `ARREO_CONFIG`, then the
-/// conventional path.
+/// The configuration file to read: `--config`, then `$ARREO_CONFIG`.
+///
+/// **Deliberately no default path.** The daemon reads `--config`/`$ARREO_CONFIG`
+/// and nothing else (T-0051), and a CLI that invented its own
+/// `$XDG_CONFIG_HOME/arreo/arreo.toml` would be a second answer to "which
+/// configuration is this machine's relay configuration" — the same fact with two
+/// sources, which is the defect class this project keeps finding. If the daemon
+/// ever grows a default, this follows it; until then the operator names the file
+/// once, in the same way for both.
 fn config_path(options: &Options) -> Result<PathBuf, ExitCode> {
     if let Some(path) = &options.config {
         return Ok(path.clone());
@@ -410,24 +416,11 @@ fn config_path(options: &Options) -> Result<PathBuf, ExitCode> {
     if let Some(path) = std::env::var_os("ARREO_CONFIG") {
         return Ok(PathBuf::from(path));
     }
-    match default_config_path() {
-        Some(path) => Ok(path),
-        None => {
-            eprintln!(
-                "machines: no configuration file found; pass --config PATH (its [relay] section \
-                 names the relay and the account)"
-            );
-            Err(ExitCode::from(USAGE))
-        }
-    }
-}
-
-/// `$XDG_CONFIG_HOME/arreo/arreo.toml`, or `~/.config/arreo/arreo.toml`.
-fn default_config_path() -> Option<PathBuf> {
-    let base = std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))?;
-    Some(base.join("arreo").join("arreo.toml"))
+    eprintln!(
+        "machines: which configuration? pass --config PATH, or set ARREO_CONFIG (the [relay] \
+         section names the relay and the account)"
+    );
+    Err(ExitCode::from(USAGE))
 }
 
 fn now_ms() -> i64 {

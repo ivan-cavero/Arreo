@@ -59,3 +59,18 @@ Note: check-targets first FAILED for Windows after the [relay] config move — i
 pub mod config; between a #[cfg(feature = "transport")] attribute and the item it gated moved
 the gate onto config and off session. Fixed by declaring config ungated, before the
 attributed block; the gate is back on session and Windows passes the pure-Rust path.
+
+## 7. A second finding, fixed after the first battery run
+
+**The CLI must not invent a configuration default the daemon does not have.** The first version of
+`machines` fell back to `$XDG_CONFIG_HOME/arreo/arreo.toml` when neither `--config` nor `$ARREO_CONFIG`
+was given; the daemon reads `--config`/`$ARREO_CONFIG` and nothing else (T-0051). That is one fact —
+"which file is this machine's relay configuration" — with two sources, the defect class this project
+has hit six times. Removed, with the reason in the code:
+
+  no path named  -> exit 2, naming both --config and ARREO_CONFIG
+  a path named, but no [relay] section (or the file is gone, or enabled = false)
+                 -> exit 4, naming the file it read
+
+Re-verified on the final code: workspace 408 passed / 0 failed over 52 targets; clippy 0; fmt clean;
+vet 336 exempted; deny 4/4; audit 0 advisories; check-targets PASS/SKIP; 8 slices green; bench 6/6.
