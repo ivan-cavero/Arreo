@@ -37,6 +37,11 @@ struct RelaySection {
     /// ever serves its peers needs none.
     #[serde(default)]
     peer: Option<String>,
+    /// The name this machine claims in the account's directory (T-0056).
+    /// Optional: without it the machine uses its hostname, which is what an
+    /// operator would have typed.
+    #[serde(default)]
+    name: Option<String>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -51,6 +56,10 @@ pub struct RelaySettings {
     pub addr: SocketAddr,
     pub account: String,
     pub peer: Option<DeviceId>,
+    /// The name this machine asserts in the account's directory (T-0056). The
+    /// relay may grant the deterministic suffix instead, and the daemon logs
+    /// what it was actually granted.
+    pub name: String,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -112,10 +121,16 @@ pub fn load_config(path: &std::path::Path) -> Result<Option<RelaySettings>, Conf
                 .map_err(|e| incomplete(&format!("`peer` is not a device id: {e}")))?,
         ),
     };
+    let name = section
+        .name
+        .map(|name| name.trim().to_string())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(arreo_core::mesh::default_machine_name);
     Ok(Some(RelaySettings {
         addr,
         account,
         peer,
+        name,
     }))
 }
 
@@ -160,6 +175,8 @@ pub struct RelayContext {
     /// cheaper and makes it obvious there is still exactly one.
     pub device: Arc<DeviceKey>,
     pub cert: Arc<DeviceCert>,
+    /// The name this machine asserts in the account's directory (T-0056).
+    pub machine_name: String,
 }
 
 impl Clone for RelayContext {
@@ -171,6 +188,7 @@ impl Clone for RelayContext {
             db: self.db.clone(),
             device: Arc::clone(&self.device),
             cert: Arc::clone(&self.cert),
+            machine_name: self.machine_name.clone(),
         }
     }
 }
@@ -234,6 +252,95 @@ fn jitter_fraction() -> f64 {
     f64::from(nanos) / 1_000_000_000.0
 }
 
+/// Load this machine's root key, or `None` with a reason on the log.
+///
+/// The root key *is* the machine's directory identity (`MachineId::from_key`,
+/// T-0043): it is the one key that outlives device re-pairing, which is exactly
+/// what a directory entry must key on.
+fn machine_root_key() -> Option<arreo_core::identity::RootKey> {
+    match arreo_core::identity::RootKey::load_or_generate(&crate::transport::root_key_path()) {
+        Ok(key) => Some(key),
+        Err(e) => {
+            eprintln!("arreo-server: cannot read the machine root key for the directory: {e}");
+            None
+        }
+    }
+}
+
+/// The join request for this machine, signed over `nonce`.
+///
+/// The signature binds the machine key to *this* session's challenge, so a
+/// recorded join cannot be replayed onto another session (T-0056).
+fn join_request(
+    root: &arreo_core::identity::RootKey,
+    nonce: &[u8],
+    account: &str,
+    name: &str,
+) -> arreo_core::relay::JoinRequest {
+    let key_hex = root.public_hex();
+    let payload = arreo_core::relay::join_proof_payload(nonce, account, &key_hex, name);
+    arreo_core::relay::JoinRequest {
+        v: arreo_core::relay::RELAY_VERSION,
+        name: name.to_string(),
+        proto_version: arreo_core::proto::VERSION,
+        machine_key: key_hex,
+        signature: root.sign(&payload).to_bytes().to_vec(),
+    }
+}
+
+/// Everything a presence beat needs to re-assert the directory row.
+///
+/// `Clone` because the beat task owns one copy and the daemon's `machine_name`
+/// feeds the initial assertion separately.
+#[derive(Clone)]
+struct DirectoryRefresh {
+    root: std::sync::Arc<arreo_core::identity::RootKey>,
+    nonce: Vec<u8>,
+    account: String,
+    name: String,
+}
+
+/// Assert this machine's directory row, logging what the relay granted.
+async fn assert_directory_row(
+    root: &arreo_core::identity::RootKey,
+    session: &RelaySession,
+    name: &str,
+) {
+    let request = join_request(root, session.nonce(), &session.account(), name);
+    match session.join_machine(request).await {
+        Ok(reply) => match (reply.refused, reply.granted) {
+            (Some(reason), _) => {
+                eprintln!(
+                    "arreo-server: the relay would not register this machine in the \
+                     directory ({reason}); remote peers can still connect, but `arreo \
+                     machines` will not list this machine"
+                );
+            }
+            (None, Some(row)) => {
+                let granted = row.name.as_str();
+                if granted == name {
+                    eprintln!("arreo-server: directory: this machine is {granted}");
+                } else {
+                    // Not a failure: T-0043's rule gave a name that was already
+                    // live to the other machine and suffixed ours. Saying so is
+                    // what keeps "why is my machine called workbox-2" from being
+                    // a mystery.
+                    eprintln!(
+                        "arreo-server: directory: {name:?} was taken; this machine is \
+                         {granted} (the deterministic suffix)"
+                    );
+                }
+            }
+            (None, None) => {
+                eprintln!("arreo-server: the relay answered a join without a row");
+            }
+        },
+        Err(e) => {
+            eprintln!("arreo-server: could not register this machine in the directory: {e}");
+        }
+    }
+}
+
 /// Serve one live session: drain what was queued, accept peers, and if a peer is
 /// configured, open a session to it.
 async fn serve(mut session: RelaySession, context: &RelayContext, peer: Option<&DeviceId>) {
@@ -243,6 +350,24 @@ async fn serve(mut session: RelaySession, context: &RelayContext, peer: Option<&
     if let Err(e) = session.drain(1).await {
         eprintln!("arreo-server: cannot drain the relay inbox: {e}");
     }
+    // Register this machine in the account's directory (T-0056). Failure is not
+    // fatal: the machine keeps serving locally and through the relay, and says
+    // so — a directory the relay would not write is a problem an operator needs
+    // to see, not one that should stop the daemon.
+    //
+    // The root key is loaded once here and shared with the presence beat below:
+    // it is the machine's directory identity, so both paths must use the same
+    // key, and loading it twice would be two chances to disagree.
+    let root = machine_root_key().map(std::sync::Arc::new);
+    if let Some(root) = &root {
+        assert_directory_row(root, &session, &context.machine_name).await;
+    }
+    let refresh = root.map(|root| DirectoryRefresh {
+        root,
+        nonce: session.nonce().to_vec(),
+        account: session.account(),
+        name: context.machine_name.clone(),
+    });
     // The heartbeat (T-0031): a quiet machine must stay `online` too. A session
     // that only ever receives would otherwise age out while still connected, so
     // a task refreshes `last_seen_ms` on the stated cadence until the session
@@ -253,6 +378,7 @@ async fn serve(mut session: RelaySession, context: &RelayContext, peer: Option<&
     {
         let outbound = session.outbound_handle();
         let closed = session.closed_handle();
+        let refresh = refresh.clone();
         tokio::spawn(async move {
             use std::time::{SystemTime, UNIX_EPOCH};
             let nanos = SystemTime::now()
@@ -270,6 +396,21 @@ async fn serve(mut session: RelaySession, context: &RelayContext, peer: Option<&
                 }
                 if outbound.send_heartbeat().await.is_err() {
                     return;
+                }
+                // The machine's own row, on the same cadence (T-0056): the
+                // device's `last_seen_ms` and the machine's are different rows
+                // (T-0031 vs T-0043), and a directory that says a connected
+                // machine is offline is worse than no directory at all.
+                if let Some(refresh) = &refresh {
+                    let request = join_request(
+                        &refresh.root,
+                        &refresh.nonce,
+                        &refresh.account,
+                        &refresh.name,
+                    );
+                    if outbound.assert_machine(request).await.is_err() {
+                        return;
+                    }
                 }
                 wait = arreo_core::relay::session::heartbeat_delay(0.0);
             }

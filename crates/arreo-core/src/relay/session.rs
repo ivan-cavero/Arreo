@@ -38,7 +38,10 @@
 //! gap.
 
 use crate::identity::{DeviceCert, DeviceId, DeviceKey};
-use crate::relay::{ClientError, Incoming, Outcome, RelayClient, RelayReader, RelayWriter};
+use crate::relay::{
+    ClientError, DirectoryReply, Incoming, JoinRequest, MachinesRequest, Outcome, RelayClient,
+    RelayReader, RelayWriter, RELAY_VERSION,
+};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::pin::Pin;
@@ -46,7 +49,7 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, DuplexStream, ReadBuf};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 /// Largest plaintext chunk carried in one envelope.
@@ -95,6 +98,31 @@ pub enum SessionError {
     Closed,
     #[error("no stream to {0}")]
     NoStream(String),
+    #[error("the relay did not answer within {}s", DIRECTORY_TIMEOUT.as_secs())]
+    Timeout,
+}
+
+/// How long a directory request waits for its answer (T-0056).
+///
+/// Generous for a local round trip and short enough that a caller which asked
+/// for a name does not hold a machine's boot forever; a relay that answers later
+/// than this has a problem a longer wait would not fix.
+const DIRECTORY_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Park a reply slot under the sequence number its request will carry.
+fn park_reply(
+    pending: &Arc<Mutex<HashMap<u64, oneshot::Sender<DirectoryReply>>>>,
+    seq: u64,
+    waiter: oneshot::Sender<DirectoryReply>,
+) {
+    match pending.lock() {
+        Ok(mut map) => {
+            map.insert(seq, waiter);
+        }
+        Err(poisoned) => {
+            poisoned.into_inner().insert(seq, waiter);
+        }
+    }
 }
 
 /// The reconnect delay for one attempt, given a jitter fraction in `[0, 1)`.
@@ -128,6 +156,12 @@ enum Outbound {
     /// self: it reaches the relay's read loop, which is where the heartbeat is
     /// recorded, and no peer ever sees it.
     Heartbeat,
+    /// Assert this machine's directory row (T-0056), with the slot its reply
+    /// goes to.
+    Join(JoinRequest, oneshot::Sender<DirectoryReply>),
+    /// Read the account's machine directory (T-0056), with the slot its reply
+    /// goes to.
+    Machines(MachinesRequest, oneshot::Sender<DirectoryReply>),
 }
 
 /// One peer's stream state.
@@ -234,6 +268,14 @@ impl Closed {
 /// A live relay session, multiplexed across peers.
 pub struct RelaySession {
     device_id: DeviceId,
+    /// The account the relay confirmed at registration. Held because a join
+    /// proof is signed over it (T-0056): the signature must commit to the account
+    /// the relay will check it against, and taking it from the session is what
+    /// makes "the id we sent" and "the id we sign" the same value.
+    account: String,
+    /// This session's handshake challenge, so a caller can sign something bound
+    /// to *this* session (T-0056's join proof).
+    nonce: Vec<u8>,
     outbound: mpsc::Sender<Outbound>,
     peers: Arc<Mutex<Peers>>,
     new_peers: mpsc::Receiver<DeviceId>,
@@ -287,19 +329,29 @@ impl RelaySession {
 
     fn from_client(client: RelayClient) -> Self {
         let device_id = client.device_id().clone();
+        let account = client.account_id().to_string();
+        let nonce = client.nonce().to_vec();
         let (writer, reader) = client.into_split();
         let (outbound_tx, outbound_rx) = mpsc::channel::<Outbound>(PEER_QUEUE * 4);
         let (new_peers_tx, new_peers) = mpsc::channel::<DeviceId>(PEER_QUEUE);
         let closed = Arc::new(Closed::default());
         let peers: Arc<Mutex<Peers>> = Arc::new(Mutex::new(Peers::default()));
         let inflight: Arc<Mutex<HashMap<u64, String>>> = Arc::new(Mutex::new(HashMap::new()));
+        let pending_replies: Arc<Mutex<HashMap<u64, oneshot::Sender<DirectoryReply>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
 
-        let writer_task = tokio::spawn(write_pump(writer, outbound_rx, Arc::clone(&inflight)));
+        let writer_task = tokio::spawn(write_pump(
+            writer,
+            outbound_rx,
+            Arc::clone(&inflight),
+            Arc::clone(&pending_replies),
+        ));
         let reader_task = tokio::spawn(read_pump(
             reader,
             Arc::clone(&peers),
             new_peers_tx,
             Arc::clone(&inflight),
+            Arc::clone(&pending_replies),
         ));
         let pumps = vec![writer_task.abort_handle(), reader_task.abort_handle()];
 
@@ -318,6 +370,8 @@ impl RelaySession {
 
         Self {
             device_id,
+            account,
+            nonce,
             outbound: outbound_tx,
             peers,
             new_peers,
@@ -330,6 +384,18 @@ impl RelaySession {
     #[must_use]
     pub fn device_id(&self) -> &DeviceId {
         &self.device_id
+    }
+
+    /// This session's handshake challenge (T-0056).
+    #[must_use]
+    pub fn nonce(&self) -> &[u8] {
+        &self.nonce
+    }
+
+    /// The account this session registered under, as the relay confirmed it.
+    #[must_use]
+    pub fn account(&self) -> String {
+        self.account.clone()
     }
 
     /// Wait until the session ends (the relay went away, or the connection
@@ -365,6 +431,68 @@ impl RelaySession {
     /// interleave into one peer's Noise channel.
     pub fn stream_to(&self, peer: &DeviceId) -> RelayStream {
         stream_for(&self.outbound, &self.peers, peer)
+    }
+
+    /// Assert this machine's directory row without waiting for the answer.
+    ///
+    /// For the periodic refresh (T-0056): a presence beat must not block on a
+    /// reply, and the reply still has a slot — it is simply dropped, which is why
+    /// a refresh does not log as an unanswered request.
+    pub async fn assert_machine(&self, request: JoinRequest) -> Result<(), SessionError> {
+        let (tx, rx) = oneshot::channel();
+        drop(rx);
+        self.outbound
+            .send(Outbound::Join(request, tx))
+            .await
+            .map_err(|_| SessionError::Closed)
+    }
+
+    /// Assert this machine's directory row and return the relay's answer.
+    ///
+    /// Bounded: a relay that accepts the request and then says nothing costs
+    /// [`DIRECTORY_TIMEOUT`], not a caller blocked forever.
+    pub async fn join_machine(&self, request: JoinRequest) -> Result<DirectoryReply, SessionError> {
+        self.directory_request(Outbound::Join, request).await
+    }
+
+    /// Read the account's machine directory.
+    pub async fn machines(&self, all: bool) -> Result<DirectoryReply, SessionError> {
+        self.directory_request(
+            Outbound::Machines,
+            MachinesRequest {
+                v: RELAY_VERSION,
+                all,
+            },
+        )
+        .await
+    }
+
+    /// The reply slot is parked by the write pump, then filled by the read pump
+    /// (both hold the same map). A request that times out leaves its slot in the
+    /// map until a reply for that sequence number arrives; the entries are
+    /// bounded by the number of outstanding requests in one session, and the map
+    /// dies with the session.
+    async fn directory_request<F, T>(
+        &self,
+        wrap: F,
+        request: T,
+    ) -> Result<DirectoryReply, SessionError>
+    where
+        F: FnOnce(T, oneshot::Sender<DirectoryReply>) -> Outbound,
+        T: std::fmt::Debug,
+    {
+        // The slot exists before the request does: the write pump parks it under
+        // the reserved sequence number before the bytes leave.
+        let (tx, rx) = oneshot::channel();
+        self.outbound
+            .send(wrap(request, tx))
+            .await
+            .map_err(|_| SessionError::Closed)?;
+        match tokio::time::timeout(DIRECTORY_TIMEOUT, rx).await {
+            Ok(Ok(reply)) => Ok(reply),
+            Ok(Err(_)) => Err(SessionError::Closed),
+            Err(_) => Err(SessionError::Timeout),
+        }
     }
 
     /// A handle that can open peer streams on its own (see [`StreamFactory`]).
@@ -486,6 +614,15 @@ pub struct OutboundHandle {
 impl OutboundHandle {
     /// Send one heartbeat. Fails when the session is gone, which is the
     /// task's signal to exit.
+    pub async fn assert_machine(&self, request: JoinRequest) -> Result<(), SessionError> {
+        let (tx, rx) = oneshot::channel();
+        drop(rx);
+        self.outbound
+            .send(Outbound::Join(request, tx))
+            .await
+            .map_err(|_| SessionError::Closed)
+    }
+
     pub async fn send_heartbeat(&self) -> Result<(), SessionError> {
         self.outbound
             .send(Outbound::Heartbeat)
@@ -518,6 +655,7 @@ async fn write_pump(
     mut writer: RelayWriter,
     mut outbound: mpsc::Receiver<Outbound>,
     inflight: Arc<Mutex<HashMap<u64, String>>>,
+    pending_replies: Arc<Mutex<HashMap<u64, oneshot::Sender<DirectoryReply>>>>,
 ) {
     while let Some(item) = outbound.recv().await {
         let result = match item {
@@ -537,6 +675,20 @@ async fn write_pump(
             Outbound::Heartbeat => {
                 let this = writer.device_id().clone();
                 writer.send(&this, &[]).await.map(|_| None)
+            }
+            // Reserve the sequence number, park the reply slot, and only then
+            // put the bytes on the wire (T-0056). In that order: the relay can
+            // answer in the time it takes to await a write, and an answer that
+            // arrives before its slot exists is an answer nobody receives.
+            Outbound::Join(request, waiter) => {
+                let seq = writer.reserve_seq();
+                park_reply(&pending_replies, seq, waiter);
+                writer.join(seq, &request).await.map(|()| None)
+            }
+            Outbound::Machines(request, waiter) => {
+                let seq = writer.reserve_seq();
+                park_reply(&pending_replies, seq, waiter);
+                writer.machines(seq, &request).await.map(|()| None)
             }
         };
         match result {
@@ -563,6 +715,7 @@ async fn read_pump(
     peers: Arc<Mutex<Peers>>,
     new_peers: mpsc::Sender<DeviceId>,
     inflight: Arc<Mutex<HashMap<u64, String>>>,
+    pending_replies: Arc<Mutex<HashMap<u64, oneshot::Sender<DirectoryReply>>>>,
 ) {
     loop {
         let incoming = match reader.next().await {
@@ -658,6 +811,28 @@ async fn read_pump(
                         };
                         held.live.remove(&key);
                     }
+                }
+            }
+            Incoming::Directory(reply) => {
+                // Route by the sequence number the request carried. A reply with
+                // no waiter is a relay answering something this session did not
+                // ask (or a caller that gave up on a timeout): logged, never
+                // mis-delivered into an unrelated caller's hands (T-0056).
+                let waiter = {
+                    let mut map = match pending_replies.lock() {
+                        Ok(guard) => guard,
+                        Err(poisoned) => poisoned.into_inner(),
+                    };
+                    map.remove(&reply.seq)
+                };
+                match waiter {
+                    Some(waiter) => {
+                        let _ = waiter.send(reply);
+                    }
+                    None => eprintln!(
+                        "arreo-server: relay sent a directory reply for unknown request {}",
+                        reply.seq
+                    ),
                 }
             }
             Incoming::PeerGone(peer) => {

@@ -407,6 +407,28 @@ impl DirectoryCache {
     }
 }
 
+/// This machine's default name: its hostname, or a stable fallback.
+///
+/// One implementation, because two callers want it — the daemon asserting its
+/// directory row (T-0056) and the CLI naming a joining device (T-0044) — and two
+/// copies would be two spellings of the same fact waiting to drift. Reads
+/// `/etc/hostname` first (the file, not the environment: a shell that forgot to
+/// export `HOSTNAME` should not rename a machine), then `HOSTNAME`, then a fixed
+/// fallback so a container without either still gets a usable name.
+#[must_use]
+pub fn default_machine_name() -> String {
+    std::fs::read_to_string("/etc/hostname")
+        .ok()
+        .map(|text| text.trim().to_string())
+        .filter(|text| !text.is_empty())
+        .or_else(|| {
+            std::env::var("HOSTNAME")
+                .ok()
+                .filter(|text| !text.is_empty())
+        })
+        .unwrap_or_else(|| "machine".to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

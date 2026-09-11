@@ -18,14 +18,17 @@
 //!   core, and the router only carries the result. That is what keeps the trust
 //!   decision in one reviewed function rather than spread across a socket loop.
 
+use crate::directory::{Directory, JoinTicket};
 use crate::inbox::{Drained, Inbox, InboxError, InboxLimits};
 use crate::store::{RelayStore, StoreError};
 use arreo_core::identity::{DeviceId, VerifyingKey};
+use arreo_core::mesh::{MachineId, Name};
+use arreo_core::relay::join_proof_payload;
 use arreo_core::relay::{
     decode_message, decode_payload, encode_message, encode_payload, fresh_nonce, read_envelope,
-    read_frame, verify_auth, write_frame, Ack, Auth, AuthReply, DrainReport, DrainRequest, Hello,
-    HelloReply, Outcome, RelayEnvelope, RelayError, RelayHeader, RelayKind, MAX_HANDSHAKE_BYTES,
-    RELAY_SENDER, RELAY_VERSION,
+    read_frame, verify_auth, write_frame, Ack, Auth, AuthReply, DirectoryReply, DrainReport,
+    DrainRequest, Hello, HelloReply, JoinRequest, MachinesRequest, Outcome, RelayEnvelope,
+    RelayError, RelayHeader, RelayKind, MAX_HANDSHAKE_BYTES, RELAY_SENDER, RELAY_VERSION,
 };
 use arreo_core::transport::{accept_connection, Connection, Endpoint, HandshakeLimiter, QuicError};
 use std::collections::HashMap;
@@ -63,6 +66,12 @@ pub enum RouterError {
 pub struct Session {
     pub account_id: String,
     pub device_id: DeviceId,
+    /// The nonce this session's handshake issued. Kept alive past the handshake
+    /// because a `join` proof is signed over it (T-0056): replaying a recorded
+    /// join into a *different* session must fail, and binding the proof to the
+    /// session's own challenge is what makes that true without a second
+    /// challenge.
+    pub nonce: Vec<u8>,
 }
 
 impl Session {
@@ -90,6 +99,8 @@ enum Outbound {
     /// This device's peer went offline (T-0054): the named device is the one that
     /// left.
     PeerGone(DeviceId),
+    /// The answer to a `join` or `machines` request (T-0056).
+    Directory(DirectoryReply),
 }
 
 /// The live sessions, keyed by `(account, device)`.
@@ -218,6 +229,125 @@ impl Router {
         // blocking every other device's disconnect.
         for sender in notified {
             let _ = sender.try_send(Outbound::PeerGone(session.device_id.clone()));
+        }
+    }
+
+    /// Answer a machine's directory assertion (T-0056).
+    ///
+    /// Two cases, one kind: a machine the account already has refreshes its
+    /// presence (no ticket, no name rule — a reconnect must not need an
+    /// operator), and a machine the account does not have claims a name through
+    /// a ticket the relay mints here, applying T-0043's collision rule. The proof
+    /// is checked first either way, so a machine cannot refresh or claim a row
+    /// for a key it does not hold.
+    fn join(&self, session: &Session, request: &JoinRequest, seq: u64) -> DirectoryReply {
+        let refuse = |reason: String| DirectoryReply {
+            v: RELAY_VERSION,
+            seq,
+            granted: None,
+            machines: Vec::new(),
+            refused: Some(reason),
+        };
+
+        if request.v != RELAY_VERSION {
+            return refuse(format!(
+                "join speaks version {} (this relay speaks {RELAY_VERSION})",
+                request.v
+            ));
+        }
+        let Ok(key) = arreo_core::identity::keys::public_from_hex(&request.machine_key) else {
+            return refuse(format!(
+                "machine key {:?} is not a 32-byte hex public key",
+                request.machine_key
+            ));
+        };
+        if !verify_join_proof(
+            &key,
+            &session.nonce,
+            &session.account_id,
+            &request.machine_key,
+            &request.name,
+            &request.signature,
+        ) {
+            return refuse(
+                "the join proof does not verify: the signature is not by this machine key over \
+                 this session's challenge"
+                    .to_string(),
+            );
+        }
+        let machine = MachineId::from_key(&key);
+        let directory = Directory::new(self.store.clone());
+        let now = crate::directory::now_ms();
+
+        // Existing row: refresh presence. The name is *not* re-applied — a
+        // returning machine keeps the name it was granted, including a suffix it
+        // did not ask for.
+        let mine = directory
+            .list(&session.account_id, now)
+            .map(|rows| rows.into_iter().find(|row| row.machine_id == machine));
+        match mine {
+            Ok(Some(_)) => {
+                if let Err(e) = directory.heartbeat(&machine, now) {
+                    return refuse(format!("could not refresh the row: {e}"));
+                }
+                return match directory.list(&session.account_id, now) {
+                    Ok(rows) => DirectoryReply {
+                        v: RELAY_VERSION,
+                        seq,
+                        granted: rows.into_iter().find(|row| row.machine_id == machine),
+                        machines: Vec::new(),
+                        refused: None,
+                    },
+                    Err(e) => refuse(format!("could not read the row back: {e}")),
+                };
+            }
+            Ok(None) => {}
+            Err(e) => return refuse(format!("could not read the directory: {e}")),
+        }
+
+        let name = match Name::parse(&request.name) {
+            Ok(name) => name,
+            Err(e) => return refuse(format!("{:?} is not a machine name: {e}", request.name)),
+        };
+        let ticket = JoinTicket::issue(&session.account_id, now);
+        match directory.join(ticket, &machine, &name, request.proto_version, now) {
+            Ok(row) => DirectoryReply {
+                v: RELAY_VERSION,
+                seq,
+                granted: Some(row),
+                machines: Vec::new(),
+                refused: None,
+            },
+            Err(e) => refuse(format!("the relay would not admit this machine: {e}")),
+        }
+    }
+
+    /// Answer a directory read (T-0056). Presence comes from the same rule the
+    /// export uses — the relay computes it, never the client.
+    fn machines(&self, session: &Session, all: bool, seq: u64) -> DirectoryReply {
+        let directory = Directory::new(self.store.clone());
+        // One reading of the clock for the whole answer: two calls could straddle
+        // a tombstone expiring and return a list that is neither "with" nor
+        // "without" it.
+        let now = crate::directory::now_ms();
+        match directory.list(&session.account_id, now) {
+            Ok(rows) => DirectoryReply {
+                v: RELAY_VERSION,
+                seq,
+                granted: None,
+                machines: rows
+                    .into_iter()
+                    .filter(|row| all || !row.tombstone_active(now))
+                    .collect(),
+                refused: None,
+            },
+            Err(e) => DirectoryReply {
+                v: RELAY_VERSION,
+                seq,
+                granted: None,
+                machines: Vec::new(),
+                refused: Some(format!("could not read the directory: {e}")),
+            },
         }
     }
 
@@ -409,6 +539,7 @@ async fn handle_connection(connection: Connection, router: Arc<Router>) -> Resul
     let session = Session {
         account_id: device.account_id.clone(),
         device_id: device.device_id.clone(),
+        nonce: nonce.to_vec(),
     };
     router.store.touch_device(
         &session.account_id,
@@ -446,6 +577,9 @@ async fn handle_connection(connection: Connection, router: Arc<Router>) -> Resul
                 }
                 Outbound::PeerGone(departed) => {
                     peer_gone_envelope(&writer_session, &departed).and_then(|e| e.encode())
+                }
+                Outbound::Directory(reply) => {
+                    directory_envelope(&writer_session, &reply).and_then(|e| e.encode())
                 }
                 // Already framed: writing it directly is what keeps the stored
                 // bytes opaque end to end.
@@ -540,11 +674,25 @@ where
                 router.inbox.ack(session.device_id.as_str(), ack.seq)?;
                 continue;
             }
+            // The machine directory (T-0056): the relay owns the only copy, so
+            // these two are answered here rather than routed.
+            RelayKind::Join => {
+                let request: JoinRequest = decode_payload(&envelope.payload)?;
+                let reply = router.join(session, &request, seq);
+                let _ = outbound.try_send(Outbound::Directory(reply));
+                continue;
+            }
+            RelayKind::Machines => {
+                let request: MachinesRequest = decode_payload(&envelope.payload)?;
+                let reply = router.machines(session, request.all, seq);
+                let _ = outbound.try_send(Outbound::Directory(reply));
+                continue;
+            }
             RelayKind::Frame => {}
             // A device may not originate the relay's own kinds: a forged
             // departure notice would let any device in an account make another
             // device's peers drop their streams.
-            RelayKind::Status | RelayKind::PeerGone => {
+            RelayKind::Status | RelayKind::PeerGone | RelayKind::Directory => {
                 let _ = outbound.try_send(Outbound::Status {
                     seq,
                     outcome: Outcome::Refused {
@@ -722,6 +870,21 @@ fn drain_report_envelope(
 /// The whole message is the header: `src_device` names the device that left, and
 /// there is no payload because there is nothing else to say. The sender is the
 /// relay's reserved word, so a receiver cannot mistake it for a device's frame.
+/// Is `signature` by `key` over this session's join payload? Parsing the key and
+/// the signature belongs to `arreo-core::identity::keys`, so the wire forms have
+/// exactly one definition (T-0056).
+fn verify_join_proof(
+    key: &VerifyingKey,
+    nonce: &[u8],
+    account_id: &str,
+    machine_key: &str,
+    name: &str,
+    signature: &[u8],
+) -> bool {
+    let payload = join_proof_payload(nonce, account_id, machine_key, name);
+    arreo_core::identity::keys::verify_bytes(key, &payload, signature)
+}
+
 fn peer_gone_envelope(session: &Session, departed: &DeviceId) -> Result<RelayEnvelope, RelayError> {
     Ok(RelayEnvelope {
         header: RelayHeader {
@@ -733,6 +896,29 @@ fn peer_gone_envelope(session: &Session, departed: &DeviceId) -> Result<RelayEnv
             kind: RelayKind::PeerGone,
         },
         payload: Vec::new(),
+    })
+}
+
+/// The always-present framing of the relay's own answers: the relay as sender,
+/// this device as destination, and the request's sequence number so the client
+/// can route the answer (T-0056).
+fn directory_envelope(
+    session: &Session,
+    reply: &DirectoryReply,
+) -> Result<RelayEnvelope, RelayError> {
+    Ok(RelayEnvelope {
+        header: RelayHeader {
+            v: RELAY_VERSION,
+            account_id: session.account_id.clone(),
+            src_device: RELAY_SENDER.to_string(),
+            dst: session.device_id.display_id(),
+            seq: reply.seq,
+            kind: RelayKind::Directory,
+        },
+        // The version travels in the payload as well as the header, so a reply
+        // is self-describing even when lifted out of its envelope (the export
+        // path does exactly that).
+        payload: encode_payload(reply)?,
     })
 }
 

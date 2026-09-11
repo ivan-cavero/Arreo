@@ -88,6 +88,11 @@ async fn main() {
                         db: arreo_server::db_path_for(&socket_path),
                         device: std::sync::Arc::new(device),
                         cert: std::sync::Arc::new(cert),
+                        // The name this machine asserts in the account's
+                        // directory (T-0056). Cloned out of the settings before
+                        // they are moved into the relay task, so the log line
+                        // and the join request cannot disagree.
+                        machine_name: settings.name.clone(),
                     };
                     eprintln!(
                         "arreo-server: relay enabled for account {} via {}",

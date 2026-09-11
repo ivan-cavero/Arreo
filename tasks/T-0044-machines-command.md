@@ -4,7 +4,7 @@ title: "`arreo machines` — list/add/rename/remove/status with a stable script 
 phase: 2
 priority: 2
 status: proposed
-depends_on: [T-0043, T-0029]
+depends_on: [T-0043, T-0029, T-0056]
 scope:
   - crates/arreo-cli/src/main.rs
   - crates/arreo-cli/src/machines.rs
@@ -92,7 +92,17 @@ machine-registration half of the daemon's relay client, so it belongs to
 account-join transport inside `arreo-cli` — the wrong file, and the wrong fence.
 
 Confirmed again after T-0029 landed (2026-09-11): the router has no join verb.
-T-0044 stays blocked until T-0050 adds one.
+
+**Resolved by T-0056 (2026-09-11):** the join RPC now exists, as its own task because it
+is a transport, not a CLI verb. T-0050 landed the daemon's session machinery without the
+machine-registration half, so the missing piece was filed and built as T-0056 —
+`join`/`machines`/`directory` kinds, the session's request/response path, the relay's
+directory handlers, and the daemon asserting its own row on connect and on the presence
+cadence. T-0044 is therefore **startable**: `add` completes a join through the daemon's own
+relay session and the CLI reads the directory through it (`arreo machines list` needs a
+socket verb that proxies to the daemon's `machines` request). T-0056 did deliberately *not*
+add a CLI verb: the fence here owns `crates/arreo-cli/src/machines.rs`, and a verb written
+there would have been this task's work done under another task's id.
 
 `status <name>`'s trusted-device count already declares itself `null` until
 T-0046, which is the honest pattern; this note applies the same standard to the

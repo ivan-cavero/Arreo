@@ -10,9 +10,9 @@
 
 use super::{
     decode_message, decode_payload, encode_message, encode_payload, proof_payload, read_envelope,
-    read_frame, write_frame, Ack, Auth, AuthReply, ClientError, DrainReport, DrainRequest, Hello,
-    HelloReply, Outcome, RelayEnvelope, RelayError, RelayHeader, RelayKind, MAX_HANDSHAKE_BYTES,
-    RELAY_VERSION,
+    read_frame, write_frame, Ack, Auth, AuthReply, ClientError, DirectoryReply, DrainReport,
+    DrainRequest, Hello, HelloReply, JoinRequest, MachinesRequest, Outcome, RelayEnvelope,
+    RelayError, RelayHeader, RelayKind, MAX_HANDSHAKE_BYTES, RELAY_VERSION,
 };
 use crate::identity::{DeviceCert, DeviceId, DeviceKey};
 use crate::transport::{client_endpoint, SERVER_NAME};
@@ -35,6 +35,9 @@ pub enum Incoming {
     /// A device in this account went offline (T-0054). The device id is the
     /// header's `src_device`; there is no payload.
     PeerGone(DeviceId),
+    /// The relay's answer to a `join` or `machines` request (T-0056), routed by
+    /// its `seq` to whoever is waiting for it.
+    Directory(DirectoryReply),
 }
 
 /// The relay's stream type: one QUIC bidi stream, joined into one object.
@@ -101,11 +104,27 @@ where
                 envelope.header.src_device
             )))),
         },
+        // The answer to a `join` or `machines` request. Decoded by its kind,
+        // never by guessing at the payload's shape (T-0056) — the relay
+        // originating one of these is exactly what the client is waiting for.
+        RelayKind::Directory => {
+            let reply: DirectoryReply = decode_payload(&envelope.payload)?;
+            if reply.v != RELAY_VERSION {
+                return Err(ClientError::Protocol(RelayError::Frame(format!(
+                    "directory reply speaks version {} (this client speaks {RELAY_VERSION})",
+                    reply.v
+                ))));
+            }
+            Ok(Incoming::Directory(reply))
+        }
         // The relay never originates these, and a device reading them would
         // mean the relay echoed a request back.
-        RelayKind::Drain | RelayKind::Ack => Err(ClientError::Protocol(RelayError::Frame(
-            format!("the relay sent a {:?} envelope", envelope.header.kind),
-        ))),
+        RelayKind::Drain | RelayKind::Ack | RelayKind::Join | RelayKind::Machines => {
+            Err(ClientError::Protocol(RelayError::Frame(format!(
+                "the relay sent a {:?} envelope",
+                envelope.header.kind
+            ))))
+        }
     }
 }
 
@@ -148,14 +167,34 @@ impl RelayWriter {
         Ok(seq)
     }
 
+    /// The sequence number the next envelope will carry, without sending it.
+    ///
+    /// Exists so a request/response caller can register its reply slot *before*
+    /// the bytes leave: a fast answer must not be able to arrive before anyone
+    /// is listening for it (T-0056).
+    pub fn reserve_seq(&mut self) -> u64 {
+        let seq = self.next_seq;
+        self.next_seq += 1;
+        seq
+    }
+
     /// Send a control message (a drain or an ack) to the relay itself.
     pub async fn control<T: serde::Serialize>(
         &mut self,
         kind: RelayKind,
         payload: &T,
     ) -> Result<(), ClientError> {
-        let seq = self.next_seq;
-        self.next_seq += 1;
+        let seq = self.reserve_seq();
+        self.control_with_seq(seq, kind, payload).await
+    }
+
+    /// A control message on a sequence number the caller already reserved.
+    pub async fn control_with_seq<T: serde::Serialize>(
+        &mut self,
+        seq: u64,
+        kind: RelayKind,
+        payload: &T,
+    ) -> Result<(), ClientError> {
         let envelope = outbound(
             &self.account_id,
             &self.device_id,
@@ -192,6 +231,23 @@ impl RelayWriter {
         .await
     }
 
+    /// Assert this machine's directory row, on a reserved sequence number
+    /// (T-0056). The caller reserves, registers its reply slot, and only then
+    /// sends — in that order, so the answer cannot race the slot.
+    pub async fn join(&mut self, seq: u64, request: &JoinRequest) -> Result<(), ClientError> {
+        self.control_with_seq(seq, RelayKind::Join, request).await
+    }
+
+    /// Read the account's machine directory, on a reserved sequence number.
+    pub async fn machines(
+        &mut self,
+        seq: u64,
+        request: &MachinesRequest,
+    ) -> Result<(), ClientError> {
+        self.control_with_seq(seq, RelayKind::Machines, request)
+            .await
+    }
+
     #[must_use]
     pub fn device_id(&self) -> &DeviceId {
         &self.device_id
@@ -222,6 +278,9 @@ pub struct RelayClient {
     io: tokio::io::Join<quinn::RecvStream, quinn::SendStream>,
     account_id: String,
     device_id: DeviceId,
+    /// This session's handshake challenge, kept because a join proof is signed
+    /// over it (T-0056).
+    nonce: Vec<u8>,
     buf: Vec<u8>,
     next_seq: u64,
 }
@@ -264,15 +323,16 @@ impl RelayClient {
 
         let device_id = cert.device().clone();
         let handshake = Self::handshake(&mut io, account_id, device, cert, &device_id);
-        let (account_id, device_id) = match tokio::time::timeout(HANDSHAKE_TIMEOUT, handshake).await
-        {
-            Ok(result) => result?,
-            Err(_) => return Err(ClientError::Timeout),
-        };
+        let (account_id, device_id, nonce) =
+            match tokio::time::timeout(HANDSHAKE_TIMEOUT, handshake).await {
+                Ok(result) => result?,
+                Err(_) => return Err(ClientError::Timeout),
+            };
         Ok(Self {
             io,
             account_id,
             device_id,
+            nonce,
             buf: Vec::new(),
             next_seq: 1,
         })
@@ -285,7 +345,7 @@ impl RelayClient {
         device: &DeviceKey,
         cert: &DeviceCert,
         device_id: &DeviceId,
-    ) -> Result<(String, DeviceId), ClientError>
+    ) -> Result<(String, DeviceId, Vec<u8>), ClientError>
     where
         S: AsyncRead + AsyncWrite + Unpin,
     {
@@ -333,7 +393,10 @@ impl RelayClient {
                 }
                 let parsed = DeviceId::parse(&device_id)
                     .map_err(|e| ClientError::Protocol(RelayError::Cert(e.to_string())))?;
-                Ok((account_id, parsed))
+                // The nonce comes back out with the identity: it is this
+                // session's challenge, and anything else that must be bound to
+                // *this* session (T-0056's machine join proof) is signed over it.
+                Ok((account_id, parsed, nonce))
             }
             AuthReply::Refused { reason, .. } => Err(ClientError::Refused { reason }),
         }
@@ -347,6 +410,13 @@ impl RelayClient {
     #[must_use]
     pub fn device_id(&self) -> &DeviceId {
         &self.device_id
+    }
+
+    /// This session's handshake challenge (T-0056): the value a join proof must
+    /// be bound to, so a recorded join cannot be replayed into another session.
+    #[must_use]
+    pub fn nonce(&self) -> &[u8] {
+        &self.nonce
     }
 
     /// Split the session into its two directions.
@@ -453,9 +523,12 @@ impl RelayClient {
                 Incoming::Envelope(envelope) => messages.push(envelope),
                 Incoming::Drain(report) => return Ok((messages, report)),
                 // Not this call's business: a drain wants its messages and its
-                // report, and a departure is handled where streams live (the
-                // session's reader, T-0054).
-                Incoming::Status { .. } | Incoming::PeerGone(_) => continue,
+                // report, a departure is handled where streams live (the
+                // session's reader, T-0054), and a directory reply belongs to
+                // whatever asked (T-0056).
+                Incoming::Status { .. } | Incoming::PeerGone(_) | Incoming::Directory(_) => {
+                    continue
+                }
             }
         }
     }
@@ -475,7 +548,10 @@ impl RelayClient {
         loop {
             match self.next().await? {
                 Incoming::Envelope(envelope) => return Ok(envelope),
-                Incoming::Status { .. } | Incoming::Drain(_) | Incoming::PeerGone(_) => continue,
+                Incoming::Status { .. }
+                | Incoming::Drain(_)
+                | Incoming::PeerGone(_)
+                | Incoming::Directory(_) => continue,
             }
         }
     }

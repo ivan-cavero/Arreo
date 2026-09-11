@@ -122,6 +122,24 @@ pub enum RelayKind {
     /// account's size; the alternative was a subscription table in the relay,
     /// which is state that can be wrong.
     PeerGone,
+    /// Device → relay: assert *this machine's* directory row. The payload is the
+    /// MessagePack encoding of [`JoinRequest`]; the relay answers with a
+    /// [`RelayKind::Directory`] carrying the granted row.
+    ///
+    /// First call claims a name through a live join ticket; a later call from the
+    /// same machine refreshes `last_seen_ms` without a ticket — which is why one
+    /// kind covers both "join" and "I am still here": a machine re-asserts its
+    /// row on every connect, and a reconnect must not need an operator (T-0056).
+    Join,
+    /// Device → relay: read the account's machine directory. The payload is the
+    /// MessagePack encoding of [`MachinesRequest`]; the relay answers with a
+    /// [`RelayKind::Directory`] carrying the rows.
+    Machines,
+    /// Relay → device: the answer to [`RelayKind::Join`] or
+    /// [`RelayKind::Machines`]. The payload is the MessagePack encoding of
+    /// [`DirectoryReply`], and the reply's **kind** is what identifies it — the
+    /// drain report's guess-by-shape is a wart this does not repeat.
+    Directory,
 }
 
 impl RelayKind {
@@ -133,6 +151,9 @@ impl RelayKind {
             Self::Drain => "drain",
             Self::Ack => "ack",
             Self::PeerGone => "peergone",
+            Self::Join => "join",
+            Self::Machines => "machines",
+            Self::Directory => "directory",
         }
     }
 }
@@ -372,6 +393,83 @@ pub struct DrainReport {
     pub queued: u64,
     /// The cursor to resume from next time.
     pub next_seq: u64,
+}
+
+/// Device → relay: assert this machine's directory row (T-0056).
+///
+/// The machine proves it holds `machine_key` by signing [`join_proof_payload`]
+/// with it: the directory's identity rule is `MachineId::from_key` (T-0043), so a
+/// row for a key the sender does not hold must be impossible to claim. The
+/// payload is bound to the session nonce, so a recorded join cannot be replayed
+/// onto another session.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JoinRequest {
+    pub v: u32,
+    /// The name the machine asks for. A request, not a guarantee: the relay's
+    /// rule (T-0043) may grant the deterministic suffix instead, and the granted
+    /// name comes back in the reply.
+    pub name: String,
+    /// The protocol version the machine's daemon speaks, recorded in the row.
+    pub proto_version: u32,
+    /// The machine's public key, hex (Ed25519, 32 bytes).
+    pub machine_key: String,
+    /// Signature by `machine_key` over [`join_proof_payload`].
+    pub signature: Vec<u8>,
+}
+
+/// Device → relay: read the account's machine directory (T-0056).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MachinesRequest {
+    pub v: u32,
+    /// Include tombstoned (removed) names rather than only live machines.
+    pub all: bool,
+}
+
+/// Relay → device: the answer to a [`RelayKind::Join`] or
+/// [`RelayKind::Machines`] (T-0056).
+///
+/// One reply type for both, with `seq` matching the request's sequence number so
+/// the client can route it, and an explicit `refused` rather than an empty list:
+/// "you may not" and "there are none" are different answers, and a client that
+/// cannot tell them apart shows the wrong thing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DirectoryReply {
+    pub v: u32,
+    /// The `seq` of the request being answered.
+    pub seq: u64,
+    /// The row a `join` produced, when it produced one.
+    pub granted: Option<crate::mesh::MachineRow>,
+    /// Rows answering a `machines` request (empty for a `join`).
+    pub machines: Vec<crate::mesh::MachineRow>,
+    /// Why the relay would not answer. `None` means it did.
+    pub refused: Option<String>,
+}
+
+/// The bytes a machine signs to assert its directory row (T-0056).
+///
+/// Bound to the session nonce, so a signature harvested from one session is
+/// useless in the next, and labelled so it can never be mistaken for the device
+/// proof ([`proof_payload`]) or anything else this product signs. The key is
+/// signed in canonical hex, so the proof does not depend on how the sender
+/// spells it.
+#[must_use]
+pub fn join_proof_payload(
+    nonce: &[u8],
+    account_id: &str,
+    machine_key: &str,
+    name: &str,
+) -> Vec<u8> {
+    let mut out =
+        Vec::with_capacity(nonce.len() + account_id.len() + machine_key.len() + name.len() + 40);
+    out.extend_from_slice(b"arreo-relay-join-v1\0");
+    out.extend_from_slice(nonce);
+    out.push(0);
+    out.extend_from_slice(account_id.as_bytes());
+    out.push(0);
+    out.extend_from_slice(machine_key.as_bytes());
+    out.push(0);
+    out.extend_from_slice(name.as_bytes());
+    out
 }
 
 /// What can go wrong on the device side of the protocol.
@@ -656,6 +754,9 @@ mod tests {
             RelayKind::Drain,
             RelayKind::Ack,
             RelayKind::PeerGone,
+            RelayKind::Join,
+            RelayKind::Machines,
+            RelayKind::Directory,
         ]
         .iter()
         .map(|kind| kind.as_str())
@@ -685,6 +786,86 @@ mod tests {
         assert_eq!(decoded.header.kind, RelayKind::PeerGone);
         assert_eq!(decoded.header.src_device, notice.header.src_device);
         assert!(decoded.payload.is_empty(), "there is nothing else to say");
+    }
+
+    /// The join proof commits to the session, the account, the key and the name
+    /// (T-0056): change any one and the bytes change, which is what makes a
+    /// recorded proof useless on another session and un-repointable at another
+    /// row.
+    #[test]
+    fn the_join_proof_is_bound_to_session_account_key_and_name() {
+        let base = join_proof_payload(b"nonce", "acct-1", "aa", "workbox");
+        let variants = [
+            join_proof_payload(b"other", "acct-1", "aa", "workbox"),
+            join_proof_payload(b"nonce", "acct-2", "aa", "workbox"),
+            join_proof_payload(b"nonce", "acct-1", "bb", "workbox"),
+            join_proof_payload(b"nonce", "acct-1", "aa", "workbox-2"),
+        ];
+        for variant in &variants {
+            assert_ne!(
+                &base, variant,
+                "the proof must change when a bound field does"
+            );
+        }
+        // The separators are what stop a shifting boundary from producing the
+        // same bytes for different fields: `("ab", "c")` must not equal
+        // `("a", "bc")`.
+        assert_ne!(
+            join_proof_payload(b"n", "acct-1", "aa", "b"),
+            join_proof_payload(b"n", "acct-1", "aab", "")
+        );
+        // And it is labelled, so it can never be mistaken for the device proof.
+        let device = proof_payload(b"nonce", "acct-1", "aa");
+        assert_ne!(base, device);
+        assert!(
+            base.starts_with(b"arreo-relay-join-v1\0"),
+            "the label is what separates the two signatures: {:?}",
+            String::from_utf8_lossy(&base)
+        );
+    }
+
+    /// A directory reply round-trips, and its `v` is checked on decode so a
+    /// future version cannot be read as this one.
+    #[test]
+    fn a_directory_reply_round_trips_by_its_own_kind() {
+        let reply = DirectoryReply {
+            v: RELAY_VERSION,
+            seq: 42,
+            granted: None,
+            machines: Vec::new(),
+            refused: Some("the name is not a name".to_string()),
+        };
+        let bytes = encode_payload(&reply).expect("encode");
+        let decoded: DirectoryReply = decode_payload(&bytes).expect("decode");
+        assert_eq!(decoded, reply);
+        assert_eq!(decoded.seq, 42);
+    }
+
+    /// A wire key parses in either case and refuses a wrong length or a stray
+    /// character rather than truncating (T-0056).
+    #[test]
+    fn a_wire_public_key_parses_by_value_not_by_spelling() {
+        let key = crate::identity::RootKey::generate().expect("entropy");
+        let lower = key.public_hex();
+        let upper = lower.to_uppercase();
+        let parsed = crate::identity::keys::public_from_hex(&lower).expect("lowercase");
+        assert_eq!(parsed, key.public());
+        assert_eq!(
+            crate::identity::keys::public_from_hex(&upper).expect("uppercase"),
+            parsed,
+            "hex is bytes, so case must not matter"
+        );
+        for bad in [
+            "",
+            "aa",
+            &lower[..62],
+            "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz",
+        ] {
+            assert!(
+                crate::identity::keys::public_from_hex(bad).is_err(),
+                "{bad:?} must be refused, not truncated into a key"
+            );
+        }
     }
 
     #[test]

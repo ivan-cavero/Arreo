@@ -174,13 +174,26 @@ fn pin_peer(socket: &Path, dir: &Path, name: &str, key: &VerifyingKey) {
 }
 
 fn write_config(path: &Path, relay_addr: SocketAddr, account: &str, peer: Option<&DeviceId>) {
+    write_config_named(path, relay_addr, account, peer, None);
+}
+
+/// The same config, with a directory name (T-0056). `None` leaves the machine to
+/// default to its hostname, which is what an operator who does not care gets.
+fn write_config_named(
+    path: &Path,
+    relay_addr: SocketAddr,
+    account: &str,
+    peer: Option<&DeviceId>,
+    name: Option<&str>,
+) {
     let peer = peer.map_or(String::new(), |peer| {
         format!("peer = \"{}\"\n", peer.display_id())
     });
+    let name = name.map_or(String::new(), |name| format!("name = \"{name}\"\n"));
     std::fs::write(
         path,
         format!(
-            "[relay]\nenabled = true\naddr = \"{relay_addr}\"\naccount = \"{account}\"\n{peer}"
+            "[relay]\nenabled = true\naddr = \"{relay_addr}\"\naccount = \"{account}\"\n{peer}{name}"
         ),
     )
     .expect("config");
@@ -582,6 +595,135 @@ fn an_incomplete_relay_configuration_is_refused() {
     assert!(
         stderr.contains("addr"),
         "the refusal must name the missing field: {stderr}"
+    );
+
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// The daemon asserts its directory row on connect (T-0056).
+///
+/// A real daemon, a real relay, and the row read back over the wire by another
+/// device in the account: the criterion is that a machine is listed by the relay
+/// *because the machine said so*, so the proof has to be the relay's answer and
+/// not the daemon's log line.
+#[tokio::test]
+async fn a_daemon_registers_itself_in_the_account_directory() {
+    let root = RootKey::generate().expect("entropy");
+    let base = std::env::temp_dir().join(format!("arreo-daemon-dir-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    let dir = base.join("a");
+    std::fs::create_dir_all(&dir).expect("scratch");
+    let key = DeviceKey::generate().expect("entropy");
+    let cert = DeviceCert::issue(&root, &key.public(), "machine-a", Role::Owner, 1_000, 1);
+    make_identity(&dir, &root, &key, &cert);
+
+    let relay = Relay::start("directory");
+    relay.register_account("acct-1", &root.public());
+    let config = base.join("a.toml");
+    write_config_named(&config, relay.addr, "acct-1", None, Some("the-workbox"));
+
+    let machine = spawn_machine("a", dir.clone(), base.join("a.sock"), Some(&config));
+    machine.await_socket();
+
+    // Read the directory as a *different* device in the account: a peer that
+    // reads the directory is exactly the use case, and using the daemon's own
+    // identity would replace its session (the relay keeps one per device).
+    let reader_key = DeviceKey::generate().expect("entropy");
+    let reader_cert = DeviceCert::issue(
+        &root,
+        &reader_key.public(),
+        "reader",
+        Role::Viewer,
+        1_000,
+        9,
+    );
+    let reader = arreo_core::relay::session::RelaySession::dial(
+        relay.addr,
+        "acct-1",
+        &reader_key,
+        &reader_cert,
+    )
+    .await
+    .expect("the reader registers");
+
+    let mut listed = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while Instant::now() < deadline {
+        listed = reader
+            .machines(false)
+            .await
+            .expect("the relay answers")
+            .machines;
+        if !listed.is_empty() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert_eq!(
+        listed.len(),
+        1,
+        "the daemon's row must be in the directory: {listed:?}; its log was:\n{}",
+        machine.log_text()
+    );
+    assert_eq!(listed[0].name.as_str(), "the-workbox");
+    assert_eq!(
+        listed[0].machine_id,
+        arreo_core::mesh::MachineId::from_key(&root.public()),
+        "the row is keyed by the machine's root key — the key a device pinned when it paired"
+    );
+    // The daemon says what it was granted, so an operator does not have to read
+    // the relay to find out what this machine is called. Polled rather than read
+    // once: the log arrives on the daemon's stderr and the reader thread that
+    // collects it is a step behind the directory write this test just observed,
+    // so a single read is a race the row assertion above cannot see.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline && !machine.log_text().contains("the-workbox") {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        machine.log_text().contains("the-workbox"),
+        "the daemon must log the granted name; its log was:\n{}",
+        machine.log_text()
+    );
+
+    drop(reader);
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// A relay that refuses the directory write does not stop the daemon serving
+/// locally: remote reach is not a prerequisite for local work.
+#[tokio::test]
+async fn a_refused_directory_write_leaves_the_daemon_serving() {
+    let root = RootKey::generate().expect("entropy");
+    let base = std::env::temp_dir().join(format!("arreo-daemon-nodir-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    let dir = base.join("a");
+    std::fs::create_dir_all(&dir).expect("scratch");
+    let key = DeviceKey::generate().expect("entropy");
+    let cert = DeviceCert::issue(&root, &key.public(), "machine-a", Role::Owner, 1_000, 1);
+    make_identity(&dir, &root, &key, &cert);
+
+    // The account is the daemon's own (authentication succeeds), but the name it
+    // asks for is not a name the directory's rule accepts (`!` is not lowercase,
+    // a digit or a hyphen). The write is refused; the daemon must keep serving.
+    let relay = Relay::start("refused-dir");
+    relay.register_account("acct-1", &root.public());
+    let config = base.join("a.toml");
+    write_config_named(&config, relay.addr, "acct-1", None, Some("workbox!"));
+
+    let machine = spawn_machine("a", dir.clone(), base.join("a.sock"), Some(&config));
+    machine.await_socket();
+
+    // Local work still works: the socket answers panes.
+    assert!(machine.local_panes().is_empty());
+    let wait = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < wait && !machine.log_text().contains("would not register") {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(
+        machine.log_text().contains("would not register"),
+        "a refused directory write must be said out loud; the log was:\n{}",
+        machine.log_text()
     );
 
     let _ = std::fs::remove_dir_all(&base);

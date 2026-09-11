@@ -21,6 +21,7 @@
 pub mod directory;
 
 pub use directory::{
-    DirectoryCache, DirectoryError, MachineId, MachineRow, Name, Presence, HEARTBEAT_SECS,
-    JOIN_TICKET_SECS, NAME_MAX, ONLINE_WINDOW_SECS, STALE_AFTER_SECS, TOMBSTONE_SECS,
+    default_machine_name, DirectoryCache, DirectoryError, MachineId, MachineRow, Name, Presence,
+    HEARTBEAT_SECS, JOIN_TICKET_SECS, NAME_MAX, ONLINE_WINDOW_SECS, STALE_AFTER_SECS,
+    TOMBSTONE_SECS,
 };

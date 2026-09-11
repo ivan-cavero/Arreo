@@ -38,6 +38,10 @@ pub enum KeyError {
     Missing { path: PathBuf },
     #[error("public key: {0}")]
     PublicKey(String),
+    /// A wire-form key that is not a valid 32-byte hex Ed25519 public key
+    /// (T-0056's machine join proof, where the key arrives as text).
+    #[error("wire public key: {0}")]
+    Format(String),
 }
 
 /// The permission bits every key file and its directory must carry (Unix).
@@ -332,6 +336,55 @@ fn static_secret_of_root(inner: &DeviceKey) -> NoiseStatic {
 #[must_use]
 pub fn verify(public: &VerifyingKey, payload: &[u8], signature: &Signature) -> bool {
     public.verify(payload, signature).is_ok()
+}
+
+/// Verify a signature that arrived as bytes — a wire form, not a typed value
+/// (T-0056's machine join proof).
+///
+/// The byte form is what any peer hands over, and parsing it belongs next to the
+/// one place that decides what a valid signature is: a caller that did its own
+/// `copy_from_slice` and length check would be a second answer to that question,
+/// and the second answer is the one that drifts. A length other than 64 is a
+/// refusal, never a panic and never a truncated signature.
+#[must_use]
+pub fn verify_bytes(public: &VerifyingKey, payload: &[u8], signature: &[u8]) -> bool {
+    let bytes: [u8; 64] = match signature.try_into() {
+        Ok(bytes) => bytes,
+        Err(_) => return false,
+    };
+    verify(public, payload, &Signature::from_bytes(&bytes))
+}
+
+/// Parse a 32-byte hex Ed25519 public key, the wire form a peer announces
+/// (T-0056).
+///
+/// Bytes, not a spelling: either case parses, and a wrong length or a non-hex
+/// character is an error rather than a truncated key.
+pub fn public_from_hex(hex: &str) -> Result<VerifyingKey, KeyError> {
+    let bytes = hex_bytes(hex)?;
+    let bytes: [u8; 32] = bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| KeyError::Format(format!("{} bytes, expected 32", bytes.len())))?;
+    VerifyingKey::from_bytes(&bytes)
+        .map_err(|e| KeyError::Format(format!("not a valid public key: {e}")))
+}
+
+/// Hex to bytes, either case, with the length the caller asked for.
+fn hex_bytes(hex: &str) -> Result<Vec<u8>, KeyError> {
+    if !hex.len().is_multiple_of(2) {
+        return Err(KeyError::Format(format!(
+            "{} characters is not a whole number of bytes",
+            hex.len()
+        )));
+    }
+    (0..hex.len())
+        .step_by(2)
+        .map(|i| {
+            u8::from_str_radix(&hex[i..i + 2], 16)
+                .map_err(|e| KeyError::Format(format!("{hex:?} is not hex: {e}")))
+        })
+        .collect()
 }
 
 /// 32 bytes of OS entropy.

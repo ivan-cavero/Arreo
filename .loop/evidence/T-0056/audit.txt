@@ -1,0 +1,64 @@
+# T-0056 evidence — directory over the wire
+
+## 1. A machine registers itself; the account lists it (real relay binary, real QUIC)
+
+$ cargo test -p arreo-relay --test router -- --nocapture
+
+test a_foreign_certificate_is_refused ... ok
+test a_malformed_join_is_refused ... ok
+test a_certificate_without_a_proof_is_refused ... ok
+test a_fire_and_forget_assertion_writes_the_row ... ok
+test a_machine_registers_itself_and_the_account_lists_it ... ok
+test a_join_proof_by_the_wrong_key_is_refused ... ok
+test a_machine_that_comes_back_reasserts_its_row ... ok
+test a_replayed_proof_is_refused ... ok
+test a_peer_that_keeps_failing_is_rate_limited ... ok
+test a_known_device_that_is_offline_is_queued_not_refused ... ok
+test an_unknown_account_is_refused ... ok
+test a_spoofed_sender_and_a_foreign_account_are_refused ... ok
+test a_reconnecting_device_keeps_its_newer_session ... ok
+test a_zero_length_payload_is_carried ... ok
+test a_stalled_peer_does_not_block_the_next_device ... ok
+test a_restart_keeps_the_account_and_still_admits_its_devices ... ok
+test an_oversized_envelope_ends_the_session_without_buffering_it ... ok
+test an_unknown_destination_is_refused_by_name ... ok
+test two_devices_exchange_opaque_bytes_through_the_relay ... ok
+test result: ok. 19 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.47s
+
+## 2. The daemon asserts its own row on connect (real daemon + real relay)
+
+$ cargo test -p arreo-server --test relay_daemon
+test an_incomplete_relay_configuration_is_refused ... ok
+test no_configuration_means_no_relay ... ok
+test a_refused_directory_write_leaves_the_daemon_serving ... ok
+test a_daemon_registers_itself_in_the_account_directory ... FAILED   <- the flake below, before the fix
+test two_daemons_exchange_a_message_through_the_relay ... ok
+test a_relay_failure_leaves_the_local_daemon_serving ... ok
+test result: FAILED. 5 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 10.13s
+
+## 3. Vocabulary unit tests (proof binding, reply kind, wire key parsing)
+
+$ cargo test -p arreo-core --lib relay
+test relay::tests::a_directory_reply_round_trips_by_its_own_kind ... ok
+test relay::tests::a_wire_public_key_parses_by_value_not_by_spelling ... ok
+test relay::tests::the_join_proof_is_bound_to_session_account_key_and_name ... ok
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 111 filtered out; finished in 0.13s
+
+## 4. Stability (the flake this task found and fixed)
+
+The directory assertions and the daemon-log assertion, 6 consecutive group runs after
+the fix (the log line is collected by a reader thread that lags the write):
+
+6/6 runs: test result: ok. 6 passed; 0 failed
+
+## 5. The full battery (final code)
+
+cargo test --workspace: 390 passed, 0 failed across 51 targets
+cargo clippy --workspace --all-targets -- -D warnings: 0 diagnostics
+cargo fmt --all -- --check: clean
+cargo vet --locked: Vetting Succeeded (336 exempted)
+cargo deny check: advisories ok, bans ok, licenses ok, sources ok
+cargo audit: no advisories
+cargo xtask check-targets: x86_64-unknown-linux-gnu PASS; x86_64-pc-windows-msvc SKIP (pure-Rust no-sqlite PASS)
+e2e slices: api green, compat green, lifecycle 2/2, persistence 3/3, enforcement passed, tui 18/18, theme 27/27, relay 14/14
+cargo xtask bench: 6/6 PASS

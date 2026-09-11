@@ -2626,15 +2626,10 @@ fn sanitize_device_name(raw: &str) -> Option<String> {
 }
 
 /// This machine's default device name: its hostname, or a stable fallback.
+///
+/// The rule lives in `arreo-core` because the daemon needs the same default for
+/// its directory row (T-0056): one answer to "what is this machine called",
+/// not two that drift.
 fn default_device_name() -> String {
-    std::fs::read_to_string("/etc/hostname")
-        .ok()
-        .map(|text| text.trim().to_string())
-        .filter(|text| !text.is_empty())
-        .or_else(|| {
-            std::env::var("HOSTNAME")
-                .ok()
-                .filter(|text| !text.is_empty())
-        })
-        .unwrap_or_else(|| "device".to_string())
+    arreo_core::mesh::default_machine_name()
 }

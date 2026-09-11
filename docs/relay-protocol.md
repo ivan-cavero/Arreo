@@ -280,7 +280,7 @@ in it to put pane text, agent state or a key.
 | `src_device` | string | the sender. The relay requires it to equal the session's own device id (parsed and compared, so `dev_<hex>` and `<hex>` are the same device) |
 | `dst` | string | the destination device id, in either spelling |
 | `seq` | u64 | the sender's own sequence number. The relay does not check or rewrite it; it echoes it on the status it answers with |
-| `kind` | `"frame"`, `"status"`, `"drain"`, `"ack"` or `"peergone"` | what the envelope is for (§4.2) |
+| `kind` | `"frame"`, `"status"`, `"drain"`, `"ack"`, `"peergone"`, `"join"`, `"machines"` or `"directory"` | what the envelope is for (§4.2) |
 
 The relay does **not** enforce monotonic `seq` and does not de-duplicate: a
 receiver that cares about ordering or replays must do that itself, on the
@@ -295,13 +295,65 @@ sender's sequence numbers.
 | `drain` | device → relay only | MessagePack of one `DrainRequest` (§4.4): hand me what is queued for me |
 | `ack` | device → relay only | MessagePack of one `Ack` (§4.4): I hold everything up to this cursor |
 | `peergone` | relay → device only | no payload: a device in your account went offline. `src_device` is the device that left; `dst` is you. The whole message is the header, so a receiver with no stream for that peer ignores it (§4.6) |
+| `join` | device → relay only | MessagePack of one `JoinRequest` (§4.7): assert *this machine's* row in the account's machine directory |
+| `machines` | device → relay only | MessagePack of one `MachinesRequest` (§4.7): read the account's machine directory |
+| `directory` | relay → device only | MessagePack of one `DirectoryReply` (§4.7), answering a `join` or a `machines` on the same `seq`. The reply's **kind** identifies it; a client must never guess at a payload's shape |
 
-A device that sends `kind = "status"` **or `kind = "peergone"`** is refused per-envelope: statuses
-and departure notices are the relay's to originate — a forged departure would let any device in an
-account make another device's peers drop their streams. `drain` and `ack` are the mirror image — the
-device's to originate, and the relay never sends them, so a client that reads one is reading its own
-request echoed back and should treat it as a protocol error. Neither is a *frame*: a control message
-carries nothing for another device, and it never reaches the routing decision of §4.3.
+A device that sends `kind = "status"`, `"peergone"` **or `"directory"`** is refused per-envelope:
+statuses, departure notices and directory replies are the relay's to originate — a forged departure
+would let any device in an account make another device's peers drop their streams, and a forged
+reply would let one device tell another what the directory says. `drain`, `ack`, `join` and
+`machines` are the mirror image — the device's to originate, and the relay never sends them, so a
+client that reads one is reading its own request echoed back and should treat it as a protocol
+error. None of them is a *frame*: a control message carries nothing for another device, and it never
+reaches the routing decision of §4.3.
+
+### 4.7 The machine directory (`join`, `machines`, `directory`)
+
+The directory of §8 (`ROADMAP` §3.7) is owned by the relay, and these three kinds are how a machine
+asserts its row and how an account reads the account. They are the wire form of the rules in
+`arreo-core::mesh`; the relay applies those rules, and a client never computes presence itself.
+
+`JoinRequest`:
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `v` | u32 | must be `1` |
+| `name` | string | the name the machine asks for. A *request*: the relay may grant the deterministic suffix instead and says so in the reply, with `name_conflict = true` on the row |
+| `proto_version` | u32 | the protocol version the machine's daemon speaks, recorded in the row |
+| `machine_key` | string | the machine's Ed25519 public key, 32 bytes of hex. Both cases parse |
+| `signature` | bytes | 64 bytes: a signature **by `machine_key`** over the join proof payload below |
+
+The machine's directory identity is `MachineId::from_key(machine_key)` — the key *is* the machine,
+so a row for a key the sender does not hold must be impossible to claim, which is what the signature
+buys. The proof payload is:
+
+```
+"arreo-relay-join-v1" 0x00 nonce 0x00 account_id 0x00 machine_key_hex 0x00 name
+```
+
+where `nonce` is the session's own handshake challenge (§3.6). Binding the proof to that nonce is
+what makes a recorded join worthless in another session; binding it to the name means a proof cannot
+be re-pointed at a different row. A reply with any other `v`, a key that is not 32 bytes of hex, a
+signature that does not verify, or a name the directory's rule rejects is refused with a reason and
+**writes nothing**.
+
+One kind covers both "join" and "I am still here": the first `join` from a key claims a name through
+a live join ticket the relay mints, and a later `join` from the same `machine_id` refreshes
+`last_seen_ms` without a ticket and without re-applying the name rule — a machine that reconnects
+must not need an operator, and must not lose a suffixed name it was granted. A machine's daemon
+sends one on every connect and again on its presence cadence.
+
+`MachinesRequest` is `{ v: u32, all: bool }`, where `all` includes tombstoned (removed) names rather
+than only live machines.
+
+`DirectoryReply` is `{ v: u32, seq: u64, granted: Option<MachineRow>, machines: [MachineRow],
+refused: Option<String> }`: `seq` echoes the request's sequence number, `granted` is the row a `join`
+produced, and `machines` answers a `machines` request. The rows are the same `MachineRow`
+(`machine_id`, `name`, `name_conflict`, `presence`, `last_seen_ms`, `proto_version`,
+`tombstone_until_ms`) the directory export uses: one shape on the wire and off it. `refused` is
+explicit rather than an empty list — "you may not" and "there are none" are different answers, and
+a client that cannot tell them apart shows the wrong thing.
 
 ### 4.3 Status envelopes and `Outcome`
 
@@ -677,7 +729,12 @@ guessed at.**
 9. De-duplicate on the drained frame's own header `(src_device, seq)` before
    acting on it: the wire is at-least-once, and a disconnect mid-drain
    redelivers what was not acked (§4.5).
-10. Expect `kind = "peergone"` (§4.6): when a device in your account goes
+10. Assert your machine's row with `kind = "join"` and a `JoinRequest` (§4.7) on
+    connect and on a presence cadence, and read the account with `kind = "machines"`.
+    Sign the join proof over the session's nonce: a proof bound to another session is
+    refused by design. The answer arrives as one `directory` envelope on the request's
+    `seq`, and its `refused` field is where a "no" lives.
+11. Expect `kind = "peergone"` (§4.6): when a device in your account goes
     offline the relay sends you one, with no payload and `src_device` naming the
     device that left. If you hold a stream to that peer, end it — its next
     connection will be a fresh one, and yours should be too. If you hold none,

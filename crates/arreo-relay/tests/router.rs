@@ -10,9 +10,12 @@
 
 use arreo_core::identity::{DeviceCert, DeviceId, DeviceKey, Role, RootKey, VerifyingKey};
 use arreo_core::relay::{
-    decode_message, encode_message, read_frame, write_frame, Auth, AuthReply, Hello, HelloReply,
-    Incoming, Outcome, RelayClient, RelayError, RELAY_VERSION,
+    decode_message, encode_message, join_proof_payload, read_frame, write_frame, Auth, AuthReply,
+    Hello, HelloReply, Incoming, JoinRequest, Outcome, RelayClient, RelayError, RELAY_VERSION,
 };
+// The session is where `RelaySession` lives (it is what a daemon holds); the
+// client is the lower-level half the relay tests connect with.
+use arreo_core::relay::session::RelaySession;
 use arreo_core::transport::{client_endpoint, SERVER_NAME};
 use std::io::{BufRead, BufReader};
 use std::net::SocketAddr;
@@ -215,6 +218,314 @@ async fn two_devices_exchange_opaque_bytes_through_the_relay() {
         log.contains("authenticated"),
         "the relay logs its sessions:\n{log}"
     );
+}
+
+/// The directory over the wire (T-0056): a machine asserts its row, and an
+/// account device reads the account.
+///
+/// Through the real binary, over real QUIC, with the join proof signed by the
+/// machine's own key: the criteria are about what the *relay* admits, and an
+/// in-process router could be green while the wire path is not even reachable.
+#[tokio::test]
+async fn a_machine_registers_itself_and_the_account_lists_it() {
+    let relay = Relay::start("directory-join");
+    let root = RootKey::generate().expect("entropy");
+    relay.register_account("acct-1", &root.public());
+
+    let (alice_key, alice_cert) = device(&root, "alice", 1);
+    let session = RelaySession::dial(relay.addr, "acct-1", &alice_key, &alice_cert)
+        .await
+        .expect("alice registers");
+
+    // The machine key is Alice's own root key here: what makes a machine a
+    // machine is that its directory identity is a key it holds, not a name it
+    // typed.
+    let machine = RootKey::generate().expect("entropy");
+    let name = "workbox";
+    let request = signed_join(&machine, session.nonce(), "acct-1", name);
+    let reply = session
+        .join_machine(request)
+        .await
+        .expect("the relay answers");
+    assert_eq!(reply.refused, None, "a valid join is not refused");
+    let granted = reply.granted.expect("a join grants a row");
+    assert_eq!(granted.name.as_str(), name, "the requested name is free");
+    assert_eq!(
+        granted.machine_id,
+        arreo_core::mesh::MachineId::from_key(&machine.public()),
+        "the row is keyed by the machine's own key, not by anything the caller said"
+    );
+
+    // The account can see it.
+    let listed = session.machines(false).await.expect("the relay answers");
+    assert_eq!(listed.refused, None);
+    assert_eq!(listed.machines.len(), 1);
+    assert_eq!(listed.machines[0].name.as_str(), name);
+
+    // A second machine with the same name: the relay applies T-0043's suffix
+    // rule and the reply says so, rather than silently renaming either machine.
+    let (bob_key, bob_cert) = device(&root, "bob", 2);
+    let bob = RelaySession::dial(relay.addr, "acct-1", &bob_key, &bob_cert)
+        .await
+        .expect("bob registers");
+    let palmer = RootKey::generate().expect("entropy");
+    let reply = bob
+        .join_machine(signed_join(&palmer, bob.nonce(), "acct-1", name))
+        .await
+        .expect("the relay answers");
+    let taken = reply.granted.expect("a colliding join still grants a row");
+    assert_ne!(
+        taken.name.as_str(),
+        name,
+        "the name was live for another machine, so the relay must not hand it over"
+    );
+    assert!(
+        taken.name_conflict,
+        "and the row must say the name was granted with a suffix"
+    );
+
+    // Both machines are listed, each under its own name.
+    let listed = bob.machines(false).await.expect("the relay answers");
+    let names: Vec<&str> = listed.machines.iter().map(|r| r.name.as_str()).collect();
+    assert!(names.contains(&name), "the first machine: {names:?}");
+    assert!(
+        names.contains(&taken.name.as_str()),
+        "the second: {names:?}"
+    );
+}
+
+/// A join that is not signed by the key it claims is refused, and writes nothing.
+#[tokio::test]
+async fn a_join_proof_by_the_wrong_key_is_refused() {
+    let relay = Relay::start("directory-forge");
+    let root = RootKey::generate().expect("entropy");
+    relay.register_account("acct-1", &root.public());
+    let (alice_key, alice_cert) = device(&root, "alice", 1);
+    let session = RelaySession::dial(relay.addr, "acct-1", &alice_key, &alice_cert)
+        .await
+        .expect("alice registers");
+
+    // Claimed key: the machine's. Signing key: someone else's.
+    let claimed = RootKey::generate().expect("entropy");
+    let forger = RootKey::generate().expect("entropy");
+    let name = "workbox";
+    let payload = join_proof_payload(session.nonce(), "acct-1", &claimed.public_hex(), name);
+    let forged = JoinRequest {
+        v: RELAY_VERSION,
+        name: name.to_string(),
+        proto_version: 1,
+        machine_key: claimed.public_hex(),
+        signature: forger.sign(&payload).to_bytes().to_vec(),
+    };
+    let reply = session
+        .join_machine(forged)
+        .await
+        .expect("the relay answers");
+    assert!(
+        reply.refused.is_some(),
+        "a signature by the wrong key must be refused"
+    );
+    assert!(reply.granted.is_none());
+    let listed = session.machines(false).await.expect("the relay answers");
+    assert!(
+        listed.machines.is_empty(),
+        "a refused join must not write a row: {:?}",
+        listed.machines
+    );
+
+    // Replaying a *correct* proof from another session must also fail: it is
+    // bound to the session nonce, so a recorded join is worthless.
+    let machine = RootKey::generate().expect("entropy");
+    let correct = signed_join(&machine, session.nonce(), "acct-1", name);
+    let second = RelaySession::dial(relay.addr, "acct-1", &alice_key, &alice_cert)
+        .await
+        .expect("alice registers again");
+    let replay = second
+        .join_machine(correct)
+        .await
+        .expect("the relay answers");
+    assert!(
+        replay.refused.is_some(),
+        "a proof bound to another session's nonce must not be accepted"
+    );
+    assert!(second
+        .machines(false)
+        .await
+        .expect("the relay answers")
+        .machines
+        .is_empty());
+
+    // And the same proof on its own session is accepted — the refusal above is
+    // about the binding, not about the machine.
+    let honest = signed_join(&machine, second.nonce(), "acct-1", name);
+    let reply = second
+        .join_machine(honest)
+        .await
+        .expect("the relay answers");
+    assert_eq!(reply.refused, None, "{reply:?}");
+    assert!(reply.granted.is_some());
+}
+
+/// A rejoin from the same machine refreshes the row and needs no ticket, and it
+/// keeps the name it was granted rather than re-claiming.
+#[tokio::test]
+async fn a_machine_that_comes_back_reasserts_its_row() {
+    let relay = Relay::start("directory-rejoin");
+    let root = RootKey::generate().expect("entropy");
+    relay.register_account("acct-1", &root.public());
+    let (alice_key, alice_cert) = device(&root, "alice", 1);
+
+    let machine = RootKey::generate().expect("entropy");
+    let first = RelaySession::dial(relay.addr, "acct-1", &alice_key, &alice_cert)
+        .await
+        .expect("alice registers");
+    let granted = first
+        .join_machine(signed_join(&machine, first.nonce(), "acct-1", "workbox"))
+        .await
+        .expect("the relay answers")
+        .granted
+        .expect("a row");
+    let first_seen = granted.last_seen_ms;
+    drop(first);
+
+    // A second session from the same machine: same row, refreshed, same name.
+    let again = RelaySession::dial(relay.addr, "acct-1", &alice_key, &alice_cert)
+        .await
+        .expect("alice registers again");
+    let rejoined = again
+        .join_machine(signed_join(&machine, again.nonce(), "acct-1", "workbox"))
+        .await
+        .expect("the relay answers")
+        .granted
+        .expect("the row comes back");
+    assert_eq!(
+        rejoined.machine_id, granted.machine_id,
+        "the same key is the same machine"
+    );
+    assert_eq!(rejoined.name.as_str(), "workbox");
+    assert!(
+        rejoined.last_seen_ms >= first_seen,
+        "a rejoin refreshes presence: {} then {}",
+        first_seen,
+        rejoined.last_seen_ms
+    );
+    assert_eq!(
+        again
+            .machines(false)
+            .await
+            .expect("the relay answers")
+            .machines
+            .len(),
+        1,
+        "a rejoin must not add a second row"
+    );
+
+    // A join from a machine that names a *different* machine's live name does not
+    // steal it: the rejoin above proves the row was matched by key, so this is
+    // the collision rule still holding after a rejoin.
+    let other = RootKey::generate().expect("entropy");
+    let stolen = again
+        .join_machine(signed_join(&other, again.nonce(), "acct-1", "workbox"))
+        .await
+        .expect("the relay answers")
+        .granted
+        .expect("a row");
+    assert_ne!(stolen.name.as_str(), "workbox");
+}
+
+/// The presence beat's path (T-0056): a fire-and-forget assertion still writes
+/// the row and still does not block on a reply.
+///
+/// Distinct from the request/response test above because the daemon's periodic
+/// refresh cannot wait for an answer, and a beat that silently did nothing would
+/// leave a connected machine reading as offline — the failure the beat exists to
+/// prevent.
+#[tokio::test]
+async fn a_fire_and_forget_assertion_writes_the_row() {
+    let relay = Relay::start("directory-assert");
+    let root = RootKey::generate().expect("entropy");
+    relay.register_account("acct-1", &root.public());
+    let (alice_key, alice_cert) = device(&root, "alice", 1);
+    let session = RelaySession::dial(relay.addr, "acct-1", &alice_key, &alice_cert)
+        .await
+        .expect("alice registers");
+
+    let machine = RootKey::generate().expect("entropy");
+    session
+        .assert_machine(signed_join(&machine, session.nonce(), "acct-1", "workbox"))
+        .await
+        .expect("the assertion is accepted");
+
+    // The reply is dropped by design, so the row is read back rather than waited
+    // for: a beat that needed its answer back would be a beat that blocks.
+    let mut listed = Vec::new();
+    for _ in 0..50 {
+        listed = session
+            .machines(false)
+            .await
+            .expect("the relay answers")
+            .machines;
+        if !listed.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(listed.len(), 1, "the beat wrote the row: {listed:?}");
+    assert_eq!(listed[0].name.as_str(), "workbox");
+    assert_eq!(
+        listed[0].machine_id,
+        arreo_core::mesh::MachineId::from_key(&machine.public())
+    );
+}
+
+/// A request the relay cannot read is a refusal, not a session-ending error.
+#[tokio::test]
+async fn a_malformed_join_is_refused() {
+    let relay = Relay::start("directory-malformed");
+    let root = RootKey::generate().expect("entropy");
+    relay.register_account("acct-1", &root.public());
+    let (alice_key, alice_cert) = device(&root, "alice", 1);
+    let session = RelaySession::dial(relay.addr, "acct-1", &alice_key, &alice_cert)
+        .await
+        .expect("alice registers");
+
+    let machine = RootKey::generate().expect("entropy");
+    let mut request = signed_join(&machine, session.nonce(), "acct-1", "workbox");
+    request.machine_key = "not-hex".to_string();
+    let reply = session
+        .join_machine(request)
+        .await
+        .expect("the relay answers");
+    assert!(reply.refused.is_some(), "a non-hex key is refused");
+    assert!(session
+        .machines(false)
+        .await
+        .expect("the relay answers")
+        .machines
+        .is_empty());
+
+    // A join for a name that is not a name: refused by the rule, not truncated
+    // into one.
+    let mut bad_name = signed_join(&machine, session.nonce(), "acct-1", "workbox");
+    bad_name.name = "  ".to_string();
+    let reply = session
+        .join_machine(bad_name)
+        .await
+        .expect("the relay answers");
+    assert!(reply.refused.is_some(), "an empty name is refused");
+}
+
+/// A machine's join request, signed by its own key over this session's nonce.
+fn signed_join(machine: &RootKey, nonce: &[u8], account: &str, name: &str) -> JoinRequest {
+    let key = machine.public_hex();
+    let payload = join_proof_payload(nonce, account, &key, name);
+    JoinRequest {
+        v: RELAY_VERSION,
+        name: name.to_string(),
+        proto_version: 1,
+        machine_key: key,
+        signature: machine.sign(&payload).to_bytes().to_vec(),
+    }
 }
 
 /// A destination that has never authenticated is a typed refusal, not a guess.
