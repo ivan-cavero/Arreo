@@ -1,0 +1,65 @@
+# T-0045 evidence — reaching a machine by name
+
+## 1. The whole scenario, driven by hand (three real processes)
+
+A relay, machine A's daemon (the machine being reached), and machine C —
+a different machine with its own root key and no configuration naming anyone.
+C types a name; the directory resolves it to the key A answers on.
+
+base: /tmp/arreo-t45-8m9V
+relay: 127.0.0.1:54259
+A device=dev_324fa024b6cd4a69678e2ae513ed8c3e
+A root  =80c661da21fb8157611d01f73a0aca6066fc77b3fe11740fc2fc26b7a73a1a08
+--- A daemon log:
+arreo-server: device authority ready (root 80c661da21fb8157…, 1 device(s))
+arreo-server: trust ledger initialized — granted 1 previously pinned device(s) access to this machine, matching how they were already treated; change any of them with `arreo machines trust`
+arreo-server: relay enabled for account acct-1 via 127.0.0.1:54259
+arreo-server: serving on /tmp/arreo-t45-8m9V/a.sock
+arreo-server: relay session up as dev_324fa024b6cd4a69678e2ae513ed8c3e (account acct-1, relay 127.0.0.1:54259)
+arreo-server: directory: this machine is workbox
+C device=dev_7d5baf8219c1badd472b4a55f12a4ddc
+--- C identity: /tmp/arreo-t45-8m9V/c/identity:
+device.key
+devices
+
+/tmp/arreo-t45-8m9V/c/identity/devices:
+7d5baf8219c1badd472b4a55f12a4ddc.cert
+--- the directory as C sees it:
+{"as_of":"2026-09-11T23:26:51.905Z","machines":[{"age_secs":1,"flags":[],"last_seen":"2026-09-11T23:26:50.508Z","machine_id":"c6938216a6cbf3fdccc9112c88cffa4c","name":"workbox","presence":"online","proto_version":0,"reachable":true}],"schema":1,"source":"relay"}
+--- what the relay stored:
+machine columns: ['machine_id', 'account_id', 'name', 'name_key', 'presence', 'last_seen_ms', 'proto_version', 'tombstone_until_ms', 'name_conflict', 'daemon_key']
+  machine_id=c6938216a6cbf3fdccc9112c88cffa4c
+  name=workbox
+  daemon_key=9886beb2ccebd5c8edf447d4381fdd50ecbd72ceb568b50fc7691f26c60059b2
+relay_device: ['324fa024b6cd4a69678e2ae513ed8c3e', '7d5baf8219c1badd472b4a55f12a4ddc']
+--- attach from C, by name, no address:
+HELLO-FROM-WORKBOX
+--- A daemon log after the attach:
+arreo-server: serving on /tmp/arreo-t45-8m9V/a.sock
+arreo-server: relay session up as dev_324fa024b6cd4a69678e2ae513ed8c3e (account acct-1, relay 127.0.0.1:54259)
+arreo-server: directory: this machine is workbox
+arreo-server: relay peer dev_7d5baf8219c1badd472b4a55f12a4ddc authenticated
+--- attach an unknown name:
+attach: no machine named "nosuch" in this account (have: ["workbox"])
+
+## 2. The key in the row is the key the session proved
+
+The relay writes the dial key from the certificate that authenticated the
+session asserting the row, not from anything the client sent:
+
+  stored daemon_key     -> dev_324fa024b6cd4a69678e2ae513ed8c3e
+  A authenticated as    -> dev_324fa024b6cd4a69678e2ae513ed8c3e
+  same device           -> True
+
+Proved by mutation: substituting the request-carried key makes
+a_machine_registers_itself_and_the_account_lists_it fail with
+"the row carries the authenticated device's key, not something the client said".
+
+## 3. The acceptance tests (three real processes each)
+
+$ cargo test -p arreo-cli --test remote_machine
+test an_unknown_machine_is_refused_by_name ... ok
+test an_offline_machine_is_refused_quickly_with_its_presence ... ok
+test a_daemon_reaches_another_machines_pane_through_the_same_client ... ok
+test attach_by_name_reaches_another_machines_pane ... ok
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.67s

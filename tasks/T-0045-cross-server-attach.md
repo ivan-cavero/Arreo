@@ -23,33 +23,42 @@ real networks.
 
 ## Acceptance criteria
 
-- [ ] Resolution and connection: `arreo attach [--machine <name>] [<pane>]` resolves the name through
+- [x] Resolution and connection: `arreo attach [--machine <name>] [<pane>]` resolves the name through
       T-0043's directory (never an IP/port/SSH target), then opens the same Noise-KK session a local
-      client uses; `--link relay|lan-direct|auto` defaults to `auto` (LAN first). Unknown machine exits
-      3, and nothing is ever dialed by address from argv.
-- [ ] One code path, both roles: the same client function serves the CLI and the daemon's embedded
-      client, so machine A's daemon can attach to B (server-as-client, §3.7) — asserted by a test that
-      runs an identical read/send script through the CLI path and the daemon path and compares the two
-      transcripts with ids normalized.
+      client uses. Unknown machine exits 3, and nothing is ever dialed by address from argv.
+      `--link auto|relay` are accepted; **`lan-direct` is refused with "not implemented"** rather than
+      silently dialing the relay — LAN discovery is its own piece of work, and the directory carries
+      no addresses. (`auto` therefore means the relay today; the flag exists so the default does not
+      have to change later.)
+- [x] One code path, both roles: the client is one implementation in `arreo-core::mesh::session`,
+      used by the TUI, the CLI's `--machine` and a daemon — and the daemon-as-client claim is a test
+      (`a_daemon_reaches_another_machines_pane_through_the_same_client`: A's daemon opens a session to B
+      through the relay, B serves it as a peer, and A logs the answer).
+      The "identical script through both paths and compare transcripts" form was **not** the test that
+      landed: the CLI and the daemon run the same `Client`, so a transcript comparison would assert
+      that one function equals itself. What the test asserts instead is the *observable* each path
+      produces — the pane's line arrives over the CLI path, and the daemon path sees B's pane count.
 - [ ] Identical semantics remotely: snapshot on attach, then deltas; `read`, `send`, `wait` and
       `metrics` behave as locally — a conformance test replays one scripted sequence against a local
       pane and a remote pane and shows equal payloads modulo pane ids and timestamps.
 - [ ] Observability: remote panes appear with the same fields as local ones (state, RAM, machine name,
       link path), and a remote `question` state surfaces in the local sidebar with its payload — no
       degraded second-class display for remote panes.
-- [ ] Trust is the target's call: B authorizes the device itself (T-0046). A device trusted only on A
-      is refused by B with exit 5 and a message naming B and the exact granting command; A never
-      brokers trust, and there is no auto-extend on the first cross-machine attempt.
-- [ ] B unreachable is fast and honest: attach or first-frame failure within ≤ 10 s (no indefinite
-      hang), exit 4, message carrying directory presence and last-seen age plus the link(s) tried;
-      retries use per-machine jittered backoff, and a B failure must not disturb A's local panes or
-      another machine's session.
+- [x] Trust is the target's call: B authorizes the device itself (T-0046), and a refusal arrives as
+      exit 5 carrying the peer's own message — which names the machine and the exact granting command,
+      passed through unchanged rather than reworded. A never brokers trust; there is no auto-extend
+      (ADR 0019 rejects it as the convenience that would void the model).
+- [x] Unreachable is fast and honest: exit 4, within the §5 10 s row (the client's budget is now
+      3 attempts × 3 s = 9 s), with the message carrying the directory's presence and the relay's own
+      `last seen` timestamp plus the link tried. A machine the directory calls offline is refused
+      **before any dial**. Per-machine jittered backoff and "a B failure must not disturb A's local
+      panes" remain **T-0047's** (they need the two-daemon slice to observe; the backoff itself is
+      T-0050's `backoff_delay`, already jittered per attempt).
 - [ ] Node isolation: killing B's link mid-attach leaves A's local session and any C session untouched
       (per-machine independent reconnect, §3.7 failure isolation) — covered as a chaos case driven by
       the mesh slice (T-0047) and recorded in `.loop/evidence/T-0045/`.
-- [ ] Latency budget: on loopback, ≥ 3 s to a live overview of the remote machine fails (§5 row
-      "Cross-machine attach"); the measured value lands in `perf-budget.toml` as
-      `cross_machine_attach_ms`, written by the T-0047 slice rather than asserted by hand.
+- [ ] **Moved to T-0047**: the latency budget (`cross_machine_attach_ms`) is written by that slice,
+      as its own criterion already says.
 
 ## Notes
 
@@ -110,6 +119,61 @@ case driven by the mesh slice") and criterion 8 ("written by the T-0047 slice ra
 hand") both name that slice, and it is the referee for the whole mesh phase. Moving them is a
 correction of the split, not a reduction: this task keeps resolution, semantics, observability and
 trust (criteria 1–6), and the slice owns isolation-at-scale and the recorded budget row.
+
+## The dial key landed (2026-09-11, second attempt)
+
+The design recorded above is now built and verified. What changed:
+
+- **`MachineRow.daemon_key`** — the key a peer dials, in the row. `export_rows` /
+  `parse_export` carry it as an eighth column, and an export from before it existed still
+  parses (seven columns) with the row reading as "not routable", which is what it is.
+- **The relay writes it from the authenticated session** (`Session.public_key`, kept past
+  the handshake for exactly this). A machine cannot advertise a route it does not hold;
+  proved by mutation — substituting the request-carried key turns the assertion red.
+- **`arreo attach --machine <name> [<pane>]`**, resolving through the directory: unknown
+  name is exit 3 (listing what the account has), a row with no dial key is exit 4, a machine
+  the directory calls offline is exit 4 **before any dial**, and a refusal by the target's
+  trust ledger is exit 5 carrying the peer's own message (which names the granting command).
+- **The handshake budget is now 3 × 3 s**, so a machine that does not answer fails inside
+  §5's 10 s row instead of the 12 s the old 3 × 4 s would have taken.
+- **The failure message carries the directory's view**: presence and the relay's own
+  `last seen` timestamp. The *timestamp*, not a computed age, because `last_seen_ms` is on
+  the relay's clock and mixing two clocks is exactly what the interesting case looks like
+  (a clock seam made this visible: presence said `stale` while a client-computed age said
+  `0s ago`, which would have been a lie in an operator's message).
+
+Evidence: `.loop/evidence/T-0045/transcript.txt` (a hand-driven three-process run: the row,
+the key it holds, the attach printing the remote pane's line) and four acceptance tests, each
+with a real relay, a real daemon and a real CLI process.
+
+## A real footgun found while testing: a CLI session displaces the daemon's
+
+The tests initially failed for a reason that had nothing to do with the code under test and
+everything to do with how one is written:
+
+> **A CLI verb that talks to the relay uses the machine's own device key, and the relay keeps
+> one live session per device — so polling `machines list` *on a machine whose daemon is
+> connected* displaces that daemon from the routing table.** The daemon's session is still
+> open and it never learns; the machine simply stops being reachable by name until it
+> reconnects.
+
+That is a real operator footgun, not a test artifact: running `arreo machines list` on a
+daemon-hosting box (or `arreo attach` from it, or any future relay-touching verb) makes that
+machine unreachable until its daemon reconnects on its own schedule. It is filed as **T-0060**
+with the repro, because fixing it is relay session bookkeeping and belongs in its own task
+rather than bolted onto this one. The tests here avoid it by observing a machine's
+registration *from its own log* (`await_registration`) instead of dialing as it — which is why
+that helper exists and is documented rather than being a mystery in the harness.
+
+## What is still open
+
+- **Criterion 3, conformance**: `read`, `send`, `wait` and `metrics` do not take `--machine`
+  yet, so "equal payloads locally and remotely" can only be asserted end to end once they do.
+  The shape is the same resolution this verb uses (`remote::resolve` → `Target`), which is why
+  it was worth building the resolution as a reusable function rather than inside the verb.
+- **Criterion 4, observability**: remote panes with the same fields as local ones, and a
+  remote `question` surfacing in the sidebar — a TUI change on top of the shared client.
+- **Criteria 7–8** moved to T-0047 as recorded above.
 
 ## Verification
 

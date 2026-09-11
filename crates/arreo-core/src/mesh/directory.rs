@@ -230,6 +230,23 @@ pub struct MachineRow {
     pub proto_version: u32,
     /// Set while a removed name is held for this machine; `None` for a live row.
     pub tombstone_until_ms: Option<i64>,
+    /// Hex of the public key a client must dial to reach this machine's daemon
+    /// (T-0045), or `None` for a row written before this field existed.
+    ///
+    /// **Why the directory holds a key at all.** A name has to resolve to
+    /// something *routable*. The relay moves bytes between **device ids**, and a
+    /// machine's directory identity is its root key (`MachineId::from_key`,
+    /// T-0043) — a different key entirely. So a machine's row records the device
+    /// key its daemon authenticates with, which is what a peer opens a Noise
+    /// session *to*: the key **is** the identity, proven by the handshake (ADR
+    /// 0011), so an id alone is not enough — a client cannot derive a key from it.
+    ///
+    /// Public material by necessity: it is what a stranger in the same account
+    /// dials, and the target's own trust ledger (T-0046) is what decides whether
+    /// the stranger gets anywhere. The relay learns it from the certificate that
+    /// authenticated the session asserting the row — it is not self-reported.
+    #[serde(default)]
+    pub daemon_key: Option<String>,
 }
 
 impl MachineRow {
@@ -268,6 +285,11 @@ pub fn export_rows(rows: &[MachineRow]) -> String {
             &row.tombstone_until_ms
                 .map_or(String::new(), |v| v.to_string()),
         );
+        out.push('\t');
+        // The dial key, empty when the row predates it. An eighth column rather
+        // than a reshuffle: a reader of an older export sees a row with a missing
+        // trailing field and treats it as "not routable", which is what it is.
+        out.push_str(row.daemon_key.as_deref().unwrap_or_default());
         out.push('\n');
     }
     out
@@ -283,7 +305,10 @@ pub fn parse_export(text: &str) -> Option<Vec<MachineRow>> {
             continue;
         }
         let fields: Vec<&str> = line.split('\t').collect();
-        if fields.len() != 7 {
+        // Seven fields is an export from before the dial key existed; eight is
+        // current. Both parse, so a saved export does not stop loading because the
+        // format grew.
+        if fields.len() != 7 && fields.len() != 8 {
             return None;
         }
         let machine_id = MachineId::parse(fields[0]).ok()?;
@@ -301,6 +326,10 @@ pub fn parse_export(text: &str) -> Option<Vec<MachineRow>> {
         } else {
             Some(fields[6].parse().ok()?)
         };
+        let daemon_key = fields
+            .get(7)
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
         rows.push(MachineRow {
             machine_id,
             name,
@@ -309,6 +338,7 @@ pub fn parse_export(text: &str) -> Option<Vec<MachineRow>> {
             last_seen_ms,
             proto_version,
             tombstone_until_ms,
+            daemon_key,
         });
     }
     Some(rows)
@@ -584,6 +614,61 @@ mod tests {
         assert_eq!(cache.as_of_ms(), 43);
     }
 
+    /// The dial key survives an export and a parse, and an export from before it
+    /// existed still loads (T-0045) — the format grew a column, and a reader of the
+    /// older one gets "not routable" rather than a parse failure.
+    #[test]
+    fn the_export_carries_the_dial_key_and_older_exports_still_load() {
+        let mut with_key = row(
+            "11111111111111111111111111111111",
+            "workbox",
+            Presence::Online,
+            1,
+        );
+        with_key.daemon_key = Some("ab".repeat(32));
+        let mut without = row(
+            "22222222222222222222222222222222",
+            "pi",
+            Presence::Online,
+            1,
+        );
+        without.daemon_key = None;
+
+        let exported = export_rows(&[with_key.clone(), without.clone()]);
+        let parsed = parse_export(&exported).expect("round trip");
+        let back = |id: &str| {
+            parsed
+                .iter()
+                .find(|row| row.machine_id.as_str() == id)
+                .expect("row")
+                .clone()
+        };
+        assert_eq!(
+            back(with_key.machine_id.as_str()).daemon_key,
+            with_key.daemon_key
+        );
+        assert_eq!(back(without.machine_id.as_str()).daemon_key, None);
+
+        // An export with seven columns (before the field existed) parses, and the
+        // row reads as not routable.
+        let legacy: String = exported
+            .lines()
+            .map(|line| {
+                let mut fields: Vec<&str> = line.split('\t').collect();
+                fields.truncate(7);
+                fields.join("\t")
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        let parsed = parse_export(&legacy).expect("an older export still loads");
+        assert_eq!(parsed.len(), 2);
+        assert!(
+            parsed.iter().all(|row| row.daemon_key.is_none()),
+            "a pre-dial-key row is honest about having no route"
+        );
+    }
+
     fn row(id: &str, name: &str, presence: Presence, proto: u32) -> MachineRow {
         MachineRow {
             machine_id: MachineId::parse(id).expect("id"),
@@ -593,6 +678,7 @@ mod tests {
             last_seen_ms: 1,
             proto_version: proto,
             tombstone_until_ms: None,
+            daemon_key: None,
         }
     }
 }

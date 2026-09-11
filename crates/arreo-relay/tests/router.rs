@@ -256,11 +256,19 @@ async fn a_machine_registers_itself_and_the_account_lists_it() {
         "the row is keyed by the machine's own key, not by anything the caller said"
     );
 
-    // The account can see it.
+    // The account can see it, **with a dial key** — the field that makes a name
+    // reachable rather than merely listed (T-0045). And the key is the one the
+    // *session proved*: the relay writes it from the verified certificate, so a
+    // machine cannot advertise a route it does not hold.
     let listed = session.machines(false).await.expect("the relay answers");
     assert_eq!(listed.refused, None);
     assert_eq!(listed.machines.len(), 1);
     assert_eq!(listed.machines[0].name.as_str(), name);
+    assert_eq!(
+        listed.machines[0].daemon_key.as_deref(),
+        Some(alice_key.public_hex().as_str()),
+        "the row carries the authenticated device's key, not something the client said"
+    );
 
     // A second machine with the same name: the relay applies T-0043's suffix
     // rule and the reply says so, rather than silently renaming either machine.
@@ -504,13 +512,28 @@ async fn the_directory_write_verbs_apply_the_relays_rules() {
         .await
         .expect("the relay answers");
 
-    // Rename to a free name: the row comes back with the new name.
+    // Rename to a free name: the row comes back with the new name, and the dial
+    // key is *kept* — a rename must not silently make a machine unreachable.
+    let rejoin_key = session
+        .machines(false)
+        .await
+        .expect("the relay answers")
+        .machines
+        .first()
+        .and_then(|row| row.daemon_key.clone())
+        .expect("the row has a dial key");
     let renamed = session
         .rename_machine(workbox.machine_id.as_str(), "workbox-2")
         .await
         .expect("the relay answers");
     assert_eq!(renamed.refused, None, "{renamed:?}");
-    assert_eq!(renamed.granted.expect("a row").name.as_str(), "workbox-2");
+    let renamed_row = renamed.granted.expect("a row");
+    assert_eq!(renamed_row.name.as_str(), "workbox-2");
+    assert_eq!(
+        renamed_row.daemon_key.as_deref(),
+        Some(rejoin_key.as_str()),
+        "a rename must not drop the route"
+    );
 
     // Rename onto the other machine's live name: refused, and *nothing*
     // changes — a rename is an explicit request for one name, so a conflict is

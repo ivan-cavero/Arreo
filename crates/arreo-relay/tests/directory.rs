@@ -16,6 +16,11 @@ use std::sync::Arc;
 
 const ACCOUNT: &str = "acct-1";
 
+/// The dial key a test machine claims. Any 64 hex characters: the *directory*
+/// stores it verbatim — the relay is what verifies a real one, from the
+/// certificate, in `router.rs`.
+const DIAL_KEY: &str = "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899";
+
 fn directory() -> Directory {
     let store = RelayStore::open_memory().expect("in-memory store");
     let directory = Directory::new(store);
@@ -47,7 +52,7 @@ fn join(
 ) -> arreo_core::mesh::MachineRow {
     let ticket = JoinTicket::issue(ACCOUNT, now);
     directory
-        .join(ticket, machine, &name(requested), 1, now)
+        .join(ticket, machine, &name(requested), 1, DIAL_KEY, now)
         .expect("join")
 }
 
@@ -70,6 +75,14 @@ fn the_schema_holds_directory_metadata_and_nothing_else() {
             "proto_version",
             "tombstone_until_ms",
             "name_conflict",
+            // v4 (T-0045) added the key a peer dials to reach this machine's
+            // daemon. Metadata by the same argument the account's root key gets: a
+            // **public** key, not a secret, and one a client in the account must
+            // know to open a session — it is the Noise identity the handshake
+            // proves, and the target's own trust ledger (T-0046) is what decides
+            // whether the caller gets anywhere. Nor is it self-reported: the relay
+            // writes it from the certificate that authenticated the session.
+            "daemon_key",
         ],
         "the machine table's columns are a contract: adding one is a decision, not a detail"
     );
@@ -113,7 +126,7 @@ fn a_machine_enters_only_through_a_live_join_ticket() {
 
     // Expired: refused.
     let expired = JoinTicket::issue(ACCOUNT, 0);
-    let refused = directory.join(expired, &machine, &name("workbox"), 1, 600_000);
+    let refused = directory.join(expired, &machine, &name("workbox"), 1, DIAL_KEY, 600_000);
     assert!(
         matches!(
             refused,
@@ -128,7 +141,7 @@ fn a_machine_enters_only_through_a_live_join_ticket() {
     // A ticket for an account that does not exist: refused, and no row appears.
     let ghost = JoinTicket::issue("nobody", 0);
     assert!(matches!(
-        directory.join(ghost, &machine, &name("workbox"), 1, 0),
+        directory.join(ghost, &machine, &name("workbox"), 1, DIAL_KEY, 0),
         Err(DirectoryFailure::NoSuchAccount(_))
     ));
     assert!(directory.list(ACCOUNT, 0).expect("list").is_empty());
@@ -200,7 +213,7 @@ fn concurrent_claims_serialize_into_one_plain_name_and_n_minus_one_suffixed() {
             // separates them.
             barrier.wait();
             directory
-                .join(ticket, &machine, &name("workbox"), 1, 1_000)
+                .join(ticket, &machine, &name("workbox"), 1, DIAL_KEY, 1_000)
                 .expect("every claimant is admitted, none rejected")
                 .name
                 .as_str()

@@ -197,6 +197,7 @@ impl Directory {
         machine_id: &MachineId,
         requested: &Name,
         proto_version: u32,
+        daemon_key: &str,
         now_ms: i64,
     ) -> Result<MachineRow, DirectoryFailure> {
         let account_id = ticket.consume(now_ms)?;
@@ -224,6 +225,7 @@ impl Directory {
             machine_id,
             requested,
             proto_version,
+            daemon_key,
             now_ms,
         )?;
         tx.commit()?;
@@ -231,12 +233,17 @@ impl Directory {
     }
 
     /// The claim itself, already inside a write transaction.
+    /// The dial key is the one thing here the *relay* supplies rather than the
+    /// client: it is the key the session proved possession of, passed down from
+    /// the router (T-0045).
+    #[allow(clippy::too_many_arguments)]
     fn claim_locked(
         conn: &rusqlite::Connection,
         account_id: &str,
         machine_id: &MachineId,
         requested: &Name,
         proto_version: u32,
+        daemon_key: &str,
         now_ms: i64,
     ) -> Result<MachineRow, DirectoryFailure> {
         // A tombstone that has run out stops holding its name. Doing this here —
@@ -251,15 +258,21 @@ impl Directory {
             if existing.name.as_str() != requested.as_str() {
                 return Err(DirectoryError::NameTaken(existing.name.to_string()).into());
             }
+            // The dial key is refreshed on every rejoin rather than written once:
+            // the device a machine authenticates with can be re-paired (T-0026's
+            // rotation), and a stale key would make the machine unreachable by
+            // name while it looked perfectly present.
             conn.execute(
                 "UPDATE machine SET last_seen_ms = ?2, proto_version = ?3,
-                                    tombstone_until_ms = NULL, name_key = ?4
+                                    tombstone_until_ms = NULL, name_key = ?4,
+                                    daemon_key = ?5
                  WHERE machine_id = ?1",
                 params![
                     machine_id.as_str(),
                     now_ms,
                     proto_version,
-                    requested.as_str()
+                    requested.as_str(),
+                    daemon_key
                 ],
             )?;
             return Self::row_for(conn, machine_id)?
@@ -269,8 +282,9 @@ impl Directory {
         let (name, conflict) = Self::pick_name(conn, account_id, requested, machine_id, now_ms)?;
         conn.execute(
             "INSERT INTO machine(machine_id, account_id, name, name_key, presence,
-                                 last_seen_ms, proto_version, tombstone_until_ms, name_conflict)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, ?8)",
+                                 last_seen_ms, proto_version, tombstone_until_ms,
+                                 name_conflict, daemon_key)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, ?8, ?9)",
             params![
                 machine_id.as_str(),
                 account_id,
@@ -279,7 +293,8 @@ impl Directory {
                 Presence::Online.as_str(),
                 now_ms,
                 proto_version,
-                i64::from(conflict)
+                i64::from(conflict),
+                daemon_key
             ],
         )?;
         Self::row_for(conn, machine_id)?
@@ -438,7 +453,8 @@ impl Directory {
     pub fn list(&self, account_id: &str, now_ms: i64) -> Result<Vec<MachineRow>, DirectoryFailure> {
         let conn = self.store.lock()?;
         let mut stmt = conn.prepare(
-            "SELECT machine_id, name, name_conflict, last_seen_ms, proto_version, tombstone_until_ms
+            "SELECT machine_id, name, name_conflict, last_seen_ms, proto_version,
+                    tombstone_until_ms, daemon_key
              FROM machine WHERE account_id = ?1 ORDER BY name_key",
         )?;
         let mut rows = stmt.query(params![account_id])?;
@@ -539,7 +555,8 @@ impl Directory {
         machine_id: &MachineId,
     ) -> Result<Option<MachineRow>, DirectoryFailure> {
         let mut stmt = conn.prepare(
-            "SELECT machine_id, name, name_conflict, last_seen_ms, proto_version, tombstone_until_ms
+            "SELECT machine_id, name, name_conflict, last_seen_ms, proto_version,
+                    tombstone_until_ms, daemon_key
              FROM machine WHERE machine_id = ?1",
         )?;
         let mut rows = stmt.query(params![machine_id.as_str()])?;
@@ -564,6 +581,7 @@ impl Directory {
             last_seen_ms,
             proto_version,
             tombstone_until_ms,
+            daemon_key: row.get::<_, Option<String>>(6)?,
         })
     }
 }

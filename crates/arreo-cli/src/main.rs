@@ -61,6 +61,9 @@ fn usage() -> ExitCode {
     eprintln!("  arreo audit export [--format jsonl|json] [--since MS] [--until MS] [--action NAME] [--out PATH|-]");
     eprintln!("      MS is Unix milliseconds; --out - (the default) is stdout");
     eprintln!("  arreo audit prune --before MS   (never automatic; says how many rows went)");
+    eprintln!("  arreo attach --machine <name> [<pane>] [--link auto|relay] [--config PATH]");
+    eprintln!("      reach another machine's pane by name, through the account's directory —");
+    eprintln!("      no IP, no port, no SSH target, and nothing dialed from argv");
     eprintln!("  arreo devices <id|list|issue|rotate|revoke|authorize> [--json] [--socket PATH]");
     eprintln!("      list --revoked|--all   (live devices by default; tombstones with --revoked)");
     eprintln!("      revoke <name|id> [--machine <name>]");
@@ -141,6 +144,8 @@ fn main() -> ExitCode {
 }
 
 mod machines;
+
+mod remote;
 
 /// Minimal block_on (current-thread runtime: no extra threads for a CLI).
 mod rt {
@@ -593,8 +598,17 @@ async fn cmd_send(rest: &[String]) -> ExitCode {
 /// running on the daemon. No full repaints: only NEW lines print (v0 delta).
 async fn cmd_attach(rest: &[String]) -> ExitCode {
     let (socket, kept) = take_socket(rest);
+    // `--machine <name>`: another machine's pane, by name (T-0045). The same verb
+    // and the same client as a local attach — the difference is what had to be
+    // resolved to open the connection.
+    if kept.iter().any(|arg| arg == "--machine") {
+        return remote::cmd_attach(&kept).await;
+    }
     if kept.len() != 1 {
         eprintln!("usage: arreo attach <id> [--socket PATH]");
+        eprintln!(
+            "       arreo attach --machine <name> [<pane>] [--link auto|relay] [--config PATH]"
+        );
         return ExitCode::from(2);
     }
     let id = kept[0].clone();

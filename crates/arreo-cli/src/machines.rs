@@ -194,6 +194,12 @@ struct Row {
     name_conflict: bool,
     /// When the name's tombstone expires, when the relay said there is one.
     tombstone_until_ms: Option<i64>,
+    /// Whether this machine has published the key a peer dials (T-0045): a name
+    /// with one can be reached by `arreo attach --machine`, and one without is in
+    /// the directory but dialable by nobody. A boolean rather than the key itself —
+    /// a script asking "can I reach this" wants an answer, not key material, and
+    /// the CLI resolves the key internally.
+    reachable: bool,
     /// Whether this row came from the cache rather than the relay: the flag that
     /// says "unverified" travels with it, so a script sees the same distinction
     /// the `source` field makes for the whole answer.
@@ -212,6 +218,7 @@ impl Row {
             proto_version: row.proto_version,
             name_conflict: row.name_conflict,
             tombstone_until_ms: row.tombstone_until_ms,
+            reachable: row.daemon_key.is_some(),
             from_cache: false,
         }
     }
@@ -238,6 +245,9 @@ impl Row {
             proto_version: cached.proto_version,
             name_conflict: cached.name_conflict,
             tombstone_until_ms: cached.tombstone_until_ms,
+            // A cached row says nothing about reachability: nobody asked, and a key
+            // asserted from memory would be a claim the relay did not make.
+            reachable: false,
             from_cache: true,
         }
     }
@@ -1373,6 +1383,7 @@ fn envelope(rows: &[Row], now_ms: i64, from_cache: bool) -> serde_json::Value {
                 "last_seen": rfc3339(row.last_seen_ms),
                 "age_secs": row.age_secs(now_ms),
                 "proto_version": row.proto_version,
+                "reachable": row.reachable,
                 "flags": row.flags(now_ms),
             })
         })
@@ -1573,6 +1584,7 @@ mod tests {
             proto_version: 1,
             name_conflict: conflict,
             tombstone_until_ms: None,
+            reachable: true,
             from_cache: false,
         }
     }
@@ -1609,6 +1621,7 @@ mod tests {
                 "last_seen",
                 "age_secs",
                 "proto_version",
+                "reachable",
                 "flags",
             ] {
                 assert!(
@@ -1652,6 +1665,11 @@ mod tests {
             serde_json::json!("offline")
         );
         assert_eq!(envelope["machines"][0]["age_secs"], serde_json::json!(9));
+        assert_eq!(
+            envelope["machines"][0]["reachable"],
+            serde_json::json!(false),
+            "a remembered row is not a claim about reachability"
+        );
         assert_eq!(
             envelope["machines"][0]["flags"],
             serde_json::json!(["unverified"]),

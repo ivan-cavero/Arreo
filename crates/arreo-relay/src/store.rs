@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 
 /// Current schema version. Bumped only alongside a migration below.
-pub const SCHEMA_VERSION: u32 = 3;
+pub const SCHEMA_VERSION: u32 = 4;
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -98,6 +98,11 @@ impl RelayStore {
                proto_version INTEGER NOT NULL,
                tombstone_until_ms INTEGER,
                name_conflict INTEGER NOT NULL DEFAULT 0,
+               -- The public key a client dials to reach this machine's daemon
+               -- (T-0045). Written from the certificate that authenticated the
+               -- session asserting the row, so it is verified rather than
+               -- self-reported; NULL for a row written before this column.
+               daemon_key TEXT,
                UNIQUE(account_id, name_key));
              CREATE INDEX IF NOT EXISTS machine_account ON machine(account_id);
              CREATE INDEX IF NOT EXISTS machine_last_seen ON machine(last_seen_ms);",
@@ -157,6 +162,14 @@ impl RelayStore {
                    -- drain cannot report the same drop twice.
                    dropped_reported INTEGER NOT NULL DEFAULT 0);",
             )?;
+        }
+        // v4: the dial key on a machine's row (T-0045). An `ALTER` rather than a
+        // rebuilt table — the row is live data an account depends on, and SQLite
+        // adds a nullable column in place. Existing rows get NULL, which the
+        // reader treats as "not routable": honest, because nothing has asserted a
+        // dial key for them yet, and the next join fills it in.
+        if version < 4 && !has_column(conn, "machine", "daemon_key")? {
+            conn.execute_batch("ALTER TABLE machine ADD COLUMN daemon_key TEXT;")?;
         }
         conn.execute(
             "INSERT INTO meta(key, value) VALUES ('schema_version', ?1)

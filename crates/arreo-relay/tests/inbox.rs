@@ -556,7 +556,15 @@ fn the_inbox_migration_leaves_the_directory_intact() {
     directory
         .create_account("acct-1", &root.public(), 1_000)
         .expect("account");
-    assert_eq!(store.schema_version().expect("version"), 3);
+    // Deliberately not an equality against the current version: this test is about
+    // the directory surviving a migration, and a pinned literal broke on every
+    // later migration while protecting nothing (it was `3` until v4 added the
+    // machine dial key). What matters is that the migration ran and the v2 tables
+    // are still there.
+    assert!(
+        store.schema_version().expect("version") >= 3,
+        "the store must have migrated"
+    );
     assert!(store
         .columns("machine")
         .expect("columns")

@@ -1,26 +1,26 @@
 ## State snapshot          ← REWRITTEN (not appended) at every checkpoint
-Task: T-0045 · cross-server attach — IN PROGRESS. One commit landed (the shared client moved to core,
-`4f79f4f`); the dial-key increment was built, tested, and **reverted** (see Findings). T-0046 and
-T-0059 are DONE.
-Where you are: the shared daemon client lives in `arreo-core::mesh::session` (TUI + CLI + daemon can all
-use it, criterion 2 landed). A machine's *name* is not yet dialable — that gap is found, designed and
-documented, but not landed. 445 tests, all green.
-Next step: **T-0045's dial key.** Start with a two-machine harness whose daemon identity is unambiguous
-(assert what each process authenticated as), then re-land `MachineRow.daemon_key` + the relay column +
-`arreo attach --machine`. Exact design and the metadata-only test's argument are in the task file.
+Task: T-0045 · cross-server attach — mostly landed. `arreo attach --machine <name>` reaches a pane on
+another machine through the directory; 4 of 7 criteria are met and the rest are named in the task file.
+Where you are: the directory row carries the key a peer dials (written by the relay from the verified
+certificate), `attach --machine` resolves and connects with the shared client, unknown/offline/refused
+all exit distinctly and fast, and a daemon reaching another machine is a test. 452 tests, all green.
+Next step: **T-0045's remaining two** — `--machine` on `read`/`send`/`wait`/`metrics` (conformance),
+then remote-pane observability in the TUI. **T-0060** (a CLI session displacing the daemon's) is filed
+and is a real operator footgun; it may deserve to go first, since it can take a machine off the relay.
 Open workers: (none)
 Known broken: (none) · Parked: (none)
 Findings:
-- **A directory name is not a route.** The relay moves bytes between *device* ids; a machine's row is
-  keyed by its *root* key. Reaching a machine by name needs the daemon's device id **and its public
-  key** (the Noise handshake pins a key, not an id) — neither is in the row today. T-0045's criteria
-  never mention this; it is the actual blocker for criterion 1.
-- **The relay's metadata-only invariant admits public keys** (the account table already holds one), so
-  the column is a decision to record, not a wall. The test that says so is worth reading before
-  widening it.
-- **The reverted prototype's failure was harness plumbing**, not design: the daemon authenticated as a
-  different device key than the test installed. Diagnosis left in the task file.
-- **`check-targets` is worth its gate** (it caught a feature-gate break twice this phase).
+- **A CLI relay session displaces the daemon's** (filed as T-0060): any relay-touching verb run on a
+  daemon-hosting machine takes that machine off the routing table until its own reconnect. Found by a
+  test harness that polled the directory as the machine it was watching.
+- **The dial key must come from the session, not the request** — proved by mutation; a client-reported
+  route is a route it does not hold.
+- **Two clocks in one message is a lie waiting to happen**: a client-computed age said "0s ago" while
+  the relay's presence said `stale`. Messages now carry the relay's own timestamp.
+- **A stale binary from a mutation test cost an hour** — `cargo test -p X` does not rebuild another
+  package's binaries. Rebuild the workspace before believing an integration test.
+- **check-targets earned its keep again**: the moved client used a Unix socket, and the Windows
+  type-check caught it.
 ## Event log               ← append-only; newest last; never rewrite
 - 2026-09-10 [turn 1] ledger created; repo at e489fac (docs only); T-0001 + T-0022 (AGENTS.md gardened) done
 - 2026-09-10 [turn 2] T-0002 PTY manager done+pushed (342606c; 9 tests); PROMPT.md v2 synced + ADR 0001 (ef6c595)
@@ -92,3 +92,5 @@ Findings:
 - 2026-09-11 [turn 47] T-0059 `arreo machines trust` done, which completes T-0046. New: `machines trust <device> [--machine] [--role viewer|operator] [--yes]` (prints the fingerprint, confirms, refuses an unpinned device so a typo is caught), `machines trust --list [--json]` (its own schema-1 contract), `devices revoke <id> --machine <name>` (cuts one machine's grant; without `--machine` it revokes the device and reports the live local grant it leaves behind), and the audit rows `trust.grant`/`trust.revoke`/`trust.refuse` with the refusal **once per session**. Two design findings: a viewer's refused spawn comes from the *certificate* gate (different fact, different fix) so it is not a trust row; and the refusal printed the certificate's `owner` where the roadmap says `operator`, fixed by `Role::operator_term` (the test asserts `owner` is *absent*). Also a real robustness fix: `SessionStore` had no busy timeout, so two writers (CLI + daemon) could fail with SQLITE_BUSY. Evidence `.loop/evidence/T-0059/` (transcript + mutation proofs). 445 tests, clippy/fmt clean, vet/deny/audit green, check-targets PASS/SKIP, 8 slices green, bench 6/6
 
 - 2026-09-11 [turn 48] T-0045 started: the shared daemon client moved from `arreo-tui` to `arreo-core::mesh::session` (`4f79f4f`) so the CLI and a daemon can both use it — the TUI's 18 tests pass untouched, which is what makes it a move rather than a rewrite. Then the *dial key* increment was built (a machine's row carrying the key a peer dials, written by the relay from the authenticated certificate; `arreo attach --machine <name>` resolving through it), and **reverted**: the design is right and recorded, but the two-machine test failed at the dial stage because the daemon authenticated as a different device key than the harness installed — harness plumbing, not design, and not something to guess at, so nothing unproven was committed. Findings written into the task file (a directory name is not a route: the relay routes by *device* id and Noise pins a *key*; the relay's metadata-only test admits public keys, and wants the argument recorded). Criteria 7–8 reassigned to T-0047, which depends on this task and is its referee. 445 tests green
+
+- 2026-09-11 [turn 49] T-0045's dial key landed and `arreo attach --machine <name>` works end to end: `MachineRow.daemon_key` (an eighth export column; older exports still parse), the relay writing it from the **authenticated session** (proved by mutation: a request-carried key fails the assertion), the verb resolving through the directory with distinct, fast, honest failures (unknown name 3, no dial key 4, offline-before-dial 4 with presence + the relay's own timestamp, trust refusal 5 carrying the peer's message), and the handshake budget cut to 3×3s so a silent peer fails inside §5's 10 s row. Four acceptance tests over three real processes each, plus a daemon-as-client test. Two findings: **a CLI relay session displaces the daemon's** (filed as T-0060 — an operator running `machines list` on a daemon-hosting box takes it off the relay), and the earlier "bug" that cost an hour was **my own mutation's stale binary** (`cargo test -p X` does not rebuild another crate's bins). Also removed a flaky 50 ms stopwatch assertion from the relay's presence test (the index-plan assertion is the real guard). 452 tests, clippy/fmt clean, vet/deny/audit green, check-targets PASS/SKIP, 8 slices green, bench 6/6. Evidence `.loop/evidence/T-0045/`

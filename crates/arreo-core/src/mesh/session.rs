@@ -420,4 +420,12 @@ const REMOTE_HANDSHAKE_ATTEMPTS: usize = 3;
 /// already connected, so a peer that has not answered in seconds is not slow, it
 /// is absent (or holding a stale stream) — and a UI that waits ten seconds before
 /// its first retry is a UI that looks hung.
-const REMOTE_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(4);
+///
+/// **Three seconds, and the arithmetic is the point** (T-0045): the whole connect
+/// is bounded by `REMOTE_HANDSHAKE_ATTEMPTS × this`, and ROADMAP §5's row says a
+/// cross-machine attach must fail within 10 s rather than hang. Three attempts at
+/// three seconds is nine, with a second spare for the relay round trips — where
+/// four seconds would be twelve and over the line. The retries stay (they exist
+/// because a reconnect races the far end's previous stream, T-0054); the length of
+/// each one is what the budget buys.
+const REMOTE_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(3);

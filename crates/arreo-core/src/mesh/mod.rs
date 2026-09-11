@@ -27,7 +27,16 @@ pub mod directory;
 #[cfg(feature = "sqlite")]
 pub mod ledger;
 /// The daemon client, over either transport (the Unix socket, or the relay to
-/// another machine). Gated on `transport` for the remote half.
+/// another machine).
+///
+/// Gated on `transport` **and `unix`**: the local half connects to a Unix socket,
+/// which is the only local transport the product has today (the daemon's listener
+/// is a `UnixListener` too), and the two halves live in one client because
+/// everything above it sees only [`session::Target`]. When Windows gets its local
+/// transport (a named pipe), this gate splits and the remote half becomes
+/// available there on its own — which is worth doing, since the remote path is
+/// what a Windows machine would use.
+#[cfg(all(feature = "transport", unix))]
 pub mod session;
 pub mod trust;
 
@@ -38,6 +47,6 @@ pub use directory::{
 };
 #[cfg(feature = "sqlite")]
 pub use ledger::{GrantedDevice, LedgerError, SharedLedger, TrustLedger, TrustRefusal};
-#[cfg(feature = "transport")]
+#[cfg(all(feature = "transport", unix))]
 pub use session::{Client as MeshClient, ClientError as MeshClientError, RemoteTarget, Target};
 pub use trust::{denial_message, evaluate, TrustDenial, TrustRecord};

@@ -73,6 +73,11 @@ pub struct Session {
     /// session's own challenge is what makes that true without a second
     /// challenge.
     pub nonce: Vec<u8>,
+    /// The public key this session proved possession of (T-0045). Kept because the
+    /// machine directory publishes it as the key a peer dials: the relay learned
+    /// it from the certificate it verified, so a row cannot advertise a route the
+    /// machine does not hold.
+    pub public_key: VerifyingKey,
 }
 
 impl Session {
@@ -81,6 +86,15 @@ impl Session {
     /// defect T-0023 hit in the transport's resolver.
     fn key(&self) -> (String, String) {
         (self.account_id.clone(), self.device_id.as_str().to_string())
+    }
+
+    /// The dial key, in the hex spelling the directory stores.
+    fn dial_key(&self) -> String {
+        let mut out = String::with_capacity(64);
+        for byte in self.public_key.to_bytes() {
+            out.push_str(&format!("{byte:02x}"));
+        }
+        out
     }
 }
 
@@ -311,7 +325,19 @@ impl Router {
             Err(e) => return refuse(format!("{:?} is not a machine name: {e}", request.name)),
         };
         let ticket = JoinTicket::issue(&session.account_id, now);
-        match directory.join(ticket, &machine, &name, request.proto_version, now) {
+        // The dial key is the **authenticated** device's key, not anything the
+        // request carried: this session already proved it holds that key (chain +
+        // proof of possession), so a machine cannot advertise a route it does not
+        // control.
+        let daemon_key = session.dial_key();
+        match directory.join(
+            ticket,
+            &machine,
+            &name,
+            request.proto_version,
+            &daemon_key,
+            now,
+        ) {
             Ok(row) => DirectoryReply {
                 v: RELAY_VERSION,
                 seq,
@@ -650,6 +676,7 @@ async fn handle_connection(connection: Connection, router: Arc<Router>) -> Resul
         account_id: device.account_id.clone(),
         device_id: device.device_id.clone(),
         nonce: nonce.to_vec(),
+        public_key: device.public_key,
     };
     router.store.touch_device(
         &session.account_id,
