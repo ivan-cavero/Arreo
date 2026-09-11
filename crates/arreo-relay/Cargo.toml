@@ -2,7 +2,9 @@
 name = "arreo-relay"
 version.workspace = true
 edition.workspace = true
-license.workspace = true
+# AGPL-3.0-or-later, NOT the workspace default (Apache-2.0): the relay is the
+# network component (ROADMAP §7), and T-0035 asserts this field in the gate.
+license = "AGPL-3.0-or-later"
 repository.workspace = true
 rust-version.workspace = true
 

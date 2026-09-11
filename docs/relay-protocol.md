@@ -6,8 +6,15 @@
 > durable inbox of `crates/arreo-relay/src/inbox.rs` (AGPL-3.0).
 > The vocabulary lives in the Apache crate on purpose (ROADMAP §7, T-0035): a
 > third party can implement a client — or a server — from this document without
-> linking AGPL code. Where this document and the code disagree, the code is
+> linking AGPL code, and **no AGPL code is needed to do it**: every type below
+> is reachable from the Apache `arreo-core` public API (the gate asserts the
+> list). Where this document and the code disagree, the code is
 > right and this document is the bug.
+>
+> License boundary, stated once: `arreo-relay` may depend on Apache first-party
+> crates (today only `arreo-core`); no Apache first-party crate may depend on
+> `arreo-relay`. Other-licensed code interoperates over this protocol or by
+> running the unmodified binary.
 
 One sentence: `[u32 little-endian length][MessagePack header][opaque payload]`
 carries bytes between two devices in one account, and the relay routes them
@@ -273,7 +280,7 @@ in it to put pane text, agent state or a key.
 | `src_device` | string | the sender. The relay requires it to equal the session's own device id (parsed and compared, so `dev_<hex>` and `<hex>` are the same device) |
 | `dst` | string | the destination device id, in either spelling |
 | `seq` | u64 | the sender's own sequence number. The relay does not check or rewrite it; it echoes it on the status it answers with |
-| `kind` | `"frame"`, `"status"`, `"drain"` or `"ack"` | what the envelope is for (§4.2) |
+| `kind` | `"frame"`, `"status"`, `"drain"`, `"ack"` or `"peergone"` | what the envelope is for (§4.2) |
 
 The relay does **not** enforce monotonic `seq` and does not de-duplicate: a
 receiver that cares about ordering or replays must do that itself, on the
@@ -287,13 +294,14 @@ sender's sequence numbers.
 | `status` | relay → device only | MessagePack of one `Outcome` (§4.3) or one `DrainReport` (§4.4), written by the relay |
 | `drain` | device → relay only | MessagePack of one `DrainRequest` (§4.4): hand me what is queued for me |
 | `ack` | device → relay only | MessagePack of one `Ack` (§4.4): I hold everything up to this cursor |
+| `peergone` | relay → device only | no payload: a device in your account went offline. `src_device` is the device that left; `dst` is you. The whole message is the header, so a receiver with no stream for that peer ignores it (§4.6) |
 
-A device that sends `kind = "status"` is refused per-envelope: statuses are the
-relay's to originate. `drain` and `ack` are the mirror image — the device's to
-originate, and the relay never sends them, so a client that reads one is reading
-its own request echoed back and should treat it as a protocol error. Neither is
-a *frame*: a control message carries nothing for another device, and it never
-reaches the routing decision of §4.3.
+A device that sends `kind = "status"` **or `kind = "peergone"`** is refused per-envelope: statuses
+and departure notices are the relay's to originate — a forged departure would let any device in an
+account make another device's peers drop their streams. `drain` and `ack` are the mirror image — the
+device's to originate, and the relay never sends them, so a client that reads one is reading its own
+request echoed back and should treat it as a protocol error. Neither is a *frame*: a control message
+carries nothing for another device, and it never reaches the routing decision of §4.3.
 
 ### 4.3 Status envelopes and `Outcome`
 
@@ -461,6 +469,24 @@ The rest of the queue's honest properties:
   key or a pane. End-to-end confidentiality remains the daemons' Noise session
   (T-0023), and wiring the daemon side to the relay is T-0050.
 
+### 4.6 Departure notices (`peergone`)
+
+When a device's session ends, the relay tells every other live device in the
+account: one `peergone` envelope each, `src_device` naming the device that left,
+no payload. The notice is account-wide rather than addressed, because the relay
+does not track who holds a stream to whom — a subscription table is state that
+can be wrong, and a missed notice is exactly the stuck stream this exists to
+prevent. A receiver with no stream for that peer ignores it; a receiver that has
+one ends it with a reason, so its next connection is served by a fresh session
+rather than delivered into a dead one (T-0054; the reconnect that took over 60 s
+before now completes in tens of milliseconds).
+
+The notice is metadata only (§3.7/§3.14): a device id, no pane content and no
+agent state. It is best-effort like every other relay message — a device that is
+itself offline during the departure learns nothing from it, and learns from the
+relay's outcome when it next writes instead. And it is the relay's own news: a
+device that sends `kind = "peergone"` is refused per-envelope (§4.2).
+
 ## 5. Refusals
 
 ### 5.1 Handshake refusals
@@ -496,7 +522,7 @@ inbox itself, with its own line (the operator's guide, §11).
 | `account_id` is not the session's account | `session is for account <a>, not <b>` |
 | `src_device` parses but is not the session's device | `session is <a>, not <b>` |
 | `src_device` is not a well-formed device id | `malformed src_device: <detail>` |
-| `kind` is `status` | `a device may not send status envelopes` |
+| `kind` is `status` or `peergone` | `a device may not send status envelopes` |
 | `dst` is not a well-formed device id | `malformed dst: <detail>` |
 | the device registry lookup itself fails | `device registry lookup failed: <detail>` |
 | the destination's inbox refuses the message: it is larger than that device's whole byte budget, or the store failed (§4.5) | `inbox refused the message: <detail>` |
@@ -651,3 +677,8 @@ guessed at.**
 9. De-duplicate on the drained frame's own header `(src_device, seq)` before
    acting on it: the wire is at-least-once, and a disconnect mid-drain
    redelivers what was not acked (§4.5).
+10. Expect `kind = "peergone"` (§4.6): when a device in your account goes
+    offline the relay sends you one, with no payload and `src_device` naming the
+    device that left. If you hold a stream to that peer, end it — its next
+    connection will be a fresh one, and yours should be too. If you hold none,
+    ignore it. Never send one yourself: the relay refuses it.

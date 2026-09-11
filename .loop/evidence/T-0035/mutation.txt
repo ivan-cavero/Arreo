@@ -1,0 +1,79 @@
+# T-0035 mutation control — the gate must fail naming the crate and the line
+
+## 1. The probe: add arreo-relay to an Apache manifest
+$ tail -2 crates/arreo-cli/Cargo.toml
+
+arreo-relay = { path = "../arreo-relay" }
+
+$ cargo test -p xtask --test workspace_deps
+test nothing_depends_on_server ... ok
+test declared_licenses_are_apache_except_the_relay ... ok
+test server_and_cli_depend_on_core ... ok
+test reuse_maps_the_relay_to_agpl_and_names_real_paths ... ok
+test nothing_apache_depends_on_the_relay ... FAILED
+test the_relay_depends_only_on_apache_core ... ok
+test the_protocol_vocabulary_is_reachable_from_apache_core ... ok
+test the_cli_has_no_relay_verb ... ok
+thread 'nothing_apache_depends_on_the_relay' (2113636) panicked at xtask/tests/workspace_deps.rs:132:9:
+arreo-cli must not depend on arreo-relay: Apache code may not link the AGPL relay
+test result: FAILED. 7 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+## 2. The probe is reverted and the gate passes
+$ git diff --stat crates/arreo-cli/Cargo.toml
+(no output = manifest restored)
+
+$ cargo test -p xtask --test workspace_deps
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+## 3. License fields read back from the manifests
+arreo-core: license.workspace = true
+arreo-server: license.workspace = true
+arreo-cli: license.workspace = true
+arreo-tui: license.workspace = true
+arreo-plugin-api: license.workspace = true
+arreo-relay: license = "AGPL-3.0-or-later"
+
+workspace default: license = "Apache-2.0"
+
+## 4. The REUSE diff
+diff --git a/REUSE.toml b/REUSE.toml
+index a5f5707..bbd630a 100644
+--- a/REUSE.toml
++++ b/REUSE.toml
+@@ -11,9 +11,11 @@ precedence = "aggregate"
+ SPDX-FileCopyrightText = "2026 Arreo contributors"
+ SPDX-License-Identifier = "Apache-2.0"
+ 
+-# AGPL-3.0-or-later: the relay — the network component.
++# AGPL-3.0-or-later: the relay — the network component. (The protocol vocabulary
++# lives in crates/arreo-core/src/relay/ and is Apache: a third party implements
++# from it without touching AGPL code, which is the whole point of the boundary.)
+ [[annotations]]
+-path = ["crates/arreo-relay/**", "crates/arreo-relay-proto/**", "LICENSE-RELAY"]
++path = ["crates/arreo-relay/**", "LICENSE-RELAY"]
+ precedence = "aggregate"
+ SPDX-FileCopyrightText = "2026 Arreo contributors"
+ SPDX-License-Identifier = "AGPL-3.0-or-later"
+
+## 5. cargo deny check (GPL-family dependency ban untouched)
+
+advisories ok, bans ok, licenses FAILED, sources ok
+
+## 6. The deny allow-list correction (same turn)
+Declaring the relay AGPL made cargo-deny fail its license gate — the allow-list had no AGPL entry, because before this task no crate in the tree declared one. The fix keeps the dependency ban untouched: AGPL-3.0-or-later is allowed as a *first-party* license (the relay crate itself), and the workspace_deps gate asserts the per-crate side (every shipped crate Apache, the relay AGPL) which cargo-deny cannot express. cargo-deny cannot say allowed-for-one-crate, so the two gates divide the work and the evidence for both is here.
+
+$ cargo deny check
+
+advisories ok, bans ok, licenses ok, sources ok
+
+## 7. The full battery (final code)
+
+cargo test --workspace: 340 passed, 0 failed across 44 targets
+cargo clippy --workspace --all-targets -- -D warnings: 0 diagnostics
+cargo fmt --all -- --check: clean
+cargo vet --locked: Vetting Succeeded (336 exempted)
+cargo deny check: advisories ok, bans ok, licenses ok, sources ok
+cargo audit: 343 crate dependencies, no advisories
+cargo xtask check-targets: x86_64-unknown-linux-gnu PASS; x86_64-pc-windows-msvc SKIP (pure-Rust no-sqlite PASS)
+e2e slices: api green, lifecycle 2/2, persistence 3/3, tui 17/17, theme 27/27, relay 14/14
+cargo xtask bench: 6/6 PASS

@@ -11,9 +11,11 @@ precedence = "aggregate"
 SPDX-FileCopyrightText = "2026 Arreo contributors"
 SPDX-License-Identifier = "Apache-2.0"
 
-# AGPL-3.0-or-later: the relay — the network component.
+# AGPL-3.0-or-later: the relay — the network component. (The protocol vocabulary
+# lives in crates/arreo-core/src/relay/ and is Apache: a third party implements
+# from it without touching AGPL code, which is the whole point of the boundary.)
 [[annotations]]
-path = ["crates/arreo-relay/**", "crates/arreo-relay-proto/**", "LICENSE-RELAY"]
+path = ["crates/arreo-relay/**", "LICENSE-RELAY"]
 precedence = "aggregate"
 SPDX-FileCopyrightText = "2026 Arreo contributors"
 SPDX-License-Identifier = "AGPL-3.0-or-later"

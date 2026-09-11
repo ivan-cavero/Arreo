@@ -121,6 +121,24 @@ If the harness has an official plugin/hook system, a native tier is even better 
 the project retains the right to offer managed-relay exceptions (dual-tracking applies to
 the relay only, never to the Apache core). If in doubt, ask before building on it.
 
+### The license boundary (enforced by `cargo test -p xtask --test workspace_deps`)
+
+Apache code may enter an AGPL work; AGPL code may not enter an Apache work (the binary
+would be AGPL). So the dependency rule points one way, and a machine checks it:
+
+- `arreo-relay` may depend on Apache first-party crates — one-way, today only
+  `arreo-core` (the protocol vocabulary, which is what makes the relay implementable
+  from other code).
+- **No Apache first-party crate may depend on `arreo-relay`** — not `arreo-core`,
+  not `arreo-server`, not `arreo-cli`, not `arreo-tui`, not `arreo-plugin-api`.
+  Other-licensed code interoperates over the documented protocol
+  (`docs/relay-protocol.md`) or by running the unmodified `arreo-relay` binary.
+- Every shipped crate declares Apache-2.0; the relay declares AGPL-3.0-or-later
+  explicitly (inheriting the workspace default would silently license it Apache).
+- `arreo relay serve` stays unimplemented on purpose: linking the relay into
+  `arreo-cli` would relicense the CLI, and an exec shim is a second name for one
+  thing. Run the relay binary; do not wrap it.
+
 ## Agent-loop contributions (yes, an agent can open your PR)
 
 Arreo is [developed in agent loops](ROADMAP.md) — machine-driven workers, human-approved

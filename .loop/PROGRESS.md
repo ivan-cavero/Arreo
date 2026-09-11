@@ -1,42 +1,29 @@
 ## State snapshot          ← REWRITTEN (not appended) at every checkpoint
-Task: T-0032 · remote TUI attach (phase 2) — DONE end to end, incl. T-0054 and T-0055
-Where you are: the TUI on one machine drives another machine's panes through the relay; a client
-that vanishes reconnects in **77 ms** with a byte-identical transcript; a machine that was away for
-weeks reattaches in **63 ms** and drains its inbox once. T-0032's whole file is ticked. 334
-workspace tests.
-Next step: **T-0035 (AGPL boundary — a live bug: the relay declares Apache while REUSE says AGPL)**,
-then T-0031 (presence), T-0028, T-0040, T-0049. T-0044 is blocked on the account-join RPC (its own
-note); **T-0036 is human-gated** — it needs a real minisign keypair whose secret the operator holds
-as a CI secret, and the gate is recorded in the task file so the next pass does not re-derive it.
+Task: T-0035 · AGPL boundary (phase 2) — DONE, the boundary is architecture a machine checks
+Where you are: the relay declares AGPL-3.0-or-later explicitly (the live manifest bug is fixed),
+the gate asserts the one-way rule plus per-crate licenses plus REUSE truth plus the portable
+interface plus no CLI shortcut, and the protocol doc versions v1 with the peergone kind T-0054
+added. 340 workspace tests.
+Next step: **T-0031 (presence)**, then T-0028, T-0040, T-0049. T-0044 is blocked on the
+account-join RPC (its own note); **T-0036 is human-gated** — it needs a real minisign keypair
+whose secret the operator holds as a CI secret, and the gate is recorded in the task file.
 Open workers: (none)
 Known broken: (none) · Parked: (none)
 Findings:
-- **A dropped handle must stop its task — second occurrence, now a pattern.** `SecureChannel` (T-0033)
-  and then `RelaySession` (T-0054) both left detached tasks holding a live connection after the handle
-  was dropped. For the session it meant the relay never learned a client had left, so the departure
-  notice had nothing to announce and a reconnect took over a minute. When a type owns a task that owns
-  a resource, its `Drop` must abort that task; a `JoinHandle` does nothing when dropped.
-- **A carrier that does not report departures makes reconnects unreliable.** The relay routed by
-  device id but never told a peer that a device left, so the far end kept a dead stream and swallowed
-  the next handshake. Fixed with `RelayKind::PeerGone` (account-wide, device-forbidden, no payload —
-  the header is the message). Retrying harder cannot substitute for the carrier telling the truth.
-- **Retention is a comparison between two timestamps, so the clock must move as one.** The T-0055
-  seam is an env var read once (`ARREO_CLOCK_OFFSET_MS`): a per-call hook would let the clock move
-  between a write and a sweep and make "expired" a function of scheduling. A short TTL with a real
-  sleep is the tempting middle and is worse than either: slow, and still not the window it claims.
-- **A restart ends every session.** The first draft of the absence test kept a client connected across
-  the clock-moving restart and failed on the next send. A kill is a kill; both clients reconnect after
-  the restart, which is also the shape a real absence has.
-- **A queue for an offline peer is not a failure.** A write to a departed peer queues durably (T-0030);
-  the property a reconnect needs is that a *fresh* stream carries data again.
-- **The session belongs to both ends of §3.7.** `RelaySession` moved from `arreo-server` into
-  `arreo-core` because the TUI may not depend on the server (AGENTS.md).
-- **A hex-key parser existed three times**; `identity::verifying_key_from_hex` is now the only one.
-- **A budget row `bench` cannot measure still needs enforcing.** `cross_machine_attach_s` and
-  `reattach_after_absence_s` are timed by the slice and the relay test, each reading the number *from
-  `perf-budget.toml`* rather than holding a copy (63–1182 ms across runs, budgets 3 s).
-- **A test that scans a file must scan the WAL** (T-0033), and its sibling: assert the fixture is real
-  before asserting what it lacks.
+- **Declaring the relay AGPL broke cargo-deny, and that is the gate working.** The license
+  allow-list had no AGPL entry because no crate had ever declared one. The fix keeps the dependency
+  ban untouched: AGPL is allowed as a first-party license, and the workspace_deps gate asserts the
+  per-crate side cargo-deny cannot express. Two gates divide the work; the evidence records both.
+- **A textual gate catches edges, not copy-paste** (T-0035's own honest gap): manifests and REUSE
+  are asserted, not code provenance. Worth remembering the next time "the boundary is enforced" is
+  claimed — it is enforced against linking, not against copying.
+- **A dropped handle must stop its task** (T-0033, T-0054 — pattern, not incident).
+- **A carrier that does not report departures makes reconnects unreliable** (T-0054, PeerGone).
+- **Retention compares two timestamps, so the clock must move as one** (T-0055,
+  ARREO_CLOCK_OFFSET_MS read once).
+- **A restart ends every session; a queue for an offline peer is not a failure** (T-0055, T-0030).
+- **A budget row bench cannot measure still needs enforcing** — the slice/test reads the number from
+  perf-budget.toml rather than holding a copy.
 ## Event log               ← append-only; newest last; never rewrite
 - 2026-09-10 [turn 1] ledger created; repo at e489fac (docs only); T-0001 + T-0022 (AGENTS.md gardened) done
 - 2026-09-10 [turn 2] T-0002 PTY manager done+pushed (342606c; 9 tests); PROMPT.md v2 synced + ADR 0001 (ef6c595)
@@ -74,3 +61,5 @@ Findings:
 - 2026-09-11 [turn 31] T-0032 remote TUI attach done for the client half (the drop criterion split to the new T-0054): `Target` (local socket | remote through the relay) in `arreo-tui::client`, `--remote/--peer/--account/--identity`, the same `Message` verbs and msgpack frames over both transports, a long-lived connection with a reconnect loop on the relay session's own backoff (250 ms base, 30 s cap, jitter) and a `reconnecting` status line, cursor-owned resume (no duplicated line, no gap), peer-key pinning via the pairing-written `server.key`, ADR 0015. Moved `RelaySession`/`RelayStream`/`StreamFactory`/`Closed` from `arreo-server` into `arreo-core::relay::session` (a client needs the same session a daemon does; the dependency rule forbids the TUI reaching into the server), fixed a real defect the move exposed (a dropped peer stream discarded the next handshake flight instead of re-parking it), consolidated three copies of the hex-key parser into `identity::verifying_key_from_hex`, and added the `relay` e2e slice: real relay + real peer daemon + the real TUI on a pty with real key events, 14 assertions including the §5 `cross_machine_attach_s` budget read from `perf-budget.toml` (406 ms vs 3 s) and the relay-holds-no-plaintext scan. Evidence `.loop/evidence/T-0032/` (frames + gates); 329 workspace tests, clippy/fmt clean, vet/deny/audit green, check-targets PASS/SKIP, 6 e2e slices green, bench 6/6; the viewer-refusal half of the attribution criterion is asserted too (a viewer reads, is refused a send with a typed error, and no keystroke reaches the pane); remote == local
 
 - 2026-09-11 [turn 33] T-0055 reattach-after-absence done (the last criterion T-0032 split out): the relay's clock is injectable through `ARREO_CLOCK_OFFSET_MS` (read once, so retention compares timestamps from one clock; pinned to no-op when unset by unit test), and a simulated five-day absence against a real relay proves reattach in 63 ms against the new `reattach_after_absence_s` budget row (dial + auth + drain of three in seq order, ack + cursor making the second drain empty), plus a twenty-five-day absence proving the window's drops are *counted* (`expired: 2`) rather than silent. Both clients reconnect after the clock-moving restart, which is the shape a real absence has. Evidence `.loop/evidence/T-0055/`. T-0032's file is now fully ticked. 334 workspace tests, clippy/fmt clean, vet/deny/audit green, check-targets PASS/SKIP, 6 e2e slices green, bench 6/6; remote == local
+
+- 2026-09-11 [turn 34] T-0035 AGPL boundary done: the relay declares AGPL-3.0-or-later explicitly (the live bug — it inherited the Apache workspace default while REUSE and LICENSE-RELAY said AGPL), the workspace_deps gate now asserts the one-way rule (relay may depend on core; nothing Apache may depend on the relay), per-crate licenses (every shipped crate Apache, the relay AGPL), REUSE truth (relay mapped, no phantom paths — the stale arreo-relay-proto entry retired), the portable interface (the envelope vocabulary reachable from Apache arreo-core), and no CLI relay verb. Declaring AGPL broke cargo-deny in the same turn and the fix keeps the dependency ban untouched (AGPL allowed as a first-party license; the per-crate side lives in the gate cargo-deny cannot express). Protocol doc versions v1 with the peergone kind T-0054 added (kind table, §4.6, refusal table, implementer step 10); deploy doc states the §13 obligations honestly; CONTRIBUTING records the rule. Mutation control (add arreo-relay to the CLI manifest → gate fails naming the crate; revert → green) plus licenses, REUSE diff and deny run in .loop/evidence/T-0035/. 340 workspace tests, clippy/fmt clean, vet/deny/audit green, check-targets PASS/SKIP, 6 e2e slices green, bench 6/6; remote == local

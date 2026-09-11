@@ -315,6 +315,27 @@ What to do when a queue is full or a device has stopped draining:
 
 ## 9. Deployment shapes
 
+### 9.0 The license, stated plainly
+
+`arreo-relay` is AGPL-3.0-or-later; the core, daemon, CLI and TUI are Apache-2.0.
+That split is the §7 protection, and this is what it means for an operator:
+
+- **Self-hosting the unmodified relay triggers no source duty.** Run the binary
+  we ship (or build it from the source we publish) and nothing more is asked of
+  you — the AGPL's obligations attach to *modifying* and *offering*, not to
+  running.
+- **Modifying the relay and offering it over a network requires publishing the
+  modified source** (AGPL §13). If you change the router, the inbox, or anything
+  else in `crates/arreo-relay/` and let devices use it over the network, the
+  users of that relay are entitled to the source of your modified version. That
+  is the protection §7 exists for: a hosted relay cannot be improved in private
+  while the project that wrote it stays public.
+- **The Apache side is unaffected.** Devices speak to the relay over the
+  documented protocol (`docs/relay-protocol.md`) or run the unmodified binary;
+  neither act brings AGPL terms into your own code. The protocol vocabulary
+  lives in the Apache `arreo-core` crate precisely so a third party can
+  implement from it without touching AGPL code.
+
 ### 9.1 Direct QUIC on the host
 
 ```console
