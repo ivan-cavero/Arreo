@@ -400,11 +400,14 @@ const REMOTE_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(4);
 /// How many fresh streams one connect may use (see [`Link::remote`]).
 const REMOTE_HANDSHAKE_ATTEMPTS: usize = 3;
 
-/// Pane summary for the sidebar (id + liveness + state + RAM).
+/// Pane summary for the sidebar (id + liveness + state + RAM + history).
 #[derive(Debug, Clone)]
 pub struct PaneSummary {
     pub id: String,
     pub alive: bool,
     pub state: AgentState,
     pub ram_kb: u64,
+    /// Recent peak RSS for the sparkline, oldest first, KiB (T-0040).
+    /// Best-effort like `ram_kb`: empty when history is unavailable.
+    pub ram_history: Vec<u64>,
 }

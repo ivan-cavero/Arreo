@@ -37,7 +37,7 @@ pub enum SessionError {
     Json(#[from] serde_json::Error),
 }
 
-pub const SCHEMA_VERSION: u32 = 5;
+pub const SCHEMA_VERSION: u32 = 6;
 
 /// One pane's persisted record: how to respawn it + what it showed.
 #[derive(Debug, Clone, PartialEq)]
@@ -370,6 +370,27 @@ impl SessionStore {
             // the honest default — and the prompt rows keep their meaning.
             conn.execute_batch(
                 "UPDATE audit SET action = 'prompt' WHERE action = 'prompt' OR action IS NULL;",
+            )?;
+        }
+        // v6 (T-0040): metrics history — a real time series beside the live
+        // sampler. Three tiers in one table, keyed (pane, ts_ms, step_ms) so a
+        // re-run rollup is idempotent: 10 s rows kept 24 h, 1 m rollups 30 d,
+        // 1 h rollups 365 d. Every row carries average AND peak RSS (peak is
+        // the number people act on) plus cpu and pids. The old `rollups` table
+        // (T-0006, unkeyed by step) is left alone — data never dropped by a
+        // migration; the series API reads the new table and the old rows age
+        // out through the normal store lifecycle.
+        if version < 6 {
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS metrics_series(
+                   pane TEXT NOT NULL, ts_ms INTEGER NOT NULL, step_ms INTEGER NOT NULL,
+                   rss_avg INTEGER NOT NULL, rss_peak INTEGER NOT NULL,
+                   cpu_avg REAL NOT NULL, cpu_peak REAL NOT NULL,
+                   pids_avg REAL NOT NULL, pids_peak INTEGER NOT NULL,
+                   samples INTEGER NOT NULL,
+                   PRIMARY KEY (pane, ts_ms, step_ms));
+                 CREATE INDEX IF NOT EXISTS metrics_series_range
+                   ON metrics_series(pane, ts_ms);",
             )?;
         }
         conn.execute(
@@ -793,6 +814,206 @@ impl SessionStore {
         })?;
         Ok(removed)
     }
+
+    /// Record one metrics sample at `ts_ms`, floored to `step_ms` (T-0040).
+    ///
+    /// The floor is what makes re-running a rollup idempotent: two writers
+    /// recording the same bucket land on the same `(pane, ts_ms, step_ms)` key,
+    /// and `INSERT OR REPLACE` keeps the later write rather than duplicating
+    /// the row. Peak RSS is the max of the two writes' peaks, so a re-run can
+    /// only keep the worst moment, never lose it.
+    pub fn metrics_record(&self, sample: &MetricsSample) -> Result<(), SessionError> {
+        let conn = self.lock()?;
+        let bucket = sample.ts_ms - (sample.ts_ms % sample.step_ms.max(1));
+        // A fresh row carries the sample's own weight (rollups arrive with the
+        // tier below's count already summed); a re-run merges by weight rather
+        // than by row, so a rollup re-run keeps the same total.
+        let weight = sample.samples.max(1) as i64;
+        conn.execute(
+            "INSERT INTO metrics_series(pane, ts_ms, step_ms, rss_avg, rss_peak,
+                                        cpu_avg, cpu_peak, pids_avg, pids_peak, samples)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+             ON CONFLICT(pane, ts_ms, step_ms) DO UPDATE SET
+               rss_avg = (rss_avg * samples + excluded.rss_avg * excluded.samples) / (samples + excluded.samples),
+               rss_peak = MAX(rss_peak, excluded.rss_peak),
+               cpu_avg = (cpu_avg * samples + excluded.cpu_avg * excluded.samples) / (samples + excluded.samples),
+               cpu_peak = MAX(cpu_peak, excluded.cpu_peak),
+               pids_avg = (pids_avg * samples + excluded.pids_avg * excluded.samples) / (samples + excluded.samples),
+               pids_peak = MAX(pids_peak, excluded.pids_peak),
+               samples = samples + excluded.samples",
+            params![
+                sample.pane,
+                bucket as i64,
+                sample.step_ms as i64,
+                sample.rss_avg as i64,
+                sample.rss_peak as i64,
+                sample.cpu_avg,
+                sample.cpu_peak,
+                sample.pids_avg,
+                sample.pids_peak as i64,
+                weight,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// One indexed range scan on `(pane, ts_ms)` at exactly `step_ms` (T-0040).
+    ///
+    /// Oldest-first (chart order). No interpolation and no cross-step blending:
+    /// a caller that wants a coarser step rolls up from this tier itself, and a
+    /// caller that asks finer than available is told to downshift by
+    /// [`metrics_step_for`] rather than receiving an empty series.
+    pub fn metrics_range(
+        &self,
+        pane: &str,
+        since_ms: u64,
+        until_ms: u64,
+        step_ms: u64,
+    ) -> Result<Vec<MetricsRow>, SessionError> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT ts_ms, rss_avg, rss_peak, cpu_avg, cpu_peak,
+                    pids_avg, pids_peak, samples
+             FROM metrics_series
+             WHERE pane = ?1 AND step_ms = ?2 AND ts_ms >= ?3 AND ts_ms <= ?4
+             ORDER BY ts_ms ASC",
+        )?;
+        let rows = stmt.query_map(
+            params![pane, step_ms as i64, clamp_ms(since_ms), clamp_ms(until_ms)],
+            |row| {
+                Ok(MetricsRow {
+                    ts_ms: row.get::<_, i64>(0)?.max(0) as u64,
+                    rss_avg: row.get::<_, i64>(1)?.max(0) as u64,
+                    rss_peak: row.get::<_, i64>(2)?.max(0) as u64,
+                    cpu_avg: row.get::<_, f64>(3)?,
+                    cpu_peak: row.get::<_, f64>(4)?,
+                    pids_avg: row.get::<_, f64>(5)?,
+                    pids_peak: row.get::<_, i64>(6)?.max(0) as u64,
+                    samples: row.get::<_, i64>(7)?.max(0) as u64,
+                })
+            },
+        )?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// Roll one tier into the next coarser one (T-0040): every `step_ms` bucket
+    /// in `[since_ms, until_ms]` becomes one row at `into_step_ms`, aligned to
+    /// the coarser boundary.
+    ///
+    /// Reads go through [`SessionStore::metrics_range`] and writes through
+    /// [`SessionStore::metrics_record`], so a rollup is a pure function of the
+    /// tier below — never a re-sample of `/proc`, which is what keeps a pane
+    /// restored late from leaving a hole where the underlying row exists.
+    /// Returns rows written.
+    pub fn metrics_rollup(
+        &self,
+        pane: &str,
+        since_ms: u64,
+        until_ms: u64,
+        step_ms: u64,
+        into_step_ms: u64,
+    ) -> Result<u64, SessionError> {
+        let rows = self.metrics_range(pane, since_ms, until_ms, step_ms)?;
+        let mut buckets: std::collections::BTreeMap<u64, Vec<MetricsRow>> =
+            std::collections::BTreeMap::new();
+        for row in rows {
+            buckets
+                .entry(row.ts_ms - (row.ts_ms % into_step_ms))
+                .or_default()
+                .push(row);
+        }
+        let mut written = 0u64;
+        for (bucket, members) in buckets {
+            if members.is_empty() {
+                continue;
+            }
+            let total_samples: u64 = members.iter().map(|m| m.samples.max(1)).sum();
+            let weight = total_samples.max(1) as f64;
+            let rss_avg = (members
+                .iter()
+                .map(|m| m.rss_avg as f64 * m.samples.max(1) as f64)
+                .sum::<f64>()
+                / weight) as u64;
+            let cpu_avg = members
+                .iter()
+                .map(|m| m.cpu_avg * m.samples.max(1) as f64)
+                .sum::<f64>()
+                / weight;
+            let pids_avg = members
+                .iter()
+                .map(|m| m.pids_avg * m.samples.max(1) as f64)
+                .sum::<f64>()
+                / weight;
+            self.metrics_record(&MetricsSample {
+                pane: pane.to_string(),
+                ts_ms: bucket,
+                step_ms: into_step_ms,
+                rss_avg,
+                rss_peak: members.iter().map(|m| m.rss_peak).max().unwrap_or(0),
+                cpu_avg,
+                cpu_peak: members
+                    .iter()
+                    .map(|m| ordered_f64(m.cpu_peak))
+                    .max()
+                    .map(unorder_f64)
+                    .unwrap_or(0.0),
+                pids_avg,
+                pids_peak: members.iter().map(|m| m.pids_peak).max().unwrap_or(0),
+                samples: total_samples,
+            })?;
+            written += 1;
+        }
+        Ok(written)
+    }
+
+    /// Hourly prune tick (T-0040): drop every tier's rows older than its
+    /// retention, and never the newest row of a live pane.
+    ///
+    /// "Live" is decided by the caller through `live_panes`: the store cannot
+    /// know which panes are running, and a graph must never go empty because a
+    /// tick ran while its pane was briefly between samples. Returns rows
+    /// removed, per tier in `(step_ms, removed)` order.
+    pub fn metrics_prune(
+        &self,
+        now_ms: u64,
+        live_panes: &[&str],
+    ) -> Result<Vec<(u64, u64)>, SessionError> {
+        let mut out = Vec::new();
+        for (step_ms, retention_ms) in metrics_retention() {
+            let cutoff = now_ms.saturating_sub(retention_ms) as i64;
+            let conn = self.lock()?;
+            let removed = conn.execute(
+                "DELETE FROM metrics_series WHERE step_ms = ?1 AND ts_ms < ?2
+                 AND NOT (pane IN (SELECT value FROM json_each(?3))
+                          AND ts_ms = (SELECT MAX(ts_ms) FROM metrics_series AS keep
+                                       WHERE keep.pane = metrics_series.pane
+                                         AND keep.step_ms = metrics_series.step_ms))",
+                params![
+                    step_ms as i64,
+                    cutoff,
+                    serde_json::json!(live_panes).to_string()
+                ],
+            )? as u64;
+            out.push((step_ms, removed));
+        }
+        Ok(out)
+    }
+
+    /// Bytes the series holds for one pane (T-0040's ≤ 2 MB bar, asserted not
+    /// assumed).
+    pub fn metrics_bytes(&self, pane: &str) -> Result<u64, SessionError> {
+        let conn = self.lock()?;
+        let bytes: i64 = conn.query_row(
+            "SELECT COALESCE(SUM(LENGTH(pane) + 48), 0) FROM metrics_series WHERE pane = ?1",
+            params![pane],
+            |row| row.get(0),
+        )?;
+        Ok(bytes.max(0) as u64)
+    }
 }
 
 /// A millisecond bound as SQLite's signed integer, clamped.
@@ -814,6 +1035,82 @@ fn clamp_ms(value: u64) -> i64 {
 /// most clearly means "everything" would take a code path nobody intended.
 fn clamp_limit(limit: usize) -> i64 {
     limit.min(i64::MAX as usize) as i64
+}
+
+/// One metrics sample to record (T-0040): average and peak RSS (peak is the
+/// number people act on) plus cpu and pids, at `step_ms` granularity.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MetricsSample {
+    pub pane: String,
+    pub ts_ms: u64,
+    pub step_ms: u64,
+    pub rss_avg: u64,
+    pub rss_peak: u64,
+    pub cpu_avg: f64,
+    pub cpu_peak: f64,
+    pub pids_avg: f64,
+    pub pids_peak: u64,
+    /// How many raw samples this row aggregates (1 for a fresh 10 s row).
+    pub samples: u64,
+}
+
+/// One stored series row, oldest-first out of [`SessionStore::metrics_range`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct MetricsRow {
+    pub ts_ms: u64,
+    pub rss_avg: u64,
+    pub rss_peak: u64,
+    pub cpu_avg: f64,
+    pub cpu_peak: f64,
+    pub pids_avg: f64,
+    pub pids_peak: u64,
+    pub samples: u64,
+}
+
+/// The three tiers (T-0040): `(step_ms, retention_ms)`. 10 s rows kept 24 h,
+/// 1 m rollups 30 d, 1 h rollups 365 d.
+#[must_use]
+pub fn metrics_retention() -> [(u64, u64); 3] {
+    [
+        (10_000, 24 * 60 * 60 * 1000),
+        (60_000, 30 * 24 * 60 * 60 * 1000),
+        (3_600_000, 365 * 24 * 60 * 60 * 1000),
+    ]
+}
+
+/// The step a query over `[since_ms, until_ms]` should read (T-0040): the
+/// finest tier whose retention covers the whole window, so asking finer than
+/// available downshifts to the nearest real step instead of returning empty.
+#[must_use]
+pub fn metrics_step_for(since_ms: u64, until_ms: u64) -> (u64, bool) {
+    let span = until_ms.saturating_sub(since_ms);
+    for (step_ms, retention_ms) in metrics_retention() {
+        if span <= retention_ms {
+            return (step_ms, false);
+        }
+    }
+    (3_600_000, true)
+}
+
+/// Total order for f64 peaks: the bit pattern, with the sign bit flipped so
+/// negatives sort below positives. NaN sorts high — a sensor that reported NaN
+/// is a finding, not a maximum, and must not become one silently.
+fn ordered_f64(value: f64) -> u64 {
+    let bits = value.to_bits();
+    if bits >> 63 == 0 {
+        bits ^ 0x8000_0000_0000_0000
+    } else {
+        !bits
+    }
+}
+
+fn unorder_f64(order: u64) -> f64 {
+    let bits = if order >> 63 == 1 {
+        order ^ 0x8000_0000_0000_0000
+    } else {
+        !order
+    };
+    f64::from_bits(bits)
 }
 
 /// What to read out of the audit log.

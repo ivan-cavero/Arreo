@@ -174,6 +174,48 @@ pub enum Message {
     },
     /// Client → server: resource truth for one pane's tree.
     MetricsReq { v: u32, id: String },
+    /// Client → server: history for one pane — the durable series (T-0040),
+    /// not the live sample. `since_ms`/`until_ms` bound the window (u64::MAX =
+    /// "to now"); `step_ms` asks a tier, and the server downshifts to the
+    /// nearest real step when the ask is finer than available, saying so in
+    /// the reply's `step_ms`. All three fields are `#[serde(default)]` so a
+    /// v0 client that never heard of history still decodes the variant — and a
+    /// v0 server answers "history unavailable" rather than zeros, which would
+    /// be a lie (N−1, ADR 0017 rule (c)).
+    MetricsHistory {
+        v: u32,
+        id: String,
+        #[serde(default)]
+        since_ms: u64,
+        #[serde(default)]
+        until_ms: u64,
+        #[serde(default)]
+        step_ms: u64,
+    },
+    /// Server → client: one window of the durable series (T-0040), oldest
+    /// first. `step_ms` is the tier actually read (== ask, or the downshift);
+    /// `downshifted` says which. Empty `rows` with `downshifted == false` means
+    /// "no data in this window", not "unknown pane" — the message carries that
+    /// distinction, so the CLI can render it instead of guessing.
+    MetricsSeries {
+        v: u32,
+        id: String,
+        step_ms: u64,
+        downshifted: bool,
+        rows: Vec<MetricsPoint>,
+    },
+}
+
+/// One history point on the wire: average and peak, so the graph draws the line
+/// and labels the worst moment from the same row.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MetricsPoint {
+    pub ts_ms: u64,
+    pub rss_avg: u64,
+    pub rss_peak: u64,
+    pub cpu_avg: f64,
+    pub cpu_peak: f64,
+    pub pids: u64,
 }
 
 fn default_cols() -> u16 {

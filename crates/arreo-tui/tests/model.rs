@@ -13,18 +13,21 @@ fn panes() -> Vec<PaneView> {
             state: "working",
             ram_kb: 100,
             lines: vec!["hello".to_string()],
+            ram_history: Vec::new(),
         },
         PaneView {
             id: "b".to_string(),
             state: "question",
             ram_kb: 200,
             lines: vec!["May I? [y/n]".to_string()],
+            ram_history: Vec::new(),
         },
         PaneView {
             id: "c".to_string(),
             state: "idle",
             ram_kb: 50,
             lines: vec![],
+            ram_history: Vec::new(),
         },
     ]
 }

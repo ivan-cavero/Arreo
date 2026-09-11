@@ -264,6 +264,7 @@ async fn run(
                             state: state_name(&s.state),
                             ram_kb: s.ram_kb,
                             lines: Vec::new(),
+                            ram_history: s.ram_history.clone(),
                         })
                         .collect();
                     // Preserve scrollback lines across polls (merge by id).
@@ -554,7 +555,8 @@ fn state_name(state: &AgentState) -> &'static str {
     }
 }
 
-/// Merge fresh summaries into the model, preserving scrollback lines.
+/// Merge fresh summaries into the model, preserving scrollback lines (and the
+/// sparkline history, which arrives with the summary).
 fn merge_views(app: &mut App, views: Vec<PaneView>) {
     let mut old_lines: std::collections::HashMap<String, Vec<String>> =
         std::collections::HashMap::new();
@@ -596,6 +598,28 @@ async fn poll_summaries(conn: &mut Client) -> anyhow::Result<Vec<PaneSummary>> {
             Ok(Message::Metrics { rss_bytes, .. }) => rss_bytes / 1024,
             _ => 0,
         };
+        // History for the sparkline (T-0040): last hour at 1 m steps, peaks —
+        // best-effort like ram_kb, empty when the daemon has no series yet.
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let ram_history = match conn
+            .call(&Message::MetricsHistory {
+                v: VERSION,
+                id: pane.id.clone(),
+                since_ms: now_ms.saturating_sub(3_600_000),
+                until_ms: u64::MAX,
+                step_ms: 60_000,
+            })
+            .await
+        {
+            Ok(Message::MetricsSeries { rows, .. }) => rows
+                .iter()
+                .map(|row| (row.rss_peak / 1024).max(1))
+                .collect(),
+            _ => Vec::new(),
+        };
         // State via non-blocking wait (timeout 0 would spin; use short wait
         // for question, else derive from liveness below).
         let state = state_for(conn, &pane.id, pane.alive).await;
@@ -604,6 +628,7 @@ async fn poll_summaries(conn: &mut Client) -> anyhow::Result<Vec<PaneSummary>> {
             alive: pane.alive,
             state,
             ram_kb,
+            ram_history,
         });
     }
     // Attention order is the model's job; keep daemon order here.

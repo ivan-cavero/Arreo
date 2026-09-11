@@ -38,7 +38,7 @@ The log lives in the daemon's sidecar SQLite file, `<socket>.db` — the same WA
 file that holds pane topology, scrollback and the device registry. The default
 socket is `$XDG_RUNTIME_DIR/arreo.sock` when that variable is set, otherwise
 `$TMPDIR/arreo-<uid>.sock`, so the default log is that path with `.db` appended.
-`meta.schema_version` is **5** for this build.
+`meta.schema_version` is **6** for this build.
 
 The `audit` table:
 

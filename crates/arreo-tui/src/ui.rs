@@ -325,10 +325,11 @@ impl App {
                         let end = pane.lines.len().saturating_sub(self.scroll);
                         pane.lines[..end].to_vec()
                     };
+                    let graph = sparkline(&pane.ram_history);
                     let title = if self.scroll > 0 {
-                        format!("{} [{}] ↑{}", pane.id, pane.state, self.scroll)
+                        format!("{} [{}] ↑{} {}", pane.id, pane.state, self.scroll, graph)
                     } else {
-                        format!("{} [{}]", pane.id, pane.state)
+                        format!("{} [{}] {}", pane.id, pane.state, graph)
                     };
                     (title, visible)
                 }
@@ -664,4 +665,35 @@ fn human_ram(ram_kb: u64) -> String {
     } else {
         format!("{:>4}M ", ram_kb / 1024)
     }
+}
+
+/// RAM sparkline from peak history (T-0040): eight block chars, oldest left.
+///
+/// Empty history renders nothing rather than a flat line — a flat line would
+/// claim "steady" where the truth is "unknown". The peak labels the worst
+/// moment; the line shows the shape. When enforcement is active the budget line
+/// is the caller's job (T-0041 renders over the same series); this draws data.
+fn sparkline(history: &[u64]) -> String {
+    if history.is_empty() {
+        return String::new();
+    }
+    const CELLS: &[char] = &['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+    // Eight cells across the recent tail: the series is per-minute over the
+    // last hour, and eight cells keep the title readable.
+    let tail: Vec<u64> = {
+        let mut tail = history.to_vec();
+        if tail.len() > 8 {
+            tail = tail[tail.len() - 8..].to_vec();
+        }
+        tail
+    };
+    let peak = tail.iter().copied().max().unwrap_or(0).max(1);
+    let mut out = String::from("▏");
+    for value in &tail {
+        let level = (value * 7 / peak).min(7) as usize;
+        out.push(CELLS[level]);
+    }
+    out.push('▏');
+    out.push_str(&format!(" peak {}", human_ram(peak)));
+    out
 }

@@ -250,6 +250,95 @@ impl Daemon {
                 }
             });
         }
+        // Metrics history writer (T-0040): every 10 s, sample every pane with
+        // a live child and record one 10 s row. Best-effort per pane (a dead
+        // child is skipped, never fatal), and the tick measures its own work:
+        // the sleep starts after the sweep, so a slow sweep delays the next
+        // one rather than stacking ticks — the cadence cannot drift.
+        {
+            let registry = Arc::clone(&self.registry);
+            let db = self.db.clone();
+            tokio::spawn(async move {
+                loop {
+                    let tick = std::time::Instant::now();
+                    let entries: Vec<(String, Arc<PaneEntry>)> = registry
+                        .read()
+                        .await
+                        .iter()
+                        .map(|(id, entry)| (id.clone(), Arc::clone(entry)))
+                        .collect();
+                    let now_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as u64)
+                        .unwrap_or(0);
+                    if let Ok(store) = arreo_core::store::SessionStore::open(&db) {
+                        for (id, entry) in &entries {
+                            let Some(pid) = entry.pane.child_pid() else {
+                                continue;
+                            };
+                            let mut sampler =
+                                entry.sampler.lock().unwrap_or_else(|e| e.into_inner());
+                            let Ok(sample) = sampler.sample_tree(pid) else {
+                                continue;
+                            };
+                            let _ = store.metrics_record(&arreo_core::store::MetricsSample {
+                                pane: id.clone(),
+                                ts_ms: now_ms,
+                                step_ms: 10_000,
+                                rss_avg: sample.rss_bytes,
+                                rss_peak: sample.rss_bytes,
+                                cpu_avg: sample.cpu_percent.unwrap_or(0.0),
+                                cpu_peak: sample.cpu_percent.unwrap_or(0.0),
+                                pids_avg: sample.pids.len() as f64,
+                                pids_peak: sample.pids.len() as u64,
+                                samples: 1,
+                            });
+                        }
+                        // Roll the tiers forward from what was just written:
+                        // 1 m from 10 s, 1 h from 1 m. Pure functions of the
+                        // tier below (never /proc), so a late restore leaves no
+                        // hole where the underlying row exists.
+                        let hour_ago = now_ms.saturating_sub(3_600_000);
+                        for (id, _) in &entries {
+                            let _ = store.metrics_rollup(id, hour_ago, now_ms, 10_000, 60_000);
+                            let _ = store.metrics_rollup(id, hour_ago, now_ms, 60_000, 3_600_000);
+                        }
+                    }
+                    let elapsed = tick.elapsed();
+                    tokio::time::sleep(std::time::Duration::from_secs(10).saturating_sub(elapsed))
+                        .await;
+                }
+            });
+        }
+        // Metrics retention (T-0040): hourly prune tick. Live panes are the
+        // registry's keys — the store never deletes a live pane's newest row,
+        // so a graph never goes empty because a tick ran at the wrong moment.
+        {
+            let registry = Arc::clone(&self.registry);
+            let db = self.db.clone();
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+                    let live: Vec<String> = registry.read().await.keys().cloned().collect();
+                    let live_refs: Vec<&str> = live.iter().map(String::as_str).collect();
+                    let now_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as u64)
+                        .unwrap_or(0);
+                    if let Ok(store) = arreo_core::store::SessionStore::open(&db) {
+                        match store.metrics_prune(now_ms, &live_refs) {
+                            Ok(removed) => {
+                                let total: u64 = removed.iter().map(|(_, n)| n).sum();
+                                if total > 0 {
+                                    eprintln!("daemon: metrics prune removed {total} row(s)");
+                                }
+                            }
+                            Err(e) => eprintln!("daemon: metrics prune failed: {e}"),
+                        }
+                    }
+                }
+            });
+        }
         loop {
             let (stream, _) = listener.accept().await?;
             let registry = Arc::clone(&self.registry);
@@ -667,7 +756,7 @@ where
             }
             _ => {}
         }
-        let reply = dispatch(&message, &registry).await;
+        let reply = dispatch(&message, &registry, &db).await;
         // Persistence: spawn/kill/split mutate the registry — snapshot after
         // them so the DB always reflects the current topology. Async task
         // (never blocks the connection); failures logged, never fatal.
@@ -764,7 +853,10 @@ fn verb_of(message: &Message) -> Verb {
         Message::Read { .. } => Verb::Read,
         Message::Attach { .. } | Message::Resume { .. } => Verb::Attach,
         Message::Wait { .. } => Verb::Wait,
-        Message::Metrics { .. } | Message::MetricsReq { .. } => Verb::Metrics,
+        Message::Metrics { .. }
+        | Message::MetricsReq { .. }
+        | Message::MetricsHistory { .. }
+        | Message::MetricsSeries { .. } => Verb::Metrics,
         // Driving the machine. `Resize` changes someone's terminal, so it
         // belongs with the control verbs even though the policy enum has no
         // separate name for it.
@@ -797,6 +889,8 @@ fn op_name(message: &Message) -> &'static str {
         Message::Error { .. } => "error",
         Message::StateEvent { .. } => "state-event",
         Message::Metrics { .. } => "metrics",
+        Message::MetricsHistory { .. } => "metrics-history",
+        Message::MetricsSeries { .. } => "metrics-series",
         Message::Spawn { .. } => "spawn",
         Message::Panes { .. } => "panes",
         Message::Attach { .. } => "attach",
@@ -823,6 +917,20 @@ fn check_version(v: u32) -> Result<(), Message> {
     }
 }
 
+/// The tier a history query reads (T-0040): the finest tier at or coarser
+/// than the ask whose retention covers the window — or the coarsest tier,
+/// flagged, when nothing covers it. Asking finer than available downshifts to
+/// the nearest real step instead of returning empty.
+fn history_step(since_ms: u64, until_ms: u64, asked_ms: u64) -> (u64, bool) {
+    let (natural, _) = arreo_core::store::metrics_step_for(since_ms, until_ms);
+    let coarser = [10_000u64, 60_000, 3_600_000]
+        .into_iter()
+        .find(|step| *step >= asked_ms.max(1))
+        .unwrap_or(3_600_000);
+    let step = coarser.max(natural);
+    (step, step != asked_ms.max(1))
+}
+
 fn not_found(id: &str) -> Message {
     Message::Error {
         v: VERSION,
@@ -832,7 +940,7 @@ fn not_found(id: &str) -> Message {
 
 /// One-shot verbs. Returns `None` when the verb streams instead (handled by
 /// the caller). Every arm checks the version first — loud, never silent.
-async fn dispatch(message: &Message, registry: &Registry) -> Option<Message> {
+async fn dispatch(message: &Message, registry: &Registry, db: &std::path::Path) -> Option<Message> {
     match message {
         Message::Spawn {
             v,
@@ -1087,6 +1195,75 @@ async fn dispatch(message: &Message, registry: &Registry) -> Option<Message> {
                 None => Some(not_found(id)),
             }
         }
+        Message::MetricsHistory {
+            v,
+            id,
+            since_ms,
+            until_ms,
+            step_ms,
+        } => {
+            if let Err(reply) = check_version(*v) {
+                return Some(reply);
+            }
+            // Unknown pane: empty series plus a clear message, not an error —
+            // the caller asked a valid question about something that is not
+            // there, which is an answer, not a failure.
+            let registry = registry.read().await;
+            if !registry.contains_key(id) {
+                return Some(Message::MetricsSeries {
+                    v: VERSION,
+                    id: id.clone(),
+                    step_ms: (*step_ms).max(1),
+                    downshifted: false,
+                    rows: vec![],
+                });
+            }
+            drop(registry);
+            // `u64::MAX` and `0` both mean "to now": the former is what a CLI
+            // sends when it has no upper bound, the latter what a v0 client
+            // sends when it never heard of the field. A window ending at the
+            // heat death of the universe would downshift every query to the
+            // coarsest tier — the span, not the sentinel, is what the step
+            // rule must see.
+            let until_ms = if *until_ms == 0 || *until_ms == u64::MAX {
+                now_ms()
+            } else {
+                *until_ms
+            };
+            let (step, downshifted) = history_step(*since_ms, until_ms, *step_ms);
+            let store = match arreo_core::store::SessionStore::open(db) {
+                Ok(store) => store,
+                Err(e) => {
+                    return Some(Message::Error {
+                        v: VERSION,
+                        message: format!("history unavailable: {e}"),
+                    })
+                }
+            };
+            match store.metrics_range(id, *since_ms, until_ms, step) {
+                Ok(rows) => Some(Message::MetricsSeries {
+                    v: VERSION,
+                    id: id.clone(),
+                    step_ms: step,
+                    downshifted,
+                    rows: rows
+                        .into_iter()
+                        .map(|row| arreo_core::proto::MetricsPoint {
+                            ts_ms: row.ts_ms,
+                            rss_avg: row.rss_avg,
+                            rss_peak: row.rss_peak,
+                            cpu_avg: row.cpu_avg,
+                            cpu_peak: row.cpu_peak,
+                            pids: row.pids_peak,
+                        })
+                        .collect(),
+                }),
+                Err(e) => Some(Message::Error {
+                    v: VERSION,
+                    message: format!("history unavailable: {e}"),
+                }),
+            }
+        }
         // Streaming verbs + handshake replies never reach dispatch.
         Message::Attach { .. }
         | Message::Resume { .. }
@@ -1098,6 +1275,7 @@ async fn dispatch(message: &Message, registry: &Registry) -> Option<Message> {
         | Message::Error { .. }
         | Message::StateEvent { .. }
         | Message::Metrics { .. }
+        | Message::MetricsSeries { .. }
         | Message::Ok { .. }
         | Message::Exited { .. } => Some(Message::Error {
             v: VERSION,

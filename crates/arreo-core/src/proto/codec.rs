@@ -138,8 +138,8 @@ pub fn classify_op(bytes: &[u8]) -> Option<Direction> {
         "hello" | "resume" | "spawn" | "attach" | "send" | "resize" | "kill" | "read" | "wait"
         | "split" | "metrics_req" | "panes" => Direction::Request,
         // Server → client: answers and news.
-        "welcome" | "snapshot" | "delta" | "error" | "state_event" | "metrics" | "ok"
-        | "exited" => Direction::Event,
+        "welcome" | "snapshot" | "delta" | "error" | "state_event" | "metrics"
+        | "metrics_series" | "ok" | "exited" => Direction::Event,
         // Unknown: the shape of a future version. A client that sent something
         // the server does not know asked for work — that is a request until a
         // newer server says otherwise, so it is refused rather than ignored. A

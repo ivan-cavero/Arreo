@@ -1,0 +1,50 @@
+# T-0040 evidence — metrics history
+
+## 1. The series (store-level acceptance)
+
+$ cargo test -p arreo-core --test metrics_history
+
+test the_tiers_are_the_stated_numbers ... ok
+test a_query_finer_than_available_downshifts_loudly ... ok
+test recording_is_idempotent_and_keeps_the_peak ... ok
+test an_unknown_pane_is_empty_not_an_error ... ok
+test rollups_come_from_the_tier_below ... ok
+test the_writer_path_costs_microseconds_not_milliseconds ... ok
+test retention_prunes_per_tier_and_never_empties_a_live_graph ... ok
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.13s
+
+## 2. The CLI transcript, rewritten against the fixed daemon (the first
+##    capture caught a real bug: until=u64::MAX downshifted every query)
+
+spawned evpane2
+$ arreo metrics history evpane2 --since 1h --step 1m
+ts_ms rss_avg rss_peak cpu_avg cpu_peak pids
+1789140720000 3476 3476 0.0 0.0 2
+
+$ arreo metrics history evpane2 --since 6h --step 1s  (downshifts to 10s, and says so)
+note: showing 10s rows (nearest real step to the ask)
+ts_ms rss_avg rss_peak cpu_avg cpu_peak pids
+1789140770000 3476 3476 0.0 0.0 2
+
+$ arreo metrics history nosuch --since 1h
+no history for "nosuch" in this window
+
+## 3. A note on the zero rows in longer captures
+
+A pane whose child has exited keeps its registry entry, and the writer keeps
+recording what the sampler sees: a zombie tree (pids=1, rss=0). The series shows
+the death as a cliff to zero — which is the graph working as intended, not a
+sampling bug. Dead panes' rows age out through normal retention; only a *live*
+pane's newest row is protected.
+
+## 4. The full battery (final code)
+
+cargo test --workspace: 364 passed, 0 failed across 48 targets
+cargo clippy --workspace --all-targets -- -D warnings: 0 diagnostics
+cargo fmt --all -- --check: clean
+cargo vet --locked: Vetting Succeeded (336 exempted)
+cargo deny check: advisories ok, bans ok, licenses ok, sources ok
+cargo audit: 343 crate dependencies, no advisories
+cargo xtask check-targets: x86_64-unknown-linux-gnu PASS; x86_64-pc-windows-msvc SKIP (pure-Rust no-sqlite PASS)
+e2e slices: api green, compat green, lifecycle 2/2, persistence 3/3, tui 18/18, theme 27/27, relay 14/14
+cargo xtask bench: 6/6 PASS

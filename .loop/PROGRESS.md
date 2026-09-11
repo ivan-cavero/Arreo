@@ -1,23 +1,24 @@
 ## State snapshot          ← REWRITTEN (not appended) at every checkpoint
-Task: T-0028 · protocol N−1 window (phase 2) — DONE, refuse loudly / downgrade silently / never guess
-Where you are: `negotiate` accepts the highest version in [server-1, server] and echoes it;
-unknown requests get a typed Error with the session left open, unknown events are ignored and
-counted, new serde-default fields downgrade silently, wider gaps refuse. Proven both directions
-over frozen corpora plus a live daemon, with a new compat slice in CI. 357 workspace tests.
-Next step: **T-0040**, then T-0049. T-0044 is blocked on the account-join RPC (its own note);
-**T-0036 is human-gated** — it needs a real minisign keypair whose secret the operator holds
-as a CI secret, and the gate is recorded in the task file.
+Task: T-0040 · metrics history (phase 2) — DONE, a durable per-pane series with a bounded store
+Where you are: three tiers (10 s/24 h, 1 m/30 d, 1 h/365 d) in one v6 table keyed
+(pane, ts_ms, step_ms); the daemon writes 10 s rows, rolls tiers forward, prunes hourly without
+ever emptying a live graph; CLI history with downshift notes, socket history verbs, TUI sparkline
+with peak. 364 workspace tests.
+Next step: **T-0049**, then T-0041 (needs T-0040, now unblocked). T-0044 is blocked on the
+account-join RPC (its own note); **T-0036 is human-gated** — it needs a real minisign keypair
+whose secret the operator holds as a CI secret, and the gate is recorded in the task file.
 Open workers: (none)
 Known broken: (none) · Parked: (none)
 Findings:
-- **rmp-serde encodes internally-tagged enums as arrays, not maps.** The classifier expected
-  `{"op":…}` and classified nothing; the bytes are `["hello",0,…]`. Both shapes are handled,
-  and every v0 verb is pinned to its side so an encoding change breaks a test.
-- **negotiate must not cap at VERSION.** A `<= VERSION` filter made a v1 server unable to agree
-  on v1 — the one case the window needs right. The window is [server-1, server], full stop.
-- **A heartbeat needs no new wire kind** (T-0031). **A dropped handle must stop its task**
-  (T-0033, T-0054). **A carrier that does not report departures breaks reconnects** (T-0054).
-- **Retention compares two timestamps, so the clock must move as one** (T-0055).
+- **Two spellings of "now" downshifted every query.** The CLI sent until=u64::MAX, the daemon
+  mapped only 0 → now, so the span was 292M years and everything fell to the coarsest tier.
+  The first evidence capture caught it. Both sentinels now map, with the reason written down.
+- **A zombie tree is data, not a sampling bug.** An exited pane records pids=1/rss=0 — the
+  death as a cliff to zero. Only a live pane's newest row is prune-protected.
+- **rmp-serde encodes internally-tagged enums as arrays** (T-0028); **negotiate never caps at
+  VERSION** (T-0028). **A heartbeat needs no new wire kind** (T-0031).
+- **A dropped handle must stop its task** (T-0033, T-0054). **Retention compares two
+  timestamps, so the clock must move as one** (T-0055).
 - **A budget row bench cannot measure still needs enforcing** — read from perf-budget.toml.
 ## Event log               ← append-only; newest last; never rewrite
 - 2026-09-10 [turn 1] ledger created; repo at e489fac (docs only); T-0001 + T-0022 (AGENTS.md gardened) done
@@ -62,3 +63,5 @@ Findings:
 - 2026-09-11 [turn 35] T-0031 relay presence done: `crates/arreo-relay/src/presence.rs` owns the relay-side rule (thresholds stay the T-0043 contract in core — 90 s window, 30-day stale — consumed, never re-derived), the router writes last_seen on connect / every envelope / disconnect, heartbeats are zero-length frames to self recorded and consumed by the relay (no new wire kind, no phantom self-peer), `Router::presence` applies the one rule at read so a kill -9 + restart recomputes with no phantom state, `DevicePresence::display` renders `offline (last seen 15 d)` never an error, and 10,000 devices list from one indexed query in budget. 7 presence tests (exact boundaries 0/89/90/91 s and 29/30/30d+1s, backwards-clock clamp, heartbeat schedule, 15-day rendering, lifecycle against the real binary, 10k timing + EXPLAIN, metadata-only schema). Evidence `.loop/evidence/T-0031/`. 347 workspace tests, clippy/fmt clean, vet/deny/audit green, check-targets PASS/SKIP, 6 e2e slices green, bench 6/6; remote == local
 
 - 2026-09-11 [turn 36] T-0028 protocol N−1 window done: `negotiate` is a window ([server-1, server], highest common wins, echoed in Welcome.v, typed Error naming offers + range outside it), `{op,v}` classification from the map/array head without a full decode (unknown ops default to request — refused loudly, session open; unknown events ignored and counted), new serde-default fields downgrade silently, wider gaps refuse as deferred updates. Refused handshakes write auth.reject rows (row before the Error frame), the 1 MB budget moved into frame_body_len (refused before allocation), per-verb check_version stays as the second layer. ADR 0017; 7 matrix tests over frozen v0 corpora + 3 live-daemon tests (v0 client keeps working, outside-window refusal with audit row, unknown teleport refused with session surviving); new `compat` slice (`cargo xtask e2e --slice compat`) wired into CI. Evidence `.loop/evidence/T-0028/`. 357 workspace tests, clippy/fmt clean, vet/deny/audit green, check-targets PASS/SKIP, 7 e2e slices green, bench 6/6; remote == local
+
+- 2026-09-11 [turn 37] T-0040 metrics history done: v6 `metrics_series` table keyed (pane, ts_ms, step_ms) with avg+peak RSS/cpu/pids (three tiers 10 s/24 h, 1 m/30 d, 1 h/365 d); idempotent record (bucket floor + weighted merge, peak keeps the worst moment), rollups read the tier below never /proc, hourly prune that never deletes a live pane's newest row, ≤ 2 MB/pane asserted; socket MetricsHistory/MetricsSeries verbs with step downshift (N−1 safe via serde-default fields); CLI `metrics history` with duration parsing and downshift notes; daemon 10 s writer + rollup + hourly prune tasks (tick measures its own work, cadence cannot drift); TUI sparkline with peak in the focused title (empty renders nothing, never a flat line). 7 store tests + writer-overhead test + tui --case metrics-graph (18 assertions); evidence `.loop/evidence/T-0040/` incl. a real-bug transcript (until=u64::MAX vs 0). 364 workspace tests, clippy/fmt clean, vet/deny/audit green, check-targets PASS/SKIP, 7 e2e slices green, bench 6/6; remote == local

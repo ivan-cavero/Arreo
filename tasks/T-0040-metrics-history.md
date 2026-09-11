@@ -3,7 +3,7 @@ id: T-0040
 title: Metrics history — durable per-agent series with a bounded store
 phase: 2
 priority: 3
-status: proposed
+status: done
 depends_on: [T-0006, T-0018]
 scope:
   - crates/arreo-core/src/metrics/**
@@ -27,28 +27,52 @@ discipline, Phase 2 "cgroups limits + metrics history").
 
 ## Acceptance criteria
 
-- [ ] Three tiers with explicit numbers: 1 s in-RAM samples (live only, last 5 min), 10 s rows
+- [x] Three tiers with explicit numbers: 1 s in-RAM samples (live only, last 5 min), 10 s rows
       kept **24 h**, 1 m rollups kept **30 d**, 1 h rollups kept **365 d**. Every tier stores
       average **and** peak RSS (peak is the number people act on) plus cpu and pids.
-- [ ] Schema v3 migration in `store.rs` along T-0018's versioned path (data never dropped); rows
+- [x] Schema v3 migration in `store.rs` along T-0018's versioned path (data never dropped); rows
       are keyed `(pane, ts_ms, step_ms)`, so re-running a rollup is idempotent, not duplicating.
-- [ ] Retention enforced by an hourly prune tick that never deletes the newest row of a live pane
+- [x] Retention enforced by an hourly prune tick that never deletes the newest row of a live pane
       (a graph never goes empty). An integration test seeds 400 days of synthetic samples, advances
       the clock, prunes, then asserts per-tier row counts and **≤ 2 MB per pane** on disk.
-- [ ] Query surface: `arreo metrics history <pane> --since 6h --step 1m [--json]` and the
+- [x] Query surface: `arreo metrics history <pane> --since 6h --step 1m [--json]` and the
       socket request `Metrics { pane, since_ms, until_ms, step_ms }` — one indexed range scan
       on `(pane, ts_ms)`. Asking finer than available downshifts to the nearest real step and
       says so (`--step 1s` over 6 h reports 10 s) instead of returning empty; an unknown pane
       gives an empty series plus a clear message, not an error.
-- [ ] N−1 safe: `Metrics` is an optional-field addition to T-0013/T-0014's protocol — a client
+- [x] N−1 safe: `Metrics` is an optional-field addition to T-0013/T-0014's protocol — a client
       that omits it still receives the live payload, and a server without history reports
       "history unavailable" rather than zeros, which would be a lie.
-- [ ] TUI: the focused pane shows a RAM sparkline from the same series, labelled with the peak
+- [x] TUI: the focused pane shows a RAM sparkline from the same series, labelled with the peak
       and, when T-0019 enforcement is active, the budget line. Evidence is a scripted frame from
       `cargo xtask e2e --slice tui --case metrics-graph` (real pty, real key events).
-- [ ] Overhead unchanged: `cargo xtask bench --probe metrics` still shows the sampler ≤ 1% CPU at
+- [x] Overhead unchanged: `cargo xtask bench --probe metrics` still shows the sampler ≤ 1% CPU at
       30 panes with rollups enabled, and the 10 s writer does not let the tick cadence drift
       (asserted from timestamps in the slice).
+
+## Landing notes (2026-09-11)
+
+Two things the work taught, both in the code rather than smoothed over:
+
+- **The CLI's "to now" and the daemon's "to now" were different sentinels.**
+  The CLI sends `until_ms: u64::MAX` for an open-ended window; the daemon mapped
+  only `0` to now. The span was therefore ~292 million years, every query
+  downshifted to the coarsest tier, and the first evidence capture caught it
+  (`--step 1m` returning 1 h rows with a downshift note). The daemon now maps
+  both — and says why, because two spellings of "now" will drift again unless
+  the next reader knows there are two.
+- **A zombie tree is data, not a sampling bug.** A pane whose child has exited
+  keeps its registry entry, and the writer records what the sampler sees:
+  pids=1, rss=0. The series shows the death as a cliff to zero, which is the
+  graph working as intended. Only a *live* pane's newest row is protected from
+  the prune; dead panes age out normally.
+
+Scope notes, recorded honestly: the schema landed as **v6** (not v3 — five
+migrations shipped since the task was written), the old T-0006 `rollups` table
+is left alone (data never dropped by a migration; its rows age out through the
+normal store lifecycle), and the TUI case runs inside the existing `tui` slice
+(`--case metrics-graph`, 18 assertions total) rather than as a new slice — the
+criterion names the case, and a slice for one assertion would be ceremony.
 
 ## Notes
 

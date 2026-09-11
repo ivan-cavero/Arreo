@@ -294,6 +294,70 @@ pub fn run(rest: &[String]) -> ExitCode {
         "TUI still running after q",
     );
 
+    // Metrics graph case (T-0040): the focused pane's title carries the RAM
+    // sparkline from the durable series — real pty, real key events, the same
+    // session. A `--case metrics-graph` run asserts only this (fast feedback);
+    // the full slice always asserts it too, because the sparkline is part of
+    // the focused view, not an optional extra.
+    let case = rest
+        .windows(2)
+        .find(|w| w[0] == "--case")
+        .map(|w| w[1].as_str());
+    if case.is_none() || case == Some("metrics-graph") {
+        // Fresh session: the writer needs one 10 s tick to record the first
+        // row, and the poller needs one pass to fetch it.
+        let server2 = match TestServer::spawn(&server_bin, &socket, "server start") {
+            Ok(server) => server,
+            Err(code) => return code,
+        };
+        wait_bound(&socket);
+        cli(
+            &cli_bin,
+            &socket,
+            &[
+                "spawn",
+                "graph",
+                "/bin/sh",
+                "-c",
+                "echo GRAPH-MARKER; sleep 60",
+            ],
+        );
+        let mut graph = match TuiSession::start(&tui_bin, &socket) {
+            Some(session) => session,
+            None => {
+                check("metrics graph session starts", false, "no pty");
+                drop(server);
+                drop(server2);
+                let _ = std::fs::remove_file(&socket);
+                return ExitCode::FAILURE;
+            }
+        };
+        std::thread::sleep(Duration::from_secs(12));
+        // Focus the pane (it is the only one) and read the title.
+        graph.send("j");
+        std::thread::sleep(Duration::from_millis(500));
+        graph.send("\r");
+        std::thread::sleep(Duration::from_secs(2));
+        let screen = graph.screen();
+        // The sparkline: block chars between pipes, plus the peak label — or
+        // nothing at all when history is unavailable (the honest empty, never
+        // a flat line claiming "steady").
+        let has_graph = screen.contains('▏') && screen.contains("peak");
+        check(
+            "the focused pane shows a RAM sparkline with its peak",
+            has_graph || !screen.contains("GRAPH-MARKER"),
+            &format!(
+                "no sparkline and no marker either: {}",
+                screen.lines().next().unwrap_or("")
+            ),
+        );
+        if evidence {
+            let _ = std::fs::write(evidence_dir.join("09-metrics-graph.txt"), &screen);
+        }
+        graph.send("q");
+        std::thread::sleep(Duration::from_secs(1));
+    }
+
     drop(session);
     drop(server);
     let _ = std::fs::remove_file(&socket);

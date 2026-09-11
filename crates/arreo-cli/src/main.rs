@@ -24,6 +24,7 @@ fn usage() -> ExitCode {
     eprintln!("  arreo wait <id> --state <state> [--timeout 5m] [--socket PATH]");
     eprintln!("  arreo split <id> <new-id> [--socket PATH]");
     eprintln!("  arreo metrics <id> [--socket PATH]   (pane query; --pid <PID> samples locally)");
+    eprintln!("  arreo metrics history <pane> --since 6h --step 1m [--json] [--socket PATH]");
     eprintln!("  arreo service install|uninstall|status [--socket PATH]");
     eprintln!("  arreo server stop [--socket PATH]   (graceful: drain + exit 0)");
     eprintln!(
@@ -58,7 +59,9 @@ fn main() -> ExitCode {
         Some("record") => cmd_record(&args[2..]),
         Some("replay") => cmd_replay(&args[2..]),
         Some("metrics") => {
-            if args[2..].iter().any(|a| a == "--pid") {
+            if args.get(2).map(String::as_str) == Some("history") {
+                rt::block_on(cmd_metrics_history(&args[3..]))
+            } else if args[2..].iter().any(|a| a == "--pid") {
                 cmd_metrics(&args[2..])
             } else {
                 rt::block_on(cmd_pane_metrics(&args[2..]))
@@ -966,6 +969,188 @@ async fn cmd_split(rest: &[String]) -> ExitCode {
             eprintln!("split: {e}");
             ExitCode::FAILURE
         }
+    }
+}
+
+/// `arreo metrics history <pane> --since 6h --step 1m [--json]`: the durable
+/// series (T-0040), not the live sample.
+///
+/// Durations accept `s`/`m`/`h`/`d` suffixes (`6h`, `30d`, `90s`) or bare
+/// milliseconds. `--step` asks a tier; the server downshifts to the nearest
+/// real step when the ask is finer than available and says so, so `--step 1s`
+/// over 6 h reports 10 s rows with a note rather than an empty series. An
+/// unknown pane gives an empty series plus a clear message, not an error.
+async fn cmd_metrics_history(rest: &[String]) -> ExitCode {
+    let (socket, kept) = take_socket(rest);
+    let mut pane: Option<String> = None;
+    let mut since_ms: Option<u64> = None;
+    let mut step_ms: u64 = 0;
+    let mut json = false;
+    let mut i = 0;
+    while i < kept.len() {
+        match kept[i].as_str() {
+            "--since" => {
+                i += 1;
+                match kept.get(i).map(|s| parse_history_arg("--since", s)) {
+                    Some(Ok(ms)) => since_ms = Some(ms),
+                    Some(Err(code)) => return code,
+                    None => {
+                        eprintln!("metrics history: --since wants a duration (e.g. 6h)");
+                        return ExitCode::from(2);
+                    }
+                }
+            }
+            "--step" => {
+                i += 1;
+                match kept.get(i).map(|s| parse_history_arg("--step", s)) {
+                    Some(Ok(ms)) => step_ms = ms,
+                    Some(Err(code)) => return code,
+                    None => {
+                        eprintln!("metrics history: --step wants a duration (e.g. 1m)");
+                        return ExitCode::from(2);
+                    }
+                }
+            }
+            "--json" => json = true,
+            other if !other.starts_with("--") && pane.is_none() => pane = Some(other.to_string()),
+            other => {
+                eprintln!("metrics history: unknown argument {other:?}");
+                eprintln!("usage: arreo metrics history <pane> --since 6h --step 1m [--json] [--socket PATH]");
+                return ExitCode::from(2);
+            }
+        }
+        i += 1;
+    }
+    let Some(pane) = pane else {
+        eprintln!(
+            "usage: arreo metrics history <pane> --since 6h --step 1m [--json] [--socket PATH]"
+        );
+        return ExitCode::from(2);
+    };
+    let Some(since) = since_ms else {
+        eprintln!("metrics history: --since is required (e.g. --since 6h)");
+        return ExitCode::from(2);
+    };
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    match request(
+        &socket,
+        &Message::MetricsHistory {
+            v: VERSION,
+            id: pane.clone(),
+            since_ms: now_ms.saturating_sub(since),
+            until_ms: u64::MAX,
+            step_ms,
+        },
+    )
+    .await
+    {
+        Ok(Message::MetricsSeries {
+            step_ms: got,
+            downshifted,
+            rows,
+            ..
+        }) => {
+            if rows.is_empty() {
+                println!("no history for {pane:?} in this window");
+                return ExitCode::SUCCESS;
+            }
+            if downshifted {
+                eprintln!(
+                    "note: showing {} rows (nearest real step to the ask)",
+                    render_duration(got)
+                );
+            }
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "pane": pane,
+                        "step_ms": got,
+                        "downshifted": downshifted,
+                        "rows": rows.iter().map(|row| serde_json::json!({
+                            "ts_ms": row.ts_ms,
+                            "rss_avg": row.rss_avg,
+                            "rss_peak": row.rss_peak,
+                            "cpu_avg": row.cpu_avg,
+                            "cpu_peak": row.cpu_peak,
+                            "pids": row.pids,
+                        })).collect::<Vec<_>>(),
+                    })
+                );
+            } else {
+                println!("ts_ms rss_avg rss_peak cpu_avg cpu_peak pids");
+                for row in &rows {
+                    println!(
+                        "{} {} {} {:.1} {:.1} {}",
+                        row.ts_ms,
+                        row.rss_avg / 1024,
+                        row.rss_peak / 1024,
+                        row.cpu_avg,
+                        row.cpu_peak,
+                        row.pids
+                    );
+                }
+            }
+            ExitCode::SUCCESS
+        }
+        Ok(Message::Error { message, .. }) => {
+            eprintln!("metrics history: {message}");
+            ExitCode::FAILURE
+        }
+        Ok(other) => {
+            eprintln!("metrics history: unexpected {other:?}");
+            ExitCode::FAILURE
+        }
+        Err(e) => {
+            eprintln!("metrics history: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// A duration for `--since`/`--step`: `90s`, `6h`, `30d`, or bare milliseconds.
+/// Non-numeric is a usage error, never a silent default — a typo'd window that
+/// silently means "everything" is how a query quietly stops being the window
+/// someone asked for.
+fn parse_history_arg(flag: &str, value: &str) -> Result<u64, ExitCode> {
+    let (digits, factor) = match value.strip_suffix(['s', 'm', 'h', 'd']) {
+        Some(_) if value.len() > 1 => {
+            let (num, suffix) = value.split_at(value.len() - 1);
+            let factor = match suffix {
+                "s" => 1_000u64,
+                "m" => 60_000,
+                "h" => 3_600_000,
+                "d" => 86_400_000,
+                _ => unreachable!("stripped above"),
+            };
+            (num, factor)
+        }
+        _ => (value, 1),
+    };
+    match digits.parse::<u64>() {
+        Ok(n) => Ok(n.saturating_mul(factor)),
+        Err(_) => {
+            eprintln!("metrics history: {flag} wants a duration (e.g. 6h), got {value:?}");
+            Err(ExitCode::from(2))
+        }
+    }
+}
+
+/// Render a step back into the duration spelling the CLI accepts.
+fn render_duration(step_ms: u64) -> String {
+    if step_ms.is_multiple_of(86_400_000) {
+        format!("{}d", step_ms / 86_400_000)
+    } else if step_ms.is_multiple_of(3_600_000) {
+        format!("{}h", step_ms / 3_600_000)
+    } else if step_ms.is_multiple_of(60_000) {
+        format!("{}m", step_ms / 60_000)
+    } else if step_ms.is_multiple_of(1_000) {
+        format!("{}s", step_ms / 1_000)
+    } else {
+        format!("{step_ms}ms")
     }
 }
 

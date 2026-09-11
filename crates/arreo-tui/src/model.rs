@@ -12,6 +12,10 @@ pub struct PaneView {
     pub state: &'static str,
     pub ram_kb: u64,
     pub lines: Vec<String>,
+    /// Recent peak RSS samples for the sparkline (T-0040): oldest first, KiB.
+    /// Best-effort like `ram_kb` — empty when history is unavailable, and the
+    /// view renders nothing rather than a lie.
+    pub ram_history: Vec<u64>,
 }
 
 /// Keyboard/mouse focus target.
