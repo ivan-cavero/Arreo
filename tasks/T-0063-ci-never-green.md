@@ -10,8 +10,18 @@ scope:
   - crates/arreo-relay/src/pairing.rs
   - crates/arreo-relay/src/main.rs
   - xtask/src/release_check.rs
+  - .gitleaks.toml
+  - REUSE.toml
+  - LICENSES/**
   - .loop/evidence/T-0063/**
 ---
+
+## Ownership boundary (2026-09-12, evening)
+
+`crates/arreo-core/src/pty/adopt.rs` and `crates/arreo-cli/tests/update_server.rs`
+are **owned by T-0038 (worker HandoffStage2, in flight)** — this task never edits them.
+This task owns the CI environment (tool installs), REUSE, the gitleaks verdict, and the
+final green run, which therefore waits for T-0038 stage 2 to land (see Sequencing).
 
 ## Goal
 
@@ -44,6 +54,31 @@ Three legs, three different failures — not one cause:
    admin rights ("Must have admin rights to Repository"), and there is no `gh` auth on
    this box, so confirmation needs a human with repo rights.
 
+## Batch 2 (2026-09-12, evening — pasted runner logs, no inference needed)
+
+`public-readiness` (`release-check --public`): **4 passed, 6 failed.**
+
+- [PASS] fmt, clippy, license (Apache/AGPL split holds), links (65 links / 13 docs).
+- [FAIL] `test`: `arreo-cli --test update_server`, 2 failures —
+  `a_running_daemon_is_handed_over_to_the_new_binary` (new daemon exits 1 before
+  takeover) and `a_candidate_that_fails_the_handoff_changes_nothing` (daemon never
+  comes up). Both are T-0038 stage-2 code, owned by HandoffStage2 (see boundary above).
+- [FAIL] `vet` / `audit` / `deny`: `no such command` — the `public-readiness` job
+  installs gitleaks + reuse but never installs these three (the matrix's supply-chain
+  job does). CI-workflow bug, owned by this task.
+- [FAIL] `reuse`: project non-compliant (missing license texts in `LICENSES/` and/or
+  missing SPDX tags — likely the new T-0072…T-0076 task files and evidence). Owned by
+  this task: `reuse download --all` + tags, then green.
+- [FAIL] `secrets`: gitleaks 8.28.0, 133 commits, **1 leak**. Owned by this task to
+  *identify* (`release-check --public --report-path <p>` keeps the deleted report):
+  fixture/test → allowlist in `.gitleaks.toml` (value-scoped, negative-controlled);
+  real secret → rotation outside the repo + recorded history-rewrite decision (the only
+  sub-case that needs the human — see Notes).
+- macOS leg: `arreo-core/src/pty/adopt.rs` does not compile — `SendFlags::NOSIGNAL`
+  (Linux-only) and `ExitProbe::Pidfd` (variant cfg-gated, use-site not) from T-0038
+  stage 2. Owned by HandoffStage2. Follow-up for this task's author: check why
+  `check-targets` did not catch a macOS breakage, and record the answer.
+
 ## Acceptance criteria
 
 - [ ] The ubuntu `test` failure is identified (from a runner with log access, or by
@@ -59,6 +94,24 @@ Three legs, three different failures — not one cause:
 - [ ] The `xtask stubs` step (`cargo xtask e2e`, exit 0) is either kept green or removed —
       it failed the first ~19 runs because the `.cargo/config.toml` alias did not exist yet.
       A step that has never passed in 90 runs is either load-bearing or deleted.
+- [ ] `public-readiness` installs its own supply-chain tools: `cargo-vet 0.10.0` +
+      `cargo-deny 0.20.2` + `cargo-audit 0.22.0` (same pins as the matrix supply-chain
+      job) before `release-check --public`, so vet/audit/deny run instead of failing
+      with `no such command`.
+- [ ] `reuse lint` (pinned 5.0.2) green on the runner: missing license texts downloaded,
+      every new file tagged or covered by `REUSE.toml`.
+- [ ] Gitleaks verdict recorded in evidence: the 1 leak identified by file+commit;
+      allowlist entry with reason if fixture, rotation + history decision if real.
+- [ ] Final green run on current HEAD: three matrix legs + `public-readiness` in one run.
+      This criterion waits for T-0038 stage 2 (adopt.rs macOS + update_server); all
+      criteria above land independently first.
+
+## Sequencing
+
+Land in this order, one push per line where possible: (1) tool installs in
+`public-readiness`, (2) REUSE, (3) gitleaks verdict, (4) final green run after T-0038.
+Never edit `adopt.rs` / `update_server.rs` from this task — that is HandoffStage2's
+tree and a collision loses work.
 
 ## Notes
 

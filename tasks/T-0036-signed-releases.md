@@ -3,7 +3,7 @@ id: T-0036
 title: Signed releases — minisign-signed artifacts with fail-closed verification
 phase: 2
 priority: 1
-status: proposed
+status: todo
 depends_on: [T-0020]
 scope:
   - crates/arreo-core/src/update/**
@@ -92,6 +92,14 @@ and a verifier nobody can use is not a deliverable.
 **Action for the operator:** generate the keypair offline (`minisign -G`), commit the public half to
 `supply-chain/arreo.pub`, and add the secret half as `MINISIGN_SECRET_KEY`. The task is then
 unblocked end to end.
+
+## Unblocked (2026-09-12, by the operator)
+
+Key generated offline with empty password (CI key), public half pushed as `cd45785`
+(`supply-chain/arreo.pub`, key id `076F2F7CEBE0AF51`), secret half stored as the
+`MINISIGN_SECRET_KEY` repo secret. Status flipped to `todo` — the human gate is gone,
+build the verifier + release job against the real key. (First keypair generated with a
+password and exposed in chat was discarded before use: never signed, never committed.)
 
 ## Verification
 
