@@ -3,7 +3,7 @@ id: T-0027
 title: Transport e2e slice — real sockets, real pairing, hostile cases as PASS/FAIL
 phase: 2
 priority: 4
-status: proposed
+status: obsolete
 depends_on: [T-0023, T-0024, T-0025, T-0026]
 scope:
   - xtask/src/transport_slice.rs
@@ -72,3 +72,32 @@ cargo xtask e2e --slice transport --weakened
 ```
 
 The `--weakened` run is expected to report the tamper/replay checks as FAIL.
+
+## Retired (2026-09-12) — superseded, not deferred
+
+`status: obsolete`. The task's goal was "one command proves the whole Phase 2 security slice", and
+every behavior it names is already asserted — at the same level (real binaries, real loopback QUIC
+sockets, real frames, real identity dirs) and already running in CI. Building the slice would be a
+second home for the same assertions, which §5.1 forbids: a test that duplicates another is deleted,
+not written.
+
+Where each criterion lives today:
+
+| T-0027 criterion | Proven by |
+| --- | --- |
+| attach → snapshot → delta → resume parity, local socket green | `crates/arreo-server/tests/api.rs`, `crates/arreo-tui/tests/remote.rs`, and `--slice api` / `--slice tui` |
+| a tampered handshake flight is refused | `crates/arreo-core/src/transport/noise.rs:934` (`a_flipped_byte_in_the_handshake_prevents_a_session`) |
+| a tampered frame is never delivered as plaintext | `crates/arreo-core/src/transport/noise.rs:957` |
+| a replayed handshake flight does not establish a session | `crates/arreo-core/src/transport/noise.rs:1124` |
+| pairing happy path, wrong code leaves no trace, TTL, revoke, restart | `crates/arreo-cli/tests/pairing.rs` — six tests over three real processes, with `snapshot_tree` for the byte-identical assertion |
+| two daemons + relay end to end, budgets as gates | `--slice mesh` (T-0047) and `--slice relay` (T-0034), both in CI |
+
+The `--weakened` mutation control is retired with T-0034's, for the reason recorded there: the
+experiment showed the marker/tamper scans cannot fail on their own, because what the transport hands
+the relay is ciphertext — so validating them would need a crypto-weakening path in shipped code,
+which costs more than it buys when the primary properties are asserted where they are decided
+(`noise.rs`'s three tests above assert the refusals directly).
+
+**What would revive this task:** if the crypto assertions ever move out of the test suite (a feature
+flag, an external harness), the aggregate slice becomes the only place they run — and this retirement
+should be revisited rather than assumed.
