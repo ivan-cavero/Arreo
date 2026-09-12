@@ -1,25 +1,26 @@
 ## State snapshot          ← REWRITTEN (not appended) at every checkpoint
-Task: **T-0047 · the mesh e2e slice — DONE.** The referee for T-0043…T-0046 exists and is green:
-two real `arreo-server` daemons + a self-hosted relay + a daemon-less client, all on loopback.
-Where you are: `cargo xtask e2e --slice mesh` = 15 passed, 2 skipped, 0 failed, 21.8 s (bar was
-60 s); the chaos case kills beta ten times and alpha never notices (2.0–2.5 s, `--slice chaos`
-8/8). The latency row T-0045 moved here is measured: 203–233 ms against a 3 s budget.
-472 workspace tests green; clippy clean on BOTH the pinned and the CI toolchain; fmt clean.
-Next step: **T-0064** (p2 — a remote trust refusal hangs the client; the post-Hello read has no
-bound). That is the last known product defect the mesh slice found, and it is small and
-self-contained. Otherwise T-0063 needs repo admin (CI logs), and T-0048 waits on a human.
+Task: **T-0064 · the remote refusal hang — DONE.** The mesh slice's finding is fixed: the read
+after Hello is bounded (5 s, chosen so the Noise handshake's bound plus this one stays inside
+§5's 10 s row), on both transports, proved load-bearing by mutation.
+Where you are: 473 workspace tests green; clippy clean on both the pinned and the CI toolchain;
+fmt clean; `--slice mesh` 16 passed / 2 skipped / 0 failed in ~29 s. T-0047 (the mesh slice) is
+done and pushed. The skip count in the mesh slice is now *informative*: each skip names the task
+that closes it.
+Next step: **T-0065** (p2 — the daemon's refusal frame is written but never reaches a remote
+peer; the hypothesis and the settling test are in the file). It is the natural continuation:
+T-0064's fix turned a hang into a sentence, and T-0065 is why the sentence is missing. Then
+T-0063 needs repo admin (CI logs); T-0048 waits on a human.
 Open workers: (none)
 Known broken: CI red on the ubuntu test leg (T-0063) · Parked: T-0048 needs-human (launch)
 Findings:
-- **A machine's daemon and its CLI share one device identity** — a remote verb on a
-  daemon-hosting machine displaces that machine's own relay session (T-0060, by design). Drive
-  remote verbs from a daemon-less client; that is also the common real deployment.
-- **A device needs pinning on the peer, not just a certificate**: the handshake resolves the
-  caller from the peer's pin list, and every refusal spends the relay's 3-per-10s handshake
-  budget for that address — which then looks like unrelated transport failures later.
-- **`devices issue` grants on issue** (T-0046), so "pinned but ungranted" takes two real verbs.
-- **A slice must bound every call it makes**: a hang produces no verdict at all. Bounding them is
-  what turned T-0064 from a mystery into a named defect.
+- **A hang is worse than a wrong message**: a wrong message can be read. Bounding the read is
+  what turned this from a mystery into a named failure — and then into T-0065.
+- **A bound must fit the budget it runs inside**: the post-Hello bound runs after the Noise
+  handshake, so 5 s + 5 s keeps §5's 10 s row; 10 s would have spent it all on the last step.
+- **Tests grade the harness when they can only fail by hanging** — so the regression test asserts
+  the *shape* of the failure, and mutation (not the test) is what proves the hang.
+- **Fixing one bug well exposes the next one**: T-0065 existed before this turn and was invisible
+  because the hang hid it.
 ## Event log               ← append-only; newest last; never rewrite
 - 2026-09-10 [turn 1] ledger created; repo at e489fac (docs only); T-0001 + T-0022 (AGENTS.md gardened) done
 - 2026-09-10 [turn 2] T-0002 PTY manager done+pushed (342606c; 9 tests); PROMPT.md v2 synced + ADR 0001 (ef6c595)
@@ -105,3 +106,5 @@ Findings:
 - 2026-09-12 [turn 54] T-0048 batch integrated: 4 workers delivered (furniture with API-verified labels + honest SECURITY.md gap; docs with 123-row link/command table and the false-claim fixes; scan with 8/8 false positives disproved; claims/license with the 137-claim audit and NOTICE fixes). Planner's slice: `cargo xtask release-check [--public]` (10 items, fail-closed on missing tools in --public), CI `public-readiness` job (fetch-depth: 0, pinned scanners, pinned toolchain), `.gitleaks.toml` (value-scoped, negative-controlled), stranger tour from a clean clone (build 1m39s, first pane, api slice green). Two tasks filed: T-0062 (Windows ungated unix import — FIXED, committed 3490dee) and T-0063 (p1, CI investigation: Windows fixed, macOS clippy fixed in 08ca7db, ubuntu test leg needs log access). Also fixed: REUSE.toml dead paths + LICENSE double-annotation + gate continuation-line blind spot, Cargo.toml repository URL, CODE_OF_CONDUCT contact. Gate: 9 pass / 1 skip locally. T-0048 → needs-human with readiness.md.
 
 - 2026-09-12 [turn 55] T-0047 done: the mesh e2e slice. `xtask/src/mesh_slice.rs` (registered, CI step, hint updated) spawns two real daemons + a relay + a daemon-less client on loopback: directory, attach-by-name in 203-233 ms against the 3 s budget, local/remote payload parity, the pin→cut-grant→refuse→grant→attach trust sequence, and node isolation (beta's death leaves alpha's pane untouched). `xtask/src/chaos/mesh_reconnect.rs` kills beta ten times and asserts alpha is intact and uncontaminated. 15 passed, 2 skipped, 0 failed, 21.8 s. Three fixture findings (daemon and CLI share a device id so remote verbs need a daemon-less client; a device needs pinning on the peer, and refusals spend the relay handshake budget; `devices issue` grants on issue) and one product defect filed as **T-0064** (a remote trust refusal at Hello hangs the client — the daemon refuses correctly, the client prints nothing, because the post-Hello read has no bound). Also filed earlier this turn: T-0062 (Windows ungated unix import, fixed) and T-0063 (CI investigation). 472 workspace tests, clippy clean on both toolchains, fmt clean, evidence `.loop/evidence/T-0047/`.
+
+- 2026-09-12 [turn 56] T-0064 done: the post-Hello read in `Client::connect_to` is bounded by `HANDSHAKE_REPLY_TIMEOUT` (5 s, chosen so the Noise handshake bound plus this one stays inside §5's 10 s row), covering both transports. Proved load-bearing by mutation (without the timeout the new regression test hangs past 60 s; with it, 5.00 s). The fix immediately exposed **T-0065**: the daemon's refusal frame is written, flushed and never arrives over the relay — the client now reports a bounded, named failure instead of hanging, which is how the missing sentence became visible. The mesh slice splits the two facts (bounded failure PASS, missing sentence SKIP naming T-0065). 473 workspace tests, clippy clean on both toolchains, fmt clean, evidence `.loop/evidence/T-0064/`.
