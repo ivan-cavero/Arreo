@@ -2,7 +2,7 @@
 id: T-0078
 title: The daemon's files are readable and connectable by other local users
 status: proposed
-priority: 2
+priority: 1
 depends_on: []
 phase: 2
 ---
@@ -57,6 +57,22 @@ keystrokes into an agent, spawn and kill panes. The relay makes the *remote* pat
 authenticated and per-verb gated (T-0023/T-0046); the local path was designed as
 "same-machine, therefore trusted", and that assumption is exactly what a mode of `775`
 fails to enforce.
+
+## Why priority 1, not 2
+
+Raised from 2 after the security re-review of the server handoff (T-0038 stage 1) named the
+consequence that makes this a *security* task rather than a hygiene task: **the socket's mode is
+the only gate in front of `Handoff`.** The handoff request is deliberately ungated (the local
+socket's trust model is "same machine"), and `connect()` on a Unix socket needs only write
+permission on the inode — so at the default `0775`/`0755` a same-**group** peer can request a
+handoff, read the nonce the daemon hands back, and drive the cut. The `.handoff` transfer socket
+is now `0600` and the descriptors are bound to the requester by a nonce, which is what the
+handoff's own review fixed; none of that helps if the *request* can be made by a peer who should
+not have it.
+
+So the ordering matters: until this task lands, T-0038 stage 1's security claim is "closed for
+same-user, open for same-group at the default mode". That is written here rather than left
+implicit, and the code comment in the handoff now says the same thing.
 
 ## Scope fence
 

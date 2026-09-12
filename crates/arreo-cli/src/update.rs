@@ -305,7 +305,7 @@ fn server(args: &Args) -> ExitCode {
                 from: pid,
                 to: new_pid,
             },
-            Err(message) => {
+            Err(HandoffError { code, message }) => {
                 // The handoff failed, so nothing is installed and nothing
                 // changed: the staged copy is dropped and the daemon that was
                 // serving keeps serving the binary it was already running.
@@ -316,7 +316,7 @@ fn server(args: &Args) -> ExitCode {
                      (pid {pid})",
                     socket.display()
                 );
-                return ExitCode::from(FAILED);
+                return ExitCode::from(code);
             }
         },
     };
@@ -386,6 +386,17 @@ fn server(args: &Args) -> ExitCode {
     OK.into()
 }
 
+/// A handoff that did not happen, with the exit code it should be reported as.
+///
+/// Two codes, not one, because "someone else is updating this machine right now"
+/// and "this update does not work" call for different actions from an operator
+/// and from a script — and collapsing them was a real (if minor) defect the
+/// security re-review found.
+struct HandoffError {
+    code: u8,
+    message: String,
+}
+
 /// What the daemon half of the update did.
 enum Handoff {
     /// Nothing was serving the socket, so there was nothing to hand over.
@@ -427,7 +438,7 @@ fn wait_for_takeover(
     socket: &std::path::Path,
     previous_pid: u32,
     args: &Args,
-) -> Result<u32, String> {
+) -> Result<u32, HandoffError> {
     use std::process::{Command, Stdio};
     use std::time::{Duration, Instant};
 
@@ -455,21 +466,47 @@ fn wait_for_takeover(
         .stdout(Stdio::null())
         .stderr(stderr)
         .spawn()
-        .map_err(|e| format!("cannot start the new daemon ({}): {e}", staged.display()))?;
+        .map_err(|e| HandoffError {
+            code: FAILED,
+            message: format!("cannot start the new daemon ({}): {e}", staged.display()),
+        })?;
 
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
         match child.try_wait() {
             Ok(Some(status)) => {
-                return Err(format!(
-                    "the new daemon exited ({status}) before taking over — it was refused, or \
-                     the handoff failed (run `arreo-server --handoff-from {}` by hand for the \
-                     reason)",
-                    socket.display()
-                ));
+                // Exit 3 is the daemon's "another handoff holds the lock", which
+                // is not a failed update but a *deferred* one: the machine is
+                // being handed over by someone else right now, and retrying is
+                // the whole remedy. Reported as "in progress" so a script sees
+                // the same code it would from the updater's own lock, rather
+                // than a generic failure that reads like a broken machine.
+                let code = if status.code() == Some(3) {
+                    IN_PROGRESS
+                } else {
+                    FAILED
+                };
+                let why = if code == IN_PROGRESS {
+                    "another handoff is already in progress on this machine".to_string()
+                } else {
+                    format!(
+                        "it was refused, or the handoff failed (run `arreo-server \
+                         --handoff-from {}` by hand for the reason)",
+                        socket.display()
+                    )
+                };
+                return Err(HandoffError {
+                    code,
+                    message: format!("the new daemon exited ({status}) before taking over — {why}"),
+                });
             }
             Ok(None) => {}
-            Err(e) => return Err(format!("cannot check on the new daemon: {e}")),
+            Err(e) => {
+                return Err(HandoffError {
+                    code: FAILED,
+                    message: format!("cannot check on the new daemon: {e}"),
+                })
+            }
         }
         if let Some(pid) = takeover(
             crate::find_daemon_pid(socket),
@@ -491,11 +528,14 @@ fn wait_for_takeover(
     // forgotten — see T-0077.
     let _ = child.kill();
     let _ = child.wait();
-    Err(format!(
-        "the handoff did not complete within {}s (the outgoing daemon, pid {previous_pid}, was \
-         still running at the last check)",
-        timeout.as_secs()
-    ))
+    Err(HandoffError {
+        code: FAILED,
+        message: format!(
+            "the handoff did not complete within {}s (the outgoing daemon, pid {previous_pid}, was \
+             still running at the last check)",
+            timeout.as_secs()
+        ),
+    })
 }
 
 /// **The readiness rule**, as a pure function of the two facts the poll can

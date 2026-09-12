@@ -352,6 +352,17 @@ impl UpdateLock {
                     UpdateError::Locked(path.display().to_string())
                 }
                 crate::lock::LockError::Io(path, e) => UpdateError::io(&path, e),
+                // `acquire` cannot produce these — they describe a descriptor
+                // *received* from another process (T-0038's handoff), which the
+                // updater never adopts — but the enum is shared, so they are
+                // named rather than wildcarded.
+                crate::lock::LockError::NotHeld(path) => {
+                    UpdateError::io(&path, std::io::Error::other("the lock is not held"))
+                }
+                crate::lock::LockError::NotTheLock { path, .. } => UpdateError::io(
+                    &path,
+                    std::io::Error::other("the descriptor is not the lock"),
+                ),
             })
     }
 }

@@ -14,8 +14,8 @@
 //! names itself refused.
 
 use arreo_core::proto::{
-    classify_op, frame_body_len, negotiate, CodecError, Direction, Message, PaneInfo,
-    MAX_FRAME_BYTES, MIN_VERSION, VERSION,
+    classify_op, client_versions, client_versions_from, frame_body_len, negotiate, CodecError,
+    Direction, Message, PaneInfo, MAX_FRAME_BYTES, MIN_VERSION, VERSION,
 };
 use arreo_core::proto::{codec, AgentState};
 
@@ -235,6 +235,80 @@ fn negotiate_is_a_window_not_a_match() {
     // The floor never underflows: a v0 server's window is just v0.
     assert_eq!(MIN_VERSION, 0);
     assert_eq!(negotiate(0, &[0]).expect("v0 agrees with v0"), 0);
+}
+
+/// A1 (T-0038 re-review): **a client announces every version it can speak.**
+///
+/// The window has two directions and only one was reachable. `negotiate` lets a
+/// *server* fall back to `server - 1`, but only for a version the client
+/// actually offered — so every client in the tree (`vec![VERSION]`, five sites)
+/// was refused at Hello by any older daemon. That is the forward direction
+/// §3.13 promises keeps working: "an old client against a new server (or vice
+/// versa) keeps working". A real update bumps the version, so the broken case
+/// was the one the feature exists for.
+///
+/// The rule is stated at *simulated* versions because this build's `VERSION` is
+/// 0, whose downgrade does not exist — the same device this suite uses for v1
+/// (hand-built frames) and the handoff uses for a forward bump
+/// (`a_forward_bump_takes_the_socket_over`). At any version the rule is:
+/// offer our own, then the one below; a server one behind us agrees with the
+/// floor, and a server one ahead also agrees with the floor.
+///
+/// What removal turns red: `client_versions_from` returning `[version]` alone
+/// (the forward assertion refuses the offer, and the "old spelling" assertion
+/// becomes a tautology of the bug); the `saturating_sub`/duplicate case
+/// (a v0 build offering `[0, 0]`, which the `[0]` assertion rejects).
+#[test]
+fn a_client_announces_every_version_it_can_speak() {
+    for version in 0..=3u32 {
+        let wants = client_versions_from(version);
+        assert!(
+            wants.contains(&version),
+            "the client offers its own version: {wants:?}"
+        );
+        match version.checked_sub(1) {
+            Some(floor) => assert_eq!(
+                wants,
+                vec![version, floor],
+                "and the one below it, which is what makes the forward direction work"
+            ),
+            None => assert_eq!(
+                wants,
+                vec![0],
+                "a v0 build has no N-1: [0], never [0, 0] — a list, not a range"
+            ),
+        }
+        // Backward: an older client against a newer daemon agrees the older one.
+        assert_eq!(
+            negotiate(version + 1, &wants).expect("a newer server serves an older client"),
+            version
+        );
+        // Forward: a newer client against an older daemon agrees the older one —
+        // only because the newer client offered it.
+        assert_eq!(
+            negotiate(version, &client_versions_from(version + 1))
+                .expect("an older server serves a newer client"),
+            version
+        );
+        // The spelling this replaced, and the reason the helper exists: a client
+        // announcing only its own version is refused by an older daemon. If this
+        // ever stops being true, the helper is dead weight; while it is true,
+        // every client site must call it.
+        assert!(
+            negotiate(version, &[version + 1]).is_err(),
+            "announcing only our own version is exactly what an older daemon refuses"
+        );
+    }
+    // This build's own offer has the same properties, through the no-argument
+    // form every client site calls.
+    let ours = client_versions();
+    assert_eq!(ours[0], VERSION, "our own version is announced first");
+    if let Some(floor) = VERSION.checked_sub(1) {
+        assert!(
+            ours.contains(&floor),
+            "the N-1 window is only usable if we announce its floor: {ours:?}"
+        );
+    }
 }
 
 /// Every v0 verb classifies to its side without a full decode — and the

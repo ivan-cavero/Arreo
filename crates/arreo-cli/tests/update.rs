@@ -44,8 +44,25 @@ impl Drop for Scratch {
 }
 
 impl Scratch {
+    /// A scratch directory **on the build tree's filesystem**, so `copy_as`'s hard
+    /// link works.
+    ///
+    /// `std::env::temp_dir()` is a tmpfs here while `target/` is on the root
+    /// filesystem; a link across them fails with `EXDEV` and silently degrades to
+    /// a 123 MB copy per parallel test, which exhausted the tmpfs during a
+    /// full-suite run. See `tests/update_server.rs`, where the same fix landed for
+    /// the same reason — one cause, two files.
     fn new(tag: &str) -> Self {
-        let dir = std::env::temp_dir().join(format!(
+        let target = std::env::current_exe()
+            .expect("test exe")
+            .parent()
+            .expect("deps dir")
+            .parent()
+            .expect("debug dir")
+            .parent()
+            .expect("target dir")
+            .to_path_buf();
+        let dir = target.join("test-scratch").join(format!(
             "arreo-cli-update-{tag}-{}-{:?}",
             std::process::id(),
             std::thread::current().id()

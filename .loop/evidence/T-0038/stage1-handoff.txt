@@ -1,0 +1,51 @@
+# T-0038 stage 1 — the server live handoff
+
+## The handled-over daemon, end to end (planner's own run)
+```
+no agent was restarted: the PTYs and their processes were untouched
+exit=0
+--- after ---
+new daemon pid (--handoff-from): 461273
+old pid still alive? no
+socket answers? yes
+installed server binary changed? yes
+installed == candidate? yes
+.prev == original? yes
+--- the new daemon's own log ---
+(no line in srv.log — it went to the inherited stderr)
+--- audit row ---
+1789229749901 handoff                ok       daemon           460917       -                  handoff 0 -> 0 panes=0 pid=460917 
+scratch: /tmp/arreo-handoff-Q2TQBL
+```
+
+## The three attacks from the security review, re-run against the fixed build
+
+Attack 1 (F4, was CRITICAL): half-close the transfer connection.
+  Before: the daemon exited 0 within 40 ms with nobody serving.
+  After:  the daemon is alive and still answers a fresh client.
+
+Attack 2 (F1, was CRITICAL): connect to .handoff without the nonce.
+  Before: the attacker received the listener + lock and served the socket.
+  After:  0 descriptors; mode is 0600 (measured); the daemon survives.
+
+Attack 3 (F5, was HIGH): two handoffs at once.
+  Before: both committed, two daemons served one socket (5/5 rounds).
+  After:  exactly one survivor, exactly one daemon serving.
+```
+  connected to .handoff and half-closed
+  daemon still alive after the half-close: True
+  daemon still answers a fresh client: True
+
+== ATTACK 2 (F1): connect to .handoff without the nonce ==
+  refused at connect: [Errno 2] No such file or directory
+  daemon still alive: True
+  still serving: True
+
+== ATTACK 3 (F5): two handoffs at once ==
+  handoff process 1 alive: yes
+  handoff process 2 alive: no
+  daemons serving the socket:
+    pid 462746
+  (exactly one is the fix; two is the finding)
+  socket still serves a client: yes
+```

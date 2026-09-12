@@ -15,49 +15,118 @@
 //! descriptor means the daemon exits and the socket goes dead — the exact
 //! "half-dead" state ADR 0021 §2 exists to prevent.
 //!
-//! ## The descriptor grammar
+//! ## The transfer grammar
 //!
-//! The dedicated connection carries **no framing other than the marker bytes
-//! the descriptor helpers already define** (`FD_PASS_BYTE = 0x01`, one per
-//! descriptor). The outgoing daemon sends exactly two descriptors in a fixed
-//! order — the **listener** first, then the **lock** (stage 2 adds panes after
-//! the lock) — and the incoming daemon receives exactly two. `commit` needs no
-//! byte of its own: the incoming daemon's `commit` is observed by the outgoing
-//! daemon as **EOF on the handoff connection** — the incoming daemon closes its
-//! side once it is genuinely accepting on the inherited listener, and the
-//! outgoing daemon's third `recv_fd` (which expects no descriptor) returns
-//! `FdTransferError::PeerClosed` for exactly that. An incoming daemon that dies
-//! before committing reads as `PeerClosed`/`TimedOut` at whatever step the
-//! outgoing daemon reached — an abort, and the outgoing daemon keeps serving.
+//! One connection, four steps, each bound by the marker bytes the descriptor
+//! helpers already define ([`arreo_core::pty::adopt::FD_PASS_BYTE`] per
+//! descriptor, [`arreo_core::pty::adopt::HANDOFF_COMMIT_BYTE`] for the commit):
+//!
+//! 1. **Incoming → outgoing: the nonce** — the 32 bytes the outgoing daemon
+//!    returned in `HandoffReady`, as the first bytes on the connection. A
+//!    mismatch or an early close refuses *before* any descriptor moves.
+//! 2. **Outgoing → incoming: the listener, then the lock** (the order is the
+//!    contract; stage 2 adds panes after the lock).
+//! 3. **Incoming → outgoing: the commit marker byte** — sent by the incoming
+//!    daemon once its accept loop owns the inherited listener. What the outgoing
+//!    daemon learns from it is that *the process it authorised is committing* —
+//!    not that a server is reachable behind it (see [`wait_for_commit`]).
+//! 4. Both sides close.
+//!
+//! **EOF is not a commit.** The first version of this file read end-of-stream
+//! on the transfer connection as the incoming daemon's success, and a process
+//! that connected, half-closed, and never served anything committed the cut:
+//! the outgoing daemon exited 0, nothing held a listener, and the audit log
+//! recorded a handoff that never happened. EOF says a peer stopped *writing* —
+//! which is also what a peer that died mid-transfer says — so the outgoing
+//! daemon requires the marker byte, and EOF before it is an abort.
+//!
+//! **And the marker byte is authorisation, not evidence of serving.** It is a
+//! real improvement over EOF — it can only come from the process the outgoing
+//! daemon answered, because only that process was given the nonce — but it does
+//! not, and cannot, show that the other end accepted anything: a peer may
+//! present the nonce, take the descriptors, send the byte and do nothing else.
+//! What closes that gap is not a stronger signal but a smaller window, and the
+//! obvious candidate is worse than the gap: a probe (connect to `<socket>`, wait
+//! for a `Welcome`) makes the cut **two** decisions — a probe that times out on
+//! a slow-but-healthy daemon leaves the outgoing daemon serving *and* the
+//! incoming daemon committed, which is two daemons on one socket, the F5
+//! failure, reintroduced by the check meant to prevent a different one. The byte
+//! is one atomic decision, so it is what ships. [`wait_for_commit`] carries the
+//! reasoning where it is implemented, and
+//! `a_commit_by_the_requester_is_authorisation_not_proof_of_serving` keeps it
+//! from being "fixed" silently.
 //!
 //! ## Ordering (outgoing)
 //!
 //! 1. Receive the request on the client socket; validate the version against
 //!    the *incoming* daemon's window; audit a refusal if refused.
-//! 2. Bind `<socket>.handoff`; reply `HandoffReady { v, protocol, panes }`.
-//! 3. Accept one connection there with a deadline ([`DEFAULT_HANDOFF_TIMEOUT`]);
-//!    unlink the path as soon as it is accepted.
-//! 4. Send the listener descriptor, then the lock descriptor.
-//! 5. Wait for the incoming daemon's commit (EOF).
-//! 6. Write the audit row (`handoff <from> -> <to> panes=0`).
-//! 7. Stop accepting — the accept loop ends, which drops *this* process's
+//! 2. Take the one-handoff lock ([`handoff_lock_path_for`]) for the duration:
+//!    a second request while it is held is refused, never raced.
+//! 3. Bind `<socket>.handoff` (mode 0600), reply
+//!    `HandoffReady { v, protocol, panes, nonce }`.
+//! 4. Accept one connection there with a deadline; check the peer's uid; read
+//!    the nonce.
+//! 5. Send the listener descriptor, then the lock descriptor.
+//! 6. Wait for the commit marker byte.
+//! 7. Write the audit row (`handoff <from> -> <to> panes=0`).
+//! 8. Stop accepting — the accept loop ends, which drops *this* process's
 //!    listener fd (the incoming daemon holds a dup, and the **socket file must
 //!    NOT be unlinked**).
-//! 8. `std::process::exit(0)`. **No destructor may run.**
+//! 9. `std::process::exit(0)`. **No destructor may run.**
 //!
 //! ## Ordering (incoming)
 //!
 //! 1. Connect to the client socket, Hello/Welcome, send the request, read
-//!    `HandoffReady`.
-//! 2. Connect to `<socket>.handoff`, receive the listener, then the lock.
-//! 3. Build the daemon around the **inherited** listener and lock: no bind, no
-//!    `try_lock`. The descriptor is made non-blocking before it becomes a
-//!    `tokio::net::UnixListener`.
-//! 4. **Verify the inheritance**: open the lock path afresh and assert the lock
-//!    is held (this replaces the acquire and proves the descriptor really
-//!    carried the lock).
+//!    `HandoffReady` (with the nonce).
+//! 2. Connect to `<socket>.handoff`, present the nonce, receive the listener,
+//!    then the lock.
+//! 3. **Validate what arrived**: the listener must be a listening stream socket
+//!    bound to this socket's path, and the lock must be *the* lock at
+//!    `<socket>.lock` (see [`validate_listener`] and
+//!    [`arreo_core::lock::ExclusiveLock::inherited_checked`]). Anything else is
+//!    refused, naming what arrived.
+//! 4. Build the daemon around the inherited listener and lock: no bind, no
+//!    acquire.
 //! 5. Start accepting on the inherited listener.
-//! 6. Send `commit` (close the handoff connection → EOF), then keep serving.
+//! 6. Send the commit marker byte, then keep serving.
+//!
+//! ## Why the transfer is authenticated (F1 of the stage-1 security review)
+//!
+//! Three layers, because they defend different things:
+//!
+//! - **Mode 0600 on `<socket>.handoff`** ([`restrict_transfer_socket`]). The
+//!   ambient umask gives 0775, and `connect()` needs only write permission on
+//!   the inode, so the default mode admits any same-group user. The socket's
+//!   *location* is not a control either: with `XDG_RUNTIME_DIR` unset the
+//!   daemon falls back to `/tmp`, whose mode is 1777 — every user on the box.
+//! - **`SO_PEERCRED` on the accepted connection** ([`check_peer_uid`]): the
+//!   peer uid must be ours.
+//! - **A per-handoff nonce** ([`send_nonce`]/[`recv_nonce`]): it binds *this*
+//!   transfer to the process that requested the handoff on the main socket,
+//!   not to any process that noticed the path. It closes the window between
+//!   `bind` and `chmod` too, where a same-group peer could still connect.
+//!
+//! **What the nonce does not change**: a same-user process can request its own
+//! handoff on the main socket, exactly as it can send any other verb there.
+//! The local socket is ungated by design (`auth: None` in `handle`), and a
+//! same-user process can already `kill` the daemon. **And the gate for
+//! `Handoff` is the main socket's mode, not the uid**: `Handoff` needs only
+//! `connect()`, which on a Unix socket requires write permission on the inode,
+//! and the main socket is bound with the ambient umask and never chmod'd — so at
+//! the default mode (0775 measured here; 0755 under `umask 022`) a peer in the
+//! same **group** can request a handoff, read the nonce and drive the cut, not
+//! merely a same-user one. Narrowing the main socket's mode is T-0078's
+//! decision; this feature neither narrows nor widens it. What the nonce adds is
+//! that the *descriptor transfer* can only be joined by the process the daemon
+//! answered.
+//!
+//! ## One handoff at a time (F5)
+//!
+//! Two concurrent handoffs both used to commit and leave **two daemons serving
+//! one socket**, which is the state T-0071's lock exists to make impossible.
+//! The duration of a handoff is now guarded by an exclusive lock at
+//! [`handoff_lock_path_for`]; a second request while it is held is answered
+//! with a typed refusal and the first proceeds undisturbed.
 //!
 //! ## What is NOT transferred
 //!
@@ -69,16 +138,31 @@
 //! is spawned, waited for, or signalled here: stage 1 moves descriptors and
 //! stops accepting; it touches no `Pane` (stage 2 does).
 
+use std::io::{Read, Write};
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::io::{BorrowedFd, FromRawFd, IntoRawFd, OwnedFd};
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 /// How long the outgoing daemon waits for the incoming daemon to connect to
-/// `<socket>.handoff`, for the commit after the descriptors, and for each
-/// descriptor on the incoming side. Generous because the alternative to waiting
-/// is a failed update, and a slow machine under load must not turn a working
-/// handoff into a refused one.
+/// `<socket>.handoff`, for the nonce, for the commit after the descriptors, and
+/// for each descriptor on the incoming side. Generous because the alternative
+/// to waiting is a failed update, and a slow machine under load must not turn a
+/// working handoff into a refused one.
 pub const DEFAULT_HANDOFF_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The nonce's length. Fixed by the grammar: the incoming daemon's first 32
+/// bytes on the transfer connection are the nonce.
+pub const NONCE_BYTES: usize = 32;
+
+/// The mode `<socket>.handoff` is bound with. `connect()` needs only write
+/// permission on the inode, so anything looser admits every user in the group.
+pub const TRANSFER_MODE: u32 = 0o600;
+
+/// How much of a peer-supplied build string may reach an audit row. A frame can
+/// carry megabytes; the audit row cannot.
+pub const MAX_BUILD_CHARS: usize = 64;
 
 /// `<socket>.handoff` — the dedicated descriptor-transfer socket, bound only
 /// for the duration of a handoff and unlinked when it ends.
@@ -87,58 +171,79 @@ pub fn handoff_path_for(socket: &Path) -> PathBuf {
     arreo_core::identity::authority::sidecar(socket, ".handoff")
 }
 
-/// What the outgoing daemon concluded. Returned to the session loop so the
-/// single place that owns the accept loop can act on it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum HandoffOutcome {
-    /// The cut happened: descriptors sent, commit observed, audit row written.
-    /// The caller must stop accepting and `std::process::exit(0)`.
-    Committed,
-    /// The incoming daemon never finished (died, timed out, or the version was
-    /// refused before any descriptor moved). The caller keeps serving; the
-    /// `.handoff` file is already gone.
-    Aborted,
+/// `<socket>.handoff.lock` — the one-handoff-at-a-time lock.
+///
+/// A path of its own rather than the transfer socket itself: `ExclusiveLock`
+/// opens a regular file, and `<socket>.handoff` is a socket (opening it
+/// read/write fails outright). The lock file stays on disk after release, like
+/// `<socket>.lock` — the *open description* carries the lock, so a leftover
+/// zero-byte file is not a stale lock.
+#[must_use]
+pub fn handoff_lock_path_for(socket: &Path) -> PathBuf {
+    arreo_core::identity::authority::sidecar(socket, ".handoff.lock")
 }
 
-/// The outgoing side: validate `incoming_protocol`, bind the handoff socket,
-/// move the listener + lock descriptors, wait for commit, audit, and report
-/// whether the caller should exit.
+/// Check the incoming daemon's protocol against **its** window.
 ///
-/// `listener_fd` and `lock_fd` are borrowed: sending over `SCM_RIGHTS` dups
-/// them into the peer, so this side keeps (and the caller drops) its own.
-/// `panes` is the live pane count for the `HandoffReady` reply and the audit
-/// row (stage 1 always reports the real count; it moves no pane).
+/// The incoming daemon is the server the socket is being handed to, so what
+/// matters is that *we* are a version it can speak: our `VERSION` must be
+/// inside `{incoming - 1, incoming}`. That is `negotiate(incoming, [VERSION])`
+/// — accepted when `incoming == VERSION` or `incoming == VERSION + 1`, refused
+/// for a gap of two or more **and for a downgrade**.
 ///
-/// A refusal (incoming protocol outside this daemon's N−1 window) writes the
-/// `handoff.refuse` audit row and returns `Ok(Aborted)` with **no reply sent
-/// and no `.handoff` file created** — the session loop answers the typed
-/// `Error` itself, and the daemon keeps serving.
-pub fn check_incoming_protocol(
-    incoming_protocol: u32,
-    db: &Path,
-    incoming_build: &str,
-) -> Result<u32, String> {
-    match arreo_core::proto::codec::negotiate(
-        arreo_core::proto::VERSION,
-        std::slice::from_ref(&incoming_protocol),
-    ) {
-        Ok(agreed) => Ok(agreed),
-        Err(e) => {
-            let detail = format!(
-                "handoff refused: incoming protocol {incoming_protocol} (build {incoming_build}) \
-                 outside this daemon's window (speaks {}): {e}",
-                arreo_core::proto::VERSION,
-            );
-            record_refusal(db, &detail);
-            Err(detail)
+/// `negotiate(VERSION, [incoming])` — what this used to call — is the same
+/// question asked backwards: its window is `{VERSION - 1, VERSION}`, so it
+/// refuses every forward bump and accepts a downgrade. A real release could
+/// never hand over.
+pub fn check_incoming_protocol(incoming_protocol: u32) -> Result<u32, String> {
+    incoming_window(arreo_core::proto::VERSION, incoming_protocol)
+}
+
+/// The window rule with both versions named, so the direction is testable at a
+/// build whose `VERSION` has no representable downgrade (it is 0 today).
+fn incoming_window(ours: u32, incoming: u32) -> Result<u32, String> {
+    arreo_core::proto::codec::negotiate(incoming, &[ours])
+        .map_err(|e| format!("protocol {incoming} cannot take over from {ours}: {e}"))
+}
+
+/// A peer-supplied build string, made safe for an audit row: control characters
+/// dropped (they can rewrite a terminal that renders the log) and the length
+/// bounded to [`MAX_BUILD_CHARS`] bytes on a char boundary.
+#[must_use]
+pub fn sanitize_build(build: &str) -> String {
+    let mut out = String::new();
+    for ch in build.chars() {
+        if ch.is_control() {
+            continue;
         }
+        if out.len() + ch.len_utf8() > MAX_BUILD_CHARS {
+            break;
+        }
+        out.push(ch);
     }
+    out
 }
 
 /// Write the `handoff.refuse` audit row. Best-effort like every background
 /// daemon write: a store failure must not take down a daemon that is — by
 /// definition of this path — still serving.
 fn record_refusal(db: &Path, detail: &str) {
+    record_row(db, arreo_core::store::actions::HANDOFF_REFUSE, detail);
+}
+
+/// Write the `handoff.abort` audit row: a cut that started and did not happen.
+fn record_abort_row(db: &Path, detail: &str) {
+    record_row(db, arreo_core::store::actions::HANDOFF_ABORT, detail);
+}
+
+/// The incoming daemon records its own refusal, with the reason the outgoing
+/// side cannot know (a missing socket path, a lock that reads as free). A
+/// failed handoff must not be silent on either side.
+pub fn record_incoming_abort(db: &Path, detail: &str) {
+    record_abort_row(db, &format!("incoming: {detail}"));
+}
+
+fn record_row(db: &Path, action: &str, detail: &str) {
     if let Ok(store) = arreo_core::store::SessionStore::open(db) {
         let _ = store.record(&arreo_core::store::AuditEvent {
             device: "daemon".to_string(),
@@ -146,12 +251,73 @@ fn record_refusal(db: &Path, detail: &str) {
             prompt: String::new(),
             detail: Some(detail.to_string()),
             ..arreo_core::store::AuditEvent::new(
-                arreo_core::store::actions::HANDOFF_REFUSE,
+                action,
                 arreo_core::store::AuditKind::Unknown,
                 arreo_core::store::AuditOutcome::Refused,
                 now_ms(),
             )
         });
+    }
+}
+
+/// The opening words of the outgoing daemon's **busy** refusal — the one
+/// refusal that is not a failure of the machine but a *deferred* update.
+///
+/// The two halves of this string are in two processes that may even be two
+/// builds apart (the incoming daemon is the new binary), so it travels as prose
+/// in the typed `Error`'s `message`: `Message` has no refusal-reason field, and
+/// adding a protocol variant to carry one local exit code would be a wire change
+/// serving a decision that is not on the wire's behalf. **The coupling is
+/// one-way and it is a string match**: the outgoing daemon builds the detail
+/// *from* this constant, and the incoming daemon asks
+/// [`is_busy_refusal`] before choosing its exit code. If the wording below
+/// changes, both sides change with it — and because it is the *only* thing that
+/// distinguishes a locked handoff from a broken one, changing it silently turns
+/// the deferred update back into a reported failure.
+pub const BUSY_REFUSAL: &str = "another handoff holds";
+
+/// Whether a refusal detail names the one-handoff lock as the reason.
+///
+/// The consumer side of [`BUSY_REFUSAL`]: the incoming daemon exits 3 (the
+/// project's "in progress" code, the same one the updater's own lock uses) for
+/// this refusal and 1 for every other.
+#[must_use]
+pub fn is_busy_refusal(detail: &str) -> bool {
+    detail.contains(BUSY_REFUSAL)
+}
+
+/// The failure rows one session may write: **one refusal and one abort**, never
+/// one per frame.
+///
+/// A client can send `Handoff` in a loop; a row per attempt would let it fill
+/// the operator's log from the machine itself, which is the cheapest denial of
+/// service against an audit trail. The first refusal and the first abort are
+/// the interesting ones — who tried, when, and why they were turned away. The
+/// ten thousandth says nothing new (T-0059 solved the same problem for trust
+/// refusals the same way).
+#[derive(Debug, Default)]
+pub struct HandoffFailureLog {
+    refused: bool,
+    aborted: bool,
+}
+
+impl HandoffFailureLog {
+    /// Record a refusal (a handoff that ended before any descriptor moved).
+    pub fn refuse(&mut self, db: &Path, detail: &str) {
+        if self.refused {
+            return;
+        }
+        self.refused = true;
+        record_refusal(db, detail);
+    }
+
+    /// Record an abort (a handoff that started and did not commit).
+    pub fn abort(&mut self, db: &Path, detail: &str) {
+        if self.aborted {
+            return;
+        }
+        self.aborted = true;
+        record_abort_row(db, &format!("outgoing: {detail}"));
     }
 }
 
@@ -175,10 +341,7 @@ pub fn record_handoff(db: &Path, from: u32, to: u32, panes: u64, pid: u32) {
 }
 
 /// Send one descriptor over an already-connected handoff stream.
-pub fn send_one(
-    socket: &std::os::unix::net::UnixStream,
-    fd: BorrowedFd<'_>,
-) -> std::io::Result<()> {
+pub fn send_one(socket: &UnixStream, fd: BorrowedFd<'_>) -> std::io::Result<()> {
     arreo_core::pty::adopt::send_fd(socket, fd).map_err(|e| {
         std::io::Error::new(
             std::io::ErrorKind::ConnectionAborted,
@@ -189,24 +352,172 @@ pub fn send_one(
 
 /// Receive one descriptor, waiting at most `timeout` in total.
 pub fn recv_one(
-    socket: &std::os::unix::net::UnixStream,
+    socket: &UnixStream,
     timeout: Duration,
 ) -> Result<OwnedFd, arreo_core::pty::adopt::FdTransferError> {
     arreo_core::pty::adopt::recv_fd(socket, timeout)
 }
 
-/// Wait for the incoming daemon's commit: EOF on the handoff connection with
-/// no further descriptor. `recv_fd` reports that as `PeerClosed` on a stream
-/// socket, which is the only success here — a descriptor at this step would
-/// mean a peer speaking a different grammar, and a timeout means it died.
-pub fn wait_for_commit(
-    socket: &std::os::unix::net::UnixStream,
-    timeout: Duration,
-) -> Result<(), String> {
-    match arreo_core::pty::adopt::recv_fd(socket, timeout) {
-        Err(arreo_core::pty::adopt::FdTransferError::PeerClosed) => Ok(()),
-        Err(e) => Err(format!("handoff commit not observed: {e}")),
-        Ok(_) => Err("handoff commit not observed: peer sent an unexpected descriptor".to_string()),
+/// Bind `<socket>.handoff` with mode [`TRANSFER_MODE`], immediately after the
+/// bind.
+///
+/// `bind` creates the socket with the process umask, which is 0775 or 0770 in
+/// the common configurations — and `connect()` on a Unix socket needs only
+/// write permission on the inode, so a same-group user could connect, present
+/// nothing, and (before this) abort or join the transfer. The tiny
+/// `bind`-then-`chmod` window is closed by the peer-uid and nonce checks on the
+/// accepted connection, so this is belt to their braces rather than the only
+/// strap.
+///
+/// Note that the socket's *location* is not a control: with `XDG_RUNTIME_DIR`
+/// unset, `arreo-server` falls back to `/tmp`, whose mode is 1777.
+pub fn restrict_transfer_socket(path: &Path) -> std::io::Result<()> {
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(TRANSFER_MODE))
+}
+
+/// Send the per-handoff nonce as the first bytes of the transfer connection.
+pub fn send_nonce(socket: &UnixStream, nonce: &[u8]) -> std::io::Result<()> {
+    let mut handle = socket;
+    handle.write_all(nonce)
+}
+
+/// Read the nonce the incoming daemon presented, waiting at most `timeout`.
+///
+/// A peer that sends fewer than [`NONCE_BYTES`] and closes reads as an error
+/// here, which is the point: nobody gets past this step without the bytes the
+/// outgoing daemon minted for *this* handoff.
+pub fn recv_nonce(socket: &UnixStream, timeout: Duration) -> Result<[u8; NONCE_BYTES], String> {
+    bound_read(socket, timeout)?;
+    let mut nonce = [0u8; NONCE_BYTES];
+    let mut handle = socket;
+    handle
+        .read_exact(&mut nonce)
+        .map_err(|e| format!("the incoming daemon did not present the handoff nonce: {e}"))?;
+    Ok(nonce)
+}
+
+/// The incoming daemon's commit: exactly one marker byte, sent once this
+/// process's accept loop owns the inherited listener and is about to accept.
+///
+/// That the marker is only sent from a genuinely-accepting process is *this*
+/// side's honest statement; the outgoing daemon reads it as authorisation
+/// rather than as proof that a server is reachable — see [`wait_for_commit`].
+pub fn send_commit(socket: &UnixStream) -> std::io::Result<()> {
+    let mut handle = socket;
+    handle.write_all(&[arreo_core::pty::adopt::HANDOFF_COMMIT_BYTE])
+}
+
+/// Wait for the incoming daemon's commit marker byte.
+///
+/// **EOF is not a commit**: it means the peer stopped writing, which is what a
+/// peer that died mid-transfer does too. Only
+/// [`arreo_core::pty::adopt::HANDOFF_COMMIT_BYTE`] commits this cut. Everything
+/// else (EOF, a wrong byte, the deadline) is an abort and the outgoing daemon
+/// keeps serving.
+///
+/// **The byte is authorisation, not proof that a peer is serving.** It can only
+/// be sent by the process that asked for the handoff on the main socket, because
+/// only that process was given the nonce — so it says "the requester has taken
+/// the descriptors and is committing". Whether a daemon is *behind* it is not
+/// something this side can see: a peer may send the byte and then do nothing.
+/// That is a real gap and it is accepted, because the candidate fixes are worse:
+/// the obvious one, connecting to `<socket>` and waiting for a `Welcome` after
+/// the byte, is **two** decisions where the protocol has one — a probe that
+/// times out on a slow-but-healthy daemon leaves the outgoing daemon serving
+/// *and* the incoming daemon committed, i.e. two daemons on one socket (the F5
+/// failure), reintroduced by the check meant to prevent a different one. It is
+/// not implemented, and
+/// `a_commit_by_the_requester_is_authorisation_not_proof_of_serving` (see the
+/// handoff tests) turns red if someone adds one.
+pub fn wait_for_commit(socket: &UnixStream, timeout: Duration) -> Result<(), String> {
+    bound_read(socket, timeout)?;
+    let mut byte = [0u8; 1];
+    let mut handle = socket;
+    loop {
+        match handle.read(&mut byte) {
+            Ok(0) => {
+                return Err(
+                    "the incoming daemon closed the transfer connection without committing \
+                     (end-of-stream is not a commit)"
+                        .to_string(),
+                )
+            }
+            Ok(_) if byte[0] == arreo_core::pty::adopt::HANDOFF_COMMIT_BYTE => return Ok(()),
+            Ok(_) => {
+                return Err(format!(
+                    "the incoming daemon sent {:#04x} instead of the commit marker {:#04x}",
+                    byte[0],
+                    arreo_core::pty::adopt::HANDOFF_COMMIT_BYTE
+                ))
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(format!("no commit marker within {timeout:?}: {e}")),
+        }
+    }
+}
+
+/// The peer on the transfer connection must be this user.
+///
+/// What this bounds, exactly: the **transfer**. A peer that got this far already
+/// held the nonce, so it is the process this daemon answered *or* one that read
+/// the nonce from it; the uid makes the descriptor handover this-user-only
+/// regardless. It is **not** what decides who may *ask* for a handoff — `Handoff`
+/// is ungated and needs only `connect()`, which on a Unix socket requires write
+/// permission on the main socket's inode. That socket is bound with the ambient
+/// umask and never chmod'd (0775 measured here; 0755 under `umask 022`), so at
+/// the default mode a same-**group** peer can request a handoff, read the nonce
+/// and drive the cut. The main socket's mode is therefore the gate for the
+/// request, and narrowing it is T-0078's decision — not this check's.
+///
+/// `Ok(())` when the platform cannot answer (`peer_uid` returns `None`): the
+/// handoff stays possible there, with the nonce and the socket's own
+/// permissions carrying the check. Nothing here ever treats an unanswerable
+/// question as a "yes" for an *answered* one — a returned uid that is not ours
+/// is always a refusal.
+pub fn check_peer_uid(socket: &UnixStream) -> Result<(), String> {
+    match arreo_core::pty::adopt::peer_uid(socket) {
+        Ok(Some(uid)) if uid == arreo_core::pty::adopt::own_uid() => Ok(()),
+        Ok(Some(uid)) => Err(format!(
+            "the transfer connection is from uid {uid}, not this daemon's uid {}",
+            arreo_core::pty::adopt::own_uid()
+        )),
+        Ok(None) => Ok(()),
+        Err(e) => Err(format!("cannot read the transfer peer's credentials: {e}")),
+    }
+}
+
+/// Validate a descriptor offered as the listener to inherit.
+///
+/// Three facts, all about the descriptor rather than about the message that
+/// described it: it is a **listening stream socket**, and `getsockname()`
+/// equals the path this process was told to take over. A descriptor that is a
+/// connected `socketpair` end, or a listener for a *different* socket, is
+/// refused naming what arrived — serving on either would accept connections
+/// the operator's clients never reach.
+pub fn validate_listener(fd: BorrowedFd<'_>, expected: &Path) -> Result<(), String> {
+    match arreo_core::pty::adopt::socket_is_listening_stream(fd) {
+        Ok(true) => {}
+        Ok(false) => {
+            return Err(
+                "the descriptor in the listener slot is not a listening stream socket".to_string(),
+            )
+        }
+        Err(e) => return Err(format!("cannot read the listener descriptor's type: {e}")),
+    }
+    match arreo_core::pty::adopt::socket_bound_path(fd) {
+        Ok(Some(bound)) if bound == expected => Ok(()),
+        Ok(Some(bound)) => Err(format!(
+            "the listener descriptor is bound to {} but this process was told to take over {}",
+            bound.display(),
+            expected.display()
+        )),
+        Ok(None) => Err(format!(
+            "the listener descriptor has no bound path (expected {})",
+            expected.display()
+        )),
+        Err(e) => Err(format!(
+            "cannot read the listener descriptor's address: {e}"
+        )),
     }
 }
 
@@ -220,9 +531,15 @@ pub fn wait_for_commit(
 /// `fd` is owned — it arrived over `SCM_RIGHTS`, so this process holds the only
 /// reference to this descriptor number. `into_raw_fd` transfers that ownership
 /// to the listener without duplicating or closing anything, and the listener
-/// takes over closing it exactly once. The descriptor is a bound Unix listener
-/// (the outgoing daemon sent its own), so interpreting it as one performs no
-/// I/O and cannot misinterpret the handle.
+/// takes over closing it exactly once.
+///
+/// The *type* is the caller's warranty, and it is a real one: interpreting an
+/// arbitrary descriptor as a `UnixListener` performs no I/O (no syscall reads
+/// the handle), so this is memory-safe for any descriptor. It is **not**
+/// identity-safe — a memory-safe misinterpretation is still a listener for some
+/// other socket — which is why [`validate_listener`] runs on the descriptor
+/// before this does, and why "the descriptor cannot misinterpret the handle"
+/// was the wrong claim to make.
 pub fn std_listener_from_fd(fd: OwnedFd) -> std::os::unix::net::UnixListener {
     let raw = fd.into_raw_fd();
     // SAFETY: `raw` came from an owned descriptor this line just consumed, so
@@ -231,9 +548,77 @@ pub fn std_listener_from_fd(fd: OwnedFd) -> std::os::unix::net::UnixListener {
     unsafe { std::os::unix::net::UnixListener::from_raw_fd(raw) }
 }
 
+/// Bound a read on the transfer connection by `timeout`, so no wait in the
+/// handoff is unbounded.
+fn bound_read(socket: &UnixStream, timeout: Duration) -> Result<(), String> {
+    socket
+        .set_read_timeout(Some(timeout))
+        .map_err(|e| format!("cannot bound the handoff read by {timeout:?}: {e}"))
+}
+
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arreo_core::proto::VERSION;
+
+    /// The version window is the **incoming** daemon's, and it is asymmetric:
+    /// a forward bump of one is accepted, the same version is accepted, a jump
+    /// of two is refused, and a downgrade is refused.
+    ///
+    /// This is the test that tells the two directions apart: the old call
+    /// (`negotiate(VERSION, [incoming])`) accepted a downgrade and refused
+    /// every bump, so `VERSION + 1` here is exactly the case it got wrong.
+    #[test]
+    fn the_version_window_is_the_incoming_daemons() {
+        assert_eq!(
+            check_incoming_protocol(VERSION).expect("same version"),
+            VERSION
+        );
+        assert_eq!(
+            check_incoming_protocol(VERSION + 1).expect("one bump forward is in its window"),
+            VERSION
+        );
+        assert!(
+            check_incoming_protocol(VERSION + 2).is_err(),
+            "a gap of two is a deferred update, not a silent one"
+        );
+        assert!(
+            check_incoming_protocol(VERSION + 3).is_err(),
+            "and a wider gap certainly is"
+        );
+        // The rule's shape at a version where a downgrade exists: the build's
+        // `VERSION` is 0 today, so there is no older protocol for it to refuse,
+        // and an absent `protocol` field (`#[serde(default)]`, ADR 0017) reads
+        // as 0 — the same version, which is accepted. That is not a hole: the
+        // requester still has to complete the whole transfer (nonce,
+        // descriptors, commit) before anything is taken over.
+        assert!(incoming_window(3, 3).is_ok(), "same version");
+        assert!(incoming_window(3, 4).is_ok(), "one bump forward");
+        assert!(incoming_window(3, 5).is_err(), "a gap of two");
+        assert!(
+            incoming_window(3, 2).is_err(),
+            "a downgrade must never take the socket over"
+        );
+    }
+
+    /// The peer's build string reaches an audit row, so it must not be able to
+    /// carry a terminal escape or megabytes of padding.
+    #[test]
+    fn a_build_string_is_stripped_and_bounded() {
+        let hostile = format!("evil\x1b[2J\x07{}", "x".repeat(900 * 1024));
+        let clean = sanitize_build(&hostile);
+        assert_eq!(clean, format!("evil[2J{}", "x".repeat(MAX_BUILD_CHARS - 7)));
+        assert!(!clean.chars().any(char::is_control));
+        assert!(clean.len() <= MAX_BUILD_CHARS);
+        // A multi-byte character is never split: the result is valid UTF-8 by
+        // construction (`String`), and ends on a boundary.
+        assert!(sanitize_build(&"é".repeat(100)).chars().count() <= MAX_BUILD_CHARS / 2);
+    }
 }

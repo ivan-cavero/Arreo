@@ -46,8 +46,30 @@ impl Drop for Scratch {
 }
 
 impl Scratch {
+    /// A scratch directory **on the build tree's filesystem**.
+    ///
+    /// Not `std::env::temp_dir()`: on this box `/tmp` is a tmpfs and `target/` is
+    /// on the root filesystem, so a hard link across them fails with `EXDEV` — the
+    /// link falls back to a copy, and a copy of a 142 MB daemon per parallel test
+    /// exhausts the tmpfs (`StorageFull` inside `copy_as`, which reads as anything
+    /// but a disk problem). Keeping the scratch beside the binaries makes the link
+    /// work, so the installed pair costs no space at all, and 95 GB of root
+    /// filesystem replaces 1.9 GB of tmpfs as the headroom.
+    ///
+    /// Derived from this test binary's own path — `target/debug/deps/x` →
+    /// `target/debug` → `target/test-scratch` — so it follows `CARGO_TARGET_DIR`
+    /// rather than assuming the default layout.
     fn new(tag: &str) -> Self {
-        let dir = std::env::temp_dir().join(format!(
+        let target = std::env::current_exe()
+            .expect("test exe")
+            .parent()
+            .expect("deps dir")
+            .parent()
+            .expect("debug dir")
+            .parent()
+            .expect("target dir")
+            .to_path_buf();
+        let dir = target.join("test-scratch").join(format!(
             "arreo-cli-server-{tag}-{}-{:?}",
             std::process::id(),
             std::thread::current().id()
@@ -62,8 +84,23 @@ impl Scratch {
     }
 }
 
+/// Install a binary at `dest` by **hard link** where possible.
+///
+/// A debug `arreo-server` is 142 MB and `arreo` 123 MB, and this file's tests run
+/// in parallel: real copies cost ~265 MB per test, which exhausted a 12 GB tmpfs
+/// during a full-suite run (and again during a targeted run, where the failure
+/// surfaced as `StorageFull` inside this function rather than as anything about
+/// the code under test).
+///
+/// A link is safe here for the same reason it is in `tests/update.rs`: the
+/// update's only mutation is renaming a directory entry, so replacing `dest`
+/// leaves the build tree's file untouched — the link *is* the thing being
+/// replaced. `copy_distinct` deliberately still copies, because appending a byte
+/// is what makes the candidate a different file.
 fn copy_as(source: &Path, dest: &Path) {
-    std::fs::copy(source, dest).expect("copy the binary");
+    if std::fs::hard_link(source, dest).is_err() {
+        std::fs::copy(source, dest).expect("copy the binary");
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -74,7 +111,14 @@ fn copy_as(source: &Path, dest: &Path) {
 /// A second, distinguishable, still-working binary: the same bytes plus one
 /// trailing byte, which an ELF loader ignores.
 fn copy_distinct(source: &Path, dest: &Path) {
-    copy_as(source, dest);
+    // A real copy: the appended byte is what makes it a different file, and a
+    // hard link would change the original too.
+    std::fs::copy(source, dest).expect("copy the binary");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dest, std::fs::Permissions::from_mode(0o755)).expect("mode");
+    }
     let mut bytes = std::fs::read(dest).expect("read");
     bytes.push(b'\n');
     std::fs::write(dest, bytes).expect("write");
@@ -130,8 +174,7 @@ fn bytes(path: &Path) -> Vec<u8> {
 fn client_only_flags_are_refused_on_the_server_path() {
     let scratch = Scratch::new("flags");
     let client = install_pair(&scratch);
-    let candidate = scratch.path().join("arreo-server-new");
-    copy_distinct(&arreo_server(), &candidate);
+    let candidate = server_script(&scratch, "arreo-server-new");
     let server = scratch.path().join("arreo-server");
     let original = bytes(&server);
 
@@ -169,8 +212,13 @@ fn a_candidate_that_is_not_a_server_is_refused() {
     let server = scratch.path().join("arreo-server");
     let original = bytes(&server);
 
+    // A candidate that runs and reports a *client* version: the check under test
+    // is that `--server` refuses it, so the stand-in only has to answer.
     let imposter = scratch.path().join("client-copy");
-    copy_distinct(&arreo(), &imposter);
+    write_script(
+        &imposter,
+        "case \"$1\" in\n  --version) echo 'arreo 0.1.0'; exit 0 ;;\nesac\nexit 1",
+    );
 
     let refused = run(
         &client,
@@ -225,8 +273,7 @@ fn with_no_daemon_it_installs_and_says_so() {
     let client = install_pair(&scratch);
     let server = scratch.path().join("arreo-server");
     let original = bytes(&server);
-    let candidate = scratch.path().join("arreo-server-new");
-    copy_distinct(&arreo_server(), &candidate);
+    let candidate = server_script(&scratch, "arreo-server-new");
 
     let done = run(
         &client,
@@ -288,8 +335,7 @@ fn rollback_restores_the_previous_server_binary() {
     let client = install_pair(&scratch);
     let server = scratch.path().join("arreo-server");
     let original = bytes(&server);
-    let candidate = scratch.path().join("arreo-server-new");
-    copy_distinct(&arreo_server(), &candidate);
+    let candidate = server_script(&scratch, "arreo-server-new");
 
     let installed = run(
         &client,
@@ -318,8 +364,7 @@ fn rollback_restores_the_previous_server_binary() {
 fn the_json_reports_the_outcome() {
     let scratch = Scratch::new("json");
     let client = install_pair(&scratch);
-    let candidate = scratch.path().join("arreo-server-new");
-    copy_distinct(&arreo_server(), &candidate);
+    let candidate = server_script(&scratch, "arreo-server-new");
 
     let done = run(
         &client,
@@ -417,6 +462,27 @@ fn running(pid: u32) -> bool {
             .unwrap_or(false),
         Err(_) => false,
     }
+}
+
+/// A **stand-in server binary**: a script that answers `--version` the way a
+/// server does and then fails, sleeps, or does nothing.
+///
+/// Most tests in this file are about the *verb's* contract — what it installs,
+/// what it refuses, what it leaves behind — and for those the candidate only has
+/// to run and identify itself. Using a real 142 MB `arreo-server` copy for each
+/// made a parallel run exhaust a 12 GB tmpfs (`StorageFull` inside `copy_as`,
+/// which reads as anything but a disk problem); a script is a few hundred bytes
+/// and states the requirement more honestly.
+///
+/// The one test that needs a real binary is the handoff itself, which copies the
+/// real `arreo-server` because nothing smaller can take a socket over.
+fn server_script(scratch: &Scratch, name: &str) -> PathBuf {
+    let path = scratch.path().join(name);
+    write_script(
+        &path,
+        "case \"$1\" in\n  --version) echo 'arreo-server 9.9.9 (a test stand-in)'; exit 0 ;;\nesac\nexit 1",
+    );
+    path
 }
 
 /// Write an executable script — a candidate that answers `--version` like a

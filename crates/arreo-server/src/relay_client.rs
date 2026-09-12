@@ -506,7 +506,7 @@ async fn ask_pane_count<S>(mut io: S) -> Result<usize, String>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    use arreo_core::proto::{codec, Message, VERSION};
+    use arreo_core::proto::{client_versions, codec, Message, VERSION};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let mut buf = Vec::new();
@@ -535,7 +535,7 @@ where
         &Message::Hello {
             v: VERSION,
             client: "arreo-server".to_string(),
-            wants: vec![VERSION],
+            wants: client_versions(),
         },
     )
     .await?;

@@ -239,7 +239,7 @@ mod tests {
     use arreo_core::identity::role::Role;
     use arreo_core::identity::DeviceKey;
     use arreo_core::proto::codec;
-    use arreo_core::proto::{Message, VERSION};
+    use arreo_core::proto::{client_versions, Message, VERSION};
     use arreo_core::transport::{client_endpoint, open_session, SecureChannel};
     use std::collections::HashMap;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -386,7 +386,7 @@ mod tests {
             &Message::Hello {
                 v: VERSION,
                 client: "phone".to_string(),
-                wants: vec![VERSION],
+                wants: client_versions(),
             },
         )
         .await;
@@ -471,7 +471,7 @@ mod tests {
             &Message::Hello {
                 v: VERSION,
                 client: "phone".to_string(),
-                wants: vec![VERSION],
+                wants: client_versions(),
             },
         )
         .await;
@@ -521,7 +521,7 @@ mod tests {
             &Message::Hello {
                 v: VERSION,
                 client: "phone".to_string(),
-                wants: vec![VERSION],
+                wants: client_versions(),
             },
         )
         .await;
@@ -554,7 +554,7 @@ mod tests {
             &Message::Hello {
                 v: VERSION,
                 client: "phone".to_string(),
-                wants: vec![VERSION],
+                wants: client_versions(),
             },
         )
         .await;
@@ -687,7 +687,7 @@ mod tests {
             &Message::Hello {
                 v: VERSION,
                 client: "phone".to_string(),
-                wants: vec![VERSION],
+                wants: client_versions(),
             },
         )
         .await;

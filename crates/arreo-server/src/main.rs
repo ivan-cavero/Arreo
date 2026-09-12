@@ -75,6 +75,8 @@ async fn main() {
                 println!(
                     "            (T-0038 stage 1: the new process inherits the listener + lock)"
                 );
+                println!("            exit codes: 3 another handoff holds the lock (retry),");
+                println!("            1 any other failure, 2 usage, 0 = handed on");
                 println!("  --handoff-timeout-secs N");
                 println!("            bound each handoff wait (default 10)");
                 println!("  --version print the server version and exit");
@@ -355,39 +357,108 @@ fn default_socket() -> PathBuf {
     std::env::temp_dir().join(format!("arreo-{uid}.sock"))
 }
 
+/// `--handoff-from`'s exit codes (documented in `--help`; `arreo update
+/// --server` reads them off the child it spawned).
+const HANDOFF_EXIT_FAILED: i32 = 1;
+/// The refusal that is not a failure: **another handoff holds the one-handoff
+/// lock**. The project's "in progress" code — the same value the updater's own
+/// lock produces — because the machine is not broken, it is being handed over by
+/// someone else right now and retrying is the whole remedy.
+const HANDOFF_EXIT_BUSY: i32 = 3;
+
+/// Why the incoming daemon gave up, and what the process exits with.
+///
+/// Two shapes rather than a bool, because "refused because a handoff is already
+/// in progress" is a different answer from "refused": the first is a *deferred*
+/// update the launcher reports as in-progress, the second a failure the operator
+/// has to read.
+enum HandoffFailure {
+    /// Anything else: exit [`HANDOFF_EXIT_FAILED`].
+    Failed(String),
+    /// The outgoing daemon refused because the one-handoff lock is held: exit
+    /// [`HANDOFF_EXIT_BUSY`].
+    Busy(String),
+}
+
+impl HandoffFailure {
+    fn exit_code(&self) -> i32 {
+        match self {
+            Self::Failed(_) => HANDOFF_EXIT_FAILED,
+            Self::Busy(_) => HANDOFF_EXIT_BUSY,
+        }
+    }
+
+    fn detail(&self) -> &str {
+        match self {
+            Self::Failed(detail) | Self::Busy(detail) => detail,
+        }
+    }
+}
+
 /// The incoming side of a live handoff (T-0038 stage 1): take over the daemon
 /// serving `socket` without the socket ever going dead. Never returns — on
 /// success the process keeps serving (it never exits), on failure it prints
-/// the reason on stderr and exits 1 (usage errors already exited 2 in `main`).
+/// the reason on stderr and exits 1 — or 3 when the refusal is another handoff
+/// holding the lock ([`HANDOFF_EXIT_BUSY`]). Usage errors already exited 2 in
+/// `main`.
 ///
 /// 1. Connect to the client socket, Hello/Welcome, send the handoff request,
-///    read `HandoffReady` (a typed `Error` here is a refusal — the outgoing
-///    daemon keeps serving, and this process exits 1 saying so).
-/// 2. Connect to `<socket>.handoff`, receive the listener, then the lock.
-/// 3. Build the daemon around the inherited listener and lock: no bind, no
-///    `try_lock`. The descriptor becomes a non-blocking tokio listener first.
-/// 4. Verify the inheritance (the lock path reads as held — this replaces the
-///    acquire and proves the descriptor really carried the lock), then serve.
-/// 5. Once genuinely accepting on the inherited listener, commit (close the
-///    handoff connection → EOF) and print `handoff complete` with the new pid.
-/// 6. Keep serving. The process never exits on success — a child that exits
-///    *is* the failure signal, and the launcher polls for a new pid on the
-///    socket rather than parsing this line.
+///    read `HandoffReady` (with the nonce; a typed `Error` here is a refusal —
+///    the outgoing daemon keeps serving, and this process exits 1 saying so,
+///    or 3 when the refusal names the one-handoff lock as held).
+/// 2. Connect to `<socket>.handoff`, present the nonce, receive the listener,
+///    then the lock.
+/// 3. **Validate what arrived** before building anything on it: the listener
+///    must be a listening stream socket bound to this socket's path, and the
+///    lock must be the lock at `<socket>.lock`. A descriptor that is not what
+///    it claims is refused, and the refusal is audited on this side too.
+/// 4. Build the daemon around the inherited listener and lock: no bind, no
+///    acquire.
+/// 5. Start accepting, and wait — **bounded** — for the accept loop to own the
+///    listener. A refusal from there is a failure: no commit byte is sent, and
+///    this process exits 1 with the reason, so the outgoing daemon keeps
+///    serving.
+/// 6. Commit: one marker byte, sent only now that the listener is genuinely
+///    accepting here (EOF is not a commit — see `handoff.rs`). What the outgoing
+///    daemon learns from it is *authorisation* — that this process, which asked
+///    for the handoff and holds the nonce, is committing — not proof that a
+///    server is answerable: see `handoff::wait_for_commit` for the limit and why
+///    a probe was rejected. Then keep serving: this process is the daemon now,
+///    and it exits 0 only when a *later* handoff hands the socket on again. A
+///    child that exits non-zero is the failure signal the launcher polls for.
 async fn run_handoff(socket: PathBuf, timeout: std::time::Duration) -> ! {
-    let detail = run_handoff_inner(&socket, timeout).await;
-    eprintln!("arreo-server: handoff failed: {detail}");
+    let failure = run_handoff_inner(&socket, timeout).await;
+    eprintln!("arreo-server: handoff failed: {}", failure.detail());
     eprintln!(
         "arreo-server: the old daemon is still serving {}",
         socket.display()
     );
-    std::process::exit(1);
+    std::process::exit(failure.exit_code());
 }
 
-async fn run_handoff_inner(socket: &std::path::Path, timeout: std::time::Duration) -> String {
+async fn run_handoff_inner(
+    socket: &std::path::Path,
+    timeout: std::time::Duration,
+) -> HandoffFailure {
     use arreo_core::proto::{codec, Message, VERSION};
     use std::io::Write;
+    use std::os::unix::io::AsFd;
 
-    let fail = |detail: String| -> String { detail };
+    // The store the outgoing daemon audits into; this side records its own
+    // refusals there, so a failed handoff is never silent on the side that
+    // knows the reason (the outgoing daemon only ever sees the connection end).
+    let db = arreo_server::persist::db_path_for(socket);
+    // Failures before the transfer begins (no daemon to talk to, a refusal)
+    // are not this side's to record — the outgoing daemon answers and audits
+    // them itself.
+    let fail = |detail: String| -> HandoffFailure { HandoffFailure::Failed(detail) };
+    // Failures once the descriptors are in flight are this side's: the reason
+    // (a missing socket path, a lock that is not the lock) is knowable here and
+    // nowhere else.
+    let refuse = |detail: String| -> HandoffFailure {
+        arreo_server::handoff::record_incoming_abort(&db, &detail);
+        HandoffFailure::Failed(detail)
+    };
     // 1. The client socket: Hello→Welcome, then the request.
     let mut stream = match std::os::unix::net::UnixStream::connect(socket) {
         Ok(stream) => stream,
@@ -407,7 +478,7 @@ async fn run_handoff_inner(socket: &std::path::Path, timeout: std::time::Duratio
     let hello = Message::Hello {
         v: VERSION,
         client: "arreo-server-handoff".to_string(),
-        wants: vec![VERSION],
+        wants: arreo_core::proto::client_versions(),
     };
     let frame = match codec::encode_frame(&hello) {
         Ok(frame) => frame,
@@ -441,24 +512,53 @@ async fn run_handoff_inner(socket: &std::path::Path, timeout: std::time::Duratio
         Ok(ready) => ready,
         Err(e) => return fail(format!("no HandoffReady: {e}")),
     };
-    let (agreed, old_protocol, panes) = match ready {
+    let (agreed, old_protocol, panes, nonce) = match ready {
         Message::HandoffReady {
             protocol,
             server_protocol,
             panes,
+            nonce,
             ..
-        } => (protocol, server_protocol, panes),
+        } => (protocol, server_protocol, panes, nonce),
         Message::Error { message, .. } => {
             // A refusal: the outgoing daemon audited it and keeps serving — a
             // deferred update, never a failure of the running machine.
-            return fail(format!(
-                "the outgoing daemon refused the handoff: {message}"
-            ));
+            let detail = format!("the outgoing daemon refused the handoff: {message}");
+            // **One refusal has its own code.** The one-handoff lock being held
+            // is not "the update failed" but "someone else is cutting the socket
+            // over right now": exit 3, which `arreo update --server` reports as
+            // an update in progress (the same code its own lock produces). Every
+            // other refusal — a version outside the window, a transfer socket
+            // that cannot be bound — stays exit 1.
+            //
+            // The distinction is a string match, and the coupling runs one way:
+            // `arreo_server::handoff::BUSY_REFUSAL` is the wording the outgoing
+            // daemon builds this detail from, so the two sides change together
+            // or the deferred update starts reading as a failure. There is no
+            // cheaper carrier: the reason arrives as a typed `Error`'s prose, and
+            // adding a protocol variant for one exit code would be a wire change
+            // to serve a local decision.
+            return if arreo_server::handoff::is_busy_refusal(&message) {
+                HandoffFailure::Busy(detail)
+            } else {
+                HandoffFailure::Failed(detail)
+            };
         }
         other => return fail(format!("handoff failed: unexpected {other:?}")),
     };
-    // 2. The dedicated connection: listener first, then the lock — the order
-    // is the contract (stage 2 adds panes after the lock).
+    // No nonce means an outgoing daemon that speaks the older grammar (no
+    // nonce, EOF as the commit). Refusing is the safe direction: the outgoing
+    // daemon aborts and goes on serving, where guessing the grammar could
+    // commit a cut nobody authorized.
+    if nonce.len() != arreo_server::handoff::NONCE_BYTES {
+        return fail(format!(
+            "the outgoing daemon sent a {}-byte handoff nonce (want {})",
+            nonce.len(),
+            arreo_server::handoff::NONCE_BYTES
+        ));
+    }
+    // 2. The dedicated connection: the nonce first, then the descriptors — the
+    // order is the contract (stage 2 adds panes after the lock).
     let handoff_path = arreo_server::handoff::handoff_path_for(socket);
     let deadline = std::time::Instant::now() + timeout;
     let transfer = loop {
@@ -475,7 +575,10 @@ async fn run_handoff_inner(socket: &std::path::Path, timeout: std::time::Duratio
             }
         }
     };
-    let _ = transfer.set_read_timeout(Some(timeout));
+    let _ = transfer.set_write_timeout(Some(timeout));
+    if let Err(e) = arreo_server::handoff::send_nonce(&transfer, &nonce) {
+        return fail(format!("cannot present the handoff nonce: {e}"));
+    }
     let listener_fd = match arreo_server::handoff::recv_one(&transfer, timeout) {
         Ok(fd) => fd,
         Err(e) => return fail(format!("the listener descriptor did not arrive: {e}")),
@@ -484,69 +587,96 @@ async fn run_handoff_inner(socket: &std::path::Path, timeout: std::time::Duratio
         Ok(fd) => fd,
         Err(e) => return fail(format!("the lock descriptor did not arrive: {e}")),
     };
-    // 3. Build the daemon around the inherited listener and lock: no bind, no
-    // `try_lock`. The descriptor becomes a non-blocking tokio listener first.
+    // 3. Validate what arrived, before anything is built on it. A descriptor in
+    // the listener slot that is not *this* listener, and a descriptor in the
+    // lock slot that is not *the* lock, are refusals: serving on either would
+    // hand the daemon to a socket nobody reaches, or serve while holding
+    // nothing.
+    if let Err(detail) = arreo_server::handoff::validate_listener(listener_fd.as_fd(), socket) {
+        return refuse(format!("the listener descriptor was refused: {detail}"));
+    }
+    let lock_path = arreo_server::persist::lock_path_for(socket);
+    let lock = match arreo_core::lock::ExclusiveLock::inherited_checked(lock_fd, &lock_path) {
+        Ok(lock) => lock,
+        Err(e) => return refuse(format!("the lock descriptor was refused: {e}")),
+    };
+    // 4. Build the daemon around the inherited listener and lock: no bind, no
+    // acquire. The descriptor becomes a non-blocking tokio listener first.
     let std_listener = arreo_server::handoff::std_listener_from_fd(listener_fd);
     if let Err(e) = std_listener.set_nonblocking(true) {
-        return fail(format!(
+        return refuse(format!(
             "cannot make the inherited listener non-blocking: {e}"
         ));
     }
     let tokio_listener = match tokio::net::UnixListener::from_std(std_listener) {
         Ok(listener) => listener,
-        Err(e) => return fail(format!("cannot adopt the inherited listener: {e}")),
+        Err(e) => return refuse(format!("cannot adopt the inherited listener: {e}")),
     };
-    let lock_path = arreo_server::persist::lock_path_for(socket);
-    let lock = arreo_core::lock::ExclusiveLock::inherited(lock_fd, lock_path.clone());
-    //
-    // 4. Verify the inheritance before serving: the lock path must read as
-    // held. This replaces the acquire and proves the descriptor really carried
-    // the lock — serving on a free lock would fork the world into two daemons.
-    if !arreo_core::lock::ExclusiveLock::is_held(&lock_path) {
-        return fail(format!(
-            "the inherited lock for {} reads as free — refusing to serve",
-            socket.display()
-        ));
-    }
     // 5. Start accepting on the inherited listener, in the background: the
     // commit must only happen once this process is genuinely accepting — not
-    // merely after the descriptors arrived — because the launcher treats the
-    // cut as done when a new pid answers on the socket. `serve_inherited`
-    // re-checks the lock itself; the check above is the early, loud refusal
-    // before any task is spawned.
+    // merely after the descriptors arrived. `serve_inherited` reports either
+    // readiness or the reason it refused through the channel, and **an `Err`
+    // there is a failure**: committing on it would exit the outgoing daemon
+    // with nobody serving, which is the half-dead state this whole mechanism
+    // exists to prevent.
     let daemon = arreo_server::Daemon::new(socket);
-    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<()>();
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
     let server_task = tokio::spawn(async move {
         // Readiness means "the accept loop owns the listener and is about to
         // accept" (the signal fires inside `serve_on`, after the lock check,
         // before the first `accept`). The kernel queues connects on the
         // inherited backlog from the moment the dup exists — so by the time
         // the outgoing daemon exits on our commit, this loop is the thing
-        // draining them. Committing before accepting would drop connects into
-        // a socket nobody drains: the half-dead state this mechanism exists
-        // to prevent.
+        // draining them.
         let _ = daemon
             .serve_inherited(tokio_listener, lock, Some(ready_tx))
             .await;
     });
-    // Wait until the accept loop is running before committing: the outgoing
-    // daemon exits on our commit, so this ordering is the cut itself.
-    let _ = ready_rx.await;
-    // 6. Commit: close our side of the transfer connection (EOF for the
-    // outgoing daemon's `wait_for_commit`), then announce the cut with the
-    // new pid — the only place an operator can see it, given no `status`
-    // verb exists. Printed only now, after the accept loop is running on
-    // the inherited listener — never merely when the descriptors arrived.
+    // Bounded (F8): an incoming daemon that never starts accepting must not
+    // hold the transfer open for ever, because the outgoing daemon is waiting
+    // on the same connection.
+    match tokio::time::timeout(timeout, ready_rx).await {
+        Ok(Ok(Ok(()))) => {}
+        Ok(Ok(Err(reason))) => {
+            return refuse(format!("the inherited listener was refused: {reason}"))
+        }
+        Ok(Err(_)) => {
+            return refuse(
+                "the serving task ended before it started accepting on the inherited listener"
+                    .to_string(),
+            )
+        }
+        Err(_) => {
+            return refuse(format!(
+                "the inherited listener did not start accepting within {timeout:?}"
+            ))
+        }
+    }
+    // 6. Commit: the marker byte, now that the accept loop owns the listener.
+    // The outgoing daemon requires this byte; it does **not** read the close of
+    // this connection as a commit, so a failure here leaves it serving.
+    if let Err(e) = arreo_server::handoff::send_commit(&transfer) {
+        return refuse(format!("cannot send the commit marker: {e}"));
+    }
     drop(transfer);
     eprintln!(
         "arreo-server: handoff complete (protocol {old_protocol} -> {agreed}, panes {panes}, pid {})",
         std::process::id()
     );
     // Keep serving: success means this process never exits. A server task that
-    // ends (its listener errored fatally) is a failure — report it and exit 1
-    // rather than idling as a pid that answers nothing.
+    // ends is a *later handoff* — this daemon handed the socket on, exactly as
+    // the outgoing daemon does, and exits 0 the same way. A real failure (the
+    // listener erroring) is an `Err` and is reported as one; `Ok(())` here is
+    // never a failure, and calling it one printed "the inherited listener
+    // failed" for a cut that succeeded.
     match server_task.await {
-        Ok(()) => fail("the inherited listener failed".to_string()),
+        Ok(()) => {
+            eprintln!(
+                "arreo-server: handed the socket on to a later handoff (pid {})",
+                std::process::id()
+            );
+            std::process::exit(0);
+        }
         Err(e) => fail(format!("the serving task failed: {e}")),
     }
 }

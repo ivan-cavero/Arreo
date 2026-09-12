@@ -97,7 +97,7 @@ PTY masters over SCM_RIGHTS, re-opens SQLite and serves — a failed step kills 
       is measured on Linux, and [INFERENCE] from XNU on Darwin. If it differs there, macOS panes
       would adopt as already-exited — fail-closed but wrong. A macOS CI runner must settle it;
       no Linux build can.
-- [ ] **Stage 1 — handoff with 0 panes.** `arreo update --server` on an idle daemon: the new
+- [x] **Stage 1 — handoff with 0 panes.** `arreo update --server` on an idle daemon: the new
       process connects, version handshake, takes over, old exits 0. Socket path and session id
       unchanged, no client sees a disconnect, the new pid is observable, audit row
       `handoff v<from> → v<to> panes=0`.
@@ -174,6 +174,26 @@ PTY masters over SCM_RIGHTS, re-opens SQLite and serves — a failed step kills 
       busy timeout already configured because the CLI opens it concurrently. Likewise §"the relay
       session token travels" has no token to travel; the incoming daemon dials its own session and
       T-0060's displacement rule recovers it in ~289 ms.
+      **Outcome.** `arreo-server --handoff-from <socket>` (plus `--handoff-timeout-secs`,
+      `--version`) and `arreo update --server --from <path>` are in. The mechanism: the outgoing
+      daemon binds `<socket>.handoff` for the duration of a handoff only, requires a nonce it
+      issued on the main socket, sends the listener then the lock over `SCM_RIGHTS`, waits for a
+      positive commit marker, writes the audit row, stops accepting and exits 0; the incoming
+      daemon builds itself around the inherited listener and lock (no bind, no acquire), verifies
+      the lock is genuinely held through the received descriptor, starts accepting, then commits.
+      Verified end to end by hand and by 16 daemon integration tests + 11 CLI tests: the socket
+      keeps answering on the same path, the serving pid changes, the old process is gone, and a
+      third daemon is still refused afterwards. Two rounds of independent security review — the
+      second by an agent that had not written any of it — reproduced the attacks against the
+      running binaries and confirmed the fixes.
+
+      **The verb's order is stage 1's other decision**: `arreo update --server` stages the
+      candidate, hands the daemon over **from the staged path**, and only then installs. A failed
+      handoff therefore changes nothing — no swap, no `.prev` churn — where install-then-hand-off
+      would leave a new binary on disk with the old one running from memory. Readiness is observed
+      externally (the old pid is gone *and* a different pid answers), not parsed from a log line,
+      because a candidate that printed the right words and failed cannot satisfy it.
+
 - [ ] **Stage 2 — N panes with output in flight.** 8 panes emitting a monotonic marker stream;
       handoff under load → every pane pid unchanged, no marker lost, duplicated or reordered
       across the cut, and lines written before the cut still readable after it.

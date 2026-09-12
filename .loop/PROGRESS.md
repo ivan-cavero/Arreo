@@ -1,62 +1,39 @@
 ## State snapshot          ← REWRITTEN (not appended) at every checkpoint
-Task: **T-0038 stage 1 — implemented, security-reviewed, HARDENING IN FLIGHT.** `arreo-server
---handoff-from <socket>` takes over from a running daemon by inheriting its listener and lock over
-`SCM_RIGHTS`; `arreo update --server --from <path>` drives it (stages from the candidate, hands the
-daemon over, installs only on success, so a failed handoff changes nothing).
-Where you are: **nothing committed for stage 1 yet, by design** — the review gate is what caught it.
-547 workspace tests / 0 failed; clippy clean on both toolchains; fmt clean; 11 slices green; bench
-6/6. Worker `HandoffFixes` is fixing 9 review findings (2 CRITICAL, both reproduced).
-Next step: collect `HandoffFixes`, verify its fixes independently (mutation-test the two critical
-ones), run a **fresh** security re-review of the fixes, then the battery, then commit.
-Open workers: **HandoffFixes** (fixing the review findings; owns the server+core handoff files)
+Task: **T-0038 stage 1 — DONE.** `arreo-server --handoff-from <socket>` + `arreo update --server
+--from <path>`: the daemon is handed over without the socket ever going dead, and the swap happens
+only after the cut succeeds. Stage 2 (N panes with output in flight) is next.
+Where you are: 569 workspace tests / 0 failed (60 targets); clippy clean on **both** toolchains; fmt
+clean; 11 slices green; bench 6/6; vet 336, deny 4/4, audit 0, **check-targets PASS/SKIP**.
+**Two independent security reviews** shaped this, and the second (by an agent that wrote none of
+it) found the first round's fix incomplete: 9 findings reproduced, then 4 more. Everything fixed
+with tests that fail without the fix, and the three headline attacks re-run by me against the
+fixed binaries (half-close → daemon survives; forged nonce → 0 descriptors; two handoffs → exactly
+one survivor).
+Next step: **T-0038 stage 2** — hand the panes over too: 8 panes emitting a monotonic marker
+stream, handoff under load, every pane pid unchanged, no marker lost/duplicated/reordered across
+the cut, lines written before the cut still readable after it. Read ADR 0021 §2c first (the commit
+is a marker byte, not EOF) and note T-0077 before starting: a timed-out handoff leaks the
+candidate's descendants, which is *nil* exposure today and real once the candidate adopts panes.
+Open workers: (none)
 Known broken: T-0063 (CI ubuntu leg, needs repo admin) · Parked: T-0048 + T-0036 needs-human
-**THE FINDINGS THAT MATTER** (all reproduced against the running binaries, none reasoned):
-1. **A half-close was read as the commit** — a local process sent `Handoff`, read `HandoffReady`,
-   connected to `.handoff`, then `shutdown(SHUT_WR)` and did nothing. The daemon **exited 0 in
-   40 ms**, wrote `handoff ok`, and left nobody serving. **EOF is evidence a peer stopped writing,
-   never that a daemon is serving** — the commit is now a positive marker byte sent only once the
-   incoming accept loop runs.
-2. **The transfer socket was unauthenticated** — whoever won the race to `.handoff` got the
-   listener and the lock and could impersonate the daemon. Mode was the umask's (`0775`); fixed
-   with `0600` + `SO_PEERCRED` + a per-handoff nonce delivered on the main socket.
-3. **Two concurrent handoffs both committed → two daemons served one socket** (T-0071 defeated:
-   a shared open file description means every holder of an inherited `flock` "holds" it). Needed
-   its own exclusive lock on the transfer path.
-4. Incoming daemon validated neither that the fd was a **listening socket** nor that it was **the
-   socket for the path it was told to take over**; the inherited-lock check proved *someone* held
-   the path, not that the descriptor carried the lock (sent `/etc/hostname`, it served anyway); it
-   committed even when its own `serve_inherited` refused (readiness error discarded); the audit
-   **inverted** (fake cut recorded `ok`, aborts silent) and took a **900 KB** attacker string from
-   one frame; and **the version check ran backwards**, so a forward bump — the normal case — could
-   never hand over, while the code comment claimed otherwise.
 Findings:
-- **`git add -A` in a shared working tree sweeps other people's work into my commits — twice this
-  session, and the second time it also caused a task-id collision.** The user's own task suite
-  (T-0072 harness-session-resume, T-0073 tui-exit-shutdown-daemon, T-0074 tui-manages-everything,
-  T-0075 harness-survey, T-0076 tui-modern-accessible) appeared in the working tree while a turn
-  was running. `git add -A` rode it into `6014082` and `4b319ad` — commits whose messages described
-  something else entirely — and because I had allocated "next free id" from a listing taken
-  *before* those files arrived, I wrote two task files with ids the user had already used (T-0072,
-  T-0073). Both are renumbered to **T-0077/T-0078**; the user's numbering stands. The rules that
-  follow: **stage by explicit path, never `-A`**, and **allocate a task id from a fresh scan of
-  `tasks/`, not from a number remembered earlier in the turn**. The tree is shared memory; treating
-  it as private is the bug.
-- **A review that reproduces is worth ten that reason.** Every one of these reads as correct and
-  none is. The three that would have hurt most were found by writing a hostile peer.
-- **An invariant enforced by an inherited descriptor is not enforced by it.** `flock` on a shared
-  open file description is held by every holder, so "both daemons hold the lock" is consistent.
-- **`arreo update --server` stages → hands off → installs, in that order**, so a failed handoff
-  changes nothing at all (no swap, no `.prev` churn). The tempting install-then-hand-off order
-  leaves a new binary on disk with the old one running from memory.
-- **A dependency can be inherited rather than needed** (T-0038 dropped T-0036; every stage is
-  mechanism) and **the ADR can be wrong about the code** (ADR 0021 §4 described a WAL checkpoint
-  nothing needed and a relay token that does not exist — both corrected).
-- **New tasks filed from this turn**: T-0077 (a timed-out handoff leaks the candidate's
-  descendants — nil exposure today, real at stage 2) and **T-0078 (p2: the daemon's store is
-  world-readable and its socket group-writable — proven, a pane's output was readable out of a
-  `0644` `-db-wal`)**. (Renumbered from 0072/0073: the user's own task suite occupies
-  T-0072–T-0076, which arrived in the working tree during this turn and was swept into commits by
-  my `git add -A` — see the process note below.)
+- **A security review must be run by someone who did not write the code, and a fix must be reviewed
+  again.** Round one found the two CRITICALs; round two found that round one's version fix was
+  still defeated one layer up (the *client* Hello announced only its own version, so a newer daemon
+  never got a session), that the commit byte authorises rather than proves, and that the main
+  socket's default mode makes the trust model "same group", not "same user". Neither round was
+  redundant.
+- **`/tmp` is a tmpfs and `target/` is not — a hard link across them is `EXDEV`, and the fallback
+  copy is what fills the disk.** Two test files were fixed; the scratch now lives beside the
+  binaries on the build tree's filesystem. The failure surfaced as `StorageFull` inside a helper,
+  which reads as anything but a disk problem, and only under parallelism.
+- **The cross-OS gate earned its keep again**: a worker's fix used `std::os::unix` in a
+  cross-platform module and its own (Linux-only) clippy could not see it. `check-targets` caught it
+  before the commit — the second time this session that gate has caught an ungated unix import.
+- **`git add -A` in a shared tree is the bug** (see the process note below).
+- **An invariant enforced by an inherited descriptor is not enforced by it**: `flock` lives in the
+  open file description, so every holder of an inherited lock "holds" it — which is why one-handoff-
+  at-a-time needed its own lock, and why the received lock descriptor is validated against the path.
 ## Event log               ← append-only; newest last; never rewrite
 - 2026-09-10 [turn 1] ledger created; repo at e489fac (docs only); T-0001 + T-0022 (AGENTS.md gardened) done
 - 2026-09-10 [turn 2] T-0002 PTY manager done+pushed (342606c; 9 tests); PROMPT.md v2 synced + ADR 0001 (ef6c595)
@@ -158,3 +135,5 @@ Findings:
 - 2026-09-12 [turn 61] T-0071 done (one daemon per socket) + T-0038 stage 0 done (the adopt primitive). T-0071 was found while designing the handoff, whose "exactly one daemon serves this machine" was assumed rather than enforced: `serve` probed the socket, removed it and bound, so two daemons starting together both unlinked and the second removed the first's listener — measured at **1 round in 12** of eight simultaneous starts with two live daemons. Fixed with an exclusive lock on `<socket>.lock` taken *before* the probe, shared with the updater's lock (refactored into `arreo_core::lock`; `identity::authority::sidecar` is now the one sidecar-path rule), held on the `Daemon` because `main` cancels the `serve` future on SIGTERM and keeps draining. The regression test asserts the *rule* deterministically rather than racing (a racing test would have passed ~11 times in 12 pre-fix), and was mutation-checked. T-0038 stage 0: `Pane::adopt` + `send_fd`/`recv_fd` (24 tests), `MasterPty` implemented rather than the crate forked, `spawn`/`adopt` sharing one `assemble`. A **mandatory security review** of the fd path found seven issues and then falsified the first fix's assumption — the pid cross-check was right, but reading a `tcgetsid` error as "the session leader exited" reported LIVE panes as dead (measured independently: child in state S, ENOTTY on the master, still writing); that branch now drops the pid and concludes nothing. Two further findings: a refused adoption was not side-effect free (the geometry repair ran before the pid check, so a refusal had already resized the sender's live terminal), and a bare pid was signalled without re-checking it against the terminal. New ADR 0021 (the handoff design: two-phase commit with the old daemon serving until the new one commits, the fd channel dedicated because ancillary data is a barrier on a stream socket, no `SOCK_SEQPACKET` because macOS lacks it). `rustix` 0.38 promoted to a direct dep of arreo-core — already in the graph at exactly 0.38.44, so no new supply-chain entry. 527 workspace tests, clippy clean on both toolchains, fmt clean, 11 slices green, bench 6/6, vet 336, deny 4/4, audit 0, check-targets PASS/SKIP. Three commits pushed: 65cc4ed, 6014082.
 
 - 2026-09-12 [turn 62] T-0038 stage 1 implemented and **security-reviewed before commit** — the review found 9 issues, 6 reproduced, 2 CRITICAL. Built: `arreo-server --handoff-from <socket>` (inherits the listener + single-instance lock over SCM_RIGHTS on a dedicated `.handoff` connection, two-phase commit, old daemon serves until the new one commits), `--version`, `arreo update --server --from <path>` (stage → hand off → install only on success; readiness observed externally as "old pid gone AND new pid answering", because a poll on "someone answers" fires before the cut), 7 daemon integration tests + 11 CLI tests + 2 CLI unit tests. **The critical findings**: (1) a half-close was read as the commit, so any local process could make the daemon exit 0 with nobody serving — the half-dead state ADR 0021 exists to prevent, reached by the cheapest input; root cause conceptual, not a missing check: EOF is not evidence of serving; (2) `.handoff` was unauthenticated, so whoever won the race got the listener and the lock and could impersonate the daemon (mode was the umask's 0775; `connect()` needs only write on the inode). Also: two concurrent handoffs both committed, leaving two daemons on one socket (T-0071 defeated — a *shared* open file description means every holder of an inherited flock "holds" it); the received fd was never validated as a listening socket bound to the expected path; the lock check proved someone held the path rather than that the descriptor carried the lock; the incoming daemon committed even after its own `serve_inherited` refused; the audit inverted (fake cut = ok, aborts silent) and took a 900 KB attacker string; and the version check ran backwards so a forward bump could never hand over. Fixes in flight. Also planted: T-0077 (a timed-out handoff leaks the candidate's descendants), T-0078 (p2: the store is world-readable — proven by reading a pane's output out of a 0644 `-db-wal`; the identity dir was already 0700/0600, so the decided case is right and the inherited case is not). ADR 0021 corrected on three of its own claims. 547 tests, 11 slices, bench 6/6 green at the point of review.
+
+- 2026-09-12 [turn 62, cont.] T-0038 stage 1 landed: the server live handoff. `arreo-server --handoff-from <socket>` (+ `--handoff-timeout-secs`, `--version`) and `arreo update --server --from <path>` (stage → hand off from the staged binary → install only on success, so a failed handoff changes nothing). Mechanism: a `.handoff` socket bound only for the duration of a handoff, a nonce issued on the main socket and required on the transfer connection, listener-then-lock over SCM_RIGHTS, a positive commit marker (never EOF), a per-handoff exclusive lock, descriptor validation (listening socket + expected path; lock inode + shared-description try_lock), bounded waits, and an audit trail that records aborts rather than inverting. Two security review rounds: the first found 2 CRITICAL + 4 HIGH/other (a half-close made the daemon exit 0 with nobody serving; the transfer socket was unauthenticated; two handoffs left two daemons on one socket; the fd was never validated; the lock check proved the wrong thing; the incoming daemon committed after refusing; the audit inverted and took a 900 KB string; the version check ran backwards), the second found 4 more (the client Hello still announced one version so a forward bump never got a session; the commit byte authorises rather than proves; the main socket's default mode makes the trust model same-group; a held handoff reports as a failure not a deferred update). All fixed with tests, all three headline attacks re-run by me against the fixed binaries. Also fixed in passing: a Windows-target break (ungated `std::os::unix` in `lock.rs`, caught by check-targets — the gate's second catch this session) and the cross-filesystem hard-link fallback that was filling /tmp during parallel test runs. 569 tests, 11 slices, bench 6/6, vet/deny/audit/targets green.

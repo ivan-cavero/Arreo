@@ -41,6 +41,18 @@ pub enum LockError {
     WouldBlock(PathBuf),
     /// The lock file itself could not be opened.
     Io(PathBuf, std::io::Error),
+    /// The lock at `path` is not held by anyone, so a descriptor claiming to be
+    /// it cannot be that lock.
+    NotHeld(PathBuf),
+    /// The descriptor offered as the lock at `path` is not on that inode — or
+    /// is a description of it that does not hold the lock.
+    NotTheLock {
+        path: PathBuf,
+        got_dev: u64,
+        got_ino: u64,
+        want_dev: u64,
+        want_ino: u64,
+    },
 }
 
 impl std::fmt::Display for LockError {
@@ -48,6 +60,23 @@ impl std::fmt::Display for LockError {
         match self {
             Self::WouldBlock(path) => write!(f, "already locked ({})", path.display()),
             Self::Io(path, e) => write!(f, "{}: {e}", path.display()),
+            Self::NotHeld(path) => write!(
+                f,
+                "{}: the lock is not held, so no descriptor can be it",
+                path.display()
+            ),
+            Self::NotTheLock {
+                path,
+                got_dev,
+                got_ino,
+                want_dev,
+                want_ino,
+            } => write!(
+                f,
+                "the received descriptor is device {got_dev} inode {got_ino}, but the lock {} \
+                 is device {want_dev} inode {want_ino}",
+                path.display()
+            ),
         }
     }
 }
@@ -62,6 +91,11 @@ impl std::error::Error for LockError {}
 pub struct ExclusiveLock {
     file: File,
     path: PathBuf,
+    /// The lock came from another process's open file description (see
+    /// [`ExclusiveLock::inherited_checked`]) rather than from [`acquire`].
+    /// `Drop` must not unlock one of these: `flock(LOCK_UN)` on a shared
+    /// description releases the lock for every holder, not just this one.
+    inherited: bool,
 }
 
 impl std::fmt::Debug for ExclusiveLock {
@@ -88,6 +122,7 @@ impl ExclusiveLock {
             Ok(()) => Ok(Self {
                 file,
                 path: path.to_path_buf(),
+                inherited: false,
             }),
             Err(fs::TryLockError::WouldBlock) => Err(LockError::WouldBlock(path.to_path_buf())),
             Err(fs::TryLockError::Error(e)) => Err(LockError::Io(path.to_path_buf(), e)),
@@ -102,43 +137,116 @@ impl ExclusiveLock {
 
     /// Borrow the lock's descriptor (for `SCM_RIGHTS` sends, which dup it into
     /// the peer — the borrow stays here, held for the daemon's life).
+    ///
+    /// Unix only, like everything descriptor-passing: a Windows daemon takes
+    /// §3.13's deferred-update path instead of a live handoff (T-0039), so there
+    /// is no descriptor to lend. Gated rather than stubbed — a function that
+    /// cannot exist on a platform should not compile there, or the next person
+    /// reads it as available.
+    #[cfg(unix)]
     #[must_use]
     pub fn fd(&self) -> std::os::unix::io::BorrowedFd<'_> {
         use std::os::unix::io::AsFd;
         self.file.as_fd()
     }
 
-    /// Adopt a lock another process already holds, from a descriptor that
+    /// Adopt the lock another process already holds, from a descriptor that
     /// arrived over `SCM_RIGHTS` (T-0038 stage 1: the daemon handoff).
     ///
     /// The descriptor is a `dup` of the outgoing daemon's lock file, so it
     /// shares the same **open file description** — and the lock lives in that
-    /// description, which is why this works at all: no `try_lock` is needed
-    /// (or wanted) here, because the lock is already ours by inheritance.
+    /// description, which is why no lock is *taken* here: the lock is already
+    /// ours by inheritance, and `try_lock` below is a check, not an acquire.
     ///
-    /// The `Drop` deliberately **closes the descriptor and nothing else**: with
-    /// a shared open file description, `flock(LOCK_UN)` releases the lock for
-    /// *every* holder, so an inherited-lock `Drop` that called `unlock()` would
-    /// hand the socket to a third daemon the moment this value was dropped.
-    /// Closing releases nothing — the kernel's own rule (the lock ends when the
-    /// last holder's descriptor closes) is what keeps the socket ours until the
-    /// process ends, the same rule the acquired lock relies on.
-    #[must_use]
-    pub fn inherited(fd: std::os::unix::io::OwnedFd, path: PathBuf) -> Self {
+    /// ## Why the checks are what they are
+    ///
+    /// "A descriptor arrived in the lock slot" is evidence of nothing, and the
+    /// path reading as held (`is_held`) is evidence only that *someone* holds
+    /// the lock — a hostile sender can satisfy it while handing over a
+    /// descriptor that is not the lock at all (a `/etc/hostname` descriptor
+    /// made the daemon serve holding nothing). So the descriptor itself is
+    /// judged, in three steps:
+    ///
+    /// 1. It is on the same inode as `path` (device + inode). Any other file is
+    ///    refused, naming what arrived.
+    /// 2. The lock at `path` is held by someone: a fresh open of the path meets
+    ///    a held lock (`WouldBlock`). Nobody holding it is a refusal, not a
+    ///    serve.
+    /// 3. The descriptor is *that* holder. `flock` on an already-locked
+    ///    description with the same type is a no-op success, so `try_lock`
+    ///    here succeeds for the shared description and would report
+    ///    `WouldBlock` for an independent descriptor of the same inode while
+    ///    someone else holds it — the asymmetry is what makes this positive
+    ///    evidence. (`try_lock` succeeding while nobody holds the lock cannot
+    ///    reach this line: step 2 refused first.)
+    ///
+    /// A refusal never leaves a lock held by this process: the descriptor is
+    /// closed on the way out, and nothing took a lock step 3 did not already
+    /// prove was held by the shared description.
+    ///
+    /// The `Drop` of the value this returns **closes the descriptor and never
+    /// unlocks** (see the `inherited` flag): with a shared open file
+    /// description, `flock(LOCK_UN)` releases the lock for *every* holder, so
+    /// unlocking on drop would hand the socket to a third daemon the moment
+    /// this value went away. Closing releases nothing — the kernel's own rule
+    /// (the lock ends when the last holder's descriptor closes) is what keeps
+    /// the socket ours until the process ends, the same rule the acquired lock
+    /// relies on.
+    #[cfg(unix)]
+    pub fn inherited_checked(
+        fd: std::os::unix::io::OwnedFd,
+        path: &Path,
+    ) -> Result<Self, LockError> {
+        use std::os::unix::fs::MetadataExt;
         use std::os::unix::io::{FromRawFd, IntoRawFd};
         // Soundness: `fd` is owned, so this process holds the only reference to
         // this descriptor number; `into_raw_fd` transfers that ownership to the
         // `File` without duplicating or closing anything, and the `File` takes
-        // over closing it exactly once. The descriptor is a regular-file
-        // descriptor (it was opened on the lock path by the outgoing daemon),
-        // so wrapping it as a `File` performs no I/O and cannot misinterpret
-        // the handle.
+        // over closing it exactly once.
         let raw = std::os::unix::io::OwnedFd::into_raw_fd(fd);
         // SAFETY: `raw` came from an owned descriptor this line just consumed,
         // so it is valid, open, and uniquely owned — the three conditions
         // `from_raw_fd` requires.
         let file = unsafe { File::from_raw_fd(raw) };
-        Self { file, path }
+
+        let (got_dev, got_ino) = match file.metadata() {
+            Ok(meta) => (meta.dev(), meta.ino()),
+            Err(e) => return Err(LockError::Io(path.to_path_buf(), e)),
+        };
+        // Not `is_held`'s `create(true)`: the lock file must already exist for
+        // the descriptor to be its lock, and creating it here would hide a
+        // missing lock behind a fresh empty file.
+        let (want_dev, want_ino) = match fs::metadata(path) {
+            Ok(meta) => (meta.dev(), meta.ino()),
+            Err(e) => return Err(LockError::Io(path.to_path_buf(), e)),
+        };
+        if (got_dev, got_ino) != (want_dev, want_ino) {
+            return Err(LockError::NotTheLock {
+                path: path.to_path_buf(),
+                got_dev,
+                got_ino,
+                want_dev,
+                want_ino,
+            });
+        }
+        if !Self::is_held(path) {
+            return Err(LockError::NotHeld(path.to_path_buf()));
+        }
+        match file.try_lock() {
+            Ok(()) => Ok(Self {
+                file,
+                path: path.to_path_buf(),
+                inherited: true,
+            }),
+            Err(fs::TryLockError::WouldBlock) => Err(LockError::NotTheLock {
+                path: path.to_path_buf(),
+                got_dev,
+                got_ino,
+                want_dev,
+                want_ino,
+            }),
+            Err(fs::TryLockError::Error(e)) => Err(LockError::Io(path.to_path_buf(), e)),
+        }
     }
 
     /// Is `path`'s lock currently held by someone (this process or another)?
@@ -165,6 +273,14 @@ impl ExclusiveLock {
 
 impl Drop for ExclusiveLock {
     fn drop(&mut self) {
+        // An inherited lock's descriptor shares the outgoing daemon's open file
+        // description: `unlock` there would release the lock for *every*
+        // holder, not just this process — including a daemon still serving
+        // after an aborted handoff. Closing the descriptor is all that is
+        // correct, and `File`'s own `Drop` does that.
+        if self.inherited {
+            return;
+        }
         // Closing the file would release the lock anyway (the kernel releases it
         // with the description); unlocking explicitly says so, and keeps the file
         // on disk for the next holder — see the module docs.
@@ -228,6 +344,120 @@ mod tests {
         let a = ExclusiveLock::acquire(&dir.join("a.lock")).expect("a");
         let b = ExclusiveLock::acquire(&dir.join("b.lock")).expect("b");
         assert_ne!(a.path(), b.path());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The review's shape: a *regular file* in the lock slot. The descriptor is
+    /// not the lock, and `is_held` on the path would have said "held" — which
+    /// is why the descriptor itself is judged.
+    #[test]
+    #[cfg(unix)]
+    fn a_descriptor_that_is_not_the_lock_is_refused() {
+        use std::os::unix::io::AsFd;
+        let dir = scratch("not-the-lock");
+        let path = dir.join("thing.lock");
+        let held = ExclusiveLock::acquire(&path).expect("first");
+        let other = File::create(dir.join("hostname")).expect("other file");
+        let received = other.as_fd().try_clone_to_owned().expect("dup");
+        let refused = ExclusiveLock::inherited_checked(received, &path)
+            .expect_err("a regular file is not the lock");
+        assert!(
+            matches!(refused, LockError::NotTheLock { .. }),
+            "expected NotTheLock, got {refused}"
+        );
+        drop(held);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A descriptor *of the lock file* that does not hold the lock is refused:
+    /// an independent description of the right inode meets the holder's lock.
+    #[test]
+    #[cfg(unix)]
+    fn an_unheld_description_of_the_lock_is_refused() {
+        use std::os::unix::io::AsFd;
+        let dir = scratch("unheld");
+        let path = dir.join("thing.lock");
+        let held = ExclusiveLock::acquire(&path).expect("first");
+        let fresh = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .expect("independent open");
+        let refused = ExclusiveLock::inherited_checked(
+            fresh.as_fd().try_clone_to_owned().expect("dup"),
+            &path,
+        )
+        .expect_err("an independent description is not the held lock");
+        assert!(
+            matches!(refused, LockError::NotTheLock { .. }),
+            "expected NotTheLock, got {refused}"
+        );
+        drop(held);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Nobody holds it: a descriptor claiming to be the lock is refused rather
+    /// than adopted (adopting would serve a socket while holding nothing).
+    #[test]
+    #[cfg(unix)]
+    fn a_descriptor_for_an_unheld_lock_is_refused() {
+        use std::os::unix::io::AsFd;
+        let dir = scratch("unheld-path");
+        let path = dir.join("thing.lock");
+        // Create the file without locking it.
+        let idle = File::create(&path).expect("file");
+        let refused = ExclusiveLock::inherited_checked(
+            idle.as_fd().try_clone_to_owned().expect("dup"),
+            &path,
+        )
+        .expect_err("nobody holds this lock");
+        assert!(
+            matches!(refused, LockError::NotHeld(_)),
+            "expected NotHeld, got {refused}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The happy path: a descriptor on the holder's own open file description
+    /// is adopted, and it *is* the lock afterwards.
+    #[test]
+    #[cfg(unix)]
+    fn a_shared_descriptor_of_the_held_lock_is_adopted() {
+        let dir = scratch("shared");
+        let path = dir.join("thing.lock");
+        let held = ExclusiveLock::acquire(&path).expect("first");
+        let dup = held.fd().try_clone_to_owned().expect("dup");
+        let adopted = ExclusiveLock::inherited_checked(dup, &path).expect("the lock itself");
+        assert_eq!(adopted.path(), path);
+        assert!(
+            ExclusiveLock::is_held(&path),
+            "the adopted lock still holds the path"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Dropping an inherited lock must **not** unlock it: the descriptor shares
+    /// the outgoing daemon's open file description, so `flock(LOCK_UN)` there
+    /// would release the lock for every holder — including a daemon that is
+    /// still serving because the handoff aborted.
+    #[test]
+    #[cfg(unix)]
+    fn dropping_an_inherited_lock_does_not_release_it() {
+        let dir = scratch("inherited-drop");
+        let path = dir.join("thing.lock");
+        let held = ExclusiveLock::acquire(&path).expect("first");
+        let dup = held.fd().try_clone_to_owned().expect("dup");
+        let adopted = ExclusiveLock::inherited_checked(dup, &path).expect("the lock itself");
+        drop(adopted);
+        assert!(
+            ExclusiveLock::is_held(&path),
+            "the holder's lock survives an inherited value being dropped"
+        );
+        drop(held);
+        assert!(
+            !ExclusiveLock::is_held(&path),
+            "and is released when the last holder goes"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 }

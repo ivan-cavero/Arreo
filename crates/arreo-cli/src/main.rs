@@ -3,7 +3,7 @@
 //! lifecycle: `service`, `server` (T-0012).
 
 use arreo_core::proto::codec;
-use arreo_core::proto::{AgentState, Message, VERSION};
+use arreo_core::proto::{client_versions, AgentState, Message, VERSION};
 use arreo_core::store::{audit_json, AuditQuery, ExportFormat, SessionStore, StoredAudit};
 use std::future::Future;
 use std::path::PathBuf;
@@ -430,7 +430,7 @@ async fn open_connection(socket: &PathBuf) -> Result<Connection, String> {
     let hello = Message::Hello {
         v: VERSION,
         client: "arreo-cli".to_string(),
-        wants: vec![VERSION],
+        wants: client_versions(),
     };
     let frame = codec::encode_frame(&hello).map_err(|e| format!("encode: {e}"))?;
     conn.writer

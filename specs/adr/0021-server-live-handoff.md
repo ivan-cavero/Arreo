@@ -133,6 +133,84 @@ easy to get wrong in stage 1:
   name an unrelated process by the time a kill arrives, and a child that has exited needs no
   signal, so refusing there loses nothing.
 
+**2c. The transfer is authenticated, and the commit is positive evidence.**
+
+Both of these came out of the mandatory security review of stage 1, and both were
+*reproduced* against the running binaries rather than reasoned about — which is the only reason
+they are in this ADR rather than in a release.
+
+**The commit must be evidence, not absence.** The first implementation treated end-of-stream on
+the transfer connection as "the incoming daemon is serving". It is not: EOF says only that a
+peer stopped writing. Measured — a local process sent `Handoff`, read `HandoffReady`, connected,
+called `shutdown(SHUT_WR)` and did nothing else, and the outgoing daemon **exited 0 within
+40 ms** with nobody serving: a client's connect hung on the stale backlog and the audit log
+recorded a cut that never happened. That is the half-dead state §2 exists to make unreachable,
+reached by the cheapest possible input. The incoming daemon now sends an explicit **commit
+marker byte** once its accept loop owns the inherited listener; EOF before it is an abort.
+
+The generalisation is worth more than the fix: **a protocol may not infer success from a
+peer's silence, and a check that a peer is gone is not a check that its successor is
+running.** Everywhere else in this design, "the other side stopped" and "the other side
+succeeded" are different facts, and they are tested as different facts.
+
+**What the marker does and does not prove.** The security re-review pushed back on this
+section's first wording, correctly: the byte is **authorisation, not evidence that the peer is
+serving**. The protocol cannot see the far side's accept loop, and a peer that presents the
+nonce, takes the descriptors, sends the byte and then does nothing will leave the outgoing
+daemon exiting 0 — reproduced. What the byte does establish is *who* sent it: only the process
+that asked for the handoff on the main socket could ever read the nonce, so the marker comes
+from the requester and not from a bystander. The shipped binary sends it after its accept loop
+is live; a hostile peer is free to lie about that, and the defence against a hostile peer is
+§2c's authentication and the local socket's trust model, not this byte.
+
+A stronger check was considered and **rejected**: after receiving the marker, connect to
+`<socket>` and require a `Welcome` before exiting. It sounds like exactly the empirical rigour
+this project asks for, and it introduces a worse fault — a probe that times out against a
+healthy-but-slow incoming daemon would leave the outgoing daemon serving *and* the incoming
+daemon committed, which is the two-daemons-on-one-socket failure (§2c) reintroduced by the
+check meant to prevent a different one. One byte is one atomic decision; a probe is two.
+
+**Descriptors require authentication, in three layers that defend different things.** A PTY
+master is worth stealing, and the transfer socket was as permissive as the umask allowed
+(`0775` measured; `connect()` on a Unix socket needs only write permission on the inode, so any
+same-group user qualified, and under `umask 0` anyone). Whoever won the race received the
+listening socket and the lock, the outgoing daemon exited 0, and the attacker served the socket
+as the daemon — a full local impersonation of the machine's agent runtime.
+
+- **Mode `0600` on the transfer socket**, at bind time. Cheap, and it is the only control that
+  does not depend on the directory: with `XDG_RUNTIME_DIR` unset the daemon's socket lives in
+  `/tmp`, mode `1777`, so the *location* is not a protection.
+- **`SO_PEERCRED`**: the peer's uid must be ours.
+- **A per-handoff nonce**, minted by the outgoing daemon, returned in `HandoffReady` **on the
+  main socket**, and required as the first bytes on the transfer connection. This is the layer
+  that binds the transfer to *the process that asked for the handoff* rather than to any process
+  that noticed the path — and it is why the request and the descriptors travel on two different
+  channels rather than one.
+
+What this does **not** claim: a same-user process can still request its own handoff, because the
+local socket's trust model is "same user, same machine" and this feature does not change it. The
+nonce binds the *transfer* to the requester; it does not make the requester trustworthy. That is
+stated in the code as well, so nobody re-derives the stronger claim from the mechanism.
+
+**And the request side is only as narrow as the main socket's mode.** The handoff request is
+ungated by design, and `connect()` on a Unix socket needs only write permission on the inode —
+so at the default `0775`/`0755` the trust model this section relies on is "same **group**", not
+"same user": a group peer can ask for a handoff, read the nonce the daemon returns, and drive
+the cut, which the re-review measured as reachable (it could not become a second uid to complete
+the connection, so the connect step is [INFERENCE] from the permission rule). The three layers
+above harden the *transfer*; none of them narrows who may *ask*. Narrowing the socket's mode is
+T-0078's decision and it is now priority 1 with this consequence named, because until it lands
+this design's honest claim is "closed for same-user, open for same-group at the default mode".
+
+**And one handoff at a time — on its own lock.** Two concurrent handoffs both committed and left
+**two daemons serving one socket** (reproduced five times out of five), because `flock` lives in
+the *open file description*: two processes that inherit the same description both "hold" it, so
+the inherited lock is structurally incapable of enforcing exclusivity among handoff
+participants. Exclusivity therefore needs its own lock on the transfer path, held by the outgoing
+daemon for the duration of a handoff. **An invariant enforced by an inherited descriptor is not
+enforced by it** — the same confusion that made the received lock descriptor need validation
+against the path rather than a probe of the path.
+
 **3. One serving daemon, enforced by `flock`.**
 
 The daemon holds an exclusive lock on its socket path for its whole life. A second daemon

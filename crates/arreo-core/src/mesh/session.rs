@@ -46,7 +46,7 @@
 
 use crate::identity::{verifying_key_from_hex, DeviceCert, DeviceId, DeviceKey, VerifyingKey};
 use crate::proto::codec;
-use crate::proto::{Message, VERSION};
+use crate::proto::{client_versions, Message, VERSION};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -249,7 +249,7 @@ impl Client {
         conn.send(&Message::Hello {
             v: VERSION,
             client: "arreo-tui".to_string(),
-            wants: vec![VERSION],
+            wants: client_versions(),
         })
         .await?;
         // **The answer to Hello is bounded, on both transports** (T-0064). A peer

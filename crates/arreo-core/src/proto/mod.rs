@@ -14,12 +14,16 @@
 //! - `negotiate(server, client_wants)`: the N−1 window (T-0028, ADR 0017) —
 //!   accept the highest version common to `[server-1, server]`, echo it in
 //!   `Welcome.v`, refuse anything outside with a typed error naming the range.
+//! - `client_versions()`: the other half of that window, and the **one** place
+//!   a client's offer is written. The server's fallback only exists for a
+//!   version the client offered, so a client announcing `[VERSION]` alone is
+//!   refused by every older daemon — the forward direction §3.13 promises.
 
 pub mod codec;
 pub mod message;
 
 pub use codec::{
-    classify_op, decode_op_for_error, frame_body_len, negotiate, CodecError, Direction,
-    MAX_FRAME_BYTES, MIN_VERSION,
+    classify_op, client_versions, client_versions_from, decode_op_for_error, frame_body_len,
+    negotiate, CodecError, Direction, MAX_FRAME_BYTES, MIN_VERSION,
 };
 pub use message::{AgentState, Message, MetricsPoint, PaneInfo, VERSION};

@@ -281,6 +281,117 @@ pub fn recv_fd(socket: impl AsFd, timeout: Duration) -> Result<OwnedFd, FdTransf
     }
 }
 
+/// The marker byte the incoming daemon sends once it has taken the socket over
+/// (T-0038 stage 1): the handoff's **commit**.
+///
+/// It is the same *grammar* as [`FD_PASS_BYTE`] — one marker byte, carrying no
+/// descriptor — with a distinct value, so the outgoing daemon requires a byte
+/// its peer had to *choose* to send rather than reading end-of-stream as
+/// success. EOF says a peer stopped *writing*, which is what a peer that died
+/// mid-transfer says as well, so a handoff that read EOF as success committed
+/// on the cheapest possible input — a process that connected, half-closed, and
+/// never served anything.
+///
+/// **What the byte proves, and what it does not.** It is *authorisation*: only
+/// the process that asked for the handoff on the main socket could know the
+/// nonce that guards this connection, so the byte says "the requester has the
+/// descriptors and is committing". It is **not** positive evidence that the far
+/// side is *serving*: no protocol can see another process's accept loop, and a
+/// peer that presents the nonce, takes the descriptors, sends this byte and does
+/// nothing else leaves the machine with no daemon at all (the outgoing one
+/// exits; that is the accepted residual risk, pinned by
+/// `a_commit_by_the_requester_is_authorisation_not_proof_of_serving` in
+/// `arreo-server`'s handoff tests). Reading the byte as proof of service is what
+/// this comment used to claim, and it is false.
+///
+/// **A probe was considered and rejected.** Having the outgoing daemon connect
+/// to `<socket>` after the byte and wait for a `Welcome` would look like it
+/// checks the far side, and the check is worse than the gap: a probe that
+/// times out on a slow-but-healthy daemon leaves the outgoing daemon serving
+/// *and* the incoming daemon committed — two daemons on one socket, the F5
+/// failure, reintroduced by the check meant to prevent a different one. One byte
+/// is one atomic decision; a probe is two. `arreo_server::handoff::wait_for_commit`
+/// carries the same reasoning next to the code that reads this byte.
+pub const HANDOFF_COMMIT_BYTE: u8 = 0x02;
+
+/// The uid of the process on the other end of a connected Unix socket.
+///
+/// `Ok(None)` means this platform does not let the workspace ask:
+/// `SO_PEERCRED` is the Linux answer and the only one reachable through the
+/// crates this workspace depends on, so elsewhere the caller falls back to the
+/// transfer's nonce and the socket's own permissions. Reported, never guessed —
+/// a caller that read `None` as "same user" would be inventing the answer.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub fn peer_uid(socket: impl AsFd) -> std::io::Result<Option<u32>> {
+    let credentials = rustix::net::sockopt::get_socket_peercred(socket.as_fd())?;
+    Ok(Some(credentials.uid.as_raw()))
+}
+
+/// See the Linux definition above: elsewhere the credential socket option is
+/// not reachable, so the answer is honestly "cannot ask".
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+pub fn peer_uid(_socket: impl AsFd) -> std::io::Result<Option<u32>> {
+    Ok(None)
+}
+
+/// This process's real uid, for comparing against [`peer_uid`].
+#[must_use]
+pub fn own_uid() -> u32 {
+    rustix::process::getuid().as_raw()
+}
+
+/// Whether `fd` is a **listening stream** socket — the two facts a descriptor
+/// must have before it can be the listener a handoff inherits.
+///
+/// `SO_TYPE` is portable. `SO_ACCEPTCONN` is the direct answer everywhere
+/// except Apple, which declares the constant and does not implement it; there
+/// the type is all this can answer, and the caller's [`socket_bound_path`]
+/// identity check is what separates a bound listener from a connected
+/// `socketpair` end. Refusing every handoff on Apple instead would give up a
+/// live agent to keep a check the platform will not answer.
+pub fn socket_is_listening_stream(fd: impl AsFd) -> std::io::Result<bool> {
+    if get_socket_type(fd.as_fd())? != SocketType::STREAM {
+        return Ok(false);
+    }
+    #[cfg(not(target_vendor = "apple"))]
+    {
+        rustix::net::sockopt::get_socket_acceptconn(fd.as_fd()).map_err(std::io::Error::from)
+    }
+    #[cfg(target_vendor = "apple")]
+    {
+        Ok(true)
+    }
+}
+
+/// The filesystem path `fd` is bound to, when it has one.
+///
+/// `None` for an unnamed or abstract address — a `socketpair` end has no path —
+/// which is exactly the identity a handoff listener must carry: the path the
+/// incoming daemon was told to take over.
+pub fn socket_bound_path(fd: impl AsFd) -> std::io::Result<Option<PathBuf>> {
+    match rustix::net::getsockname(fd.as_fd())? {
+        rustix::net::SocketAddrAny::Unix(address) => Ok(address
+            .path()
+            .map(|path| PathBuf::from(OsStr::from_bytes(path.to_bytes())))),
+        _ => Ok(None),
+    }
+}
+
+/// 32 bytes of OS entropy, for the per-handoff nonce the outgoing daemon mints
+/// and the incoming daemon must present before any descriptor moves (T-0038
+/// stage 1).
+///
+/// Lives beside the descriptor helpers because it is part of the same
+/// handshake grammar: it is what binds the transfer connection to the process
+/// that asked for the handoff, rather than to any process that noticed the
+/// path.
+pub fn fresh_nonce() -> std::io::Result<[u8; 32]> {
+    let mut nonce = [0u8; 32];
+    getrandom::fill(&mut nonce)
+        .map_err(|e| std::io::Error::other(format!("no entropy for the handoff nonce: {e}")))?;
+    Ok(nonce)
+}
+
 /// The geometry a sender claims for a master it is handing over.
 ///
 /// Named rather than a `(u16, u16)` on purpose. This crate speaks `(cols,
@@ -926,5 +1037,77 @@ mod tests {
 
         bystander.kill().expect("clean up the bystander");
         bystander.wait().expect("reap the bystander");
+    }
+
+    /// The handoff's validation primitives answer about real descriptors (F1
+    /// and F2 of the stage-1 security review): a bound listener is a listening
+    /// stream socket *at its path*, a `socketpair` end is a stream socket that
+    /// is not listening and has no path, and the peer of a connection this
+    /// process accepted is this process's own uid.
+    ///
+    /// What removal turns red: `socket_is_listening_stream` answering `true`
+    /// unconditionally (the pair end passes); `socket_bound_path` returning the
+    /// expected path rather than the descriptor's own (`getsockname` is the
+    /// identity check); the credentials lookup returning a placeholder instead
+    /// of the kernel's answer.
+    #[test]
+    fn the_handoff_validation_primitives_answer_about_real_descriptors() {
+        let dir = std::env::temp_dir().join(format!(
+            "arreo-adopt-primitives-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch");
+        let path = dir.join("s.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).expect("bind");
+        assert!(
+            socket_is_listening_stream(listener.as_fd()).expect("SO_ACCEPTCONN"),
+            "a bound listener is a listening stream socket"
+        );
+        assert_eq!(
+            socket_bound_path(listener.as_fd())
+                .expect("getsockname")
+                .as_deref(),
+            Some(path.as_path()),
+            "and its bound path is the path it was bound at"
+        );
+
+        let (pair, _peer) = std::os::unix::net::UnixStream::pair().expect("pair");
+        assert!(
+            !socket_is_listening_stream(pair.as_fd()).expect("SO_ACCEPTCONN"),
+            "a socketpair end is a stream socket but not a listener"
+        );
+        assert_eq!(
+            socket_bound_path(pair.as_fd()).expect("getsockname"),
+            None,
+            "and it has no bound path to be mistaken for a socket's"
+        );
+
+        // The peer of a connection we accepted is this process. On the
+        // platforms where the credential option is not reachable the answer is
+        // honestly "cannot ask", which is what the handoff's nonce and the
+        // socket's permissions cover.
+        let connector = std::thread::spawn({
+            let path = path.clone();
+            move || std::os::unix::net::UnixStream::connect(&path).expect("connect")
+        });
+        let (server, _) = listener.accept().expect("accept");
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        assert_eq!(
+            peer_uid(server.as_fd()).expect("SO_PEERCRED"),
+            Some(own_uid()),
+            "the peer is this process, so its uid is ours"
+        );
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        assert_eq!(
+            peer_uid(server.as_fd()).expect("no answer"),
+            None,
+            "this platform cannot answer, and the primitive says so"
+        );
+
+        drop(connector.join().expect("the connector does not panic"));
+        drop(server);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

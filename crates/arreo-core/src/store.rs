@@ -142,10 +142,16 @@ pub mod actions {
     /// never writes one, so exactly one row exists per cut.
     pub const HANDOFF: &str = "handoff";
     /// A handoff request was refused (T-0038 stage 1): the incoming daemon's
-    /// protocol version was outside the outgoing daemon's N−1 window. The
-    /// outgoing daemon keeps serving — a refused handoff is a deferred
-    /// update, never a failure — and the row names both versions.
+    /// protocol version was outside the outgoing daemon's window, a handoff was
+    /// already in progress, or the transfer could not be prepared. The outgoing
+    /// daemon keeps serving — a refused handoff is a deferred update, never a
+    /// failure — and the row names the reason.
     pub const HANDOFF_REFUSE: &str = "handoff.refuse";
+    /// A handoff started and did **not** commit (T-0038 stage 1): the incoming
+    /// daemon died, timed out, or refused what arrived. Written by whichever
+    /// side knows the reason — `outgoing: …` or `incoming: …` in `detail` — so
+    /// a cut that did not happen is never recorded as `ok`, and never silently.
+    pub const HANDOFF_ABORT: &str = "handoff.abort";
 }
 
 /// One audit row (prompt already redacted on write).

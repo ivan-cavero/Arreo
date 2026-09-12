@@ -232,11 +232,22 @@ pub enum Message {
     /// `VERSION` (so the incoming daemon — and the audit row — can name both
     /// sides of the cut), and `panes` is the live pane count (stage 2 will
     /// transfer the panes themselves; stage 1 moves no pane process).
+    ///
+    /// `nonce` (T-0038 stage 1 security review, F1) is 32 bytes of entropy the
+    /// outgoing daemon minted for this handoff, and the incoming daemon must
+    /// present it as the **first bytes** on the transfer connection before any
+    /// descriptor moves. It is what binds the transfer to the process that
+    /// asked for the handoff on this socket, rather than to any process that
+    /// noticed `<socket>.handoff` exist. Empty from a peer that does not send
+    /// one (an older build); the outgoing daemon never accepts an empty nonce.
+    /// `#[serde(default)]` keeps the enum append-only (ADR 0017).
     HandoffReady {
         v: u32,
         protocol: u32,
         server_protocol: u32,
         panes: u64,
+        #[serde(default)]
+        nonce: Vec<u8>,
     },
 }
 

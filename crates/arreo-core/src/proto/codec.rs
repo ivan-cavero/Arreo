@@ -7,7 +7,7 @@
 //! Performance: rmp-serde borrows on decode where cheap (`decode_borrowed`);
 //! the 1 MB / 5 ms budget is asserted in `tests/proto.rs`.
 
-use super::message::Message;
+use super::message::{Message, VERSION};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -440,6 +440,42 @@ fn skip_value(bytes: &[u8]) -> Option<(&[u8], &[u8])> {
 /// offering N or N−1, and a client offers both. A gap wider than one is a
 /// deferred update (§3.13), not a silent downgrade.
 pub const MIN_VERSION: u32 = 0;
+
+/// Every version **this build speaks as a client** — the list a `Hello`
+/// announces in `wants`, in the order it should be announced.
+///
+/// The N−1 window has two directions and only one of them was reachable. A
+/// server (`negotiate`) falls back to `server - 1`, but only for a version the
+/// client actually *offered*; a client that announces `[VERSION]` alone is
+/// refused at Hello by every older daemon. That is the forward direction —
+/// exactly the update §3.13 promises keeps working ("an old client against a
+/// new server (or vice versa) keeps working", ROADMAP §3.13) — and it was
+/// broken by five copies of `vec![VERSION]` in five client sites. So the offer
+/// is `[VERSION, VERSION - 1]` while that exists.
+///
+/// **One rule, one home**: this is the only place the client's offer is
+/// written down. The server side is deliberately *not* symmetric —
+/// `negotiate(VERSION, &wants)` is the server's window, and how much older a
+/// server will go is the server's business.
+#[must_use]
+pub fn client_versions() -> Vec<u32> {
+    client_versions_from(VERSION)
+}
+
+/// [`client_versions`] at an explicit version — the same rule, so a build whose
+/// `VERSION` has no representable downgrade (it is 0 today) can still have the
+/// rule proven at the versions that do (`tests/compat.rs`).
+///
+/// `checked_sub`, not `saturating_sub`: a v0 build's offer is `[0]`, not
+/// `[0, 0]`. The list is the set of versions this binary speaks, and a version
+/// named twice is not a version.
+#[must_use]
+pub fn client_versions_from(version: u32) -> Vec<u32> {
+    match version.checked_sub(1) {
+        Some(floor) => vec![version, floor],
+        None => vec![version],
+    }
+}
 
 /// Version negotiation (N−1 window, T-0028). `server` is our version; `wants`
 /// is the client's offered list (from `Hello.wants`).

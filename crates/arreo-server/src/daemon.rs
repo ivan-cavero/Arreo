@@ -503,45 +503,47 @@ impl Daemon {
     }
 
     /// Serve on an **inherited** listener + lock (T-0038 stage 1: the incoming
-    /// daemon). No bind, no `try_lock` — the descriptors arrived over
+    /// daemon). No bind, no acquire — the descriptors arrived over
     /// `SCM_RIGHTS` from the outgoing daemon, and the lock lives in the shared
-    /// open file description, so acquiring would be both redundant and wrong.
+    /// open file description.
     ///
-    /// Verifies the inheritance before serving: opens the lock path afresh and
-    /// asserts the lock is held, which proves the descriptor really carried
-    /// the lock (a forged or dropped descriptor would read as free). A lock
-    /// that reads as free is a loud refusal, never a serve — two daemons on
-    /// one socket is the state the lock exists to prevent.
+    /// The lock is *already proven* by the time it gets here:
+    /// [`arreo_core::lock::ExclusiveLock::inherited_checked`] refused anything
+    /// that was not the lock at the path it names, so this checks only that the
+    /// path is the socket this daemon was told to serve — an inexpensive
+    /// contract check on a value that has already been judged.
+    ///
+    /// `ready` reports readiness to the incoming daemon's commit path: `Ok(())`
+    /// once the accept loop owns the listener and is about to accept, or
+    /// `Err(reason)` when this refused before that. **The caller must not commit
+    /// on an `Err`** — committing there would exit the outgoing daemon with
+    /// nobody serving, which is the half-dead state ADR 0021 §2 exists to make
+    /// unreachable.
     pub async fn serve_inherited(
         &self,
         listener: UnixListener,
         lock: arreo_core::lock::ExclusiveLock,
-        ready: Option<tokio::sync::oneshot::Sender<()>>,
+        ready: Option<tokio::sync::oneshot::Sender<Result<(), String>>>,
     ) -> Result<(), DaemonError> {
         let lock_path = super::persist::lock_path_for(&self.socket);
         if lock.path() != lock_path {
-            return Err(DaemonError::Io(std::io::Error::new(
+            let error = DaemonError::Io(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 format!(
                     "inherited lock is for {} but this daemon serves {}",
                     lock.path().display(),
                     self.socket.display()
                 ),
-            )));
-        }
-        if !arreo_core::lock::ExclusiveLock::is_held(&lock_path) {
-            return Err(DaemonError::Io(std::io::Error::new(
-                std::io::ErrorKind::AddrInUse,
-                format!(
-                    "inherited lock for {} reads as free — refusing to serve",
-                    self.socket.display()
-                ),
-            )));
+            ));
+            if let Some(ready) = ready {
+                let _ = ready.send(Err(error.to_string()));
+            }
+            return Err(error);
         }
         // Held for the daemon's life, like the acquired lock. The inherited
         // variant's `Drop` closes the descriptor and never unlocks (shared
-        // open file description — see `ExclusiveLock::inherited`), so holding
-        // it here keeps the socket ours until the process ends.
+        // open file description — see `ExclusiveLock::inherited_checked`), so
+        // holding it here keeps the socket ours until the process ends.
         //
         // The socket file must already exist: the outgoing daemon never unlinks
         // it across the cut, so a missing path means this process was given a
@@ -549,13 +551,17 @@ impl Daemon {
         // into two daemons (a fresh `serve` would bind the same path). Refuse
         // rather than guess.
         if !self.socket.exists() {
-            return Err(DaemonError::Io(std::io::Error::new(
+            let error = DaemonError::Io(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
                 format!(
                     "socket {} is missing — refusing an inherited listener with no path",
                     self.socket.display()
                 ),
-            )));
+            ));
+            if let Some(ready) = ready {
+                let _ = ready.send(Err(error.to_string()));
+            }
+            return Err(error);
         }
         *self.instance.lock().unwrap_or_else(|e| e.into_inner()) = Some(lock);
         self.serve_on(listener, ready).await
@@ -570,8 +576,9 @@ impl Daemon {
     ///
     /// `ready` fires once the loop owns the listener and is about to accept
     /// (T-0038 stage 1: the incoming daemon commits only after this, so a
-    /// connect is never queued on a socket nobody drains). `None` on a fresh
-    /// start, where nobody waits for it.
+    /// connect is never queued on a socket nobody drains); a refusal before
+    /// that point reports `Err(reason)` through it, so the incoming daemon
+    /// exits without committing. `None` on a fresh start, where nobody waits.
     ///
     /// The `accept` carries a 200 ms timeout and the stop flag is re-checked
     /// on every wake: the commit path also self-connects to wake the loop, but
@@ -581,7 +588,7 @@ impl Daemon {
     async fn serve_on(
         &self,
         listener: UnixListener,
-        ready: Option<tokio::sync::oneshot::Sender<()>>,
+        ready: Option<tokio::sync::oneshot::Sender<Result<(), String>>>,
     ) -> Result<(), DaemonError> {
         // Boot restore BEFORE serving: crash survivors reappear with history.
         self.restore_boot().await;
@@ -748,7 +755,7 @@ impl Daemon {
         // (The sweeps above are spawned, not awaited — nothing between them
         // and the loop blocks.)
         if let Some(ready) = ready {
-            let _ = ready.send(());
+            let _ = ready.send(Ok(()));
         }
         loop {
             // The stop flag is re-checked on every wake: the commit path also
@@ -978,6 +985,13 @@ async fn handle(
     // authorization gate applies — and no device to register under, so no
     // cutoff handle either. A remote peer always arrives with one (see
     // [`SessionAuth`]).
+    //
+    // "Same-machine" is wider than "same user" in practice: the socket is bound
+    // with the ambient umask and never chmod'd, and `connect()` needs only write
+    // permission on the inode — so at the default mode (0775 measured; 0755
+    // under `umask 022`) a same-**group** peer reaches every verb here, `Handoff`
+    // included. The mode is the gate; narrowing it is T-0078's decision, and this
+    // session's `auth: None` deliberately does not pretend otherwise.
     serve_session_with_handoff(reader, writer, registry, sessions, db, None, handoff).await
 }
 
@@ -1421,6 +1435,11 @@ where
     // function of its tick while burning CPU on every idle connection. The
     // cost here is one store read per session per idle second — the same as a
     // verb, and idle sessions already cost a task each.
+    //
+    // The handoff's failure rows are throttled per session (one refusal, one
+    // abort): a client can send `Handoff` in a loop, and a row per frame would
+    // let it fill the operator's log (T-0059's rule for trust refusals).
+    let mut handoff_failures = crate::handoff::HandoffFailureLog::default();
     let ended_because = loop {
         let message = tokio::select! {
             // Biased: a revocation racing a verb is observed first, so the
@@ -1529,6 +1548,7 @@ where
                     handoff.as_ref(),
                     protocol,
                     &build,
+                    &mut handoff_failures,
                 )
                 .await
                 {
@@ -2129,28 +2149,77 @@ enum HandoffSessionOutcome {
     Gone,
 }
 
+/// The bound `<socket>.handoff` listener for one handoff.
+///
+/// Unlinks the path on drop, so every exit — commit, refusal, abort, panic —
+/// leaves no transfer socket behind and no exit path has to remember. (Before
+/// this, each `return` had its own `remove_file`, which is exactly the shape
+/// that forgets one.)
+struct TransferSocket {
+    path: PathBuf,
+    listener: std::os::unix::net::UnixListener,
+}
+
+impl Drop for TransferSocket {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// Remove a leftover transfer socket **only after proving nothing is listening
+/// on it** (T-0071's discipline, applied to the transfer path).
+///
+/// A path that answers a `connect` has a live peer holding it, and this handoff
+/// must not unlink it — that is the "stop blindly removing" half of the
+/// one-handoff rule. A path that refuses the connect is a leftover from a
+/// handoff that died before its unlink, and removing it is the only way to bind
+/// the real one.
+fn clear_stale_transfer_path(path: &Path) -> Result<(), String> {
+    if !path.exists() {
+        return Ok(());
+    }
+    match std::os::unix::net::UnixStream::connect(path) {
+        Ok(_) => Err(format!(
+            "handoff refused: {} exists and something is listening on it",
+            path.display()
+        )),
+        Err(_) => std::fs::remove_file(path).map_err(|e| {
+            format!(
+                "handoff refused: cannot remove the stale transfer socket {}: {e}",
+                path.display()
+            )
+        }),
+    }
+}
+
 /// Serve one handoff request on the client socket (T-0038 stage 1, outgoing
 /// side). The full ordering lives here; the session loop acts on the outcome.
 ///
-/// 1. Validate the incoming daemon's protocol against *this* daemon's window
-///    (`negotiate(VERSION, [incoming])` — the incoming daemon is the one that
-///    must speak our protocol). A refusal writes the `handoff.refuse` audit
-///    row, answers a typed `Error` naming both versions, and leaves this
-///    daemon serving — a refused handoff is a deferred update, never a failure.
-/// 2. Bind `<socket>.handoff`; reply `HandoffReady { v, protocol, panes }`.
-/// 3. Accept one connection there with a deadline; unlink the path as soon as
-///    it is accepted.
-/// 4. Send the listener descriptor, then the lock descriptor (the order is part
+/// 1. Validate the incoming daemon's protocol against *its* window
+///    ([`crate::handoff::check_incoming_protocol`]): it must be able to speak
+///    our protocol. A refusal writes the `handoff.refuse` audit row, answers a
+///    typed `Error` naming both versions, and leaves this daemon serving — a
+///    refused handoff is a deferred update, never a failure.
+/// 2. Take the one-handoff lock for the duration; a second request is refused
+///    with a typed error rather than raced.
+/// 3. Bind `<socket>.handoff` (mode 0600, unlinked on every exit by
+///    [`TransferSocket`]), mint the nonce, reply
+///    `HandoffReady { v, protocol, panes, nonce }`.
+/// 4. Accept one connection there with a deadline; the peer must be this user
+///    and must present the nonce first.
+/// 5. Send the listener descriptor, then the lock descriptor (the order is part
 ///    of the contract; stage 2 adds panes after the lock).
-/// 5. Wait for the incoming daemon's commit (EOF — see `handoff.rs`).
-/// 6. Write the audit row (`handoff <from> -> <to> panes=<n>`).
-/// 7. Set the stop flag (the accept loop ends after its current `accept`,
+/// 6. Wait for the incoming daemon's **commit marker byte**, and record an
+///    abort row when it does not arrive. EOF is not a commit — see `handoff.rs`.
+/// 7. Write the audit row (`handoff <from> -> <to> panes=<n>`).
+/// 8. Set the stop flag (the accept loop ends after its current `accept`,
 ///    dropping *this* process's listener fd; the incoming daemon holds a dup,
 ///    and the socket file stays).
 ///
-/// Every abort path unlinks the `.handoff` path before returning: an aborted
-/// handoff leaves the outgoing daemon serving, holding the lock, with no
-/// `.handoff` file behind — and a retry succeeds.
+/// Every abort path leaves the outgoing daemon serving, holding the lock, with
+/// no `.handoff` file behind — and a retry succeeds. `failures` throttles the
+/// rows, so a client looping `Handoff` cannot make this daemon write one row
+/// per frame.
 async fn serve_handoff_request(
     writer: &mut (impl AsyncWriteExt + Unpin),
     registry: &Registry,
@@ -2158,6 +2227,7 @@ async fn serve_handoff_request(
     handoff: Option<&HandoffCtx>,
     incoming_protocol: u32,
     incoming_build: &str,
+    failures: &mut crate::handoff::HandoffFailureLog,
 ) -> HandoffSessionOutcome {
     // A handoff request without the transfer context is not a handoff: it
     // arrived on a path that cannot move descriptors (remote transport, relay).
@@ -2174,38 +2244,126 @@ async fn serve_handoff_request(
         .ok();
         return HandoffSessionOutcome::Answered;
     };
-    // 1. The version check is the *incoming* daemon's window: it must speak our
-    // protocol (`old == new` or `old == new - 1`). `negotiate(old, [new])` would
-    // refuse any version bump at all — backwards.
-    let agreed =
-        match crate::handoff::check_incoming_protocol(incoming_protocol, db, incoming_build) {
-            Ok(agreed) => agreed,
-            Err(detail) => {
-                write_message(
-                    writer,
-                    &Message::Error {
-                        v: VERSION,
-                        message: detail,
-                    },
-                )
-                .await
-                .ok();
-                return HandoffSessionOutcome::Answered;
-            }
-        };
-    // 2. Bind the dedicated transfer socket. Bound only for this handoff;
-    // every exit below unlinks it.
-    let handoff_path = crate::handoff::handoff_path_for(&ctx.socket);
-    let _ = std::fs::remove_file(&handoff_path);
-    let handoff_listener = match std::os::unix::net::UnixListener::bind(&handoff_path) {
-        Ok(listener) => listener,
-        Err(e) => {
-            let _ = std::fs::remove_file(&handoff_path);
+    // 1. The version check is the *incoming* daemon's window: `incoming ==
+    // VERSION` or `incoming == VERSION + 1` is accepted, a gap of two and a
+    // downgrade are refused. The build string is peer-supplied and reaches the
+    // audit row, so it is stripped and bounded first.
+    let agreed = match crate::handoff::check_incoming_protocol(incoming_protocol) {
+        Ok(agreed) => agreed,
+        Err(reason) => {
+            let detail = format!(
+                "handoff refused: incoming protocol {incoming_protocol} (build {}) {reason}",
+                crate::handoff::sanitize_build(incoming_build),
+            );
+            failures.refuse(db, &detail);
             write_message(
                 writer,
                 &Message::Error {
                     v: VERSION,
-                    message: format!("handoff unavailable (cannot bind transfer socket): {e}"),
+                    message: detail,
+                },
+            )
+            .await
+            .ok();
+            return HandoffSessionOutcome::Answered;
+        }
+    };
+    // 2. **One handoff at a time** (F5): held for the whole transfer, so a
+    // second request that arrives meanwhile is refused rather than raced. Two
+    // concurrent handoffs used to both commit and leave two daemons serving one
+    // socket — the state T-0071's lock exists to prevent.
+    let handoff_lock_path = crate::handoff::handoff_lock_path_for(&ctx.socket);
+    let _handoff_lock = match arreo_core::lock::ExclusiveLock::acquire(&handoff_lock_path) {
+        Ok(lock) => lock,
+        Err(e) => {
+            let detail = format!("handoff refused: {} {e}", crate::handoff::BUSY_REFUSAL);
+            failures.refuse(db, &detail);
+            write_message(
+                writer,
+                &Message::Error {
+                    v: VERSION,
+                    message: detail,
+                },
+            )
+            .await
+            .ok();
+            return HandoffSessionOutcome::Answered;
+        }
+    };
+    // 3. Bind the dedicated transfer socket, under the handoff lock: an
+    // existing path is probed rather than blindly unlinked.
+    let handoff_path = crate::handoff::handoff_path_for(&ctx.socket);
+    if let Err(detail) = clear_stale_transfer_path(&handoff_path) {
+        failures.refuse(db, &detail);
+        write_message(
+            writer,
+            &Message::Error {
+                v: VERSION,
+                message: detail,
+            },
+        )
+        .await
+        .ok();
+        return HandoffSessionOutcome::Answered;
+    }
+    let listener = match std::os::unix::net::UnixListener::bind(&handoff_path) {
+        Ok(listener) => listener,
+        Err(e) => {
+            let detail = format!(
+                "handoff unavailable (cannot bind the transfer socket {}): {e}",
+                handoff_path.display()
+            );
+            failures.refuse(db, &detail);
+            write_message(
+                writer,
+                &Message::Error {
+                    v: VERSION,
+                    message: detail,
+                },
+            )
+            .await
+            .ok();
+            return HandoffSessionOutcome::Answered;
+        }
+    };
+    let transfer_socket = TransferSocket {
+        path: handoff_path.clone(),
+        listener,
+    };
+    // The transfer socket is created with the process umask (0775 in a common
+    // configuration) and `connect()` needs only write permission on the inode,
+    // so its mode is narrowed at once. The bind→chmod window is covered by the
+    // peer-uid and nonce checks on the accepted connection below.
+    if let Err(e) = crate::handoff::restrict_transfer_socket(&handoff_path) {
+        let detail = format!(
+            "handoff unavailable (cannot restrict the transfer socket {}): {e}",
+            handoff_path.display()
+        );
+        failures.refuse(db, &detail);
+        write_message(
+            writer,
+            &Message::Error {
+                v: VERSION,
+                message: detail,
+            },
+        )
+        .await
+        .ok();
+        return HandoffSessionOutcome::Answered;
+    }
+    // The nonce binds the transfer to the process that asked for it here: it
+    // travels on this (client) socket, where the requester is, and must come
+    // back as the first bytes of the transfer connection.
+    let nonce = match arreo_core::pty::adopt::fresh_nonce() {
+        Ok(nonce) => nonce,
+        Err(e) => {
+            let detail = format!("handoff unavailable (no entropy for the nonce): {e}");
+            failures.refuse(db, &detail);
+            write_message(
+                writer,
+                &Message::Error {
+                    v: VERSION,
+                    message: detail,
                 },
             )
             .await
@@ -2221,20 +2379,19 @@ async fn serve_handoff_request(
             protocol: agreed,
             server_protocol: VERSION,
             panes,
+            nonce: nonce.to_vec(),
         },
     )
     .await
     .is_err()
     {
-        let _ = std::fs::remove_file(&handoff_path);
         return HandoffSessionOutcome::Gone;
     }
-    // 3. Accept one connection there with a deadline; unlink the path as soon
-    // as it is accepted (it exists only for this transfer).
-    let _ = handoff_listener.set_nonblocking(true);
+    // 4. Accept one connection there with a deadline.
+    let _ = transfer_socket.listener.set_nonblocking(true);
     let deadline = std::time::Instant::now() + crate::handoff::DEFAULT_HANDOFF_TIMEOUT;
     let conn = loop {
-        match handoff_listener.accept() {
+        match transfer_socket.listener.accept() {
             Ok((conn, _)) => break Some(conn),
             Err(e)
                 if e.kind() == std::io::ErrorKind::WouldBlock
@@ -2248,46 +2405,28 @@ async fn serve_handoff_request(
             Err(_) => break None,
         }
     };
-    let _ = std::fs::remove_file(&handoff_path);
     let Some(conn) = conn else {
+        let detail = "the new daemon never connected for the descriptors".to_string();
+        failures.abort(db, &detail);
         write_message(
             writer,
             &Message::Error {
                 v: VERSION,
-                message: "handoff aborted: the new daemon never connected for the descriptors"
-                    .to_string(),
+                message: format!("handoff aborted: {detail}"),
             },
         )
         .await
         .ok();
         return HandoffSessionOutcome::Answered;
     };
-    // The transfer socket stays blocking: `send_fd`/`recv_fd` do one message
-    // each, and blocking keeps the commit wait exact (EOF, not WouldBlock).
+    // The transfer socket stays blocking for the steps below; the *reads* carry
+    // their own timeouts, so no wait here is unbounded.
     let _ = conn.set_nonblocking(false);
-    // 4. The listener first, then the lock — the order is the contract.
-    use std::os::unix::io::AsFd;
-    if crate::handoff::send_one(&conn, ctx.listener_fd.as_fd()).is_err()
-        || crate::handoff::send_one(&conn, ctx.lock_fd.as_fd()).is_err()
-    {
-        write_message(
-            writer,
-            &Message::Error {
-                v: VERSION,
-                message: "handoff aborted: the descriptor transfer failed".to_string(),
-            },
-        )
-        .await
-        .ok();
-        return HandoffSessionOutcome::Answered;
-    }
-    // 5. Wait for the incoming daemon's commit (EOF on the handoff connection:
-    // it closes its side once it is genuinely accepting on the inherited
-    // listener). A dead incoming daemon reads as PeerClosed/TimedOut here —
-    // an abort, and this daemon keeps serving.
-    if let Err(detail) =
-        crate::handoff::wait_for_commit(&conn, crate::handoff::DEFAULT_HANDOFF_TIMEOUT)
-    {
+    // The peer must be this user (F1). On a platform that cannot answer
+    // (`peer_uid` → `None`) this defers to the nonce and the socket's
+    // permissions, which is why the transfer also requires the nonce.
+    if let Err(detail) = crate::handoff::check_peer_uid(&conn) {
+        failures.abort(db, &detail);
         write_message(
             writer,
             &Message::Error {
@@ -2299,13 +2438,83 @@ async fn serve_handoff_request(
         .ok();
         return HandoffSessionOutcome::Answered;
     }
-    // 6. The audit row, written by the outgoing daemon before it exits — with
-    // the two protocol versions, the pane count, and the incoming daemon's pid
-    // is not yet known here, so the row carries this process's pid as the agent
-    // and the versions + panes in `detail` (the incoming daemon's own
-    // `handoff complete` line carries its pid for the operator).
+    let presented = match crate::handoff::recv_nonce(&conn, crate::handoff::DEFAULT_HANDOFF_TIMEOUT)
+    {
+        Ok(presented) => presented,
+        Err(detail) => {
+            failures.abort(db, &detail);
+            write_message(
+                writer,
+                &Message::Error {
+                    v: VERSION,
+                    message: format!("handoff aborted: {detail}"),
+                },
+            )
+            .await
+            .ok();
+            return HandoffSessionOutcome::Answered;
+        }
+    };
+    if presented != nonce {
+        let detail = "the transfer connection presented the wrong handoff nonce".to_string();
+        failures.abort(db, &detail);
+        write_message(
+            writer,
+            &Message::Error {
+                v: VERSION,
+                message: format!("handoff aborted: {detail}"),
+            },
+        )
+        .await
+        .ok();
+        return HandoffSessionOutcome::Answered;
+    }
+    // 5. The listener first, then the lock — the order is the contract.
+    use std::os::unix::io::AsFd;
+    if crate::handoff::send_one(&conn, ctx.listener_fd.as_fd()).is_err()
+        || crate::handoff::send_one(&conn, ctx.lock_fd.as_fd()).is_err()
+    {
+        let detail = "the descriptor transfer failed".to_string();
+        failures.abort(db, &detail);
+        write_message(
+            writer,
+            &Message::Error {
+                v: VERSION,
+                message: format!("handoff aborted: {detail}"),
+            },
+        )
+        .await
+        .ok();
+        return HandoffSessionOutcome::Answered;
+    }
+    // 6. Wait for the commit **marker byte**. It is *authorisation*, not proof
+    // that a server is behind it: only the process this daemon answered can
+    // know the nonce, so the byte says the requester is committing — whether it
+    // went on to accept anything is not something this side can see (see
+    // `handoff::wait_for_commit` for why a probe was rejected). End-of-stream is
+    // an abort: a peer that connected and half-closed never served anything, and
+    // committing on that left the socket with no listener.
+    if let Err(detail) =
+        crate::handoff::wait_for_commit(&conn, crate::handoff::DEFAULT_HANDOFF_TIMEOUT)
+    {
+        failures.abort(db, &detail);
+        write_message(
+            writer,
+            &Message::Error {
+                v: VERSION,
+                message: format!("handoff aborted: {detail}"),
+            },
+        )
+        .await
+        .ok();
+        return HandoffSessionOutcome::Answered;
+    }
+    // 7. The audit row, written by the outgoing daemon before it exits — with
+    // the two protocol versions, the pane count, and this process's pid as the
+    // agent (the incoming daemon's pid is not known here; its own
+    // `handoff complete` line carries it for the operator).
     crate::handoff::record_handoff(db, VERSION, incoming_protocol, panes, std::process::id());
-    // 7. Stop accepting. The accept loop ends after its current `accept` and
+    // 8. Stop accepting. The accept loop ends after its current `accept` and
     // drops *this* process's listener fd; the incoming daemon holds a dup, and
     // the socket file stays. This session returns `Committed` so the session
     // loop ends it — the caller (`main`) exits 0 after `serve` returns.
