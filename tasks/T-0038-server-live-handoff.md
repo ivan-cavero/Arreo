@@ -247,8 +247,18 @@ PTY masters over SCM_RIGHTS, re-opens SQLite and serves — a failed step kills 
 
 - [ ] **Stage 3 — clients reconnect transparently.** TUI + CLI attached through a stage-2 handoff
       reattach with an unchanged session id in < 2 s — flip `perf-budget.toml`'s recorded
-      `server_handoff_reattach_s` row to enforced and assert it in `xtask bench`. Resume tokens
-      stay valid, and input sent during the cut is acked once or refused as retryable.
+      `server_handoff_reattach_s` row to enforced. Resume tokens stay valid, and input sent during
+      the cut is acked once or refused as retryable.
+
+      **One criteria clarification, written down rather than silently reinterpreted:** the
+      criterion's "assert it in `xtask bench`" collides with this codebase's own precedent — the
+      comment on `reattach_after_absence_s` says it is asserted by a *test* that reads the row
+      from the file, because "bench measures load and this needs a relay plus a moved clock". A
+      handoff needs live daemons and a live client, so the same logic applies: **the slice is the
+      authority**, reading `server_handoff_reattach_s` from `perf-budget.toml` and asserting
+      against the number in the file. `xtask bench` measures load; it is not the home for a
+      two-daemon timing test. The row is flipped to enforced (`phase0 = true`) in the same change
+      that makes the slice pass.
 - [ ] **Stage 4 — abort leaves the old daemon whole.** Kill -9 the new daemon at three points
       (before fd transfer, mid-transfer, after ack before commit): every pane alive, old daemon
       serving, clients unaware, a retry succeeding — `flock` keeps exactly one serving daemon.

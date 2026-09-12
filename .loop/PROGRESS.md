@@ -1,38 +1,34 @@
 ## State snapshot          ← REWRITTEN (not appended) at every checkpoint
-Task: **T-0038 stage 2 — DONE** (`82933d8`): the panes cross the handoff. **T-0076 — DONE**
-(`e65221b`): the brand palette, state without colour, tested repaint budget. **T-0079 — filed**
-(p1): the 30-pane wall's ~9 s first frame.
-Where you are: 624 workspace tests / 0 failed (61 targets); clippy clean on both toolchains; fmt
-clean; **11 slices green** (tui 42, theme 33, relay 20/20 after a slice-assertion fix); bench 6/6;
-vet 336, deny 4/4, audit 0, check-targets PASS/SKIP. **The user's own task edits (T-0036 → todo,
-T-0063 → ownership notes + pasted runner logs) are in the working tree, uncommitted and untouched —
-theirs to land.**
-Next step: **T-0038 stage 3** — clients reconnect transparently: TUI + CLI attached through a
-stage-2 handoff reattach with an unchanged session id in < 2 s, flipping the perf-budget row to
-enforced. Read ADR 0021 §2c/§2d and note T-0077 (a timed-out handoff leaks the candidate's
-descendants — now *more* real, since stage 2's candidate adopts panes before committing) and
-T-0079 (the wall poller) if the queue order allows.
-Open workers: (none)
-Known broken: T-0063 (CI ubuntu leg, **the user is actively working it** — its file gained batch-2
-runner logs and an ownership boundary naming the handoff worker; do not touch) · Parked: T-0048 +
-T-0036 needs-human (T-0036 now `todo` per the user)
+Task: **T-0038 stage 3 (clients reattach across the handoff) IN FLIGHT** with worker `Stage3Clients`.
+Stages 1-2 are done and pushed; T-0076 is done; T-0079 (the 30-pane wall poller) is filed p1.
+Where you are: 624 tests / 61 targets, 11 slices green, bench 6/6, all gates green at the last
+commit (`82933d8`, `725ccfa`). The user's T-0036/T-0063 edits remain dirty in the tree, theirs.
+Next step: collect `Stage3Clients`, verify its slice and the CLI reattach independently, then the
+battery on the merged tree and commit stage 3.
+Open workers: **Stage3Clients** (CLI attach reconnect + the reattach slice + input-during-cut test
++ the budget flip; owns arreo-cli attach, arreo-tui if the measurement demands a fix, xtask slice,
+perf-budget.toml, tests/handoff.rs for the input test)
+Known broken: T-0063 (CI ubuntu leg — the user is actively working it; do not touch) · Parked:
+T-0048 + T-0036 needs-human (T-0036 now `todo` per the user)
+Stage 3's design, held by the planner:
+- **The daemon clamps `from_line`** (`min(cursor, len)`), so a client tracking an absolute line
+  count can resume after a disconnect: the clamp self-heals a stale cursor and cannot panic, and
+  stage 2 transferred the ring, so the same pane id serves continuous scrollback — which is why
+  "unchanged session id" is satisfiable at all.
+- **The TUI already reconnects** (shared `backoff_delay`, per-pane absolute cursors); whether it
+  meets 2 s across a real local handoff is unmeasured — that is the slice's job.
+- **The CLI's `attach` does NOT reconnect** — it is one-shot and dies at the cut. The real gap.
+- **The budget row's enforcement is the slice, not bench** — the criterion said "assert it in
+  `xtask bench`", which collides with the codebase's own precedent (`reattach_after_absence_s` is
+  asserted by a test reading the file because "bench measures load and this needs a relay plus a
+  moved clock"; a handoff needs live daemons and a live client, same logic). Clarification written
+  into the task file.
 Findings:
-- **A race test cannot pin a millisecond window — so the design removes the choice instead.**
-  Stage 2's "incoming daemon must not read before the commit" was first enforced by a caller
-  literal; a test that aborted a real handoff after adoption could not catch the mutant that
-  flipped it (the transfer completed first). The rule is now structural: `adopt_seeded` always
-  parks, no argument says otherwise. Same lesson as T-0070's hard link.
-- **The security review's two most valuable findings were availability and a path bug, and the
-  one I did not name was the worse.** Unbounded transfer writes let a peer that stops reading
-  freeze every agent indefinitely (reproduced: output frozen, thread wedged in the kernel send);
-  `guard_path` was adopted unvalidated and `Guard::drop` rmdirs — a hostile peer could delete an
-  arbitrary empty directory *and* serve the agent without its ceiling while reporting success.
-  Both fixed; the guard-path rule extracted from `create` so the two cannot disagree.
-- **A test that pins one exact rendering of a UI is a test that breaks at the next legitimate
-  retune.** The relay slice asserted a 20-column question cut; T-0076 retuned the indent and the
-  cut moved. Now it checks the contract (a sidebar-left question line bearing a cut mark).
-- **The user is working in the tree concurrently** — T-0036 flipped to `todo`, T-0063 gained
-  ownership notes naming my worker. Scoped staging is now load-bearing, not a nicety.
+- **A client that reconnects from `from_line: 0` would duplicate the ring** — the daemon's
+  clamp makes the absolute-cursor resume exact, and the slice must assert no duplicated line.
+- **"Assert it in bench" was wrong for the same reason a previous criterion was** — the second
+  time a stage criterion referenced a mechanism that does not fit the feature (stage 1's
+  `arreo status --json`, now this). Worth noticing as a pattern in the criteria-writing.
 ## Event log               ← append-only; newest last; never rewrite
 - 2026-09-10 [turn 1] ledger created; repo at e489fac (docs only); T-0001 + T-0022 (AGENTS.md gardened) done
 - 2026-09-10 [turn 2] T-0002 PTY manager done+pushed (342606c; 9 tests); PROMPT.md v2 synced + ADR 0001 (ef6c595)
@@ -164,3 +160,5 @@ Findings:
   ever checked. Also fixed: the relay slice's question-cut assertion (pinned old geometry; now
   checks the contract). The user's T-0036/T-0063 edits were left uncommitted — theirs. 624
   tests, 11 slices, bench 6/6, all gates green. Commits: e65221b (T-0076), 82933d8 (stage 2).
+
+- 2026-09-12 [turn 64] T-0038 stage 3 delegated (`Stage3Clients`): clients reattach across the handoff. Reconnaissance established the design before the worker started: the daemon clamps `from_line` (so an absolute-cursor resume self-heals and cannot panic), the TUI already reconnects with shared backoff and per-pane cursors (unmeasured against the 2 s row), and the **CLI's `attach` is one-shot — the real gap**. The criterion's "assert it in `xtask bench`" collides with the codebase's own precedent (a handoff needs live daemons and a live client; the slice is the authority, reading `server_handoff_reattach_s` from the file) — clarification written into the task file, the second time a stage criterion referenced a mechanism that does not fit. Also noted: reconnecting from `from_line: 0` would duplicate the ring; the absolute cursor is the exact resume.
