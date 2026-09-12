@@ -59,12 +59,19 @@ connection to the daemon.
   bytes it cannot decrypt; it also holds the machine directory and the pairing
   mailbox.
 - **The machine directory and pairing are how machines find each other.** You do
-  not configure IP addresses or SSH. On a machine that already belongs to the
-  account, `arreo pair` prints a four-word code; on the machine being added,
-  `arreo machines add` takes that code, does a SPAKE2 exchange, receives a device
-  certificate, and registers itself in the account's directory. Every later
-  connection is authenticated by that certificate. Run the relay yourself or don't
-  run one at all — a single machine needs no relay.
+  not configure IP addresses or SSH. An account's root key is its identity: the
+  relay accepts a device certificate only if it verifies under the key the account
+  was registered with. So the **first** machine makes that key, you register it at
+  your relay, and the machine admits itself (`arreo pair`, then `arreo pair --join`
+  with its own code). After that, adding a machine is one code: `arreo pair` on a
+  machine that already belongs prints four words, and `arreo machines add` on the
+  machine being added takes them, does a SPAKE2 exchange, receives a device
+  certificate, and registers itself in the directory. Every later connection is
+  authenticated by that certificate. Run the relay yourself or don't run one at
+  all — a single machine needs no relay.
+
+  The first-machine steps, with the exact commands and which half of the key to
+  paste where, are in [machines.md](machines.md#the-first-machine).
 
 ## First pane in 60 seconds
 

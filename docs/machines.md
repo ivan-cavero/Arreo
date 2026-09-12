@@ -139,6 +139,61 @@ tombstone expires. The output says until when. Two things make it deliberate:
 than accepted and ignored: the write verbs print one line, which is not a
 contract, and a write cannot answer from memory.
 
+## The first machine
+
+Everything below this section is about adding a machine to an account that
+already has one. This is how the first one gets there — and it is the step every
+account starts with, so it comes first.
+
+An account's root key *is* its identity: the relay accepts a device certificate
+only if it verifies under the key the account was registered with. So the order
+is: this machine makes the key, the relay is told the key, and then this machine
+admits **itself** as the account's first device.
+
+```console
+# 1. This machine makes its root key, and prints the public half.
+#    (Any verb that loads the identity does this; the fingerprint is what you want.)
+$ arreo devices list
+root 17d0a47fbfc70f63d1e9a44e2b1c933d51f6b0c8e4a927d3f1c05b8a6e2d4f709
+no devices paired yet (pair one, or issue from a public key)
+
+# 2. Register the account at your relay with that key.
+$ arreo-relay account add --state-dir /var/lib/arreo-relay \
+    --account my-account --root-key 17d0a47fbfc70f63d1e9a44e2b1c933d51f6b0c8e4a927d3f1c05b8a6e2d4f709
+
+# 3. This machine admits itself. Two steps, because the first one waits for a
+#    joiner — and here the joiner is step two, in another shell or the same one.
+$ arreo pair                                  # prints four words, then waits
+$ arreo pair --join "four word phrase" --uri 'arreo://pair?v=1&…' --name workbox
+
+# 4. Now the daemon can join the relay and assert this machine's directory row.
+$ arreo-server --socket ~/.local/share/arreo/arreo.sock --config /etc/arreo/arreo.toml
+arreo-server: directory: this machine is workbox
+```
+
+**Where the key lives, and which half you want.** The machine's identity directory
+holds two files that are easy to confuse:
+
+| File | Holds | Use |
+| --- | --- | --- |
+| `identity/root.key` | the **secret** seed (64 hex characters) | never leaves the machine |
+| `arreo devices list` → `root …` | the **public** key (64 hex characters) | this is what `account add --root-key` takes |
+
+Registering the secret by mistake is accepted by the relay and then fails much
+later, when a certificate is rejected for not verifying — a confusing place to
+learn about a mixup. `arreo devices list --json` carries the same public value as
+`.root` for scripts.
+
+A self-admitted machine is granted the **viewer** role by the pairing default.
+That is sufficient to observe it; grant more from the account's machines with
+`arreo machines trust` (see [Trust](#trust-who-may-use-this-machine) below) if you
+want this machine to drive other machines, or be driven. If the machine is the
+account's owner, it already holds the root, so it can issue itself any role:
+
+```console
+$ arreo pair --role owner            # on step 3, instead of the default
+```
+
 ## Joining: `add`
 
 ```console

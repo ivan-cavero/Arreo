@@ -688,9 +688,19 @@ async fn handle_connection(connection: Connection, router: Arc<Router>) -> Resul
         .await;
     }
     let Some(root_bytes) = router.store.account_root(&hello.account_id)? else {
+        // **The refusal names the fix, because this is the first thing a new
+        // installation gets wrong** (T-0066: the exit criterion is that a stranger
+        // reaches two machines "without docs help"). An account exists only once
+        // an operator registers one *with its root public key*, and the machine
+        // that will own it is the one holding the matching secret — so the
+        // sentence has to say where that public key comes from, not just that the
+        // account is missing.
         eprintln!(
-            "arreo-relay: refused {peer}: unknown account {}",
-            hello.account_id
+            "arreo-relay: refused {peer}: unknown account {} — register it on this host with \
+             `arreo-relay account add --state-dir <the dir this relay serves from> --account \
+             {} --root-key <the account's root PUBLIC key>`; a machine prints its own with \
+             `arreo devices list` (the `root …` line)",
+            hello.account_id, hello.account_id
         );
         router.record(
             crate::audit::RelayAuditEvent::new(
@@ -706,7 +716,12 @@ async fn handle_connection(connection: Connection, router: Arc<Router>) -> Resul
         return refuse_hello(
             &mut send,
             &connection,
-            format!("unknown account {}", hello.account_id),
+            format!(
+                "unknown account {}: this relay has no such account. Register it on the relay's \
+                 host with `arreo-relay account add --account {} --root-key <the account's root \
+                 PUBLIC key>` — a machine prints its own with `arreo devices list`",
+                hello.account_id, hello.account_id
+            ),
         )
         .await;
     };

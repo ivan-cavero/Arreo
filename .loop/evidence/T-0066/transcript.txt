@@ -1,37 +1,46 @@
-T-0066 — the exit criterion, exercised (final)
-==============================================
+T-0066 — the first machine: every documented command executed
+==========================================================
 
-Timed, from empty dirs, following only named steps. 8 s to the last step.
 
-## What works
-  - relay + account registration (once the root PUBLIC key is used)
-  - machine A admits itself: a certificate is issued and saved (3.5 s)
+$ arreo devices list        # step 1: makes the key, prints the public half
+root 329d4dd87619449fe6ad6244bea3b20ff9f0f1f52f8c4d13a3e2fe5b93d2c0e3
+DEVICE                               NAME             ROLE    SERIAL  STATUS
+   (json .root matches: yes)
 
-## What fails, in order
+$ arreo-relay account add --root-key <that>
+registered account my-account with root key 329d4dd87619449fe6ad6244bea3b20ff9f0f1f52f8c4d13a3e2fe5b93d2c0e3
 
-1. The account root public key is not discoverable.
-   'arreo devices list' prints 'root 17d0a47fbfc70f63...' - TRUNCATED.
-   identity/root.key holds the SECRET seed, so registering it fails later with
-   'certificate signature does not verify under the root key' - a confusing,
-   late, and dangerous-looking failure. The full value exists only in
-   'devices list --json' ({"root": ...}), which no document mentions for this.
+$ arreo pair --role owner        # step 3, with the owner role
 
-2. Even with the account registered from this machine's own root public key,
-   the daemon's relay registration is REFUSED:
-     arreo-server: relay registration failed: the peer's certificate does not
-     authorize it: certificate signature does not verify under the root key
-   The daemon reports the same root the account was registered with
-   (b7982e04edd07dc1...), so this is not a path mismatch. The self-admitted
-   certificate is not verifiable against the account root. Diagnosis continues;
-   the mesh slice's certs (issued in-process via DeviceCert::issue with the
-   account root) DO verify, so the difference is in the pairing issuance path.
+$ arreo pair --join "island beaver gravel delta" --uri ... --name workbox
+paired with this server as owner (dev_e64bc4391815d35c8cee54c054c2a5bf)
+certificate: /tmp/docverify-3856999/id/identity/devices/e64bc4391815d35c8cee54c054c2a5bf.cert
 
-3. The relay's handshake budget masks all of the above.
-   Once a machine retries, 127.0.0.1 exceeds 3 handshakes/10 s and the error
-   becomes 'the server refused to accept a new connection' - which reads as a
-   network problem, not a certificate problem. On loopback (one IP) a stranger
-   testing the flow hits this immediately.
+$ arreo-server --socket ... --config ...    # step 4
+directory: this machine is workbox
+relay session up as dev_e64bc4391815d35c8cee54c054c2a5bf (account my-account, relay 127.0.0.1:25497)
 
-## Verdict
-The exit criterion FAILS, and the failure is in the product, not only the docs.
-Script: exit-criterion.sh (run it to reproduce).
+$ the role the account recorded
+dev_68f1cbc9dabfcdbbf79c3b239877a1bf workbox          owner       93  never seen
+dev_e64bc4391815d35c8cee54c054c2a5bf workbox          owner       98  never seen
+
+== and the 'without docs help' pass: what a stranger is told when the account is missing ==
+
+=== the machine's operator sees ===
+arreo-server: relay registration failed (127.0.0.1:26867): relay client: the relay refused the 
+session: unknown account never-registered: this relay has no such account. Register it on the 
+relay's host with `arreo-relay account add --account never-registered --root-key <the account's 
+root PUBLIC key>` — a machine prints its own with `arreo devices list`
+
+=== the relay's operator sees ===
+arreo-relay: refused 127.0.0.1:48919: unknown account never-registered — register it on this 
+host with `arreo-relay account add --state-dir <the dir this relay serves from> --account 
+never-registered --root-key <the account's root PUBLIC key>`; a machine prints its own with 
+`arreo devices list` (the `root …` line)
+
+== the criterion itself ==
+NAME                     PRESENCE     LAST SEEN   PROTO
+machine-a                online              now     0  
+machine-b                online              now     0  
+
+=== TOTAL: 1s (budget 300) ===

@@ -171,11 +171,17 @@ arreo-server ──outbound QUIC──▶ arreo-relay ◀──outbound QUIC─�
                                   · durable per-device inbox
 ```
 
-Pairing is a four-word code shown on the machine that already belongs; the device
-being added proves it saw that screen through SPAKE2, and receives a certificate
-signed by the account root. Later connections authenticate the certificate, and each
-machine keeps its **own** trust ledger deciding which devices it will serve — so a
-phone paired to one machine is not automatically trusted by another.
+The **first** machine in an account makes the account's root key and admits itself:
+`arreo devices list` prints the public half, you register it at your relay
+(`arreo-relay account add --root-key …`), and then `arreo pair` followed by
+`arreo pair --join` with its own code issues it a certificate. After that, pairing is
+a four-word code shown on the machine that already belongs; the device being added
+proves it saw that screen through SPAKE2, and receives a certificate signed by the
+account root. Later connections authenticate the certificate, and each machine keeps
+its **own** trust ledger deciding which devices it will serve — so a phone paired to
+one machine is not automatically trusted by another. The exact commands, and which
+half of the key goes where, are in
+[docs/machines.md § The first machine](docs/machines.md#the-first-machine).
 [docs/machines.md](docs/machines.md) is the reference; [docs/relay-deploy.md](docs/relay-deploy.md)
 is how to run the relay; [docs/relay-protocol.md](docs/relay-protocol.md) is the wire.
 

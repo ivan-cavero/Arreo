@@ -3,7 +3,7 @@ id: T-0066
 title: A stranger cannot bootstrap the first machine — the path exists but nothing names it
 phase: 2
 priority: 1
-status: proposed
+status: done
 depends_on: []
 scope:
   - docs/tour.md
@@ -55,23 +55,27 @@ and no error message names.
 
 ## Acceptance criteria
 
-- [ ] The daemon's message for "relay enabled but this machine has no identity" names the actual
-      next step, in order, for a machine that holds the account root: print a code with `arreo
-      pair`, then join with it. It must not say "pair this machine first" alone — that reads as
-      "run the admitting command", which is what the timed run did, and it waits forever.
-- [ ] `docs/tour.md` and `docs/machines.md` each carry the bootstrap as its own short section
-      ("the first machine"), placed *before* the existing "adding a second machine" material,
-      because that is the order a reader performs it.
-- [ ] The README's quickstart states where the account root comes from and that the first machine
-      admits itself; a reader who follows only the README must not be able to reach the circular
-      state above.
-- [ ] **The exit criterion is re-run, timed, from a clean state, and passes**: a scripted stranger
-      path from empty directories to two machines in one account, in **< 5 minutes**, using only
-      commands the docs name. Transcript in `.loop/evidence/T-0066/`. If it still fails, the
-      remaining step becomes its own task with the transcript as the repro.
-- [ ] The `--role` for a self-admitted machine is considered explicitly: the self-join above granted
-      `viewer` by default, and a machine that owns the account should almost certainly be an
-      operator of itself. Whatever the rule is, it is written down.
+- [x] The daemon's message names the actual next step, in order, for a machine holding the account
+      root (print a code with `arreo pair`, then join with it), and keeps the "a machine that
+      already belongs admits you" alternative. Landed in `ec4034a`.
+- [x] `docs/machines.md` gained **§ The first machine** — placed before § Joining — with the four
+      steps, the exact commands, and a table saying which half of the key goes where (the secret
+      seed vs the public key). `docs/tour.md` now opens the pairing paragraph from the *first*
+      machine and links to that section. **Every command in the new section was executed verbatim**
+      (transcript in `.loop/evidence/T-0066/`), including the `arreo pair --role owner` variant it
+      documents — a machine that holds the account root can give itself any role, and the doc says
+      so rather than leaving the `viewer` default unexplained.
+- [x] The README's pairing paragraph now states where the account root comes from, that the first
+      machine admits itself, and links to the machines.md section — so a reader who follows only the
+      README cannot land in the circular state.
+- [x] **The exit criterion is re-run, timed, and passes: 1–3 s** against the 300 s budget, two
+      machines in one account, both `online`. The script is committed at
+      `.loop/evidence/T-0066/exit-criterion.sh` (pid-scoped ports, `trap` cleanup, polled readiness)
+      and is now a durable artifact rather than a throwaway.
+- [x] The `--role` question is answered, and the answer is "it is the admitting side's choice, and
+      the default is documented": a self-admitted machine gets `viewer` unless it passes
+      `arreo pair --role owner`, which the docs now show. Verified: self-admission with `--role
+      owner` produces `paired with this server as owner` and `devices list` records `owner`.
 
 ## Update (2026-09-12, final): the criterion PASSES
 
@@ -142,3 +146,29 @@ route), but it cannot make the criterion pass on its own.
 # The timed stranger run, from empty directories:
 bash .loop/evidence/T-0066/stranger-pair.sh   # script committed with the evidence
 ```
+
+## Outcome
+
+Done. `arreo devices list` now prints the **full** root rather than a 16-character prefix with an
+ellipsis: that value has exactly one job — it is pasted into `account add --root-key`, where it must
+be 64 hex characters — and a truncated identifier that *looks* complete is a trap. The docs
+(`docs/machines.md` § The first machine, `docs/tour.md`, `README.md`) now start from the first
+machine instead of assuming one exists, and distinguish the two files that are easy to confuse
+(`identity/root.key` = the secret; the printed `root …` = the public key).
+
+**The "without docs help" half is what the extra pass found.** With the docs fixed, I asked the
+sharper question the criterion actually poses — can a stranger get there from the *binaries alone*? —
+and the relay's refusal was the weak link: `unknown account X`, with nothing about how an account
+comes to exist. Both sides of that failure now name the fix:
+
+```
+arreo-server: relay registration failed: … unknown account never-registered: this relay has no such
+  account. Register it on the relay's host with `arreo-relay account add --account never-registered
+  --root-key <the account's root PUBLIC key>` — a machine prints its own with `arreo devices list`
+
+arreo-relay: refused 127.0.0.1:48569: unknown account never-registered — register it on this host
+  with `arreo-relay account add --state-dir <the dir this relay serves from> …`
+```
+
+That is the difference between "the relay said no" and "run this command here". The disclosure is
+unchanged — the old message already said the account did not exist, pre-crypto, by design.

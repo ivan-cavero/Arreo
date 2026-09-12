@@ -1921,7 +1921,14 @@ fn devices_list(socket: &std::path::Path, json: bool, show: DeviceFilter) -> Exi
         );
         return ExitCode::SUCCESS;
     }
-    println!("root {}…", &authority.root_fingerprint()[..16]);
+    // **The full root, not a truncation** (T-0066). This value has exactly one
+    // job: the operator pastes it into their relay to register the account
+    // (`account add --root-key …`), and it must be 64 hex characters there. A
+    // 16-character prefix with an ellipsis *looks* like a complete answer, so it
+    // gets copied, and the relay then refuses it — a stumble at the first step of
+    // the first-machine path, with the working value hidden behind a flag nobody
+    // mentioned. `--json` still carries the same value for scripts.
+    println!("root {}", authority.root_fingerprint());
     if devices.is_empty() {
         println!(
             "{}",
