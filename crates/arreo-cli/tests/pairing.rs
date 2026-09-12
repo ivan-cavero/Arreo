@@ -774,7 +774,9 @@ fn a_self_admitted_machine_gets_a_certificate_the_root_signs() {
         "the certificate must name the key this machine holds"
     );
     cert.verify(&root.public(), &key.public())
-        .unwrap_or_else(|e| panic!("a self-admitted certificate must verify under the root that signed it: {e}"));
+        .unwrap_or_else(|e| {
+            panic!("a self-admitted certificate must verify under the root that signed it: {e}")
+        });
 
     // **And the half the unit check above cannot see: the daemon must be able to
     // register with the relay using that certificate.** That is where the
@@ -790,21 +792,16 @@ fn a_self_admitted_machine_gets_a_certificate_the_root_signs() {
     )
     .expect("config");
     let socket = machine.join("daemon.sock");
-    let server_daemon = Command::new(
-        arreo()
-            .parent()
-            .expect("target dir")
-            .join("arreo-server"),
-    )
-    .arg("--socket")
-    .arg(&socket)
-    .arg("--config")
-    .arg(&config)
-    .env("ARREO_IDENTITY_DIR", &machine)
-    .stdout(Stdio::null())
-    .stderr(Stdio::piped())
-    .spawn()
-    .expect("the daemon starts");
+    let server_daemon = Command::new(arreo().parent().expect("target dir").join("arreo-server"))
+        .arg("--socket")
+        .arg(&socket)
+        .arg("--config")
+        .arg(&config)
+        .env("ARREO_IDENTITY_DIR", &machine)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("the daemon starts");
     let mut daemon = Guard::new(server_daemon);
     let daemon_stderr = daemon.0.stderr.take().expect("daemon stderr");
     let mut daemon_reader = BufReader::new(daemon_stderr);

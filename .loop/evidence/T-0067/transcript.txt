@@ -1,21 +1,16 @@
-T-0067 — pinning has two answers
-=================================
+T-0067 — pinning has two answers: FIXED
+======================================
 
-Reproduced on a clean box (all stray relays killed first):
+Before (fresh socket, certificate on disk, store empty):
+  devices list -> 'no devices paired yet'
+  machines trust -> '... is not pinned on this machine, so a grant would do nothing
+                    (it could not authenticate here)'   <- false
 
-  $ arreo devices list --socket $D/a/fresh.sock
-  no devices paired yet (pair one, or issue from a public key)
+After:
+  devices list -> dev_09a94313... machine-a viewer 83 never seen
+  machines trust -> dev_09a94313... may now observe on vmi3525064
 
-  $ arreo machines trust dev_09a94313... --yes --socket $D/a/fresh.sock
-  machines trust: dev_09a94313... is not pinned on this machine, so a grant would
-  do nothing (it could not authenticate here). Pin it first: ...
+Mutation (devices() reverted to store-only) fails the new test:
+  a verified certificate on disk is a pin, even with no row in this store: []
 
-Both false: the certificate is on disk, verifies under this machine's root, and the
-authority's index (what the handshake consults) includes it -- a daemon at that same
-socket authenticates the device normally.
-
-Cause: authorization reads store + disk ('reload' adds disk certs to the index and says
-so), while 'devices list' and 'machines trust' read DeviceAuthority::devices() = store only.
-
-Harness note: the earlier 'certificate does not verify' report was a leaked-relay bug in
-the exit-criterion script (fixed ports, no kill), not the product. See the task file.
+Script: pinning-two-answers.sh

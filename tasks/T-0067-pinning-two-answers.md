@@ -3,7 +3,7 @@ id: T-0067
 title: "Pinning has two answers — `devices list` and `machines trust` read the store, authorization reads the store + disk"
 phase: 2
 priority: 2
-status: proposed
+status: done
 depends_on: []
 scope:
   - crates/arreo-core/src/identity/authority.rs
@@ -49,21 +49,27 @@ includes it, which is why a daemon at that same socket authenticates the device 
 
 ## Acceptance criteria
 
-- [ ] The question "is this device pinned here?" is answered by **one** function on
-      `DeviceAuthority`, and both the listing and `machines trust`'s pre-flight use it. Whether that
-      function reads the index, the store, or both is a decision to write down — with the argument,
-      because it is a policy question and not just a refactor: *does a verified certificate on disk
-      constitute a pin?*
-- [ ] `arreo devices list` and `arreo machines trust` agree with authorization: a device the daemon
-      would authenticate as pinned is listed, and is grantable.
-- [ ] A refusal's message is true. `pinned_here`'s current sentence — "it could not authenticate
-      here" — must not be printed for a device whose certificate verifies.
-- [ ] A test covers the mismatched-socket shape that produced this: `pair` on the default socket, a
-      daemon (or a listing) on an explicit one, asserting the device is visible and grantable. The
-      third case is the one nobody tests today: the store *empty* and the cert dir *populated*.
-- [ ] No regression for the ordinary case: `crates/arreo-server/tests/trust.rs` (local trust) and
-      `crates/arreo-cli/tests/machines.rs` stay green, and T-0059's "refuses an unpinned device so a
-      typo is caught" still refuses a device that genuinely has no certificate here.
+- [x] One function answers it, and both readers use it. **The decision, written down: a verified
+      certificate on disk *is* a pin.** The authority's own index already said so (see `reload`), and
+      the sibling test `a_certificate_file_without_a_store_row_is_pinned_for_both_doors` had already
+      pinned that intent for the two authorization doors — the listing was simply never included.
+      So `DeviceAuthority::devices()` now returns the **union**: the store's records (which carry
+      what a certificate cannot — `revoked`, `retired_to`, `last_seen_ms`, so revocation keeps its
+      meaning), plus the index's ids the store does not know.
+- [x] `arreo devices list` and `arreo machines trust` agree with authorization: verified against the
+      reproduction — at a fresh socket the device is now listed, and
+      `machines trust <id> --yes` reports `may now observe on <machine>` instead of refusing.
+- [x] The false refusal is gone: `pinned_here` consults `devices()`, so the sentence is no longer
+      reachable for a device whose certificate verifies. (The wording itself is unchanged, because it
+      is now accurate for every case that reaches it.)
+- [x] A test covers the mismatched-store shape: `a_certificate_on_disk_is_pinned_even_with_no_row_in_this_store`
+      issues through one store and reads back through a second authority that shares the certificate
+      directory but opens a *different* store — the explicit-`--socket` shape — asserting the device
+      is both authoritative and listed. **Proved load-bearing by mutation**: reverting `devices()` to
+      store-only fails it with an empty list.
+- [x] No regression: the full workspace suite is green, including `crates/arreo-server/tests/trust.rs`,
+      `crates/arreo-cli/tests/machines.rs` and T-0059's "refuses an unpinned device so a typo is
+      caught" (which still refuses a device with no certificate *and* no row — the case it is about).
 
 ## Notes
 
@@ -94,3 +100,13 @@ cargo test -p arreo-cli --test pairing
 cargo test -p arreo-cli --test machines
 cargo test -p arreo-server --test trust
 ```
+
+## Outcome
+
+Fixed. `DeviceAuthority::devices()` returns the union of the store and the index, so "is this device
+pinned here?" has one answer and the listing, `machines trust`'s pre-flight and the handshake all
+give it. Verified against the original reproduction and by mutation.
+
+The change is small and deliberately conservative: the store still wins on every id it knows, so
+revocation and retirement are untouched (a revoked device stays revoked in the listing, which is what
+`devices list --revoked` is for), and the index only contributes ids the store has never heard of.

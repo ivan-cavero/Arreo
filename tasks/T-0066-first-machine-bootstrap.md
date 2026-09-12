@@ -73,7 +73,36 @@ and no error message names.
       `viewer` by default, and a machine that owns the account should almost certainly be an
       operator of itself. Whatever the rule is, it is written down.
 
-## Update (2026-09-12, after exercising the criterion)
+## Update (2026-09-12, final): the criterion PASSES
+
+Exercised with `.loop/evidence/T-0066/exit-criterion.sh` — pid-scoped ports, `trap`-killed relay,
+poll-for-readiness, account registered from `devices list --json`:
+
+```
+--- 3. machine A's daemon registers with the account's relay
+directory: this machine is machine-a
+--- 5. machine B joins — it has NO config and NO identity of its own
+joined as dev_9970bf3c4ec096903811f3cb4a1e718c (machine-b)
+--- 6. the account lists both machines
+machine-a                online              now
+machine-b                online              now
+=== TOTAL: 1s (budget 300) ===
+```
+
+**1 second against the 300 s budget**, both machines listed and online. The self-admission
+mechanism works; the two earlier "failures" were my harness (a leaked relay on a fixed port, and
+registering the *secret* seed as the account root). See T-0067 for that correction.
+
+What remains from this task is therefore the **discoverability** half — and the evidence for it is
+now precise rather than guessed:
+
+1. The daemon message (fixed this turn) names the two-step self-admission.
+2. `devices list` prints the root **truncated**, so a stranger cannot get the account root from the
+   human output; `--json` carries it, and no document says so. **This is the remaining gap.**
+3. The docs describe adding a *second* machine before ever establishing a first — `docs/machines.md`
+   starts from "the admitting side must already belong".
+
+## Earlier update (2026-09-12, mid-investigation)
 
 The timed run was completed and it found more than a documentation gap. Recording it here because
 this task owns the exit criterion:

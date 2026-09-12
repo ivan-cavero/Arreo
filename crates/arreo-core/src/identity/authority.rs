@@ -214,14 +214,36 @@ impl DeviceAuthority {
         self.root.public_hex()
     }
 
+    /// Every device pinned on this machine, in id order.
+    ///
+    /// **The union of the store and the disk** (T-0067). These are two sources
+    /// for one fact, and they genuinely disagree:
+    ///
+    /// - the store carries what a certificate cannot — `revoked`, `retired_to`,
+    ///   `last_seen_ms` — and is therefore the only place a revocation is
+    ///   recorded;
+    /// - the certificate directory is where a pairing *puts* a certificate, and
+    ///   the authority's own index already treats a verified certificate there as
+    ///   a pinned device (see [`Self::reload`], which says so in as many words).
+    ///
+    /// Reading only the store made the two answers disagree: a device whose
+    /// certificate landed on disk without a row in *this* socket's store — which
+    /// is what happens whenever `arreo pair` runs against the default socket and
+    /// the daemon against an explicit one — would authenticate fine and be
+    /// reported as not pinned, by a message that even claimed it "could not
+    /// authenticate here". That sentence was false, and the operator it was shown
+    /// to had no way to tell.
+    ///
+    /// The store wins on every id it knows (so revocation keeps its meaning); the
+    /// index contributes the ids it knows and the store does not.
     #[must_use]
     pub fn devices(&self) -> Vec<DeviceRecord> {
-        let mut out: Vec<DeviceRecord> = self
-            .store
-            .devices()
-            .unwrap_or_default()
-            .into_iter()
-            .collect();
+        let mut out: Vec<DeviceRecord> = self.store.devices().unwrap_or_default();
+        for record in self.index.iter() {
+            if !out.iter().any(|known| known.id == record.id) {
+                out.push(record.clone());
+            }
+        }
         out.sort_by(|a, b| a.id.cmp(&b.id));
         out
     }
@@ -692,6 +714,63 @@ mod tests {
         assert_eq!(record.role, Role::Viewer);
         assert_eq!(authority.role_of(cert.device()), Some(Role::Viewer));
         std::fs::remove_dir_all(root).ok();
+    }
+
+    /// **T-0067: a certificate on disk is a pin, even when this store has no row
+    /// for it.**
+    ///
+    /// The mismatched-store shape, in one test: a certificate is issued through
+    /// one store (the default socket, say) and then read back through a second
+    /// authority that shares the certificate directory but opens a *different*
+    /// store (an explicit `--socket`). That is an ordinary deployment, and it used
+    /// to report the device as absent — while the same authority would happily
+    /// authenticate it, because the index reads disk certificates and the listing
+    /// did not.
+    #[test]
+    fn a_certificate_on_disk_is_pinned_even_with_no_row_in_this_store() {
+        let (layout, root) = scratch("two-sources");
+        // Issued through the first authority: certificate on disk, row in its store.
+        let device = key();
+        let cert = {
+            let mut first = DeviceAuthority::load(layout.clone()).expect("first authority");
+            first
+                .issue("pixel-7", Role::Viewer, &device.public())
+                .expect("issue")
+        };
+        assert!(cert.verify(&first_root(&layout), &device.public()).is_ok());
+
+        // A second authority, same certificate directory, a different store — the
+        // explicit-`--socket` shape.
+        let second_layout = Layout {
+            root_key: layout.root_key.clone(),
+            cert_dir: layout.cert_dir.clone(),
+            store: root.join("another.sock.db"),
+        };
+        let mut second = DeviceAuthority::load(second_layout).expect("second authority");
+
+        // It authenticates the device (that always worked)...
+        assert!(
+            second.device(cert.device()).is_some(),
+            "the certificate on disk must authorize the device"
+        );
+        // ...and now it reports it too, so `devices list` and `machines trust`
+        // agree with the handshake instead of denying the device exists.
+        let listed = second.devices();
+        assert!(
+            listed.iter().any(|record| &record.id == cert.device()),
+            "a verified certificate on disk is a pin, even with no row in this \
+             store: {:?}",
+            listed.iter().map(|r| r.id.clone()).collect::<Vec<_>>()
+        );
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// The root public key a `scratch` layout was loaded with, for verifying what
+    /// a test issued.
+    fn first_root(layout: &Layout) -> VerifyingKey {
+        RootKey::load_or_generate(&layout.root_key)
+            .expect("root key")
+            .public()
     }
 
     /// A revoked device cannot be re-pinned: the pairing flow issues through
