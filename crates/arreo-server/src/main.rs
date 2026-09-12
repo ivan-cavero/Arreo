@@ -150,10 +150,29 @@ async fn main() {
                     tokio::spawn(arreo_server::relay_client::run(settings, context));
                 }
                 Err(e) => {
+                    // **The one moment a stranger is stuck, so the message names the
+                    // actual next step** (T-0066). It used to say "pair this machine
+                    // first (arreo pair)", which reads as "run the admitting
+                    // command" — and `arreo pair` on its own prints a code and then
+                    // waits for a joiner, so following that advice costs the full
+                    // TTL (300 s) and ends in "the pairing window closed". The
+                    // machine that holds the account root can admit *itself*; the
+                    // message has to say so, and say that the code must be used.
                     eprintln!("arreo-server: relay enabled but this machine has no identity: {e}");
                     eprintln!(
-                        "arreo-server: pair this machine first (arreo pair), or set \
-                         enabled = false"
+                        "arreo-server: a machine joins an account by pairing, which needs a code \
+                         from a machine that already belongs. If this machine holds the account \
+                         root (the key the relay registered the account with), it admits itself — \
+                         in two steps, because the first one waits:"
+                    );
+                    eprintln!("arreo-server:   arreo pair                       # prints four words, then waits");
+                    eprintln!(
+                        "arreo-server:   arreo pair --join \"<the four words>\" --uri \"<the invite>\""
+                    );
+                    eprintln!(
+                        "arreo-server: otherwise run `arreo pair` on a machine that already belongs \
+                         and `arreo machines add <the four words> --uri <the invite>` here. \
+                         (`enabled = false` runs this machine without a relay.)"
                     );
                     std::process::exit(1);
                 }

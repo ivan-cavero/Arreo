@@ -1,22 +1,37 @@
-T-0066 — Phase 2's exit criterion, exercised
-=============================================
+T-0066 — the exit criterion, exercised (final)
+==============================================
 
-ROADMAP §6: 'a stranger pairs a second machine in < 5 min without docs help'
+Timed, from empty dirs, following only named steps. 8 s to the last step.
 
-## Attempt 1: the documented flow, timed (303 s, FAILED)
+## What works
+  - relay + account registration (once the root PUBLIC key is used)
+  - machine A admits itself: a certificate is issued and saved (3.5 s)
 
-Following only the docs: relay + account + config + daemon. The daemon refused to
-join the relay and told the operator to 'pair this machine first (arreo pair)'.
-Running 'arreo pair' waited the full 300 s TTL for a joiner that never comes:
-  {"paired":false,"reason":"the pairing window closed while waiting for slot B"}
+## What fails, in order
 
-## Attempt 2: the mechanism does exist — self-admission (3.5 s)
+1. The account root public key is not discoverable.
+   'arreo devices list' prints 'root 17d0a47fbfc70f63...' - TRUNCATED.
+   identity/root.key holds the SECRET seed, so registering it fails later with
+   'certificate signature does not verify under the root key' - a confusing,
+   late, and dangerous-looking failure. The full value exists only in
+   'devices list --json' ({"root": ...}), which no document mentions for this.
 
-  code=[button scroll silver quilt]
-  paired with this server as viewer (dev_2f0e21f000a4bf7752559742dcf57649)
-  certificate: /tmp/boot2/a/identity/devices/2f0e21f000a4bf7752559742dcf57649.cert
+2. Even with the account registered from this machine's own root public key,
+   the daemon's relay registration is REFUSED:
+     arreo-server: relay registration failed: the peer's certificate does not
+     authorize it: certificate signature does not verify under the root key
+   The daemon reports the same root the account was registered with
+   (b7982e04edd07dc1...), so this is not a path mismatch. The self-admitted
+   certificate is not verifiable against the account root. Diagnosis continues;
+   the mesh slice's certs (issued in-process via DeviceCert::issue with the
+   account root) DO verify, so the difference is in the pairing issuance path.
 
-Conclusion: a discoverability defect, not a missing capability. The one step a
-stranger must take first is named by no document and no error message.
+3. The relay's handshake budget masks all of the above.
+   Once a machine retries, 127.0.0.1 exceeds 3 handshakes/10 s and the error
+   becomes 'the server refused to accept a new connection' - which reads as a
+   network problem, not a certificate problem. On loopback (one IP) a stranger
+   testing the flow hits this immediately.
 
-Scripts: stranger-pair.sh (attempt 1), self-admit.sh (attempt 2).
+## Verdict
+The exit criterion FAILS, and the failure is in the product, not only the docs.
+Script: exit-criterion.sh (run it to reproduce).

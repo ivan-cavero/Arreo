@@ -1,0 +1,19 @@
+T-0067 — a self-admitted certificate that nothing can verify
+==========================================================
+
+Reproduction (from empty dirs, one box):
+  1. devices list --json -> root R
+  2. relay account add --root-key R -> accepted
+  3. pair (print code) then pair --join (its own code) -> 'paired ... certificate: <path>'
+  4. devices list --socket -> 'no devices paired yet', with TWO certs in identity/devices/
+  5. daemon -> 'relay registration failed: ... certificate signature does not verify
+     under the root key', retrying forever
+
+Cross-check (the obvious explanation is ruled out):
+  relay.db account.root_key   = b7982e04edd07dc116f300e2c6cf248bb824a7570f841e7cd5b219f70374681a
+  devices list --json .root   = b7982e04edd07dc116f300e2c6cf248bb824a7570f841e7cd5b219f70374681a
+  -> identical. The cert is not signed by the registered root.
+
+Established: issuance path (authority.rs:268 signs with self.root; main.rs:2679 calls it),
+not key resolution. What is NOT established: which of the two differs at issue time, or whether
+the signed payload differs from what DeviceCert::verify recomputes. See the task file.

@@ -73,6 +73,27 @@ and no error message names.
       `viewer` by default, and a machine that owns the account should almost certainly be an
       operator of itself. Whatever the rule is, it is written down.
 
+## Update (2026-09-12, after exercising the criterion)
+
+The timed run was completed and it found more than a documentation gap. Recording it here because
+this task owns the exit criterion:
+
+1. **The account root public key is effectively undiscoverable.** `arreo devices list` prints
+   `root 17d0a47fbfc70f63…` — truncated. `identity/root.key` holds the **secret** seed, and the relay
+   rejects it as `--root-key` (or worse, accepts the wrong thing and fails later). The full value
+   exists only in `devices list --json` (`{"root": …}`), which no document names for this purpose.
+2. **Self-admission produces a certificate nothing can verify** — including the issuing machine's own
+   authority and the relay, *with the account registered from this machine's own root public key*
+   (verified byte-identical in the relay's database). Filed as **T-0067** with the reproduction; it
+   is the actual blocker, and it is a product bug rather than a doc bug.
+3. **The relay's handshake budget masks it**: after a few retries, `127.0.0.1` exceeds 3 handshakes
+   per 10 s and the message becomes "the server refused to accept a new connection" — a network-shaped
+   error for a certificate problem.
+
+So the criterion's fix is **T-0067 first**, then this task's documentation half, then the timed re-run.
+The docs work here is still worth doing (a stranger should not have to discover the root-public-key
+route), but it cannot make the criterion pass on its own.
+
 ## Notes
 
 - **Why p1:** it is the Phase 2 exit gate, it is cheap to fix, and the repo is public — a stranger
