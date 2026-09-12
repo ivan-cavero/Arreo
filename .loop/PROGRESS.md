@@ -1,30 +1,35 @@
 ## State snapshot          ← REWRITTEN (not appended) at every checkpoint
-Task: **T-0065 · the lost refusal frame — DONE.** `RelayStream`'s drop aborted the one task that
-hands bytes to the session, so the frame written immediately before closing (every refusal path)
-never arrived. It now closes the write half and lets the task drain; the `Handle` is gone.
-Where you are: the two defects the mesh slice found (T-0064 hang, T-0065 lost frame) are **both
-fixed and pushed**, and T-0047's refusal assertion passes end to end — the operator gets
-`arreo machines trust … --yes`. The slice runs 11.9 s instead of 29 s. Then the Phase 2 exit
-criterion was exercised (§6) and it **fails for product reasons**, filed as T-0066 + T-0067:
-the root public key is undiscoverable (T-0066) and a self-admitted certificate verifies against
-nothing (T-0067, p1) — with the relay's handshake budget masking both on loopback.
-474 workspace tests green; clippy clean on both toolchains; fmt clean; 10 slices green.
-Next step: **T-0067** (diagnose and fix the unverifiable self-admitted certificate — the reproduction
-and what is/ isn't established are in the file). It blocks Phase 2's exit criterion. Then T-0066's
-documentation half, then the timed re-run of the exit criterion.
+Task: **T-0067 · pinning has two answers — DONE**, and the task it came out of (T-0066) is
+resolved on the product side: **Phase 2's exit criterion passes** — two machines in one account in
+**1–3 s** against the 300 s budget, both listed `online`.
+Where you are: the self-admission bootstrap is tested for the first time
+(`a_self_admitted_machine_gets_a_certificate_the_root_signs` — real relay, real account, then a
+daemon that must register), `DeviceAuthority::devices()` is the union of the store and the disk so
+"is this device pinned here?" has one answer, and the earlier "certificate does not verify" report
+was corrected: it was my harness (a leaked relay on a fixed port holding a previous run's account),
+not the product.
+476 workspace tests green; clippy clean on both toolchains; fmt clean; 10 slices green
+(relay 20, mesh 16/1 skip, chaos 8, theme 27, tui 20, api, compat, lifecycle 2, persistence 3,
+enforcement); vet 336, deny 4/4, audit 0, check-targets PASS/SKIP; bench 6/6.
+Next step: **T-0066's documentation half** — the one real gap left in the criterion: `devices list`
+prints the account root **truncated**, `identity/root.key` holds the *secret*, and only
+`devices list --json` carries the value a stranger needs; no doc says so. Then T-0063 (p1, needs repo
+admin for the ubuntu CI log) and T-0048 (needs-human).
 Open workers: (none)
-Known broken: T-0067 (self-admitted cert unverifiable) · T-0063 (CI ubuntu leg, needs admin) ·
-Parked: T-0048 needs-human (launch decision), T-0036 needs-human (signing key custody)
+Known broken: T-0063 (CI ubuntu leg, needs admin) · Parked: T-0048 + T-0036 needs-human
 Findings:
-- **A destructor that aborts work loses data** (T-0065): `Drop` called `forward.abort()`, killing
-  the task holding the last frame. Closing instead of aborting lets it finish.
-- **A local-only test suite cannot see a transport-shaped bug**: T-0046's refusals were all tested
-  on a socket with no forwarding task, so the sentence never had to travel.
-- **Two bugs can hide each other**: the hang (T-0064) masked the loss (T-0065).
-- **A check that cannot fail is not evidence** (T-0034): mutating the relay to log every payload it
-  routes left the opacity check passing — because what it logs is ciphertext. That is a *stronger*
-  property than the check tests, and the check now says so.
-- **Exercising the exit criterion found more than the docs**: two tasks, one of them p1.
+- **A leaked process on a fixed address is indistinguishable from a product defect.** The
+  exit-criterion script never killed its relay, so runs 2+ talked to run 1's relay — which held an
+  account registered with the *secret* seed. The relay then rejected a good certificate, and the
+  message read exactly like a crypto bug. When a security failure looks impossible, check whether
+  the peer is the one you think it is.
+- **One fact, two sources — again.** Authorization read the store *plus* disk certificates; the
+  listing read the store alone, so a device could authenticate and be denied existence.
+- **Verify the task before you trust the task file**: T-0067 was filed as a p1 product bug on
+  evidence that turned out to be the harness's. Re-scoping it honestly (keeping the misdiagnosis in
+  the record) was worth more than deleting it.
+- **Registering a key: the human output truncates it, the secret file is not it.** Three ways to get
+  the account root wrong, and two of them are accepted silently.
 ## Event log               ← append-only; newest last; never rewrite
 - 2026-09-10 [turn 1] ledger created; repo at e489fac (docs only); T-0001 + T-0022 (AGENTS.md gardened) done
 - 2026-09-10 [turn 2] T-0002 PTY manager done+pushed (342606c; 9 tests); PROMPT.md v2 synced + ADR 0001 (ef6c595)
@@ -116,3 +121,5 @@ Findings:
 - 2026-09-12 [turn 57] T-0065 done: `RelayStream::drop` no longer aborts its forwarding task — it closes the write half and lets the task drain, so a frame written immediately before closing (every refusal path) reaches the peer. The `JoinHandle` is gone and the type is simpler (`sink: Option<DuplexStream>`). Root cause: `forward.abort()` killed the one task that hands bytes to the session, so anything buffered in the duplex died with it; locally there is no such task, which is why T-0046's all-local refusal tests never saw it. Proved by `a_frame_written_immediately_before_closing_reaches_the_peer` (write, flush, shutdown, drop, over a real relay) — fails with the abort restored, passes without it. End to end, T-0047's mesh slice now PASSES the refusal assertion (the operator gets `arreo machines trust … --yes`), collapsing the two split checks back into one and dropping the slice from 29 s to 11.9 s. Audited every write-then-close caller: only `serve_session`'s wrapper, reached by both relay consumers through the same drop. 474 workspace tests, clippy clean on both toolchains, 10 slices green, vet/deny/audit/check-targets clean, evidence `.loop/evidence/T-0065/`.
 
 - 2026-09-12 [turn 57] T-0065 done (RelayStream no longer aborts its forwarding task on drop; a frame written before close reaches the peer; proved load-bearing by mutation and end to end by T-0047's refusal assertion, which now PASSES), plus three gardening/exercise outcomes: T-0034 marked done with inbox/presence criteria dropped as redundant and `--weakened` retired after an experiment showed the opacity check cannot fail alone (the relay logs ciphertext, which is stronger than the check tests); T-0027 retired as superseded (its hostile cases are noise.rs and pairing.rs tests, all in CI); Phase 2's exit criterion exercised and found to FAIL for product reasons — T-0066 (the account root *public* key is undiscoverable: `devices list` truncates it and the obvious file holds the secret seed) and T-0067 (p1: a self-admitted certificate verifies against nothing, with the relay's stored root byte-identical to the machine's, so the fault is in issuance). The daemon's "pair this machine first" message now names the real two-step self-admission. 474 workspace tests, clippy clean on both toolchains, fmt clean, 10 slices green.
+
+- 2026-09-12 [turn 58] T-0067 done, and with it the Phase 2 exit criterion is met. Diagnosis first: the "self-admitted certificate does not verify" report was **my harness**, not the product — the exit-criterion script used fixed ports and never killed its relay, so later runs talked to a stale relay holding an account registered with the *secret* seed; rewritten with pid-scoped ports, `trap` cleanup, polled readiness and the account root from `devices list --json`, the criterion passes in **1-3 s** (budget 300 s) with both machines `online`. Two real deliverables came out of it: (1) the first-machine bootstrap is now tested (`a_self_admitted_machine_gets_a_certificate_the_root_signs` — real relay + real account + a daemon that must register; nothing covered it before, since every pairing test used a mailbox-only relay that verifies no certificates), and (2) `DeviceAuthority::devices()` now returns the union of the store and the index, because authorization read store+disk while the listing read store-only — so a certificate on disk without a store row (the explicit-`--socket` deployment shape) was a device the daemon authenticated and `machines trust` denied with a false message. Proved load-bearing by mutation. 476 workspace tests, clippy clean on both toolchains, fmt clean, 10 slices green, exit criterion scripted and green, bench 6/6.
