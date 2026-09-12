@@ -691,6 +691,33 @@ fn a_running_daemon_is_handed_over_to_the_new_binary() {
     );
     // The handoff socket is cleaned up, so a second update is not confused by it.
     assert!(!scratch.path().join("arreo.sock.handoff").exists());
+
+    // **Kill the daemon this test caused to exist.** The handed-over daemon is a
+    // child of the CLI process, which has exited — and the CLI deliberately spawns
+    // it detached from its own stdio so it outlives the launcher (a daemon that can
+    // be killed by its launcher exiting is what the handoff exists to prevent). So
+    // nothing reaps it for us: without this, every run of this test leaves a live
+    // daemon behind, and a leaked process is indistinguishable from a product
+    // defect — the trap this project has already paid a session for.
+    kill_daemon(new_pid);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while running(new_pid) && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(
+        !running(new_pid),
+        "the handed-over daemon must be gone before the test ends (pid {new_pid})"
+    );
+}
+
+/// SIGTERM a daemon and do not wait: the daemon's own shutdown path is what makes
+/// this clean, and this test is not the place to assert on it (the lifecycle slice
+/// owns that).
+fn kill_daemon(pid: u32) {
+    let _ = std::process::Command::new("kill")
+        .arg("-TERM")
+        .arg(pid.to_string())
+        .status();
 }
 
 /// Find the daemon serving `socket` the way the verb does: a process whose argv
