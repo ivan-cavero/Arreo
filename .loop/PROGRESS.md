@@ -1,31 +1,25 @@
 ## State snapshot          ← REWRITTEN (not appended) at every checkpoint
-Task: **T-0048 · OSS launch readiness — needs-human (the handoff is the criterion).**
-The batch is integrated: 4 workers' surfaces + the release-check gate + the stranger
-tour + the scan verdict. The repo's public text is now honest (137 claims audited,
-false ones fixed in place); the gate runs green (9 pass, 1 skip locally — reuse needs
-a Python toolchain this box lacks, CI installs it); the scan is clean (0 findings with
-the triaged allowlist, negative-controlled).
-Where you are: T-0062 (Windows build) done and committed; the macOS clippy failure
-fixed (2 new stable-only lints in my own gate file); CI pinned to 1.98.0 so one lint
-set holds everywhere. T-0063 (p1) carries the CI investigation: Windows leg fixed,
-macOS leg fixed, ubuntu test leg unidentified (needs log access). The readiness.md
-handoff names the two human actions (read the ubuntu log; decide the launch).
-Next step: human gate on T-0048; T-0063 is the highest-priority actionable task but
-needs repo admin (CI logs) — otherwise T-0047 (mesh slice).
-Open workers: (none — all four delivered)
-Known broken: CI red on ubuntu test leg (T-0063) · Parked: T-0048 needs-human (launch decision)
+Task: **T-0047 · the mesh e2e slice — DONE.** The referee for T-0043…T-0046 exists and is green:
+two real `arreo-server` daemons + a self-hosted relay + a daemon-less client, all on loopback.
+Where you are: `cargo xtask e2e --slice mesh` = 15 passed, 2 skipped, 0 failed, 21.8 s (bar was
+60 s); the chaos case kills beta ten times and alpha never notices (2.0–2.5 s, `--slice chaos`
+8/8). The latency row T-0045 moved here is measured: 203–233 ms against a 3 s budget.
+472 workspace tests green; clippy clean on BOTH the pinned and the CI toolchain; fmt clean.
+Next step: **T-0064** (p2 — a remote trust refusal hangs the client; the post-Hello read has no
+bound). That is the last known product defect the mesh slice found, and it is small and
+self-contained. Otherwise T-0063 needs repo admin (CI logs), and T-0048 waits on a human.
+Open workers: (none)
+Known broken: CI red on the ubuntu test leg (T-0063) · Parked: T-0048 needs-human (launch)
 Findings:
-- **The repo is already public** (since 2026-09-10) serving the OLD false README — landing
-  this batch is itself a launch-blocking fix.
-- **CI has never passed (90/90 red)** — three different failures, not one cause. Windows:
-  ungated unix import (T-0062, fixed). macOS: stable-only clippy lints (fixed). Ubuntu:
-  test exit 101, unidentified without log access (T-0063).
-- **A repo that pins its toolchain but lets CI install @stable has two lint sets.**
-  Pinned CI to 1.98.0.
-- **gitleaks allowlists must be value-scoped, not rule-scoped** — proven by negative
-  control (live-shaped ghp_ fires, dummy ghp_AAAA does not).
-- **The REUSE gate missed continuation lines** of multi-line TOML arrays — fixed, proven
-  with a probe.
+- **A machine's daemon and its CLI share one device identity** — a remote verb on a
+  daemon-hosting machine displaces that machine's own relay session (T-0060, by design). Drive
+  remote verbs from a daemon-less client; that is also the common real deployment.
+- **A device needs pinning on the peer, not just a certificate**: the handshake resolves the
+  caller from the peer's pin list, and every refusal spends the relay's 3-per-10s handshake
+  budget for that address — which then looks like unrelated transport failures later.
+- **`devices issue` grants on issue** (T-0046), so "pinned but ungranted" takes two real verbs.
+- **A slice must bound every call it makes**: a hang produces no verdict at all. Bounding them is
+  what turned T-0064 from a mystery into a named defect.
 ## Event log               ← append-only; newest last; never rewrite
 - 2026-09-10 [turn 1] ledger created; repo at e489fac (docs only); T-0001 + T-0022 (AGENTS.md gardened) done
 - 2026-09-10 [turn 2] T-0002 PTY manager done+pushed (342606c; 9 tests); PROMPT.md v2 synced + ADR 0001 (ef6c595)
@@ -109,3 +103,5 @@ Findings:
 - 2026-09-12 [turn 53] T-0053 done: the relay's audit trail. `relay_audit` (relay schema v5) with one append-only writer (`RelayStore::record`, no update/delete API), written at the router's connect/disconnect/refusal sites and the mailbox's own eviction/expiry, read by `arreo-relay audit export|prune`. Shared with the machine's log rather than mirrored: `render_export` was extracted from `arreo_core`'s `audit_export` so both logs emit identical bytes, `truncate_peer` does both redactions, and `AuditQuery` is the filter type for both. `accept_connection` gained a typed `Accepted` return (open, or the address over its budget) because the rate-limit refusal is an audit row and the address was otherwise only in a log line. Two real bugs found by the tests: a `u64`→`i64` cast that made `--since u64::MAX` match everything and `--before u64::MAX` delete nothing, and a deadlock from recording while holding the store mutex. Also measured: a vanished QUIC client is noticed at ~15 s (idle timeout). 468 tests, clippy/fmt clean, vet/deny/audit/check-targets clean, 8 slices green, bench 6/6. Evidence `.loop/evidence/T-0053/`.
 
 - 2026-09-12 [turn 54] T-0048 batch integrated: 4 workers delivered (furniture with API-verified labels + honest SECURITY.md gap; docs with 123-row link/command table and the false-claim fixes; scan with 8/8 false positives disproved; claims/license with the 137-claim audit and NOTICE fixes). Planner's slice: `cargo xtask release-check [--public]` (10 items, fail-closed on missing tools in --public), CI `public-readiness` job (fetch-depth: 0, pinned scanners, pinned toolchain), `.gitleaks.toml` (value-scoped, negative-controlled), stranger tour from a clean clone (build 1m39s, first pane, api slice green). Two tasks filed: T-0062 (Windows ungated unix import — FIXED, committed 3490dee) and T-0063 (p1, CI investigation: Windows fixed, macOS clippy fixed in 08ca7db, ubuntu test leg needs log access). Also fixed: REUSE.toml dead paths + LICENSE double-annotation + gate continuation-line blind spot, Cargo.toml repository URL, CODE_OF_CONDUCT contact. Gate: 9 pass / 1 skip locally. T-0048 → needs-human with readiness.md.
+
+- 2026-09-12 [turn 55] T-0047 done: the mesh e2e slice. `xtask/src/mesh_slice.rs` (registered, CI step, hint updated) spawns two real daemons + a relay + a daemon-less client on loopback: directory, attach-by-name in 203-233 ms against the 3 s budget, local/remote payload parity, the pin→cut-grant→refuse→grant→attach trust sequence, and node isolation (beta's death leaves alpha's pane untouched). `xtask/src/chaos/mesh_reconnect.rs` kills beta ten times and asserts alpha is intact and uncontaminated. 15 passed, 2 skipped, 0 failed, 21.8 s. Three fixture findings (daemon and CLI share a device id so remote verbs need a daemon-less client; a device needs pinning on the peer, and refusals spend the relay handshake budget; `devices issue` grants on issue) and one product defect filed as **T-0064** (a remote trust refusal at Hello hangs the client — the daemon refuses correctly, the client prints nothing, because the post-Hello read has no bound). Also filed earlier this turn: T-0062 (Windows ungated unix import, fixed) and T-0063 (CI investigation). 472 workspace tests, clippy clean on both toolchains, fmt clean, evidence `.loop/evidence/T-0047/`.
