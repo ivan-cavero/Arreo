@@ -93,17 +93,50 @@ impl Clone for RelayContext {
     }
 }
 
+/// How long to wait after the relay has **answered and said no**.
+///
+/// A refusal is deterministic in everything the daemon controls: the account
+/// does not exist, or the certificate is not one this account accepts. Retrying
+/// in 250 ms cannot change either — and it actively hurts, because the relay's
+/// handshake budget is per *address* (3 per 10 s): a daemon that keeps
+/// presenting a refused registration exhausts the budget for its whole host, and
+/// then every client behind that address — including this one — starts seeing
+/// transport refusals instead of the reason. That is how a clear "unknown
+/// account" becomes "the server refused to accept a new connection" (T-0069).
+///
+/// So a refusal is retried at the ceiling, not on the ramp. It is still retried:
+/// the operator may register the account or grant trust while the daemon runs,
+/// and waiting has to end by itself. Just not every quarter second.
+const REFUSED_RETRY: Duration = BACKOFF_CEILING;
+
+/// The delay before the next dial.
+///
+/// One policy, two causes: a *transport* failure is transient (ramp up, so a
+/// brief blip recovers fast and an endless outage costs one attempt per
+/// ceiling), while a *refusal* is deterministic and waits at the ceiling.
+/// `refused` takes precedence because the reason is what the caller needs to
+/// keep seeing — and because the retries themselves are what destroy it.
+#[must_use]
+pub fn retry_delay(refused: bool, attempt: u32, jitter: f64) -> Duration {
+    if refused {
+        // An attempt count far past the ceiling: the same policy, applied at its
+        // end, so the jitter behaves identically to every other retry.
+        return backoff_delay(u32::BITS, jitter);
+    }
+    backoff_delay(attempt, jitter)
+}
+
 /// Keep a relay session up for as long as the daemon runs.
 ///
 /// The loop is the reconnect policy: dial, serve, and on any ending wait a
 /// backed-off interval before trying again. A relay that is simply absent costs
-/// one attempt per ceiling rather than a spin, and a *refused* registration
-/// carries the relay's own reason to the log — it is retried on the same
-/// schedule rather than in a tight loop, because a bad certificate will not fix
-/// itself by being presented again sooner.
+/// one attempt per ceiling rather than a spin; a *refused* registration carries
+/// the relay's own reason to the log and then waits at the ceiling, so the
+/// reason stays the last thing an operator sees (see [`REFUSED_RETRY`]).
 pub async fn run(settings: RelaySettings, context: RelayContext) {
     let mut attempt: u32 = 0;
     loop {
+        let mut refused = false;
         match RelaySession::dial(
             settings.addr,
             &settings.account,
@@ -128,10 +161,23 @@ pub async fn run(settings: RelaySettings, context: RelayContext) {
                     "arreo-server: relay registration failed ({}): {e}",
                     settings.addr
                 );
+                // The relay answered and said no, as opposed to a transport that
+                // is not there: the two deserve different retry schedules.
+                refused = matches!(
+                    &e,
+                    SessionError::Client(arreo_core::relay::ClientError::Refused { .. })
+                );
+                if refused {
+                    eprintln!(
+                        "arreo-server: the relay refused this registration; that reason will \
+                         not change by retrying, so the next attempt waits {REFUSED_RETRY:?} \
+                         (register the account, or fix the certificate, and it will connect)"
+                    );
+                }
             }
         }
         let jitter = jitter_fraction();
-        let delay = backoff_delay(attempt, jitter);
+        let delay = retry_delay(refused, attempt, jitter);
         attempt = attempt.saturating_add(1);
         eprintln!("arreo-server: retrying the relay in {delay:?}");
         tokio::time::sleep(delay).await;

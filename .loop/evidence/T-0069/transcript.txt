@@ -1,0 +1,19 @@
+T-0069 — a refusal no longer burns the relay's handshake budget
+==============================================================
+
+ROADMAP: T-0066 dogfooding found this. Before the fix, a refused registration
+retried on the 250ms->30s ramp and exhausted the relay's 3-per-10s-per-address
+budget, replacing the reason with a transport error:
+
+  registration failed: ... certificate signature does not verify under the root key
+  registration failed: ... certificate signature does not verify under the root key
+  registration failed: ... certificate signature does not verify under the root key
+  registration failed: ... aborted by peer: the server refused to accept a new connection
+
+After: one attempt in 30s, the reason stays last, and the relay sees one refusal:
+
+=== the machine's operator sees (first three attempts) ===
+arreo-server: relay registration failed (127.0.0.1:26609): relay client: the relay refused the session: unknown accoun
+
+=== the relay sees ===
+arreo-relay: refused 127.0.0.1:40249: unknown account never-registered — register it on this host with `arreo-relay 

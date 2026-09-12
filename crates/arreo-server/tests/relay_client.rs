@@ -12,7 +12,9 @@
 
 use arreo_core::identity::{DeviceCert, DeviceId, DeviceKey, Role, RootKey, VerifyingKey};
 use arreo_core::transport::noise::{FlightGuard, SecureChannel};
-use arreo_server::relay_client::{backoff_delay, RelaySession, BACKOFF_BASE, BACKOFF_CEILING};
+use arreo_server::relay_client::{
+    backoff_delay, retry_delay, RelaySession, BACKOFF_BASE, BACKOFF_CEILING,
+};
 use std::io::{BufRead, BufReader};
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -161,6 +163,36 @@ fn device(root: &RootKey, name: &str, serial: u64) -> (DeviceKey, DeviceCert) {
 
 fn contains(haystack: &[u8], needle: &[u8]) -> bool {
     !needle.is_empty() && haystack.windows(needle.len()).any(|w| w == needle)
+}
+
+/// **A refusal does not get the quick first retry** (T-0069).
+///
+/// The transport schedule starts at 250 ms so a momentary blip is invisible —
+/// and that is exactly wrong for a registration the relay *answered and refused*,
+/// because the reason (no such account, a certificate this account does not
+/// accept) cannot change in the next quarter second. Retrying that fast is what
+/// exhausts the relay's per-address handshake budget, and an exhausted budget
+/// replaces the reason with a transport error: the operator loses the sentence
+/// that would have told them what to fix.
+#[test]
+fn a_refused_registration_waits_at_the_ceiling_not_on_the_ramp() {
+    // The property that matters, at the attempt that matters: the *first* retry
+    // after a refusal already waits the ceiling.
+    assert_eq!(
+        retry_delay(true, 0, 0.0),
+        BACKOFF_CEILING,
+        "a refusal must not get the 250 ms first retry"
+    );
+    // Far above the ramp's start, and still jittered so a fleet refused for the
+    // same reason does not attempt in lockstep.
+    assert_eq!(retry_delay(true, 5, 0.0), BACKOFF_CEILING);
+    let quiet = retry_delay(true, 0, 0.0);
+    let loud = retry_delay(true, 0, 1.0);
+    assert!(loud > quiet && loud <= quiet.mul_f64(1.25), "{loud:?}");
+
+    // A transport failure keeps the ramp: recovery from a blip must stay quick.
+    assert_eq!(retry_delay(false, 0, 0.0), BACKOFF_BASE);
+    assert_eq!(retry_delay(false, 3, 0.0), backoff_delay(3, 0.0));
 }
 
 /// The headline criterion: two devices hold an encrypted byte stream through the
