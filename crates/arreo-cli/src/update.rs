@@ -488,7 +488,7 @@ fn wait_for_takeover(
     // for; the practical exposure today is nil because an `arreo-server` waiting
     // on a handoff has adopted nothing and spawned nothing. It stops being nil
     // when the handoff carries panes, so it is filed rather than noted and
-    // forgotten — see T-0072.
+    // forgotten — see T-0077.
     let _ = child.kill();
     let _ = child.wait();
     Err(format!(
