@@ -37,6 +37,11 @@ pub fn db_path_for(socket: &Path) -> PathBuf {
     arreo_core::identity::authority::sidecar_db(socket)
 }
 
+/// `<socket>.lock` — the single-instance lock a serving daemon holds (T-0071).
+pub fn lock_path_for(socket: &Path) -> PathBuf {
+    arreo_core::identity::authority::sidecar(socket, ".lock")
+}
+
 /// Snapshot `panes` (id → pane) into the DB at `socket`'s sidecar path.
 /// Returns panes saved. Scrollback comes from `drain()` (decoded lines —
 /// both save and restore go through `drain`, so equality is exact).

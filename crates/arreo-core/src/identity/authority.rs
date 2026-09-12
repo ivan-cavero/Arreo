@@ -39,8 +39,19 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// rule, used by the daemon (`persist::db_path_for`) and by the CLI.
 #[must_use]
 pub fn sidecar_db(socket: &Path) -> PathBuf {
+    sidecar(socket, ".db")
+}
+
+/// `<socket><suffix>` — a sidecar path for a daemon socket.
+///
+/// The suffix is appended to the whole path rather than to the file name, so
+/// `/run/arreo.sock` gives `/run/arreo.sock.db` and `/run/arreo.sock.lock`: the
+/// sidecars sort next to their socket and can never collide with a *different*
+/// socket's file name.
+#[must_use]
+pub fn sidecar(socket: &Path, suffix: &str) -> PathBuf {
     let mut path = socket.as_os_str().to_owned();
-    path.push(".db");
+    path.push(suffix);
     PathBuf::from(path)
 }
 

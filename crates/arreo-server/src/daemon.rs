@@ -330,6 +330,14 @@ pub struct Daemon {
     socket: PathBuf,
     db: PathBuf,
     sessions: Sessions,
+    /// Taken in `serve` and held until the process ends (T-0071). A `Daemon` that
+    /// is dropped releases it, which is the honest lifetime: the lock is "this
+    /// process serves this socket".
+    ///
+    /// It lives here rather than as a local in `serve` because `main` cancels the
+    /// `serve` future on SIGTERM and keeps draining — the lock has to outlive the
+    /// future so a second daemon cannot start inside that window.
+    instance: std::sync::Mutex<Option<arreo_core::lock::ExclusiveLock>>,
 }
 
 impl Daemon {
@@ -341,6 +349,7 @@ impl Daemon {
             socket: socket.to_path_buf(),
             db,
             sessions: Arc::new(LiveSessions::default()),
+            instance: std::sync::Mutex::new(None),
         }
     }
 
@@ -401,7 +410,30 @@ impl Daemon {
     /// Serve forever (until the listener errors fatally). Removes a stale
     /// socket file first (previous crash) — safe: bind would fail otherwise,
     /// and a live daemon holds the path (we check by connecting first).
+    ///
+    /// ## Why the lock comes first (T-0071)
+    ///
+    /// The probe-then-unlink sequence above is not atomic, and two daemons
+    /// starting together walked through it: both probed a not-yet-bound socket,
+    /// both removed the path, and the second unlinked the first's listener and
+    /// bound its own — two live daemons, one clients could not reach. Measured at
+    /// 1 in 12 rounds of eight simultaneous starts, so it is rare, silent, and
+    /// exactly the kind of state a handoff must never begin from.
+    ///
+    /// The lock is taken **before** the probe, which makes probe→remove→bind a
+    /// critical section: only the lock holder may decide the socket is dead.
     pub async fn serve(&self) -> Result<(), DaemonError> {
+        let lock_path = super::persist::lock_path_for(&self.socket);
+        let lock = arreo_core::lock::ExclusiveLock::acquire(&lock_path).map_err(|e| {
+            DaemonError::Io(std::io::Error::new(
+                std::io::ErrorKind::AddrInUse,
+                format!("socket {} already served ({e})", self.socket.display()),
+            ))
+        })?;
+        // Held for the daemon's life; see the field's comment for why it is not a
+        // local that dies with this future.
+        *self.instance.lock().unwrap_or_else(|e| e.into_inner()) = Some(lock);
+
         if Self::is_live(&self.socket).await {
             return Err(DaemonError::Io(std::io::Error::new(
                 std::io::ErrorKind::AddrInUse,

@@ -1,0 +1,7 @@
+# T-0071 — the race, before and after
+
+## BEFORE the fix (daemon.rs as it was)
+rounds=12 rounds-with-more-than-one-daemon=1   <- round 6: two daemons alive on one socket
+
+## AFTER the fix
+rounds=12 rounds-with-more-than-one-daemon=0

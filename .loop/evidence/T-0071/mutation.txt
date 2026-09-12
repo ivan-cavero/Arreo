@@ -1,0 +1,31 @@
+# T-0071 — the regression test bites (mutation transcript)
+
+The regression test is `a_daemon_refuses_a_socket_whose_lock_another_holder_has`
+in `crates/arreo-server/tests/single_instance.rs`.
+
+Mutation: delete the lock acquisition from `Daemon::serve` — i.e. put the code back
+the way it was before this task. Only those lines change.
+
+```
+$ cargo test -p arreo-server --test single_instance        # WITH the fix
+test a_daemon_refuses_a_socket_whose_lock_another_holder_has ... ok
+test the_socket_is_servable_once_the_holder_releases_it ... ok
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+
+
+$ # mutation applied: the lock acquisition is removed from serve()
+$ cargo test -p arreo-server --test single_instance        # PRE-FIX code
+test the_socket_is_servable_once_the_holder_releases_it ... ok
+test a_daemon_refuses_a_socket_whose_lock_another_holder_has ... FAILED
+the daemon served a socket whose lock is held by another process
+test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 10.01s
+```
+
+So the test fails exactly when the fix is absent, and its failure message names the
+defect rather than the mechanism: *a daemon served a socket another process had locked*.
+
+Note what the mutation does **not** do: it does not make the test flaky, and it does not
+need the race to reproduce. The test takes the lock itself and leaves the socket absent —
+the precise state both racing daemons saw — so the pre-fix code binds and serves
+deterministically. That is the whole reason the test is shaped this way; see the task
+file's Findings.

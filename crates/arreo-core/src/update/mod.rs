@@ -330,16 +330,13 @@ pub fn package_manager_advice(path: &Path) -> String {
 /// because the kernel owns it — see the module docs for why that beats a pid
 /// file.
 pub struct UpdateLock {
-    file: fs::File,
-    path: PathBuf,
+    inner: crate::lock::ExclusiveLock,
 }
 
 impl std::fmt::Debug for UpdateLock {
-    /// Prints the lock file, never the handle: a debug line is not a place to
-    /// leak an open description.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("UpdateLock")
-            .field("path", &self.path)
+            .field("path", &self.inner.path())
             .finish_non_exhaustive()
     }
 }
@@ -348,30 +345,14 @@ impl UpdateLock {
     /// Take the lock beside `current`, or report who holds it.
     pub fn acquire(current: &Path) -> Result<Self, UpdateError> {
         let path = with_suffix(current, "update.lock");
-        let file = fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(&path)
-            .map_err(|e| UpdateError::io(&path, e))?;
-        match file.try_lock() {
-            Ok(()) => Ok(Self { file, path }),
-            Err(fs::TryLockError::WouldBlock) => {
-                Err(UpdateError::Locked(path.display().to_string()))
-            }
-            Err(fs::TryLockError::Error(e)) => Err(UpdateError::io(&path, e)),
-        }
-    }
-}
-
-impl Drop for UpdateLock {
-    fn drop(&mut self) {
-        // The file stays: it is the *description* that carries the lock, and a
-        // leftover zero-byte lock file is not a stale lock — the next process
-        // locks it again. Removing it here would race a process that has already
-        // opened it and is about to lock.
-        let _ = self.file.unlock();
+        crate::lock::ExclusiveLock::acquire(&path)
+            .map(|inner| Self { inner })
+            .map_err(|e| match e {
+                crate::lock::LockError::WouldBlock(path) => {
+                    UpdateError::Locked(path.display().to_string())
+                }
+                crate::lock::LockError::Io(path, e) => UpdateError::io(&path, e),
+            })
     }
 }
 
@@ -379,7 +360,7 @@ impl UpdateLock {
     /// The lock file, for a message that says which one is held.
     #[must_use]
     pub fn path(&self) -> &Path {
-        &self.path
+        self.inner.path()
     }
 }
 
