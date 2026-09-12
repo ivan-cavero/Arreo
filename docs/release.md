@@ -26,6 +26,67 @@
    the manifest parses and still names the expected targets and installers. Real builds
    happen on tags only.
 
+## Updating a client in place
+
+While there is no release channel, a client can still be updated from a binary you
+already have (T-0070):
+
+```console
+$ arreo update --from /path/to/a/newer/arreo
+installed /home/you/.cargo/bin/arreo
+version: arreo 0.1.0
+previous kept at /home/you/.cargo/bin/arreo.prev
+resumed pane build from /run/user/1000/arreo.sock (4 line(s) after 0)
+
+$ arreo update --rollback          # put the previous binary back
+$ arreo update --check             # refused: this build has no channel (see below)
+```
+
+### The invariant
+
+**The client update path never signals, reaps, restarts or stops a PTY-bearing
+process, and never stops the daemon.** It touches exactly three things: the binary
+path, the `.prev` sibling, and the resume token. The daemon owns the agents; this
+verb owns the client binary. That is what makes a client restart cost seconds and
+touch nobody else, and it is asserted — not promised — by `cargo xtask e2e --slice
+update`, which holds a real daemon and eight live panes across a real update and
+checks that no pid moved and no pane's output stream restarted.
+
+### What happens, in order
+
+```text
+1. write the resume token      (before the swap: a swapped client that cannot say
+                                where it was has lost the operator's place)
+2. copy the candidate to       (same directory ⇒ same filesystem ⇒ the rename
+   <binary>.staged              below is atomic)
+3. hard_link the current       (a second name for the old inode; nothing moves)
+   binary to <binary>.prev
+4. rename(<binary>.staged,     (atomic replace, one syscall)
+   <binary>)
+5. hand over to the new        (exec with the same arguments; the second run finds
+   binary                       the binary already installed and resumes)
+```
+
+There is no instant at which the binary path is missing or non-executable, and a
+crash between any two steps leaves a runnable binary there — the old one before
+step 4, the new one after. The reasoning, and the rejected two-rename design, are
+in [ADR 0020](../specs/adr/0020-client-update-swap.md).
+
+### What `--check` refuses
+
+`arreo update` with no `--from` is the **anonymous** path: fetch a release and
+verify its signature before staging it. That needs the signing key (T-0036), and
+this build has no channel to check — so `--check` says so and exits 2 rather than
+pretending. Installing an artifact nobody verified is the one thing an updater
+must never do quietly.
+
+### When the path belongs to a package manager
+
+Homebrew and `cargo install` own their binary paths. The updater does not fight
+them: a path it cannot write produces the command that does the job
+(`brew upgrade arreo`, `cargo install --force arreo`) instead of a partial write or
+a `sudo` over the package manager's files.
+
 ## Install URLs (reserved — none of these resolves today)
 
 | Channel | URL | State |

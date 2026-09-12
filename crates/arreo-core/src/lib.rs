@@ -20,6 +20,7 @@ pub mod store;
 pub mod theme;
 #[cfg(feature = "transport")]
 pub mod transport;
+pub mod update;
 pub mod vt;
 
 /// Write bytes to an owner-only file (0600 on Unix, created before writing).

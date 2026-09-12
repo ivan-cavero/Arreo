@@ -26,6 +26,7 @@ mod relay_slice;
 mod release_check;
 mod theme_slice;
 mod tui_slice;
+mod update_slice;
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -70,8 +71,9 @@ fn e2e(rest: &[String]) -> ExitCode {
         Some("tui") => tui_slice::run(rest),
         Some("theme") => theme_slice::run(rest),
         Some("relay") => relay_slice::run(rest),
+        Some("update") => update_slice::run(rest),
         Some(other) => {
-            eprintln!("xtask e2e: unknown slice {other:?} (have: chaos, api, compat, lifecycle, persistence, state, enforcement, tui, theme, relay, mesh)");
+            eprintln!("xtask e2e: unknown slice {other:?} (have: chaos, api, compat, lifecycle, persistence, state, enforcement, tui, theme, relay, mesh, update)");
             ExitCode::from(2)
         }
         None => stub("e2e", rest),

@@ -1,0 +1,56 @@
+--- pane-1 (read exited Some(0)) ---
+PANE-1-MARKER
+tick-1
+tick-2
+tick-3
+tick-4
+tick-5
+--- pane-2 (read exited Some(0)) ---
+PANE-2-MARKER
+tick-1
+tick-2
+tick-3
+tick-4
+tick-5
+--- pane-3 (read exited Some(0)) ---
+PANE-3-MARKER
+tick-1
+tick-2
+tick-3
+tick-4
+tick-5
+--- pane-4 (read exited Some(0)) ---
+PANE-4-MARKER
+tick-1
+tick-2
+tick-3
+tick-4
+tick-5
+--- pane-5 (read exited Some(0)) ---
+PANE-5-MARKER
+tick-1
+tick-2
+tick-3
+tick-4
+tick-5
+--- pane-6 (read exited Some(0)) ---
+PANE-6-MARKER
+tick-1
+tick-2
+tick-3
+tick-4
+tick-5
+--- pane-7 (read exited Some(0)) ---
+PANE-7-MARKER
+tick-1
+tick-2
+tick-3
+tick-4
+tick-5
+--- pane-8 (read exited Some(0)) ---
+PANE-8-MARKER
+tick-1
+tick-2
+tick-3
+tick-4
+tick-5

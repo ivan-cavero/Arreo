@@ -84,6 +84,11 @@ fn usage() -> ExitCode {
     );
     eprintln!("      invite also names the account and relay, so `arreo machines add` can register the new");
     eprintln!("  arreo pair --join \"four words\" --uri arreo://pair?... [--name N] [--json]   (this device joins)");
+    eprintln!("  arreo update --from <path> [--json] [--no-reexec] [--reattach-pane ID]");
+    eprintln!("      replace this binary in place (atomic; keeps the previous as .prev);");
+    eprintln!(
+        "      `--rollback` puts it back. Never touches a running agent (see docs/release.md)"
+    );
     eprintln!("  arreo machines list [--json] [--all] [--offline] [--config PATH]");
     eprintln!("  arreo machines status [<name>] [--json] [--offline]   (0 ok, 2 usage, 3 unknown machine, 4 relay unreachable, 5 conflict)");
     eprintln!(
@@ -141,6 +146,7 @@ fn main() -> ExitCode {
         Some("devices") => cmd_devices(&args[2..]),
         Some("pair") => cmd_pair(&args[2..]),
         Some("machines") => machines::run(&args[2..]),
+        Some("update") => update::run(&args[2..]),
         _ => usage(),
     }
 }
@@ -148,6 +154,8 @@ fn main() -> ExitCode {
 mod machines;
 
 mod remote;
+
+mod update;
 
 /// Minimal block_on (current-thread runtime: no extra threads for a CLI).
 mod rt {

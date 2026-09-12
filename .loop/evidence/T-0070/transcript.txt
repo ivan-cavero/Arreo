@@ -1,0 +1,26 @@
+T-0070 — the client swap: the invariant, proven
+==============================================
+
+## The slice (cargo xtask e2e --slice update)
+
+[PASS] update: the candidates differ from the installed binary and still run
+[PASS] update: eight panes are running their counters
+update: pane counters before the update: pane-1 tick 5 (starts 1, tick-1 1), pane-2 tick 6 (starts 1, tick-1 1), pane-3 tick 5 (starts 1, tick-1 1), pane-4 tick 5 (starts 1, tick-1 1), pane-5 tick 5 (starts 1, tick-1 1), pane-6 tick 5 (starts 1, tick-1 1), pane-7 tick 5 (starts 1, tick-1 1), pane-8 tick 5 (starts 1, tick-1 1)
+[PASS] update: the daemon was never signalled or reaped
+[PASS] update: every pane is still alive and still printing its marker
+[PASS] update: no pane was restarted: every counter continued instead of resetting
+update: pane counters after the update:  pane-1 tick 9 (starts 1, tick-1 1), pane-2 tick 9 (starts 1, tick-1 1), pane-3 tick 9 (starts 1, tick-1 1), pane-4 tick 9 (starts 1, tick-1 1), pane-5 tick 9 (starts 1, tick-1 1), pane-6 tick 8 (starts 1, tick-1 1), pane-7 tick 9 (starts 1, tick-1 1), pane-8 tick 8 (starts 1, tick-1 1)
+[PASS] update: the installed binary is now the candidate
+[PASS] update: the binary it replaced is kept beside it as .prev
+[PASS] update: the installed binary runs
+[PASS] update: the update reattached the pane it was asked to resume
+update: reattach: Some("resumed pane pane-1 from /tmp/arreo-e2e-update-3972242/arreo.sock (11 line(s) after 0)") in 0.59 s (budget 2 s); the pane came back with Some("PANE-1-MARKER")
+[PASS] update: the reattach finished inside its 2 s budget
+[PASS] update: rollback restored the previous binary
+[PASS] update: the rolled-back binary runs
+[PASS] update: a candidate with no execute bit is refused
+[PASS] update: a refused candidate leaves the installed binary byte-identical
+[PASS] update: a refused candidate leaves no .staged file behind
+[PASS] update: a second updater is refused with exit 3 and says why
+[PASS] update: `--version` runs at every point the slice checked
+update: 17 passed, 0 skipped, 0 failed
