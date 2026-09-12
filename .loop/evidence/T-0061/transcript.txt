@@ -1,0 +1,86 @@
+T-0061 — remote panes are not second-class in the sidebar
+======================================================
+
+## 1. The sidebar names the machine and the link, and shows the question
+
+Real arreo-tui on a real pty, pointed at a peer machine over a real relay,
+reached BY NAME (--machine peer-machine), frame 04 of the relay slice:
+
+┌peer-machine · relay──────┐┌(no focus — Enter on a sidebar row)───────────────────────────────────────────────────────┐
+│◉ question                ││                                                                                          │
+│  asking-pane   3M █░░░░░░││                                                                                          │
+│    Proceed with the dep… ││                                                                                          │
+│● working                 ││                                                                                          │
+│  remote-pane   3M █░░░░░░││                                                                                          │
+
+The title is the session label (peer-machine · relay, resolved through the
+account's directory); the question is indented under the pane it belongs to
+and cut with an ellipsis because the sidebar is narrower than the sentence.
+
+## 2. The whole question is in the pane view (frame 05, after Enter)
+
+┌peer-machine · relay──────┐┌asking-pane [question] ───────────────────────────────────────────────────────────────────┐
+│◉ question                ││Proceed with the deploy? [y/n]                                                            │
+│▸ asking-pane   3M █░░░░░░││                                                                                          │
+
+## 3. A local session says so, rather than inventing a machine name
+
+┌this machine · socket─────┐┌(no focus — Enter on a sidebar row)───────────────────────────────────────────────────────┐
+│◉ question                ││                                                                                          │
+│  beta        3M █░░░░░░░░││                                                                                          │
+│    Proceed? [y/n]        ││                                                                                          │
+
+
+$ cargo xtask e2e --slice relay
+[PASS] relay: the client device is pinned on the peer machine
+[PASS] relay: the peer daemon is serving and connected to the relay
+[PASS] relay: the peer machine owns a pane
+[PASS] relay: the TUI lists the remote machine's pane
+[PASS] relay: attaching streams the remote pane's output
+[PASS] relay: the cross-machine attach meets its §5 budget
+[PASS] relay: the remote pane's whole scrollback arrived
+[PASS] relay: the peer's audit trail names the client device
+[PASS] relay: the peer recorded the session that carried the attach
+[PASS] relay: no keystroke was audited as input
+[PASS] relay: the relay holds no pane content
+[PASS] relay: the relay's log holds no pane content
+[PASS] relay: an unreachable relay is a visible state, not a hang
+[PASS] relay: q quits the remote TUI cleanly
+[PASS] relay: the peer machine owns a pane that asks a question
+[PASS] relay: the TUI reaches a machine by name
+[PASS] relay: the sidebar names the machine it is showing, and the link
+[PASS] relay: the hung remote agent's question is shown in the sidebar
+[PASS] relay: and a question too long for the sidebar is cut, with the cut marked
+[PASS] relay: attaching shows the whole question, not the sidebar's summary of it
+relay: 20 passed, 0 failed
+
+$ cargo xtask e2e --slice tui
+[PASS] tui: sidebar lists all panes
+[PASS] tui: attention order puts the hung agent's group first
+[PASS] tui: the sidebar names the machine and the link
+[PASS] tui: the hung agent's question is shown beside it, in the sidebar
+[PASS] tui: state dots rendered
+[PASS] tui: status bar advertises keys
+[PASS] tui: RAM rendered for every live pane with a unit
+[PASS] tui: focused pane header shows id + state
+[PASS] tui: focused pane streams daemon output
+[PASS] tui: search prompt rendered on the status line
+[PASS] tui: applied search reports match count
+[PASS] tui: mouse click focuses the clicked row
+[PASS] tui: resize re-lays-out to the new width
+[PASS] tui: no stale rows below the resized frame
+[PASS] tui: wall tiles every pane simultaneously
+[PASS] tui: wall tiles stream their own pane's output
+[PASS] tui: mouse drag resizes the sidebar split
+[PASS] tui: steady state repaints deltas only
+[PASS] tui: q quits cleanly
+[PASS] tui: the focused pane shows a RAM sparkline with its peak
+tui: 20 passed, 0 failed
+
+$ cargo test -p arreo-tui --test remote
+test the_client_reaches_a_remote_daemon_and_sees_the_same_pane ... ok
+test a_viewer_is_refused_with_a_typed_error_and_no_keystroke ... ok
+test the_question_a_remote_pane_is_waiting_on_reaches_the_sidebar ... ok
+test resume_from_the_cursor_replays_without_duplication_or_gaps ... ok
+test a_dropped_connection_reconnects_promptly_and_resumes_exactly ... ok
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.65s

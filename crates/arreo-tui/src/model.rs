@@ -16,6 +16,10 @@ pub struct PaneView {
     /// Best-effort like `ram_kb` — empty when history is unavailable, and the
     /// view renders nothing rather than a lie.
     pub ram_history: Vec<u64>,
+    /// What this pane is waiting for, when it is in `question` (T-0061): the last
+    /// thing it said, which is what an agent's prompt is. `None` when it is not
+    /// asking, or when it is asking by *silence* and there is no text to show.
+    pub asking: Option<String>,
 }
 
 /// Keyboard/mouse focus target.

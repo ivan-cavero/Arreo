@@ -137,6 +137,22 @@ impl Target {
         }
     }
 
+    /// How the connection is carried — T-0061's "link path" field.
+    ///
+    /// There is deliberately no `machine()` here. A `Target` does not know a
+    /// machine's *name*: the name lives in the account's directory, and a remote
+    /// target carries only the device id the relay routes to. A method that
+    /// answered with a device id would be read as a name by every caller, which is
+    /// worse than no method. The name comes from whoever resolved it
+    /// ([`super::resolve::Resolved::name`]) — which is where a name genuinely is.
+    #[must_use]
+    pub fn link(&self) -> &'static str {
+        match self {
+            Target::Local(_) => "socket",
+            Target::Remote(_) => "relay",
+        }
+    }
+
     /// Load a remote target from this machine's identity directory.
     ///
     /// The pieces are the ones `arreo pair --join` wrote: this device's key and

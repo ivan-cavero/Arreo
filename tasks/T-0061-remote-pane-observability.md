@@ -3,7 +3,7 @@ id: T-0061
 title: Remote panes are not second-class in the sidebar — machine, link and the question payload
 phase: 2
 priority: 3
-status: proposed
+status: in-progress
 depends_on: [T-0032, T-0045]
 scope:
   - crates/arreo-tui/src/ui.rs
@@ -33,21 +33,54 @@ asking YOU"*):
 
 ## Acceptance criteria
 
-- [ ] The TUI's model carries the target's machine name and link path, and the sidebar shows
-      them once per target (a header line, not repeated on every row — the panes in one
-      sidebar are one machine's, today, and a repeated column would be ten copies of one fact).
-- [ ] A pane whose state is `question` shows **the question**: the payload the daemon already
-      reports for that state, truncated to the sidebar's width, with the full text available in
-      the pane view. Locally and remotely the same — one code path, whatever carried the session.
-- [ ] A remote question reaches the sidebar **without the operator doing anything**: the daemon
-      emits the state change and the payload (T-0004's state engine already detects it), the
-      client carries it over whichever transport, and the sidebar re-renders.
-- [ ] Tested at the level the claim needs: a scripted PTY driving the real TUI against a daemon
-      whose pane is made to ask a question, asserting the machine name, the link path and the
-      question text are all *visible* — the pattern T-0015/T-0016 established for TUI slices,
-      with the frame captured to `.loop/evidence/T-0061/`.
-- [ ] A remote pane and a local pane with the same state render identically apart from the
-      machine/link header: no field is present for one and absent for the other.
+- [x] The TUI's model carries the target's machine name and link path, and the sidebar shows
+      them once per target — as its title, not a per-row column: one sidebar is one machine's
+      panes, so a repeated column would be ten copies of one fact. The CLI's `--machine`/`--config`
+      flags now work on `arreo-tui` too, resolving through the same `arreo_core::mesh::resolve`
+      the CLI uses (moved there from `arreo-cli` so both clients share one answer to "what does
+      this name mean"). A local session says "this machine · socket" — a hostname would be a
+      different fact, and `Target` deliberately has no `machine()` to lie with.
+- [x] A pane whose state is `question` shows **the question** — the last non-empty line of its
+      hot ring, which *is* an agent's prompt — indented under the pane, cut to the sidebar's
+      width with the cut marked (`…`), and whole in the pane view. The read is
+      `arreo_tui::client::asking_line`, the same call on either transport, fetching only for a
+      pane already known to be asking (an ordinary cycle costs what it cost before). A pane
+      asking by *silence* shows the state and no text, rather than an invented prompt.
+- [x] A remote question reaches the sidebar **without the operator doing anything**: the relay
+      slice's pane prints its prompt, the engine infers `question`, and the next poll cycle puts
+      it in the sidebar — asserted on the reconstructed pty screen after a timeout, not by
+      driving a refresh.
+- [x] Tested at the level the claim needs: the relay slice drives the real `arreo-tui` on a real
+      pty against a peer machine over a real relay, reached **by name**, and asserts the machine,
+      the link, the question in the sidebar, the marked cut, and the whole question in the pane
+      view. Frames in `.loop/evidence/T-0061/`. A relay-slice test proves the read crosses the
+      relay (parity with the peer's own socket); the sidebar/page render is proven load-bearing by
+      mutation — suppressing the question line fails two slice checks.
+- [x] A remote pane and a local pane with the same state render identically apart from the
+      session header, because there is one render path and one `PaneView`: the sidebar reads the
+      same fields whichever transport filled them (`--remote`, `--machine`, or a local socket),
+      and the slice's local frame (`.loop/evidence/T-0061/03-local-session-sidebar.txt`) shows the
+      same groups, RAM and question line as the remote one — the title is the only difference.
+
+## Done
+
+Delivered. `arreo-tui` takes `--machine NAME [--config PATH]` (mutually exclusive with
+`--remote/--peer/--socket`: one names a machine, the others an address), resolving through
+`arreo_core::mesh::resolve` — the resolver moved out of `arreo-cli` so both clients share one
+answer and `arreo-tui` does not depend on a binary crate. The sidebar's title is the session
+label; a `question` pane shows the line it is waiting on, cut to width with the mark.
+
+Two things the work taught, both recorded because they will recur:
+
+- **A `Target` cannot name a machine.** The name lives in the directory; a remote target carries
+  only the device id. An accessor returning that id would have been read as a name by every
+  caller, so `Target::link()` exists and `machine()` deliberately does not — the name travels with
+  the resolution. The address-addressed form (`--remote`) labels itself "device ab12cd34 · relay",
+  which is what is actually known there.
+- **Two live sessions for one device id displace each other at the relay** (T-0060). The first
+  version of the slice ran the by-name TUI alongside the address-addressed one and flaked: the
+  product was right and the test was asking for something impossible. The block now runs after the
+  first TUI quits.
 
 ## Notes
 

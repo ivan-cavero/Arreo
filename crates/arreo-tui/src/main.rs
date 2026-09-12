@@ -37,6 +37,8 @@ async fn main() -> anyhow::Result<()> {
     let mut peer: Option<String> = None;
     let mut account: Option<String> = None;
     let mut identity: Option<PathBuf> = None;
+    let mut machine: Option<String> = None;
+    let mut config: Option<PathBuf> = None;
     let mut theme: Option<String> = None;
     let mut variant: Option<String> = None;
     let mut depth: Option<String> = None;
@@ -60,6 +62,8 @@ async fn main() -> anyhow::Result<()> {
             "--peer" => peer = args.next(),
             "--account" => account = args.next(),
             "--identity" => identity = args.next().map(PathBuf::from),
+            "--machine" => machine = args.next(),
+            "--config" => config = args.next().map(PathBuf::from),
             "--theme" => theme = args.next(),
             "--variant" => variant = args.next(),
             "--depth" => depth = args.next(),
@@ -68,11 +72,16 @@ async fn main() -> anyhow::Result<()> {
                     "usage: arreo-tui [--socket PATH] [--theme NAME] \
                      [--variant dark|light] [--depth truecolor|256|16|none]"
                 );
+                println!("       arreo-tui --machine NAME [--config PATH]   (a machine, by name)");
                 println!(
                     "       arreo-tui --remote HOST:PORT --peer DEVICE_ID [--account A] \
                      [--identity DIR]"
                 );
-                println!("  --remote  a daemon on another machine, through the relay");
+                println!("  --machine  another machine, by the name the account's directory holds");
+                println!("             (the same name `arreo attach --machine` takes; nothing is");
+                println!("             dialed from argv — the name resolves through the relay)");
+                println!("  --config   the config whose [relay] section names the account");
+                println!("  --remote  a daemon on another machine, at a known address");
                 println!("  --peer    that machine's device id (as `arreo devices list` shows it)");
                 println!("  --identity  this device's identity dir (default: the standard one)");
                 return Ok(());
@@ -83,43 +92,76 @@ async fn main() -> anyhow::Result<()> {
             }
         }
     }
-    let target = match (remote, &peer) {
-        (Some(relay), Some(peer)) => {
-            let root = identity.unwrap_or_else(arreo_core::identity::identity_root);
-            let Some(account) = account.or_else(|| std::env::var("ARREO_ACCOUNT").ok()) else {
-                eprintln!(
-                    "arreo-tui: --account is required for a remote target (or set ARREO_ACCOUNT)"
-                );
-                eprintln!(
-                    "  the account is the relay-side tenant both machines are registered under"
-                );
+    if machine.is_some() && (remote.is_some() || peer.is_some() || socket.is_some()) {
+        eprintln!(
+            "arreo-tui: --machine names a machine; it cannot be combined with --remote/--peer/\
+             --socket (those are addresses, and mixing them would leave it ambiguous which one \
+             was obeyed)"
+        );
+        std::process::exit(2);
+    }
+    // What this TUI is looking at, said once and shown in the sidebar (T-0061). A
+    // local session says so rather than naming a machine: `Target` does not know a
+    // name, and only a resolution does — so a name here is one that was resolved,
+    // never one that was assumed.
+    let mut session = "this machine · socket".to_string();
+    let target = if let Some(name) = machine {
+        match arreo_core::mesh::resolve::by_name(&name, config.as_deref()).await {
+            Ok(resolved) => {
+                session = format!("{} · {}", resolved.name, resolved.target.link());
+                resolved.target
+            }
+            Err(e) => {
+                eprintln!("arreo-tui: --machine {name}: {}", e.message());
                 std::process::exit(2);
-            };
-            match Target::remote(relay, &account, peer, &root) {
-                Ok(target) => target,
-                Err(e) => {
-                    eprintln!("arreo-tui: {e}");
-                    eprintln!(
-                        "  a remote target needs this device paired with that machine \
-                         (`arreo pair --join`), which writes device.key, the certificate and \
-                         the pinned server key into {}",
-                        root.display()
-                    );
-                    std::process::exit(2);
-                }
             }
         }
-        // A peer without a relay is a typo, not a default: silently attaching to
-        // the local daemon would show the user the wrong machine's panes.
-        (None, Some(_)) => {
-            eprintln!("arreo-tui: --peer needs --remote HOST:PORT");
-            std::process::exit(2);
+    } else {
+        match (remote, &peer) {
+            (Some(relay), Some(peer)) => {
+                let root = identity.unwrap_or_else(arreo_core::identity::identity_root);
+                let Some(account) = account.or_else(|| std::env::var("ARREO_ACCOUNT").ok()) else {
+                    eprintln!(
+                    "arreo-tui: --account is required for a remote target (or set ARREO_ACCOUNT)"
+                );
+                    eprintln!(
+                        "  the account is the relay-side tenant both machines are registered under"
+                    );
+                    std::process::exit(2);
+                };
+                match Target::remote(relay, &account, peer, &root) {
+                    Ok(target) => {
+                        // Addressed by device id, so the label says so: a name here
+                        // would be one this process never resolved, and `Target` holds
+                        // no name to give (see its `link`). Eight characters is enough
+                        // to tell two machines apart on screen and to paste elsewhere.
+                        session = format!("device {} · relay", short_id(peer));
+                        target
+                    }
+                    Err(e) => {
+                        eprintln!("arreo-tui: {e}");
+                        eprintln!(
+                            "  a remote target needs this device paired with that machine \
+                         (`arreo pair --join`), which writes device.key, the certificate and \
+                         the pinned server key into {}",
+                            root.display()
+                        );
+                        std::process::exit(2);
+                    }
+                }
+            }
+            // A peer without a relay is a typo, not a default: silently attaching to
+            // the local daemon would show the user the wrong machine's panes.
+            (None, Some(_)) => {
+                eprintln!("arreo-tui: --peer needs --remote HOST:PORT");
+                std::process::exit(2);
+            }
+            (Some(_), None) => {
+                eprintln!("arreo-tui: --remote needs --peer DEVICE_ID");
+                std::process::exit(2);
+            }
+            (None, None) => Target::Local(socket.unwrap_or_else(default_socket)),
         }
-        (Some(_), None) => {
-            eprintln!("arreo-tui: --remote needs --peer DEVICE_ID");
-            std::process::exit(2);
-        }
-        (None, None) => Target::Local(socket.unwrap_or_else(default_socket)),
     };
     let request = ThemeRequest {
         theme,
@@ -135,7 +177,7 @@ async fn main() -> anyhow::Result<()> {
     )?;
     let backend = CrosstermBackend::new(std::io::stdout());
     let mut terminal = Terminal::new(backend)?;
-    let result = run(target, request, &mut terminal).await;
+    let result = run(target, session, request, &mut terminal).await;
     disable_raw_mode()?;
     crossterm::execute!(
         std::io::stdout(),
@@ -143,6 +185,11 @@ async fn main() -> anyhow::Result<()> {
         crossterm::terminal::LeaveAlternateScreen
     )?;
     result
+}
+
+/// Enough of a device id to name it on screen without filling the sidebar.
+fn short_id(id: &str) -> String {
+    id.chars().take(8).collect()
 }
 
 /// One daemon snapshot delivered to the UI loop.
@@ -194,10 +241,14 @@ fn parse_depth(raw: &str) -> Option<Depth> {
 
 async fn run(
     target: Target,
+    session: String,
     request: ThemeRequest,
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
 ) -> anyhow::Result<()> {
     let mut app = App::new();
+    // Which machine, and over what (T-0061): shown in the sidebar once, not
+    // repeated on every row — one sidebar is one machine's panes today.
+    app.session = session;
     app.theme = ThemeState::with_depth(
         request.depth.unwrap_or_else(Depth::detect),
         request.variant.unwrap_or_default(),
@@ -265,6 +316,7 @@ async fn run(
                             ram_kb: s.ram_kb,
                             lines: Vec::new(),
                             ram_history: s.ram_history.clone(),
+                            asking: s.asking.clone(),
                         })
                         .collect();
                     // Preserve scrollback lines across polls (merge by id).
@@ -623,12 +675,23 @@ async fn poll_summaries(conn: &mut Client) -> anyhow::Result<Vec<PaneSummary>> {
         // State via non-blocking wait (timeout 0 would spin; use short wait
         // for question, else derive from liveness below).
         let state = state_for(conn, &pane.id, pane.alive).await;
+        // **What it is asking, for a pane that is asking (T-0061).** Fetched only
+        // in that state, so an ordinary cycle costs exactly what it cost before.
+        // `Read` is a snapshot of the pane's hot ring (`HOT_LINES`), not a
+        // consuming read — several readers see the same lines, which is why the
+        // focused pane's attach and this cannot steal from each other.
+        let asking = if state == AgentState::Question {
+            arreo_tui::client::asking_line(conn, &pane.id).await
+        } else {
+            None
+        };
         out.push(PaneSummary {
             id: pane.id,
             alive: pane.alive,
             state,
             ram_kb,
             ram_history,
+            asking,
         });
     }
     // Attention order is the model's job; keep daemon order here.

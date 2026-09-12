@@ -109,6 +109,26 @@ pub fn run(rest: &[String]) -> ExitCode {
         },
         "question group not above working",
     );
+    // **T-0061: which machine, and what the hung agent is asking.** Both are read
+    // off the sidebar *region* — before the sidebar's right edge — because the
+    // question text is also in the focused pane's view on the right, and a check
+    // that cannot tell those apart would pass on a frame with no sidebar at all.
+    check(
+        "the sidebar names the machine and the link",
+        screen.contains("this machine · socket"),
+        "the session label is not in the sidebar title",
+    );
+    check(
+        "the hung agent's question is shown beside it, in the sidebar",
+        match screen.find("    Proceed? [y/n]") {
+            Some(at) => {
+                let line_start = screen[..at].rfind('\n').map_or(0, |n| n + 1);
+                at - line_start < 30
+            }
+            None => false,
+        },
+        "beta's question is not on an indented sidebar line",
+    );
     check(
         "state dots rendered",
         screen.contains('◉') && screen.contains('●'),

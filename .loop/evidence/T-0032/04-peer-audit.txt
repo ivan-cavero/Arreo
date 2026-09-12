@@ -1,3 +1,4 @@
-1789130807545 device.issue           ok       dev_6666ddcac6a9a4ccf3a188e12089cd79              -                  -                        issued owner for tui
-1789130807723 spawn                  ok       local-cli        remote-pane  -                  -                        /bin/sh
-1789130808027 session.connect        ok       dev_6666ddcac6a9a4ccf3a188e12089cd79              -                  -                        
+1789172588380 device.issue           ok       dev_2ba104ddb8fae0a69c7fe0642319dd17              -                  -                        issued owner for tui
+1789172588396 trust.grant            ok       dev_2ba104ddb8fae0a69c7fe0642319dd17 vmi3525064   -                  machine=16b100a59353a04c8094eb92b7992c31 role=operator by=2ba104ddb8fae0a69c7fe0642319dd17 
+1789172588729 spawn                  ok       local-cli        remote-pane  -                  -                        /bin/sh
+1789172588931 session.connect        ok       dev_2ba104ddb8fae0a69c7fe0642319dd17              -                  -                        

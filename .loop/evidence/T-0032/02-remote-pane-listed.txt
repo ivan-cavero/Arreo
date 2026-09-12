@@ -1,4 +1,4 @@
-┌agents────────────────────┐┌(no focus — Enter on a sidebar row)───────────────────────────────────────────────────────┐
+┌device dev_9441 · relay───┐┌(no focus — Enter on a sidebar row)───────────────────────────────────────────────────────┐
 │● working                 ││                                                                                          │
 │  remote-pane   3M █░░░░░░││                                                                                          │
 │                          ││                                                                                          │

@@ -27,6 +27,7 @@ fn views() -> Vec<PaneView> {
             ram_kb: 3500,
             lines: vec![],
             ram_history: Vec::new(),
+            asking: None,
         },
         PaneView {
             id: "beta".into(),
@@ -34,6 +35,7 @@ fn views() -> Vec<PaneView> {
             ram_kb: 3500,
             lines: vec!["Proceed? [y/n]".into()],
             ram_history: Vec::new(),
+            asking: None,
         },
         PaneView {
             id: "gamma".into(),
@@ -41,6 +43,7 @@ fn views() -> Vec<PaneView> {
             ram_kb: 3500,
             lines: vec!["GAMMA".into()],
             ram_history: Vec::new(),
+            asking: None,
         },
     ]
 }
@@ -103,6 +106,7 @@ fn many_views(n: usize) -> Vec<PaneView> {
             ram_kb: 3500,
             lines: (0..40).map(|l| format!("line-{l}")).collect(),
             ram_history: Vec::new(),
+            asking: None,
         })
         .collect()
 }

@@ -553,7 +553,9 @@ async fn connect(
         let conn = open_connection(socket).await.map_err(|e| (4u8, e))?;
         return Ok((Session::Local(conn), rest));
     };
-    let resolved = remote::resolve(&name, config.as_deref()).await?;
+    let resolved = arreo_core::mesh::resolve::by_name(&name, config.as_deref())
+        .await
+        .map_err(|e| (remote::exit_code(&e), e.message().to_string()))?;
     let client = arreo_core::mesh::session::Client::connect_to(&resolved.target)
         .await
         .map_err(|e| (4u8, format!("{}: {e}", resolved.name)))?;

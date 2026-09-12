@@ -37,6 +37,10 @@ pub const SIDEBAR_DEFAULT: u16 = 28;
 
 pub struct App {
     pub model: Model,
+    /// Which machine, and over what — "workbox · relay", "this machine · socket"
+    /// (T-0061). Rendered once, in the sidebar's title: one sidebar is one
+    /// machine's panes, so a per-row column would be the same fact N times.
+    pub session: String,
     pub theme: ThemeState,
     pub search: String,
     pub searching: bool,
@@ -109,6 +113,7 @@ impl App {
     pub fn new() -> Self {
         Self {
             model: Model::new(),
+            session: "this machine · socket".to_string(),
             theme: ThemeState::new(),
             search: String::new(),
             searching: false,
@@ -295,13 +300,31 @@ impl App {
                     ),
                     Span::styled(bar, Style::default().fg(color)),
                 ])));
+                // **What it is asking (T-0061).** Indented under the pane, so the
+                // operator reads "which agent, waiting for what" as one thing —
+                // and on a remote pane this is the whole point: they cannot walk
+                // over and look at the terminal.
+                if let Some(asking) = pane.and_then(|p| p.asking.as_deref()) {
+                    items.push(ListItem::new(Line::from(Span::styled(
+                        format!("    {}", truncate(asking, ask_width(area.width))),
+                        self.theme.muted_style(),
+                    ))));
+                }
             }
         }
         let list = List::new(items).block(
             Block::default()
                 .borders(Borders::ALL)
                 .border_style(self.theme.border_style())
-                .title("agents")
+                // The session label *is* the title: "which machine, over what" is
+                // the fact a sidebar of panes needs (T-0061), and it fits — a
+                // prefix would push it past the block's width, where ratatui
+                // clips silently and the operator learns nothing. Cut here, with a
+                // mark, when a long machine name still does not fit.
+                .title(truncate(
+                    &self.session,
+                    usize::from(area.width).saturating_sub(2),
+                ))
                 .title_style(self.theme.text_style()),
         );
         frame.render_widget(list, area);
@@ -642,6 +665,28 @@ fn state_dot(state: &str) -> &'static str {
         "idle" => "○",
         _ => "?",
     }
+}
+
+/// How much room a question line has inside the sidebar: the block's borders and
+/// the four-column indent, off the sidebar's own width. A question that cannot fit
+/// is cut with an ellipsis rather than wrapped — a wrapped question would push
+/// every pane below it off the screen, and the full text is in the pane view.
+fn ask_width(sidebar_width: u16) -> usize {
+    usize::from(sidebar_width).saturating_sub(2 + 4 + 1)
+}
+
+/// Cut a line to `width` columns, marking that it was cut.
+fn truncate(text: &str, width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    let chars: Vec<char> = text.chars().collect();
+    if chars.len() <= width {
+        return text.to_string();
+    }
+    let mut out: String = chars[..width.saturating_sub(1)].iter().collect();
+    out.push('…');
+    out
 }
 
 /// RAM bar: 10 cells, █ per 100 MB. Any nonzero RSS paints at least one cell

@@ -24,12 +24,10 @@
 //! is at the other end, is what ADR 0011 forbids.
 
 use crate::ExitCode;
-use arreo_core::identity::{
-    self, verifying_key_from_hex, DeviceCert, DeviceId, DeviceKey, VerifyingKey,
-};
-use arreo_core::mesh::session::{Client, RemoteTarget, Target};
+use arreo_core::mesh::resolve::{by_name, ResolveError};
+use arreo_core::mesh::session::{Client, Target};
 use arreo_core::proto::{Message, VERSION};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 /// Exit codes, one vocabulary with `arreo machines`.
 const OK: u8 = 0;
@@ -61,218 +59,15 @@ impl LinkMode {
     }
 }
 
-/// How this machine reaches the account: the relay and account from `[relay]`.
-struct Account {
-    relay: std::net::SocketAddr,
-    account: String,
-}
-
-/// Read this machine's `[relay]` configuration, or say what to do about it.
-///
-/// One parser for the whole product (`arreo_core::relay::config`): the daemon,
-/// `arreo machines` and this verb must agree about what a valid section is.
-fn account(config: Option<&Path>) -> Result<Account, (u8, String)> {
-    let path = match config
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("ARREO_CONFIG").map(PathBuf::from))
-    {
-        Some(path) => path,
-        None => {
-            return Err((
-                USAGE,
-                "which account am I in? pass --config PATH or set ARREO_CONFIG (its [relay] \
-                 section names the relay and the account)"
-                    .to_string(),
-            ))
-        }
-    };
-    match arreo_core::relay::config::load_config(&path) {
-        Ok(Some(settings)) => Ok(Account {
-            relay: settings.addr,
-            account: settings.account,
-        }),
-        Ok(None) => Err((
-            UNREACHABLE,
-            format!(
-                "no relay is configured ({}), so another machine cannot be reached by name",
-                path.display()
-            ),
-        )),
-        Err(e) => Err((USAGE, e.to_string())),
+/// Which exit code a resolution failure deserves: `arreo machines`' one
+/// vocabulary, so an operator learns it once. The kind is the resolver's, not this
+/// file's — a caller that maps them must not also be the one deciding them.
+pub fn exit_code(e: &ResolveError) -> u8 {
+    match e {
+        ResolveError::Usage(_) => USAGE,
+        ResolveError::UnknownMachine(_) => UNKNOWN_MACHINE,
+        ResolveError::Unreachable(_) => UNREACHABLE,
     }
-}
-
-/// This machine's own device identity: the key and certificate `arreo pair`
-/// saved, which is what the peer's trust ledger sees.
-fn own_device() -> Result<(DeviceKey, DeviceCert), (u8, String)> {
-    let dir = identity::identity_root();
-    let key_path = dir.join("device.key");
-    let key = DeviceKey::load(&key_path).map_err(|e| {
-        (
-            UNREACHABLE,
-            format!(
-                "this machine has no paired identity ({}): {e}",
-                key_path.display()
-            ),
-        )
-    })?;
-    let id = DeviceId::from_key(&key.public());
-    let cert_path = dir.join("devices").join(format!("{}.cert", id.as_str()));
-    let cert = DeviceCert::load(&cert_path).map_err(|e| {
-        (
-            UNREACHABLE,
-            format!("no certificate at {}: {e}", cert_path.display()),
-        )
-    })?;
-    Ok((key, cert))
-}
-
-/// A machine resolved through the directory: where to dial, and what the
-/// directory said about it.
-pub struct Resolved {
-    pub target: Target,
-    /// The name the directory actually holds — a machine renamed since the
-    /// operator last looked is reported as it is now, not as they typed it.
-    pub name: String,
-    pub presence: arreo_core::mesh::Presence,
-    pub last_seen_ms: i64,
-}
-
-impl Resolved {
-    /// The directory's view, for a message after a failure. T-0045 asks for it:
-    /// "no answer" is only half the story, and how stale the machine is decides
-    /// what the operator does next.
-    ///
-    /// **The absolute timestamp, not a computed age.** `last_seen_ms` is on the
-    /// *relay's* clock — it is the relay that observed the heartbeat — so an age
-    /// computed here would silently mix two clocks, and the interesting case is
-    /// exactly the one where they differ (a relay restarted, or a machine whose
-    /// clock is off). The timestamp is the relay's own statement; how long ago that
-    /// was is arithmetic the reader can do against a clock they trust.
-    fn directory_note(&self) -> String {
-        format!(
-            "directory says {} (last seen {}); tried relay",
-            self.presence.as_str(),
-            arreo_core::store::rfc3339_ms(self.last_seen_ms)
-        )
-    }
-}
-
-/// Resolve a machine name to a dialable target through the directory.
-pub async fn resolve(name: &str, config: Option<&Path>) -> Result<Resolved, (u8, String)> {
-    let account = account(config)?;
-    let (key, cert) = own_device()?;
-
-    // Ask the relay — the account's directory, not a local cache. A name only
-    // exists in the account, and an address remembered from a previous session is
-    // exactly what the directory exists to avoid.
-    let session = arreo_core::relay::session::RelaySession::dial(
-        account.relay,
-        &account.account,
-        &key,
-        &cert,
-    )
-    .await
-    .map_err(|e| {
-        (
-            UNREACHABLE,
-            format!("cannot reach the relay at {}: {e}", account.relay),
-        )
-    })?;
-    let reply = session.machines(true).await.map_err(|e| {
-        (
-            UNREACHABLE,
-            format!("the relay did not answer the directory request: {e}"),
-        )
-    })?;
-    if let Some(reason) = reply.refused {
-        return Err((UNREACHABLE, format!("the relay refused: {reason}")));
-    }
-
-    let Some(row) = reply.machines.iter().find(|row| row.name.as_str() == name) else {
-        let known: Vec<&str> = reply
-            .machines
-            .iter()
-            .filter(|row| row.tombstone_until_ms.is_none())
-            .map(|row| row.name.as_str())
-            .collect();
-        return Err((
-            UNKNOWN_MACHINE,
-            match known.is_empty() {
-                true => format!("no machine named {name:?}: this account lists no machines"),
-                false => format!("no machine named {name:?} in this account (have: {known:?})"),
-            },
-        ));
-    };
-    if let Some(until) = row.tombstone_until_ms {
-        return Err((
-            UNKNOWN_MACHINE,
-            format!(
-                "{name:?} was removed from this account and its name is held until {}",
-                arreo_core::store::rfc3339_ms(until)
-            ),
-        ));
-    }
-
-    // Present means routable. Absent means the row predates the dial key, and the
-    // fix is on the machine itself: its daemon asserts the row on every relay
-    // connect.
-    let Some(daemon_key_hex) = row.daemon_key.clone() else {
-        return Err((
-            UNREACHABLE,
-            format!(
-                "{name:?} is in the account but has published no dial key yet (its row predates \
-                 it). Once its daemon has connected to the relay, try again"
-            ),
-        ));
-    };
-    let server_key: VerifyingKey = verifying_key_from_hex(&daemon_key_hex).map_err(|e| {
-        (
-            UNREACHABLE,
-            format!("{name:?} published an unusable dial key: {e}"),
-        )
-    })?;
-    // **Ask the directory before dialing (T-0045's "fast and honest").** The relay
-    // already knows whether this machine has been seen recently, so a machine that
-    // is plainly offline costs one directory round trip instead of a dial plus a
-    // handshake timeout — and the operator is told *why* rather than waiting to
-    // find out. The dial below remains the backstop for the case the directory
-    // cannot see: a machine that went away between its last heartbeat and now.
-    if row.presence != arreo_core::mesh::Presence::Online {
-        let age = arreo_core::store::rfc3339_ms(row.last_seen_ms);
-        return Err((
-            UNREACHABLE,
-            format!(
-                "{name:?} is {} (last seen {age}, {}s ago), so nothing was dialed. Its daemon \
-                 will reappear in the directory when it reconnects",
-                row.presence.as_str(),
-                (now_ms().saturating_sub(row.last_seen_ms)).max(0) / 1000
-            ),
-        ));
-    }
-
-    let peer = DeviceId::from_key(&server_key);
-    Ok(Resolved {
-        name: row.name.as_str().to_string(),
-        presence: row.presence,
-        last_seen_ms: row.last_seen_ms,
-        target: Target::Remote(Box::new(RemoteTarget {
-            relay: account.relay,
-            account: account.account,
-            peer,
-            server_key,
-            device: std::sync::Arc::new(key),
-            cert: std::sync::Arc::new(cert),
-        })),
-    })
-}
-
-/// Epoch milliseconds: for the age in an "it is offline" message.
-fn now_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
 }
 
 /// The only pane on a machine, or a message naming the choices.
@@ -457,11 +252,11 @@ pub async fn cmd_attach(kept: &[String]) -> ExitCode {
         );
         return ExitCode::from(USAGE);
     }
-    let resolved = match resolve(&args.machine, args.config.as_deref()).await {
+    let resolved = match by_name(&args.machine, args.config.as_deref()).await {
         Ok(resolved) => resolved,
-        Err((code, message)) => {
-            eprintln!("attach: {message}");
-            return ExitCode::from(code);
+        Err(e) => {
+            eprintln!("attach: {}", e.message());
+            return ExitCode::from(exit_code(&e));
         }
     };
     let pane = match args.pane {

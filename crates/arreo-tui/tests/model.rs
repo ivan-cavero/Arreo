@@ -14,6 +14,7 @@ fn panes() -> Vec<PaneView> {
             ram_kb: 100,
             lines: vec!["hello".to_string()],
             ram_history: Vec::new(),
+            asking: None,
         },
         PaneView {
             id: "b".to_string(),
@@ -21,6 +22,7 @@ fn panes() -> Vec<PaneView> {
             ram_kb: 200,
             lines: vec!["May I? [y/n]".to_string()],
             ram_history: Vec::new(),
+            asking: None,
         },
         PaneView {
             id: "c".to_string(),
@@ -28,6 +30,7 @@ fn panes() -> Vec<PaneView> {
             ram_kb: 50,
             lines: vec![],
             ram_history: Vec::new(),
+            asking: None,
         },
     ]
 }

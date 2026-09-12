@@ -26,6 +26,14 @@ pub mod directory;
 /// without a database can still answer "may this device do this".
 #[cfg(feature = "sqlite")]
 pub mod ledger;
+/// Name → dialable target, through the account's directory (T-0045's dial key).
+///
+/// Gated like [`session`]: it hands back a `Target`, and the local half of that is
+/// a Unix socket. Two clients resolve names — `arreo attach` and `arreo-tui` — and
+/// they share this one implementation rather than each reading the directory
+/// themselves; `arreo-tui` cannot depend on the CLI, so the shared home is here.
+#[cfg(all(feature = "transport", unix))]
+pub mod resolve;
 /// The daemon client, over either transport (the Unix socket, or the relay to
 /// another machine).
 ///

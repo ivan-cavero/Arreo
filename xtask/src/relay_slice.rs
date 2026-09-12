@@ -20,6 +20,11 @@ use std::process::{Child, Command, ExitCode, Stdio};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
+/// The name the peer machine claims in the account's directory. Reaching it by
+/// this name — rather than by address — is the T-0045 path, and the name is what
+/// T-0061's sidebar must report.
+const PEER_NAME: &str = "peer-machine";
+
 /// The pty size the harness uses; the same numbers go to the screen renderer.
 const ROWS: usize = 30;
 const COLS: usize = 120;
@@ -115,6 +120,43 @@ fn wait_screen(session: &TuiSession, needle: &str, timeout: Duration) -> bool {
         std::thread::sleep(Duration::from_millis(100));
     }
     false
+}
+
+/// Is `needle` on an indented sidebar line — near the left edge of the frame?
+///
+/// The question text also appears in the focused pane's view on the right, so a
+/// bare `contains` could not tell "the sidebar shows the question" from "the
+/// terminal shows the question". The sidebar is the leftmost column, so the line
+/// that holds it starts within a few characters of the frame's left edge.
+fn sidebar_holds(screen: &str, needle: &str) -> bool {
+    screen.split('\n').any(|line| {
+        line.find(needle)
+            .is_some_and(|at| line[..at].chars().take_while(|c| *c == ' ').count() <= 8)
+    })
+}
+
+/// Is `needle` in the pane view — right of the sidebar's edge, so not the sidebar's
+/// own copy of the same text?
+///
+/// The edge is read off the frame (the sidebar's top-right corner) rather than
+/// assumed: the sidebar is resizable, and a hardcoded column would quietly stop
+/// meaning anything the day the default width changed.
+///
+/// Compared in **columns, not bytes**: the frame is box-drawing characters, three
+/// bytes each, so byte offsets from two different lines are not comparable — the
+/// first version of this compared them and reported a pane-view hit as a sidebar
+/// one.
+fn right_region_holds(screen: &str, needle: &str) -> bool {
+    let Some(edge) = screen
+        .lines()
+        .find_map(|line| line.find('┐').map(|at| line[..at].chars().count()))
+    else {
+        return false;
+    };
+    screen.lines().any(|line| {
+        line.find(needle)
+            .is_some_and(|at| line[..at].chars().count() > edge)
+    })
 }
 
 /// Write the painted screen, for a reviewer.
@@ -279,9 +321,14 @@ pub fn run(rest: &[String]) -> ExitCode {
 
     // The peer's daemon, now connected to the relay (the route the client needs).
     let config = peer_dir.join("peer.toml");
+    // Named, so this machine can be reached *by name* as well as by address
+    // (T-0061): the name is what a person says, and the sidebar has to say it back.
     std::fs::write(
         &config,
-        format!("[relay]\nenabled = true\naddr = \"{relay_addr}\"\naccount = \"{account}\"\n"),
+        format!(
+            "[relay]\nenabled = true\naddr = \"{relay_addr}\"\naccount = \"{account}\"\n\
+             name = \"{PEER_NAME}\"\n"
+        ),
     )
     .expect("config");
     let mut peer_cmd = Command::new(&server_bin);
@@ -506,6 +553,100 @@ pub fn run(rest: &[String]) -> ExitCode {
         quit,
         "the TUI did not exit",
     );
+
+    // ---- T-0061: a remote question, in the local sidebar ----
+    //
+    // **After the quit above, deliberately.** This TUI uses the same client identity
+    // as the one just closed, and two live sessions for one device id displace each
+    // other at the relay (T-0060) — running them together made this section flaky
+    // ("the TUI reaches a machine by name" lost its route mid-poll), which is the
+    // product behaving correctly and the test asking for something impossible.
+    //
+    // A pane on the *other machine* blocks on a prompt. The operator's sidebar must
+    // say which machine these panes belong to, and what the blocked agent is asking
+    // — the flagship moment of §3.11, and the one that is worst to miss remotely,
+    // because nobody can walk over and look at that terminal.
+    let prompt = "Proceed with the deploy? [y/n]";
+    let spawned = Command::new(&cli_bin)
+        .args([
+            "spawn",
+            "asking-pane",
+            "/bin/sh",
+            "-c",
+            &format!("printf '{prompt} '; sleep 300"),
+            "--socket",
+            &peer_socket.display().to_string(),
+        ])
+        .env("ARREO_IDENTITY_DIR", &peer_dir)
+        .output()
+        .expect("the spawn command runs");
+    check(
+        "the peer machine owns a pane that asks a question",
+        spawned.status.success(),
+        &String::from_utf8_lossy(&spawned.stderr),
+    );
+
+    // The TUI, on a pty, reaching that machine **by name** — nothing dialed from
+    // argv, the name resolved through the account's directory.
+    let config_arg = config.display().to_string();
+    let name_args = ["--machine", PEER_NAME, "--config", &config_arg];
+    // `ARREO_IDENTITY_DIR` names the *directory that holds* `identity/` — the
+    // resolver appends that last segment itself (it is the same variable the
+    // daemon and the CLI read).
+    let identity_arg = client_dir.display().to_string();
+    let name_env = [("ARREO_IDENTITY_DIR", identity_arg.as_str())];
+    let Some(mut by_name) = TuiSession::start_by_name(&tui_bin, &name_args, &name_env) else {
+        println!("[FAIL] relay: the TUI did not start with --machine");
+        return ExitCode::FAILURE;
+    };
+    let named = wait_screen(&by_name, "asking-pane", Duration::from_secs(30));
+    check(
+        "the TUI reaches a machine by name",
+        named,
+        &by_name.screen(),
+    );
+    check(
+        "the sidebar names the machine it is showing, and the link",
+        by_name.screen().contains(&format!("{PEER_NAME} · relay")),
+        &by_name.screen(),
+    );
+    // The question must be *in the sidebar*, not only in the focused pane's view:
+    // an indented line starting near the sidebar's left edge. A check that only
+    // searched the whole frame would pass on a frame with no sidebar at all.
+    let asking = wait_screen(&by_name, "Proceed", Duration::from_secs(30));
+    let in_sidebar = sidebar_holds(&by_name.screen(), "Proceed");
+    // A long question is cut to the sidebar's width — marked with an ellipsis
+    // rather than wrapped, because a wrapped line would push every pane below it
+    // off the screen. The mark is the promise that this is the same text, shorter.
+    let cut_marked = sidebar_holds(&by_name.screen(), "Proceed with the dep…");
+    check(
+        "the hung remote agent's question is shown in the sidebar",
+        asking && in_sidebar,
+        &by_name.screen(),
+    );
+    check(
+        "and a question too long for the sidebar is cut, with the cut marked",
+        cut_marked,
+        &by_name.screen(),
+    );
+    if evidence {
+        frame(&evidence_dir, "04-remote-question-in-sidebar", &by_name);
+    }
+
+    // The other half of the criterion: the *whole* question is readable, in the
+    // pane view — the sidebar is the index, the pane is the text. Real key events:
+    // the asking pane sorts first (question group leads), so Enter attaches it.
+    by_name.send("\r");
+    let whole = wait_screen(&by_name, prompt, Duration::from_secs(30));
+    let on_the_right = right_region_holds(&by_name.screen(), prompt);
+    check(
+        "attaching shows the whole question, not the sidebar's summary of it",
+        whole && on_the_right,
+        &by_name.screen(),
+    );
+    if evidence {
+        frame(&evidence_dir, "05-remote-question-in-pane", &by_name);
+    }
 
     let _ = std::fs::remove_dir_all(&base);
     println!("relay: {passes} passed, {failures} failed");

@@ -1,10 +1,10 @@
-┌agents────────────────────┐┌beta [question]───────────────────┐┌alpha [working]───────────────────┐
+┌this machine · socket─────┐┌beta [question]───────────────────┐┌alpha [working]───────────────────┐
 │◉ question                ││Proceed? [y/n]                    ││ALPHA-MARKER                      │
 │  beta        3M █░░░░░░░░││                                  ││                                  │
+│    Proceed? [y/n]        ││                                  ││                                  │
 │● working                 ││                                  ││                                  │
 │  alpha       3M █░░░░░░░░││                                  ││                                  │
 │▸ gamma       3M █░░░░░░░░││                                  ││                                  │
-│                          ││                                  ││                                  │
 │                          ││                                  ││                                  │
 │                          ││                                  ││                                  │
 │                          ││                                  ││                                  │

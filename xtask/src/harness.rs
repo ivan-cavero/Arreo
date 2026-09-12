@@ -105,6 +105,23 @@ impl TuiSession {
         args: &[&str],
         env: &[(&str, &str)],
     ) -> Option<Self> {
+        Self::start_at(tui_bin, Some(socket), args, env)
+    }
+
+    /// The same, for a run that names its machine instead of a socket (T-0061):
+    /// `--machine` and `--socket` are mutually exclusive on purpose — one names a
+    /// machine, the other an address — so this variant passes no socket at all
+    /// rather than a path the TUI would have to ignore.
+    pub fn start_by_name(tui_bin: &Path, args: &[&str], env: &[(&str, &str)]) -> Option<Self> {
+        Self::start_at(tui_bin, None, args, env)
+    }
+
+    fn start_at(
+        tui_bin: &Path,
+        socket: Option<&Path>,
+        args: &[&str],
+        env: &[(&str, &str)],
+    ) -> Option<Self> {
         let pty = native_pty_system();
         let pair = pty
             .openpty(PtySize {
@@ -127,8 +144,10 @@ impl TuiSession {
         for arg in args {
             cmd.arg(arg);
         }
-        cmd.arg("--socket");
-        cmd.arg(socket);
+        if let Some(socket) = socket {
+            cmd.arg("--socket");
+            cmd.arg(socket);
+        }
         let child = pair.slave.spawn_command(cmd).ok()?;
         drop(pair.slave);
 

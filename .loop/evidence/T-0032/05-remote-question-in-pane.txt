@@ -1,9 +1,9 @@
-┌device dev_9441 · relay───┐┌remote-pane [working] ────────────────────────────────────────────────────────────────────┐
-│● working                 ││REMOTE-MACHINE-MARKER-7c31                                                                │
-│▸ remote-pane   3M █░░░░░░││second-line                                                                               │
-│                          ││                                                                                          │
-│                          ││                                                                                          │
-│                          ││                                                                                          │
+┌peer-machine · relay──────┐┌asking-pane [question] ───────────────────────────────────────────────────────────────────┐
+│◉ question                ││Proceed with the deploy? [y/n]                                                            │
+│▸ asking-pane   3M █░░░░░░││                                                                                          │
+│    Proceed with the dep… ││                                                                                          │
+│● working                 ││                                                                                          │
+│  remote-pane   3M █░░░░░░││                                                                                          │
 │                          ││                                                                                          │
 │                          ││                                                                                          │
 │                          ││                                                                                          │
@@ -27,4 +27,4 @@
 │                          ││                                                                                          │
 │                          ││                                                                                          │
 └──────────────────────────┘└──────────────────────────────────────────────────────────────────────────────────────────┘
-1 panes · j/k move · Enter attach · w wall · t theme · / search · q quit
+2 panes · j/k move · Enter attach · w wall · t theme · / search · q quit

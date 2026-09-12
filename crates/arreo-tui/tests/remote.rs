@@ -16,7 +16,7 @@
 //! does not build another package's binary.
 
 use arreo_core::identity::{DeviceCert, DeviceId, DeviceKey, Role, RootKey};
-use arreo_core::proto::{codec, Message, VERSION};
+use arreo_core::proto::{codec, AgentState, Message, VERSION};
 use arreo_tui::client::{Client, Target};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::SocketAddr;
@@ -745,4 +745,95 @@ async fn a_viewer_is_refused_with_a_typed_error_and_no_keystroke() {
         sends.is_empty(),
         "a refused send is not a send that happened: {sends:?}"
     );
+}
+
+/// **T-0061: the sidebar's question reaches across the relay.** A pane on the
+/// peer blocks on a prompt; the sidebar's tail read — the one call that turns
+/// `question` into "waiting for *what*" — must return the prompt over the relay
+/// exactly as it does over the peer's own socket.
+///
+/// The parity half is the point: reading the tail locally and remotely for the
+/// same pane must agree, because a sidebar that showed the question for a local
+/// pane and nothing for a remote one would be the second-class display the
+/// criterion forbids.
+#[tokio::test]
+async fn the_question_a_remote_pane_is_waiting_on_reaches_the_sidebar() {
+    let fixture = Fixture::start("asking");
+    fixture.pane(
+        "asking-pane",
+        "sleep 0.5; printf 'Proceed? [y/n] '; sleep 30",
+    );
+
+    let mut remote = Client::connect_to(&fixture.target())
+        .await
+        .expect("the remote session opens");
+    // The state engine infers `question` from *observed* silence, and it observes
+    // only when the daemon pumps a pane (a verb touching it). So this waits the way
+    // the TUI slice does — a generous `Wait` that gives the silence time to
+    // accumulate — rather than sleeping and hoping: the question is the
+    // precondition, and a test that skipped it would be testing the classifier.
+    let remote_state = await_state(&mut remote, "asking-pane", AgentState::Question).await;
+    assert_eq!(
+        remote_state,
+        AgentState::Question,
+        "the pane must be asking for this test to mean anything"
+    );
+    let over_relay = arreo_tui::client::asking_line(&mut remote, "asking-pane").await;
+
+    let mut local = Client::connect(&fixture.peer_socket())
+        .await
+        .expect("the local session opens");
+    let over_socket = arreo_tui::client::asking_line(&mut local, "asking-pane").await;
+
+    assert_eq!(
+        over_relay, over_socket,
+        "the question a pane is waiting on must read the same over the relay as over its \
+         own socket"
+    );
+    assert!(
+        over_relay
+            .as_deref()
+            .is_some_and(|line| line.contains("Proceed?")),
+        "and it must be the prompt: {over_relay:?}"
+    );
+
+    // The honest empty: a pane that is *working* is not asked what it wants, and
+    // the reader returns nothing rather than a stale earlier line.
+    assert_eq!(
+        arreo_tui::client::asking_line(&mut remote, "no-such-pane").await,
+        None,
+        "an unknown pane yields nothing to show"
+    );
+}
+
+/// Block until the daemon reports `want` for a pane, or say what it reports
+/// instead. The same shape `arreo wait` uses, over whichever transport `conn` is.
+async fn await_state(conn: &mut Client, id: &str, want: AgentState) -> AgentState {
+    if let Ok(Message::StateEvent { .. }) = conn
+        .call(&Message::Wait {
+            v: VERSION,
+            id: id.to_string(),
+            state: want,
+            timeout_ms: 10_000,
+        })
+        .await
+    {
+        return want;
+    }
+    // Not the state we wanted: report the one that is true, from the same reads
+    // `poll_summaries` uses (an actionable state, else liveness).
+    for other in [AgentState::Question, AgentState::Blocked] {
+        if let Ok(Message::StateEvent { .. }) = conn
+            .call(&Message::Wait {
+                v: VERSION,
+                id: id.to_string(),
+                state: other,
+                timeout_ms: 200,
+            })
+            .await
+        {
+            return other;
+        }
+    }
+    AgentState::Working
 }
