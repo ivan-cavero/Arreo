@@ -219,11 +219,13 @@ pub fn run(rest: &[String]) -> ExitCode {
             let _ = std::fs::write(evidence_dir.join(format!("{}.raw", shape.name)), &raw);
         }
 
-        // The frame exists and carries the theme's structure.
+        // The frame exists and carries the theme's structure. The session label is
+        // the sidebar's title (T-0061), so it is the marker that the sidebar — as
+        // opposed to the pane wall or the status line — is what rendered.
         check(
             &format!("{} renders a themed frame", shape.name),
-            screen.contains("agents") && screen.contains("alpha"),
-            "sidebar missing from the frame",
+            screen.contains("this machine · socket") && screen.contains("alpha"),
+            "sidebar (or its session label) missing from the frame",
         );
 
         // What the terminal actually received.
