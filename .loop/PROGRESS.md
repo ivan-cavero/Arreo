@@ -1,43 +1,38 @@
 ## State snapshot          ← REWRITTEN (not appended) at every checkpoint
-Task: **T-0076 (modern/accessible TUI) DONE and committed (`e65221b`)** — 5 of 6 criteria met,
-the 6th re-scoped to the new **T-0079**. **T-0038 stage 2 (panes across the handoff) still IN
-FLIGHT** with worker `HandoffStage2`.
-Where you are: T-0076's work is verified and pushed: the brand palette is checked against
-`design/BRAND.md` by a test that parses the document (planner mutation-checked: one hex digit of
-drift fails two tests), state is never colour-only (a `NO_COLOR` frame carries zero colour cells
-and still names every state), "no per-tick repaints" is asserted with a counting backend (5 idle
-ticks → 0 cells), contrast is computed in a test, and 75 scripted pty assertions plus frames at
-four depths are in `.loop/evidence/T-0076/`. 182 core + 16 TUI suites green, clippy/fmt clean.
-Next step: collect `HandoffStage2`, verify its two hazards by mutation (the pause's atomicity and
-**unpause-on-abort**), run a fresh security review of the pane transfer, then the full battery on
-the merged tree and commit stage 2.
-Open workers: **HandoffStage2** (arreo-server + arreo-core/pty + proto/message.rs — its 6 files are
-the only dirty ones in the tree)
-Known broken: T-0063 (CI ubuntu leg, needs repo admin) · Parked: T-0048 + T-0036 needs-human
-**T-0079 (p1) — the wall takes ~9 s to paint 30 panes.** `poll_summaries` is serial and makes four
-round-trips per pane, two of them blocking `Wait`s at 150 ms; a wall of *working* panes pays both
-per pane, so 30 panes ≈ 9 s before the first frame is correct. Found by T-0076's worker trying to
-*enforce* `tui_attach_30panes_ms`, which is `phase0 = false` — **recorded but enforced by nothing**,
-so nothing had ever checked it. That is the deeper finding: worth auditing the other unenforced rows.
+Task: **T-0038 stage 2 — DONE** (`82933d8`): the panes cross the handoff. **T-0076 — DONE**
+(`e65221b`): the brand palette, state without colour, tested repaint budget. **T-0079 — filed**
+(p1): the 30-pane wall's ~9 s first frame.
+Where you are: 624 workspace tests / 0 failed (61 targets); clippy clean on both toolchains; fmt
+clean; **11 slices green** (tui 42, theme 33, relay 20/20 after a slice-assertion fix); bench 6/6;
+vet 336, deny 4/4, audit 0, check-targets PASS/SKIP. **The user's own task edits (T-0036 → todo,
+T-0063 → ownership notes + pasted runner logs) are in the working tree, uncommitted and untouched —
+theirs to land.**
+Next step: **T-0038 stage 3** — clients reconnect transparently: TUI + CLI attached through a
+stage-2 handoff reattach with an unchanged session id in < 2 s, flipping the perf-budget row to
+enforced. Read ADR 0021 §2c/§2d and note T-0077 (a timed-out handoff leaks the candidate's
+descendants — now *more* real, since stage 2's candidate adopts panes before committing) and
+T-0079 (the wall poller) if the queue order allows.
+Open workers: (none)
+Known broken: T-0063 (CI ubuntu leg, **the user is actively working it** — its file gained batch-2
+runner logs and an ownership boundary naming the handoff worker; do not touch) · Parked: T-0048 +
+T-0036 needs-human (T-0036 now `todo` per the user)
 Findings:
-- **A recorded-but-unenforced budget is a claim, not a law.** The first attempt to enforce
-  `tui_attach_30panes_ms` found a nine-second breach that had been sitting in `perf-budget.toml`
-  since Phase 0. The row was aspirational and nobody could tell.
-- **A worker removing a red check rather than leaving it red is the right call — if it says so.**
-  T-0076's worker removed the 30-pane assertion and reported why; that is what turned a silent gap
-  into T-0079. Its one inaccurate claim (that `cargo xtask bench` still owned the row) is corrected
-  in the commit and the ledger: bench does not measure that row.
-- **The user's own task suite arrived mid-turn** (T-0072…T-0076). T-0076 was startable, priority 1
-  and disjoint from the handoff work, so it ran in parallel — two slices, no shared file, which is
-  the fan-out the prompt asks for rather than serializing on one crate.
-- **`Guard::drop` removes the cgroup**, so a re-opened guard adopted *before* a handoff commits
-  would `rmdir` the live pane's group on an abort — stripping a running agent's memory ceiling
-  while reporting that nothing changed. Re-opened after the commit, where ownership is real.
-  (Second time this design needed an inherited resource's *destructive* path reconsidered: cf.
-  `ExclusiveLock::inherited`, whose `Drop` must not unlock a shared description.)
-- **Measured, not assumed**: a pty with no reader blocks its writer after **~12 KiB**, three times
-  less than the pipe default this ADR first claimed — so the abort-must-unpause requirement is
-  about a couple of screens of build output, not an unlikely burst.
+- **A race test cannot pin a millisecond window — so the design removes the choice instead.**
+  Stage 2's "incoming daemon must not read before the commit" was first enforced by a caller
+  literal; a test that aborted a real handoff after adoption could not catch the mutant that
+  flipped it (the transfer completed first). The rule is now structural: `adopt_seeded` always
+  parks, no argument says otherwise. Same lesson as T-0070's hard link.
+- **The security review's two most valuable findings were availability and a path bug, and the
+  one I did not name was the worse.** Unbounded transfer writes let a peer that stops reading
+  freeze every agent indefinitely (reproduced: output frozen, thread wedged in the kernel send);
+  `guard_path` was adopted unvalidated and `Guard::drop` rmdirs — a hostile peer could delete an
+  arbitrary empty directory *and* serve the agent without its ceiling while reporting success.
+  Both fixed; the guard-path rule extracted from `create` so the two cannot disagree.
+- **A test that pins one exact rendering of a UI is a test that breaks at the next legitimate
+  retune.** The relay slice asserted a 20-column question cut; T-0076 retuned the indent and the
+  cut moved. Now it checks the contract (a sidebar-left question line bearing a cut mark).
+- **The user is working in the tree concurrently** — T-0036 flipped to `todo`, T-0063 gained
+  ownership notes naming my worker. Scoped staging is now load-bearing, not a nicety.
 ## Event log               ← append-only; newest last; never rewrite
 - 2026-09-10 [turn 1] ledger created; repo at e489fac (docs only); T-0001 + T-0022 (AGENTS.md gardened) done
 - 2026-09-10 [turn 2] T-0002 PTY manager done+pushed (342606c; 9 tests); PROMPT.md v2 synced + ADR 0001 (ef6c595)
@@ -145,3 +140,27 @@ Findings:
 - 2026-09-12 [turn 63] T-0038 stage 2 delegated (`HandoffStage2`) and T-0076 delegated (`TuiModern`) in parallel — two disjoint slices (arreo-server+pty vs arreo-tui+theme), so the fleet is not serialized on one crate. Planner's work this turn: the stage-2 design, recorded in **ADR 0021 §2d** before the worker started — the pause must be atomic with respect to the pump's read→push (the buffer lock cannot be it, because `read` blocks on an idle pane); **every abort must resume the pumps**, because a paused pane whose child fills the 64 KiB pipe buffer blocks that child forever (worse than not updating); the incoming daemon must not read before it commits, or an abort loses bytes the resuming daemon cannot recover; state travels (scrollback lines + partial + raw journal + pane identity) while **derived** state is re-derived (the engine's state and its feed cursor — a pure function of the journal, so transferring them would create a second source of truth for one fact); and the enforcement guard travels as a **cgroup path**, re-opened on the other side, because a pane that arrived without its guard would silently lose its memory ceiling. Reconnaissance findings that shaped it: `persist::restore` (the crash path) **re-spawns** a new child, so it cannot be reused for this; `PaneEntry::pump` feeds the engine from the raw journal, so without the journal a pane that was `question` becomes `unknown` at the cut — the product's headline feature regressing visibly.
 
 - 2026-09-12 [turn 63, cont.] T-0076 done + committed (`e65221b`): the brand palette (a test parses `design/BRAND.md` so drift fails the build — planner mutation-checked with one hex digit), state never colour-only (six dot shapes + six words, a NO_COLOR frame with zero colour cells), no per-tick repaints asserted with a counting backend, focus/layout/degradation tested, contrast computed against WCAG AA, 75 scripted pty assertions and frames at four depths. `[tui]` config parsing went into `arreo-core` rather than adding a `toml` edge to the TUI crate (one crate owns the config file's shape — the precedent `[relay]` set); the module keeps its `relay::config` path with the rename rejected for cause in its header. **One criterion re-scoped rather than narrowed silently**: the 30-pane wall's first frame is not under 300 ms and no rendering change can fix it — `poll_summaries` is serial with two blocking 150 ms `Wait`s per pane, so a wall of working panes takes ~9 s before the first frame is correct. Filed as **T-0079 (p1)** with the deeper finding that `tui_attach_30panes_ms` is `phase0 = false` — recorded and enforced by nothing, which is why the breach sat there since Phase 0. Also this turn: `Guard::reopen` added to arreo-core (`499f8b2`) for the handoff worker, with the ordering hazard that `Drop` removes the group — so it is re-opened only after a handoff commits; and the ADR's pause-buffer claim corrected to the measured ~12 KiB.
+
+- 2026-09-12 [turn 63] T-0038 stage 2 + T-0076 both landed, two slices in parallel (handoff:
+  arreo-server+pty+proto; TUI: arreo-tui+theme+xtask slices; no shared file). Stage 2: the panes
+  cross the cut — descriptors + scrollback + journal in a manifest, engine re-derived, guard
+  re-opened by path. Three structural decisions recorded in ADR 0021 §2d: the pause is atomic
+  with respect to read→push (the buffer lock cannot be the point, `read` blocks); every abort
+  resumes the pumps (a paused pane's child blocks after ~12 KiB measured); the incoming daemon
+  does not read before the commit — **enforced by construction** after a race test could not
+  catch the mutant (the window is milliseconds; the rule is now "adopt_seeded always parks, no
+  argument says otherwise"). The stage-2 security review reproduced six findings; the two that
+  mattered: unbounded transfer writes (a stalled peer froze every agent; now a total write
+  deadline, re-armed per syscall because SO_SNDTIMEO is per-blocked-syscall — measured) and
+  unvalidated `guard_path` ending in `rmdir` (now: must be a direct child of the cgroup scope
+  *and* read like a cgroup; rule extracted from `create`). Also: entry-count cap (64 MiB of
+  minimal entries amplified to ~1 GB), total manifest-read deadline, geometry repair moved after
+  the commit, advisory-state comment. T-0076: brand palette checked against `design/BRAND.md`
+  by a test that parses it (planner mutation-checked with one hex digit), state never
+  colour-only (NO_COLOR frame with zero colour cells), repaint budget asserted with a counting
+  backend, contrast computed, 75 scripted pty assertions. One criterion re-scoped to **T-0079**
+  (p1): the 30-pane wall's first frame is ~9 s because the poller is serial with two blocking
+  150 ms `Wait`s per pane — a recorded-but-unenforced budget (`phase0 = false`) that nothing had
+  ever checked. Also fixed: the relay slice's question-cut assertion (pinned old geometry; now
+  checks the contract). The user's T-0036/T-0063 edits were left uncommitted — theirs. 624
+  tests, 11 slices, bench 6/6, all gates green. Commits: e65221b (T-0076), 82933d8 (stage 2).
