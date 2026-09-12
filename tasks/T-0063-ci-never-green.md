@@ -34,12 +34,15 @@ Three legs, three different failures — not one cause:
    the pinned clippy never fired (`items_after_test_module`, `vec_init_then_push`, both in
    the new `xtask/src/release_check.rs`) broke the leg. Fixed and verified with both
    `cargo clippy` and `cargo +stable clippy` at zero warnings.
-3. **Ubuntu (`test`, ~2 min, exit 101): OPEN.** fmt, build and clippy all pass on this leg;
-   `cargo test --workspace` fails. The failure is fast (~2 min), so it is a compile error in
-   a test target or an early test failure — not a timeout. CI job logs require admin rights
-   ("Must have admin rights to Repository"), and there is no `gh` auth on this box, so the
-   actual failing test is **unknown**. Local reproduction attempts: full suite green with
-   default and `--test-threads=4`; `cargo test --workspace --no-run` compiles clean.
+3. **Ubuntu (`test`, ~2 min, exit 101): LIKELY LOAD, UNCONFIRMED.** fmt, build and clippy
+   all pass on this leg; `cargo test --workspace` fails. Local data point (2026-09-12):
+   the full suite failed once with `a_stalled_peer_does_not_block_the_next_device` (a 5 s
+   connect timeout while a stalled peer holds a slot — under a 55-target parallel suite,
+   5 s can expire), then passed 3/3 in isolation and 472/0 on the next full run. That is
+   the signature of a load-sensitive timing assertion, the same class removed in T-0060's
+   turn — but without the CI log it is a hypothesis, not a diagnosis. CI job logs require
+   admin rights ("Must have admin rights to Repository"), and there is no `gh` auth on
+   this box, so confirmation needs a human with repo rights.
 
 ## Acceptance criteria
 
