@@ -245,7 +245,7 @@ PTY masters over SCM_RIGHTS, re-opens SQLite and serves — a failed step kills 
         and `repair_geometry` applied the manifest's claimed size before the commit (moved after,
         so an abort cannot leave the outgoing daemon serving a resized terminal).
 
-- [ ] **Stage 3 — clients reconnect transparently.** TUI + CLI attached through a stage-2 handoff
+- [x] **Stage 3 — clients reconnect transparently.** TUI + CLI attached through a stage-2 handoff
       reattach with an unchanged session id in < 2 s — flip `perf-budget.toml`'s recorded
       `server_handoff_reattach_s` row to enforced. Resume tokens stay valid, and input sent during
       the cut is acked once or refused as retryable.
@@ -259,6 +259,19 @@ PTY masters over SCM_RIGHTS, re-opens SQLite and serves — a failed step kills 
       against the number in the file. `xtask bench` measures load; it is not the home for a
       two-daemon timing test. The row is flipped to enforced (`phase0 = true`) in the same change
       that makes the slice pass.
+      **Outcome.** `arreo attach` reconnects instead of dying, the TUI's reconnect resumes within
+      the budget, and input that raced the cut is exactly-once or retryable. The mechanism is the
+      daemon's `from_line` clamp plus stage 2's transferred ring: a client tracks an absolute line
+      count, a stale cursor self-heals, and the same pane id serves continuous scrollback — which
+      is why "unchanged session id" is satisfiable at all. Measured by the new `reattach` slice
+      (11 checks, registered in CI): CLI 309 ms, TUI 910 ms, budget 2 s from perf-budget.toml,
+      which the same change flipped to enforced. The TUI had a real bug the measurement found —
+      a reconnect re-subscribed but its `Read`s sat until the next 1 s tick (worst case 2.04 s);
+      a fresh connection now polls immediately. Input during the cut: two tests prove a paused-pane
+      `Send` survives exactly once and a racing send is acked once or refused-and-retried. The
+      criterion's "assert it in `xtask bench`" was clarified (recorded above): the slice is the
+      authority, matching the precedent set by `reattach_after_absence_s`.
+
 - [ ] **Stage 4 — abort leaves the old daemon whole.** Kill -9 the new daemon at three points
       (before fd transfer, mid-transfer, after ack before commit): every pane alive, old daemon
       serving, clients unaware, a retry succeeding — `flock` keeps exactly one serving daemon.
