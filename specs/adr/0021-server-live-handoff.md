@@ -232,8 +232,12 @@ acknowledges when it has finished the read+push it was in; once every pump has a
 nothing is in flight and the snapshot is exact.
 
 **And every abort must resume the pumps — this is the requirement the design nearly missed.**
-A paused pane whose child keeps writing fills the kernel pipe buffer (commonly 64 KiB) and then
-**the child blocks**. If a handoff aborts while the pumps are paused and nobody resumes them,
+A paused pane whose child keeps writing fills the kernel's terminal buffer and then **the child
+blocks**. Measured on this kernel (6.12) rather than assumed: a pty with no reader accepts only
+**~12 KiB** before the writer blocks — *less* than the 64 KiB a pipe would take, which is what
+this ADR first claimed and why the number is now written down from a measurement. Twelve
+kilobytes is a couple of screens of build output, so the window is not theoretical: any agent
+printing progress during a paused handoff reaches it. If a handoff aborts while the pumps are paused and nobody resumes them,
 that agent is stuck until the daemon restarts — a worse outcome than the update simply not
 happening, arrived at by the feature meant to protect it. So the outgoing daemon resumes before
 it returns to serving, on every abort path, and a test proves it by pushing well over a pipe
@@ -254,11 +258,27 @@ truth for the same fact — the defect class this codebase keeps finding — and
 free to disagree. The metrics sampler is derived the same way (it samples `/proc`, which is the
 one place process facts live).
 
-**Enforcement travels as a path, not a descriptor.** A cgroup is a *named* kernel object
-(`/sys/fs/cgroup/...`), so the guard is re-opened from its path on the other side rather than
-passed. A pane that arrived without its guard would silently lose its memory ceiling, so the
-incoming daemon either re-opens it or says so — serving an agent unprotected while reporting a
-clean handoff is the failure that would matter most and show least.
+**Enforcement travels as a path, not a descriptor — and is re-opened only after the commit.**
+A cgroup is a *named* kernel object (`/sys/fs/cgroup/...`), so the guard is re-opened from its
+path on the other side rather than passed. A pane that arrived without its guard would silently
+lose its memory ceiling, so the incoming daemon either re-opens it or says so — serving an agent
+unprotected while reporting a clean handoff is the failure that would matter most and show least.
+
+The ordering is load-bearing, and it was found while implementing it: **`Guard::drop` removes the
+group** (`rmdir`). An incoming daemon that re-opened the guard *before* committing would, on an
+abort, remove a cgroup that the **outgoing daemon's still-running pane lives in** — stripping the
+ceiling off a live agent while reporting that it had changed nothing. So the guard is re-opened
+after the commit, where taking ownership (and the removal that comes with it) is correct: when the
+new daemon's pane dies, the group goes. Between the commit and the re-open the pane is unpolled for
+breaches for a few milliseconds, which is the right trade against destroying a live pane's
+enforcement. The same asymmetry shows up on the outgoing side and explains why nothing cleans up
+there: the daemon exits via `std::process::exit`, which runs no destructors, so the group outlives
+it by construction and the adopting daemon becomes its genuine owner.
+
+This is the second time in this design that an inherited resource needed its *destructive* path
+reconsidered rather than its acquisition path — the first was `ExclusiveLock::inherited`, whose
+`Drop` must not unlock a shared description. The general shape: **when ownership moves, ask what
+the new owner's cleanup does to the old owner's world.**
 
 **Rejected: reusing the crash path.** T-0018's restore re-spawns the recorded command, which is
 right for a reboot (a descriptor cannot survive one) and wrong here: it produces a *new* child,

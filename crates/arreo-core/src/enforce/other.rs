@@ -16,6 +16,12 @@ impl Guard {
         Err(EnforceError::Unimplemented("T-0019 (resource enforcement)"))
     }
 
+    /// No group exists on this OS to adopt: a handoff that carried a guard path
+    /// has nothing to re-open, and says so rather than serving the pane bare.
+    pub fn reopen(_path: std::path::PathBuf) -> Result<Self, EnforceError> {
+        Err(EnforceError::Unimplemented("T-0019 (resource enforcement)"))
+    }
+
     pub fn attach(&self, _pid: u32) -> Result<(), EnforceError> {
         Err(EnforceError::Unimplemented("T-0019 (resource enforcement)"))
     }

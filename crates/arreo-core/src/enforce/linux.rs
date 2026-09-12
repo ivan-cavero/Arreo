@@ -60,6 +60,43 @@ impl Guard {
         Ok(guard)
     }
 
+    /// Adopt an existing group by path (T-0038 stage 2: the daemon handoff).
+    ///
+    /// The incoming daemon inherits panes whose cgroups already exist — a cgroup
+    /// is a *named* kernel object, so it crosses a handoff as a path rather than
+    /// as a descriptor, and this is how the new daemon takes ownership of one.
+    ///
+    /// ## Call this only once you own the pane
+    ///
+    /// [`Drop`] removes the group, so adopting one **before** the handoff commits
+    /// is a way to destroy a running agent's enforcement: the outgoing daemon is
+    /// still serving that pane, and an aborted handoff that dropped this value
+    /// would `rmdir` the live pane's group out from under it, silently removing
+    /// the ceiling it was running under. The incoming daemon therefore re-opens
+    /// guards **after** it has committed to serving, where taking ownership (and
+    /// the removal that comes with it) is exactly right.
+    ///
+    /// Nothing removes the group on the *outgoing* side: the daemon exits via
+    /// `std::process::exit`, which runs no destructors, so the group outlives it
+    /// by construction and the adopting daemon becomes its owner.
+    ///
+    /// Refuses a path that is not an existing directory: a pane that arrived with
+    /// a guard path that cannot be re-opened must be reported, never served
+    /// unprotected while the handoff claims success.
+    pub fn reopen(path: PathBuf) -> Result<Self, EnforceError> {
+        match std::fs::metadata(&path) {
+            Ok(meta) if meta.is_dir() => Ok(Self { path }),
+            Ok(_) => Err(EnforceError::Unavailable(format!(
+                "{} is not a cgroup directory",
+                path.display()
+            ))),
+            Err(e) => Err(EnforceError::Unavailable(format!(
+                "cannot re-open cgroup {}: {e}",
+                path.display()
+            ))),
+        }
+    }
+
     fn write(&self, file: &str, value: &str) -> Result<(), EnforceError> {
         std::fs::write(self.path.join(file), value).map_err(|e| {
             EnforceError::Unavailable(format!("{}: {e}", self.path.join(file).display()))

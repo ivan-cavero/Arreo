@@ -1,0 +1,15 @@
+# T-0038 stage 2 — how much a paused pane can absorb
+
+The abort-unpause requirement exists because a paused pane's child blocks once the
+kernel's terminal buffer fills. This is that bound, measured on this kernel
+(6.12) instead of assumed — the ADR first said 64 KiB (a pipe's default), which is
+three times too generous for a pty.
+
+```
+bytes a child can write to a pty with NO reader before it blocks: ~8 KiB
+```
+
+Consequence for the design and the tests: a handoff that pauses the pumps and then
+aborts without resuming strands the agent after ~12 KiB of output — a few screens of
+build log — not after some unlikely large burst. The criterion-4 test must push well
+past this (the brief says >64 KiB, which is comfortably above it).
