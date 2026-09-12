@@ -7,7 +7,7 @@ Where you are: `arreo-tui` takes `--machine NAME` (same name the CLI takes, reso
 `arreo_core::mesh::resolve`), the sidebar title is the session label, and a `question` pane shows the
 line it is waiting on — cut to the sidebar's width, whole in the pane view. Remote-pane state, RAM and
 question all cross the relay through one code path; the resolver now lives in `arreo-core` because two
-clients resolve names and `arreo-tui` may not depend on `arreo-cli`. 456 tests, all green.
+clients resolve names and `arreo-tui` may not depend on `arreo-cli`. 456 tests, all green; theme slice 27/27, relay 20/20, tui 20/20, bench 6/6.
 Next step: **T-0047** (the mesh e2e slice — the referee for T-0043…T-0046, and where the
 `cross_machine_attach_ms` budget row lives), or T-0048 (OSS launch readiness) if a release-shaped
 deliverable is wanted first.
