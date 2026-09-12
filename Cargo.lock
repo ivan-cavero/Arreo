@@ -131,6 +131,7 @@ dependencies = [
  "regex",
  "rmp-serde",
  "rusqlite",
+ "rustix 0.38.44",
  "rustls",
  "serde",
  "serde_json",

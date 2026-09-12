@@ -35,6 +35,13 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 rcgen = { version = "0.13", optional = true }
 snow = { version = "0.9", optional = true }
 portable-pty = "0.9"
+# PTY adoption (T-0038 stage 0): a master descriptor handed over by the daemon
+# being replaced arrives over `SCM_RIGHTS`, which needs `sendmsg`/`recvmsg`
+# plus the winsize/tty probes, `fcntl` and `pidfd_open` around it. rustix is
+# already in `Cargo.lock` at 0.38.44 via portable-pty (the `polling = "=3.7.0"`
+# pin at the bottom is what keeps it at 0.38), so this adds no supply-chain
+# entry and no hand-rolled `unsafe libc::sendmsg`.
+rustix = { version = "0.38", features = ["alloc", "event", "net", "process", "pty", "termios"] }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "time", "io-util", "net"] }
 anyhow = "1"
 thiserror = "2"

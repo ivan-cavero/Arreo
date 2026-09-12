@@ -6,11 +6,20 @@
 //! [`RingBuffer::dropped`] counts them, so a runaway child can never OOM us.
 
 use std::io::{Read, Write};
+#[cfg(unix)]
+use std::os::unix::io::OwnedFd;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 use thiserror::Error;
+
+/// Adopting a PTY master that arrived as a file descriptor (T-0038), plus the
+/// `SCM_RIGHTS` helpers the handoff passes it with. Unix-only: descriptor
+/// passing has no Windows analogue (T-0039 routes that case).
+#[cfg(unix)]
+pub mod adopt;
 
 /// Hot scrollback capacity: 512 lines (ROADMAP §3.1 memory discipline).
 pub const HOT_LINES: usize = 512;
@@ -33,6 +42,29 @@ pub enum PtyError {
     Io(#[from] std::io::Error),
     #[error("pane is closed")]
     Closed,
+    /// [`Pane::adopt`] was handed a descriptor that is not a terminal at all
+    /// (a socket, a file, an eventfd). Refused, and the descriptor closed:
+    /// adopting it would put an arbitrary descriptor behind the pane API.
+    #[error("adopt: descriptor is not a terminal")]
+    NotATerminal,
+    /// [`Pane::adopt`] was handed a terminal that is not a PTY *master* — the
+    /// slave end, most plausibly. A slave is a tty, so `isatty` accepts it;
+    /// `ptsname` does not, and adopting the wrong end would leave the pane
+    /// reading its own output instead of the child's.
+    #[error("adopt: descriptor is not a pty master")]
+    NotPtyMaster,
+    /// [`Pane::adopt`] was handed a `child_pid` the terminal disagrees with:
+    /// the master's session leader — the process the sending daemon created,
+    /// and the one a kill would reach — is `session`, not `claimed`.
+    ///
+    /// The pid arrives over the same untrusted channel as the descriptor, so it
+    /// is a number an attacker picks until the terminal confirms it. A pid the
+    /// terminal names *no* session for is not refused this way: it is dropped,
+    /// so it can never become a signal target, without giving up a pane whose
+    /// agent has already exited (see `AdoptedMaster::claimed_pid`). Here the
+    /// terminal contradicted the claim outright.
+    #[error("adopt: claimed child pid {claimed}, but the terminal's session leader is {session}")]
+    ChildPidMismatch { claimed: u32, session: u32 },
 }
 
 /// Bounded line-oriented ring buffer.
@@ -189,6 +221,18 @@ pub enum ExitState {
     Exited(u32),
 }
 
+/// Exit code reported for a pane whose process this daemon did not fork
+/// ([`Pane::adopt`]): the process is known to be gone, but `waitpid` can never
+/// be called on it, so the status it exited with died with the daemon that
+/// forked it.
+///
+/// `u32::MAX` is the sentinel, and it cannot be confused with a real status: a
+/// process exit code is `0..=255`. It is a constant rather than a third
+/// [`ExitState`] variant because a new variant would break every exhaustive
+/// `match` on it downstream (`arreo-server`'s daemon has one), and widening the
+/// enum is not this task's business.
+pub const UNKNOWN_EXIT: u32 = u32::MAX;
+
 /// A spawned pane: owned PTY master, reader pump, bounded buffer, child handle.
 ///
 /// `Send + Sync`: the daemon shares panes across threads/tasks (`Arc<Pane>`),
@@ -227,10 +271,108 @@ impl Pane {
         cmd.args(args);
         let child = pair.slave.spawn_command(cmd)?;
         drop(pair.slave);
+        Self::assemble(
+            pair.master,
+            child,
+            Arc::new(AtomicBool::new(false)),
+            SpawnSpec {
+                program: program.to_string(),
+                args: args.iter().map(|s| s.to_string()).collect(),
+            },
+        )
+    }
 
+    /// Adopt a PTY master that was opened by another process and handed over as
+    /// a file descriptor (T-0038: the zero-cut update).
+    ///
+    /// `master_fd` is a master whose child is already running — the daemon
+    /// being replaced forked it, and this one inherits the pane rather than
+    /// re-creating it. The resulting [`Pane`] is the same object
+    /// [`Pane::spawn`] builds: same reader pump, same bounded ring, so
+    /// `send`/`resize`/`drain`/`size`/`raw_snapshot` behave identically.
+    ///
+    /// `child_pid` is whatever the sender knew; `None` is accepted (an old
+    /// sender, or a handoff that could not resolve it) and only costs the
+    /// sharper exit detection. `Some(pid)` is only ever used when the inherited
+    /// terminal confirms it — the master's session leader is that very pid — so
+    /// a pid the terminal contradicts refuses the adoption
+    /// ([`PtyError::ChildPidMismatch`]), and a terminal that names *no* session
+    /// simply keeps no pid: it cannot confirm the claim, so the claim is
+    /// dropped and the pane is watched the way a pane handed over with no pid
+    /// is (`adopt::ClaimedPid::NoSession`). A pid that arrived over an untrusted
+    /// channel never becomes a signal target on a claim alone.
+    ///
+    /// A refusal here has changed nothing about the sender's terminal: every
+    /// check a handoff can trigger — the descriptor's validity, the pid's claim
+    /// — runs before the one step that touches the inherited terminal, so a
+    /// transfer this call declines leaves the live pane it came from exactly as
+    /// it was. (The final assembly can still fail on resource exhaustion, which
+    /// is not a refusal and not something the sender can bring about.)
+    ///
+    /// `size` is the geometry the sender believes it was serving, in
+    /// [`adopt::AdoptSize`]'s named fields, and it is used only when the
+    /// inherited master has none: the kernel's geometry is authoritative, so a
+    /// stale sender cannot resize a live agent's terminal by lying about it.
+    ///
+    /// Refuses a descriptor that is not a terminal, one that is a terminal but
+    /// not a master, and a pid the master contradicts
+    /// ([`PtyError::NotATerminal`] / [`PtyError::NotPtyMaster`] /
+    /// [`PtyError::ChildPidMismatch`]); the descriptor is closed in every case.
+    #[cfg(unix)]
+    pub fn adopt(
+        master_fd: OwnedFd,
+        child_pid: Option<u32>,
+        size: adopt::AdoptSize,
+        spec: SpawnSpec,
+    ) -> Result<Self, PtyError> {
+        // Shared with the adopted child before the pane exists: the pump sets
+        // it at end-of-stream, which is that child's fallback exit signal.
+        let closed = Arc::new(AtomicBool::new(false));
+        let master = adopt::AdoptedMaster::new(master_fd)?;
+        // Before the pid reaches anything that can signal: the descriptor
+        // arrived on an untrusted channel, and so did the pid that came with
+        // it. Refusing here drops `master` and with it the descriptor, having
+        // touched nothing else.
+        let pid = match child_pid {
+            None => None,
+            Some(pid) => match master.claimed_pid(pid)? {
+                adopt::ClaimedPid::SessionLeader => Some(pid),
+                // The terminal names no session, so it cannot confirm the
+                // claim: the pid is dropped, and *nothing* is concluded about
+                // the child. A session-less terminal can belong to a child
+                // that is running right now, so the pane is watched by
+                // end-of-stream — the no-pid path — and the child's actual
+                // death is what ends up being reported.
+                adopt::ClaimedPid::NoSession => None,
+            },
+        };
+        // Every check that can still refuse has run, and so has every step that
+        // can fail on a resource (the child's terminal `dup`): only now is the
+        // inherited terminal changed, and nothing that a handoff can trigger
+        // changes it again. What remains below is the final assembly, whose
+        // failures are resource exhaustion (a thread that will not start) —
+        // not a refusal of the transfer, and not reachable by anything the
+        // sender controls.
+        let child = adopt::AdoptedChild::new(pid, &master, Arc::clone(&closed))?;
+        master.repair_geometry(size)?;
+        Self::assemble(Box::new(master), Box::new(child), closed, spec)
+    }
+
+    /// Assemble a pane around an already-open master and child handle.
+    ///
+    /// The single place that installs the reader pump, the bounded ring, the
+    /// writer and the `closed` flag: [`Pane::spawn`] and [`Pane::adopt`] differ
+    /// only in where `master` and `child` come from. `closed` is passed in
+    /// because it is shared, not private here — an adopted child reads it to
+    /// learn that the terminal reached end-of-stream.
+    fn assemble(
+        master: Box<dyn MasterPty + Send>,
+        child: Box<dyn portable_pty::Child + Send + Sync>,
+        closed: Arc<AtomicBool>,
+        spec: SpawnSpec,
+    ) -> Result<Self, PtyError> {
         let buffer = Arc::new(Mutex::new(RingBuffer::new(HOT_LINES)));
-        let closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let mut reader = pair.master.try_clone_reader()?;
+        let mut reader = master.try_clone_reader()?;
         let pump_buffer = Arc::clone(&buffer);
         let pump_closed = Arc::clone(&closed);
         std::thread::Builder::new()
@@ -238,6 +380,9 @@ impl Pane {
             .spawn(move || {
                 let mut chunk = [0u8; 8192];
                 loop {
+                    // A master read reports end-of-stream as `Ok(0)` or, on
+                    // Linux, as `EIO` once the last slave closes: both end the
+                    // pump, and `closed` is what callers see.
                     match reader.read(&mut chunk) {
                         Ok(0) | Err(_) => break,
                         Ok(n) => {
@@ -247,12 +392,12 @@ impl Pane {
                         }
                     }
                 }
-                pump_closed.store(true, std::sync::atomic::Ordering::SeqCst);
+                pump_closed.store(true, Ordering::SeqCst);
             })
             .map_err(PtyError::Io)?;
 
         let killer = Mutex::new(child.clone_killer());
-        let master = Mutex::new(pair.master);
+        let master = Mutex::new(master);
         let writer = Mutex::new(master.lock().map_err(|_| PtyError::Closed)?.take_writer()?);
         Ok(Self {
             master,
@@ -261,10 +406,7 @@ impl Pane {
             child: Arc::new(Mutex::new(child)),
             killer,
             closed,
-            spawn: SpawnSpec {
-                program: program.to_string(),
-                args: args.iter().map(|s| s.to_string()).collect(),
-            },
+            spawn: spec,
         })
     }
 
@@ -356,6 +498,9 @@ impl Pane {
 
     /// Non-blocking exit poll. Observes EOF as well as the child handle, so a
     /// pane whose child already reaped elsewhere still reports termination.
+    /// An adopted pane ([`Pane::adopt`]) reports
+    /// [`ExitState::Exited(UNKNOWN_EXIT)`]: it is known to be gone, but this
+    /// process can never reap the status it went with.
     #[must_use]
     pub fn try_wait(&self) -> ExitState {
         if let Ok(mut child) = self.child.lock() {
