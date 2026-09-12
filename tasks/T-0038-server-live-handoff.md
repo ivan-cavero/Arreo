@@ -194,9 +194,57 @@ PTY masters over SCM_RIGHTS, re-opens SQLite and serves — a failed step kills 
       externally (the old pid is gone *and* a different pid answers), not parsed from a log line,
       because a candidate that printed the right words and failed cannot satisfy it.
 
-- [ ] **Stage 2 — N panes with output in flight.** 8 panes emitting a monotonic marker stream;
+- [x] **Stage 2 — N panes with output in flight.** 8 panes emitting a monotonic marker stream;
       handoff under load → every pane pid unchanged, no marker lost, duplicated or reordered
       across the cut, and lines written before the cut still readable after it.
+      **Outcome.** The panes cross the cut: master descriptors over `SCM_RIGHTS`, scrollback
+      (lines + the unterminated partial) and the raw journal in a length-prefixed manifest on the
+      transfer connection, and the pane's identity and its guard's cgroup path. The incoming daemon
+      rebuilds each `PaneEntry`: a fresh engine fed the transferred journal (so a pane that was
+      mid-question stays mid-question), a fresh sampler, the guard re-opened from its path, the alert
+      episode reconstructed through `AlertState`'s own rule. Verified by operating it — the planner
+      ran eight real panes through a real `arreo update --server` cut and every tick stream came
+      back contiguous from 1, each pane with a single pid (evidence
+      `.loop/evidence/T-0038/stage2-panes.txt`).
+
+      **The two design decisions that make it safe, both enforced structurally rather than by
+      discipline:**
+      - **The transfer point is atomic with respect to read→push.** Each pump checks a pause flag
+        before reading and acknowledges quiescence; the snapshot is taken only once every pump has
+        acknowledged, so no byte is in flight. The buffer lock cannot be the point — `read` blocks
+        on an idle pane — which is why the pause gate exists at all.
+      - **`adopt_seeded` always parks, and there is no argument that says otherwise.** The incoming
+        daemon must not consume a byte before the cut commits; a byte read by a daemon that then
+        aborts is gone and the outgoing daemon could not recover it. This is structural because a
+        test *cannot* race the window: one was written that aborted a real handoff after adoption
+        and it could not catch the mutant that unparked the pump — the transfer completed first.
+        The same lesson as T-0070's hard link: remove the window rather than test inside it. The
+        deterministic unit test pins the mechanism (a parked adoption consumes nothing; `resume`
+        makes the buffered bytes arrive).
+
+      **The stage-2 security review reproduced six findings; the two that mattered:**
+      - **HIGH — the outgoing transfer's writes are unbounded.** A peer that takes the descriptors
+        and stops reading freezes every pane's pump indefinitely: the daemon blocks in
+        `send_manifest`/`send_one` and never reaches the bounded `wait_for_commit`. Reproduced:
+        the agent's output froze (thread wedged in `sock_alloc_send_pskb`), recovered only when
+        the peer died, and the one-handoff lock stayed held so the machine could not update. Fixed
+        with a total write deadline: a stalled peer costs an abort (pumps resume, `.handoff`
+        unlinked, abort row), never a frozen machine.
+      - **MEDIUM — `guard_path` was adopted without validation, and `Guard::drop` rmdirs it.**
+        A hostile peer named an arbitrary empty directory; the incoming daemon committed and, when
+        the pane was killed, **removed that directory** — and worse, reported `has_guard() == true`
+        while reading nothing, so an agent was served without its ceiling and the handoff claimed
+        success. Fixed: `reopen` requires the path to be a direct child of this machine's cgroup
+        scope *and* to read like a cgroup — the same rule `create` builds under, extracted to one
+        place so the two cannot disagree.
+      - The rest, recorded: the manifest's 64 MiB *byte* bound is not a *structure* bound (minimal
+        entries amplify ~275×, so the full bound is ~1 GB before the count is read — fixed with an
+        entry-count cap and a total read deadline); pane state is a pure function of peer bytes and
+        can be fabricated (sound — no authorization or enforcement reads engine state; recorded so
+        nobody wires it to one later); N entries = N threads and fds (bounded by the entry cap);
+        and `repair_geometry` applied the manifest's claimed size before the commit (moved after,
+        so an abort cannot leave the outgoing daemon serving a resized terminal).
+
 - [ ] **Stage 3 — clients reconnect transparently.** TUI + CLI attached through a stage-2 handoff
       reattach with an unchanged session id in < 2 s — flip `perf-budget.toml`'s recorded
       `server_handoff_reattach_s` row to enforced and assert it in `xtask bench`. Resume tokens

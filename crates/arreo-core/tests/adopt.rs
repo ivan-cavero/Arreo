@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 use arreo_core::pty::adopt::{
     recv_fd, send_fd, AdoptSize, FdTransferError, DEFAULT_FD_TRANSFER_TIMEOUT, FD_PASS_BYTE,
 };
-use arreo_core::pty::{ExitState, Pane, PtyError, SpawnSpec, UNKNOWN_EXIT};
+use arreo_core::pty::{AdoptSeed, ExitState, Pane, PtyError, Scrollback, SpawnSpec, UNKNOWN_EXIT};
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtyPair, PtySize};
 use rustix::net::{sendmsg, SendAncillaryBuffer, SendAncillaryMessage, SendFlags};
 use rustix::termios::Winsize;
@@ -1052,4 +1052,81 @@ fn adopted_pane_without_a_pid_learns_exit_from_end_of_stream() {
     assert_eq!(exit, ExitState::Exited(UNKNOWN_EXIT), "got {exit:?}");
 
     drop(sender);
+}
+
+/// **Adoption parks the pump, and only `resume` starts it.**
+///
+/// The rule this pins: a daemon that adopts a terminal must not consume a byte
+/// from it before the cut commits. A byte read by a daemon that then aborts is
+/// **gone** — the outgoing daemon resumes and its scrollback has a hole in the
+/// agent's output that nothing can detect afterwards, because the missing bytes
+/// were never written anywhere either side keeps.
+///
+/// ## Why this is a unit test and not a handoff test
+///
+/// The window it protects is the milliseconds between adoption and the commit,
+/// and **a test cannot reliably get inside it**: one was written that aborted a
+/// real handoff after adoption (by unlinking the lock, so the refusal came from
+/// `serve_inherited` — which runs once the panes exist) and asserted the tick
+/// stream was unbroken. It did not catch the mutant that unparked the pump: the
+/// transfer completed before the test could act, so the mutant passed. That is
+/// the same lesson as T-0070's hard link and this task's listener inheritance —
+/// **remove the window rather than testing inside it**.
+///
+/// So the protection is structural: `adopt_seeded` always parks, and there is no
+/// argument that says otherwise (`Pane::adopt` never parks, and has no cut to
+/// protect). This test pins the mechanism that makes that structural choice worth
+/// anything: parked really means nothing is consumed, and `resume` really means
+/// the bytes that arrived meanwhile are still there to read.
+#[test]
+fn an_adopted_pane_consumes_nothing_until_it_is_resumed() {
+    let (mut sender, master_fd, _pid) = Sender::open(
+        "/bin/sh",
+        &[
+            "-c",
+            "i=0; while true; do i=$((i+1)); echo tick-$i; sleep 0.05; done",
+        ],
+    );
+    // Let the child certainly write something before the adoption.
+    std::thread::sleep(Duration::from_millis(400));
+
+    let pane = Pane::adopt_seeded(
+        master_fd,
+        AdoptSeed {
+            child_pid: None,
+            size: AdoptSize { cols: 80, rows: 24 },
+            spec: spec(),
+            scrollback: Scrollback::default(),
+        },
+    )
+    .expect("adopt a seeded pane");
+
+    // Parked: the child keeps writing into the terminal's buffer and the pane
+    // consumes none of it. This is the assertion the rule rests on.
+    std::thread::sleep(Duration::from_millis(400));
+    let parked = pane.drain();
+    assert!(
+        parked.is_empty(),
+        "a parked pump read from the terminal: {parked:?}"
+    );
+
+    // Resumed: what arrived while parked is still there — nothing was dropped,
+    // which is what makes the parking safe rather than merely quiet.
+    pane.resume();
+    let lines = wait_for(&pane, "tick-", Duration::from_secs(5));
+    assert!(
+        lines.iter().any(|line| line.contains("tick-1")),
+        "the first tick written while parked arrived after the resume: {lines:?}"
+    );
+
+    // The ticking child must not outlive the test: kill it through the side that
+    // forked it (the adopted pane has no pid here, so it cannot signal), then
+    // reap, which is the same discipline every test in this file follows.
+    drop(pane);
+    sender
+        .child
+        .clone_killer()
+        .kill()
+        .expect("kill the ticking child");
+    reap(&mut sender, Duration::from_secs(5));
 }

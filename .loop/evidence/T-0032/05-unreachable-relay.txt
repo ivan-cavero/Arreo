@@ -1,4 +1,4 @@
-┌device dev_9441 · relay───┐┌(no focus — Enter on a sidebar row)───────────────────────────────────────────────────────┐
+┌device dev_7d63 · relay───┐┌(no pane attached — Enter on a sidebar row)───────────────────────────────────────────────┐
 │                          ││                                                                                          │
 │                          ││                                                                                          │
 │                          ││                                                                                          │
@@ -27,4 +27,4 @@
 │                          ││                                                                                          │
 │                          ││                                                                                          │
 └──────────────────────────┘└──────────────────────────────────────────────────────────────────────────────────────────┘
-reconnecting to dev_9441510375bab706fb89be718f399c29 via relay 127.0.0.1:1 (attempt 1, next in 0.3s): mesh client remote
+reconnecting to dev_7d632ee5cf4804c2426957d9cd8770d1 via relay 127.0.0.1:1 (attempt 1, next in 0.3s): mesh client remot…

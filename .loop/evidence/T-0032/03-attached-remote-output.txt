@@ -1,6 +1,6 @@
-┌device dev_9441 · relay───┐┌remote-pane [working] ────────────────────────────────────────────────────────────────────┐
-│● working                 ││REMOTE-MACHINE-MARKER-7c31                                                                │
-│▸ remote-pane   3M █░░░░░░││second-line                                                                               │
+┌device dev_7d63 · relay───┐┌▶ ● remote-pane [working] ────────────────────────────────────────────────────────────────┐
+│  ● working               ││REMOTE-MACHINE-MARKER-7c31                                                                │
+│ ▸ remote-pane   3M █░░░░░││second-line                                                                               │
 │                          ││                                                                                          │
 │                          ││                                                                                          │
 │                          ││                                                                                          │
@@ -27,4 +27,4 @@
 │                          ││                                                                                          │
 │                          ││                                                                                          │
 └──────────────────────────┘└──────────────────────────────────────────────────────────────────────────────────────────┘
-1 panes · j/k move · Enter attach · w wall · t theme · / search · q quit
+1 panes · j/k move · Enter attach · Tab cycle · w wall · t theme · / search · ? keys · q quit

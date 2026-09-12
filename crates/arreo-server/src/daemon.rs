@@ -48,7 +48,14 @@ pub struct PaneEntry {
     pub sampler: Mutex<Sampler>,
     /// Enforcement guard (T-0019): present when the pane was spawned with a
     /// budget. Held for its Drop (group removal) + breach polls.
-    pub guard: Option<arreo_core::enforce::Guard>,
+    ///
+    /// A `Mutex` rather than a plain `Option` because of the handoff's ordering
+    /// (T-0038 stage 2): an adopted pane's guard is re-opened **after** the cut
+    /// commits, since [`arreo_core::enforce::Guard`]'s `Drop` removes the cgroup
+    /// and adopting one early would strip a live agent's ceiling if the handoff
+    /// then aborted. The window between the commit and the re-open is the price,
+    /// and it is bounded by this code rather than by a timer.
+    pub guard: Mutex<Option<arreo_core::enforce::Guard>>,
     /// Kill the pane on breach (from `Spawn.kill_on_breach`).
     pub kill_on_breach: bool,
     /// Graded-alert episode memory (T-0041): the highest level fired since the
@@ -59,6 +66,11 @@ pub struct PaneEntry {
     /// client attached the alert is held here and delivered on attach —
     /// dropping it is the failure mode this field forbids.
     pub pending_alerts: Mutex<Vec<String>>,
+    /// The last alert line this entry fed into its engine (T-0041/T-0038): the
+    /// engine's *input* is not the raw journal alone — an alert is a synthetic
+    /// line — so a handoff that carried only the journal would lose the
+    /// `Blocked` state an alert put the pane in. Kept for exactly that transfer.
+    pub last_alert_line: Mutex<Option<String>>,
 }
 
 impl PaneEntry {
@@ -76,11 +88,109 @@ impl PaneEntry {
             engine: Mutex::new(Engine::new(Adapter::default(), 0)),
             fed: Mutex::new(0),
             sampler: Mutex::new(Sampler::new()),
-            guard,
+            guard: Mutex::new(guard),
             kill_on_breach,
             alert_state: Mutex::new(arreo_core::enforce::AlertState::default()),
             pending_alerts: Mutex::new(Vec::new()),
+            last_alert_line: Mutex::new(None),
         }
+    }
+
+    /// Take ownership of this pane's enforcement guard, after the cut committed
+    /// (T-0038 stage 2).
+    ///
+    /// **Why this is separate from construction**: `Guard::drop` removes the
+    /// cgroup, so an incoming daemon that adopted a guard before committing
+    /// would — on abort — remove the group of a pane the outgoing daemon is
+    /// still serving, silently stripping a live agent's memory ceiling while
+    /// reporting that nothing happened. So the guard is adopted only once this
+    /// process owns the pane for good.
+    pub fn adopt_guard(&self, guard: arreo_core::enforce::Guard) {
+        *self.guard.lock().unwrap_or_else(|e| e.into_inner()) = Some(guard);
+    }
+
+    /// Whether this pane is under enforcement right now (T-0019/T-0038).
+    #[must_use]
+    pub fn has_guard(&self) -> bool {
+        self.guard
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some()
+    }
+
+    /// This pane's cgroup reading, when it has a guard (T-0041).
+    #[must_use]
+    fn guard_pressure(&self) -> Option<arreo_core::enforce::Pressure> {
+        self.guard
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .map(|guard| guard.pressure())
+    }
+
+    /// Rebuild the entry for a pane adopted across a handoff (T-0038 stage 2).
+    ///
+    /// Three of this entry's fields are **derived**, and this is where they are
+    /// re-derived rather than transferred (ADR 0021 §4, and the design's §2):
+    ///
+    /// - **The engine.** A fresh engine is fed the transferred raw journal once,
+    ///   so the state the sender had reached is the state this daemon starts
+    ///   from — which is the whole reason the journal travels. Feeding it here,
+    ///   before the pump resumes, is also what makes `fed` correct: it is set to
+    ///   the journal's length *after* the feed, so the first `pump` tick picks up
+    ///   from the first byte written after the cut.
+    /// - **The alert line.** Also engine input, and also synthetic — it is not in
+    ///   the journal. Fed after the journal, in the order the sender fed it.
+    /// - **The sampler.** Nothing to re-derive: it samples `/proc`, and its first
+    ///   tick on this side is as good as its last on the other.
+    ///
+    /// The guard is *not* derived and is not built here either: it is re-opened
+    /// by the caller **after** the cut commits (see [`PaneEntry::adopt_guard`]),
+    /// because `Guard::drop` removes the cgroup and adopting one early would
+    /// strip a live agent's ceiling if the handoff then aborted.
+    pub fn adopted(
+        pane: Arc<Pane>,
+        alert: Option<&str>,
+        alert_line: Option<&str>,
+        kill_on_breach: bool,
+    ) -> Self {
+        let (journal, _) = pane.raw_snapshot();
+        let entry = Self::new_with_guard(pane, None, kill_on_breach);
+        {
+            let mut engine = entry.engine.lock().unwrap_or_else(|e| e.into_inner());
+            // **The state this engine derives is advisory (F4, stage-2
+            // review).** Its input — the transferred journal and the alert line
+            // — is peer-supplied: a hostile outgoing daemon can feed lines that
+            // make a fresh engine report `Question` or `Blocked` for a pane
+            // that is nothing of the sort. That is the point (the state IS
+            // derived from the journal, by construction), but it means no
+            // authorization or enforcement decision may ever read engine state:
+            // enforcement is cgroup-guard-based and the kill switch drives off
+            // `kill_on_breach`, both fielded here, never off the engine.
+            engine.feed(&journal, now_ms());
+            if let Some(line) = alert_line {
+                engine.feed(line.as_bytes(), now_ms());
+            }
+        }
+        *entry.fed.lock().unwrap_or_else(|e| e.into_inner()) = journal.len();
+        if let Some(line) = alert_line {
+            entry
+                .last_alert_line
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .replace(line.to_string());
+        }
+        if let Some(level) = alert.and_then(alert_level_of) {
+            // The episode is reconstructed through the public check, not by
+            // writing the field: `AlertState` owns its own hysteresis rule, and
+            // a handoff must not be a second way to set it.
+            entry
+                .alert_state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .check(Some(level.threshold()));
+        }
+        entry
     }
 
     /// Feed unfed journal bytes through the engine at `now_ms`. Returns new events.
@@ -117,12 +227,15 @@ impl PaneEntry {
     /// group stays over the limit. Returns the breach, if any.
     /// Idempotent per breach episode (engine dedups: already-Blocked stays).
     fn poll_breach(&self, id: &str, db: &std::path::Path) -> Option<arreo_core::enforce::Breach> {
-        let guard = self.guard.as_ref()?;
         // Graded alerts ride the same tick (T-0041): warn at 80%, critical at
         // 95%, each once per episode with hysteresis — and always before any
-        // kill below, so the ordering invariant holds within one tick.
+        // kill below, so the ordering invariant holds within one tick. Called
+        // *before* the guard is locked below: `poll_alerts` takes the same lock,
+        // and a `std::sync::Mutex` is not reentrant.
         self.poll_alerts(id, db);
-        let breach = guard.breached().ok()??;
+        let guard = self.guard.lock().unwrap_or_else(|e| e.into_inner());
+        let breach = guard.as_ref()?.breached().ok().flatten()?;
+        drop(guard);
         let label = match breach {
             arreo_core::enforce::Breach::Memory => "memory",
             arreo_core::enforce::Breach::Pids => "pids",
@@ -168,9 +281,13 @@ impl PaneEntry {
     /// client attached nothing is lost — the buffer holds it until attach
     /// drains it, which is the delivery the criterion forbids dropping.
     fn poll_alerts(&self, id: &str, db: &std::path::Path) {
-        let guard = self.guard.as_ref();
-        let Some(guard) = guard else { return };
-        let pressure = guard.pressure();
+        let pressure = {
+            let guard = self.guard.lock().unwrap_or_else(|e| e.into_inner());
+            match guard.as_ref() {
+                Some(guard) => guard.pressure(),
+                None => return,
+            }
+        };
         let mut state = self.alert_state.lock().unwrap_or_else(|e| e.into_inner());
         let Some(level) = state.check(pressure.ratio()) else {
             return;
@@ -211,6 +328,13 @@ impl PaneEntry {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .feed(line.as_bytes(), now_ms());
+        // The engine's input, kept for the handoff (T-0038): a synthetic line is
+        // not in the raw journal, so a pane that was `Blocked` because of an
+        // alert would arrive `Unknown` if only the journal travelled.
+        self.last_alert_line
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .replace(line.clone());
         // 2. The buffer (visible on attach).
         self.pending_alerts
             .lock()
@@ -499,7 +623,7 @@ impl Daemon {
         }
         let _ = std::fs::remove_file(&self.socket);
         let listener = UnixListener::bind(&self.socket)?;
-        self.serve_on(listener, None).await
+        self.serve_on(listener, None, None).await
     }
 
     /// Serve on an **inherited** listener + lock (T-0038 stage 1: the incoming
@@ -523,6 +647,7 @@ impl Daemon {
         &self,
         listener: UnixListener,
         lock: arreo_core::lock::ExclusiveLock,
+        adopted: Vec<(String, Arc<PaneEntry>)>,
         ready: Option<tokio::sync::oneshot::Sender<Result<(), String>>>,
     ) -> Result<(), DaemonError> {
         let lock_path = super::persist::lock_path_for(&self.socket);
@@ -564,15 +689,26 @@ impl Daemon {
             return Err(error);
         }
         *self.instance.lock().unwrap_or_else(|e| e.into_inner()) = Some(lock);
-        self.serve_on(listener, ready).await
+        self.serve_on(listener, Some(adopted), ready).await
     }
 
-    /// The accept loop both starts share: restore, warn, spawn the sweeps,
-    /// then accept until the listener errors or [`Daemon::stop_accepting`]
-    /// fires. The socket file is **never** unlinked here — neither the fresh
-    /// bind (which removed a stale file before binding) nor the handoff cut
-    /// (where the incoming daemon holds a dup of the same listener) may leave
-    /// the path missing.
+    /// The accept loop both starts share: restore (or install the adopted
+    /// panes), warn, spawn the sweeps, then accept until the listener errors or
+    /// [`Daemon::stop_accepting`] fires. The socket file is **never** unlinked
+    /// here — neither the fresh bind (which removed a stale file before binding)
+    /// nor the handoff cut (where the incoming daemon holds a dup of the same
+    /// listener) may leave the path missing.
+    ///
+    /// `adopted` is `Some` only on the inherited path (T-0038 stage 2): the
+    /// panes that arrived over the transfer connection, already built with their
+    /// rings seeded and their reader pumps **parked**, and installed here before
+    /// readiness so the commit that follows comes from a daemon that can already
+    /// answer `Panes`. It replaces [`Daemon::restore_boot`] rather than joining
+    /// it, and that is a correctness requirement, not an optimisation:
+    /// `persist::restore` **re-spawns** the panes it finds on disk, so running it
+    /// on a handoff would fork a second copy of every agent whose record the
+    /// outgoing daemon had persisted. The children are inherited here, never
+    /// restarted.
     ///
     /// `ready` fires once the loop owns the listener and is about to accept
     /// (T-0038 stage 1: the incoming daemon commits only after this, so a
@@ -588,10 +724,27 @@ impl Daemon {
     async fn serve_on(
         &self,
         listener: UnixListener,
+        adopted: Option<Vec<(String, Arc<PaneEntry>)>>,
         ready: Option<tokio::sync::oneshot::Sender<Result<(), String>>>,
     ) -> Result<(), DaemonError> {
-        // Boot restore BEFORE serving: crash survivors reappear with history.
-        self.restore_boot().await;
+        match adopted {
+            // Boot restore BEFORE serving: crash survivors reappear with history.
+            None => self.restore_boot().await,
+            // The handoff path: the panes are inherited, not restored (see
+            // `serve_inherited` for why `restore_boot` must not run here).
+            Some(adopted) => {
+                if !adopted.is_empty() {
+                    let mut registry = self.registry.write().await;
+                    for (id, entry) in adopted {
+                        registry.insert(id, entry);
+                    }
+                    eprintln!(
+                        "daemon: adopted {} pane(s) across the handoff",
+                        registry.len()
+                    );
+                }
+            }
+        }
         // Tell the operator if the audit log has grown past what they should
         // notice. A warning and never a prune: the trail is append-only, and a
         // log that deletes itself to stay small is not a log (T-0033).
@@ -612,7 +765,7 @@ impl Daemon {
                         .map(|(id, entry)| (id.clone(), Arc::clone(entry)))
                         .collect();
                     for (id, entry) in entries {
-                        if entry.guard.is_some() {
+                        if entry.has_guard() {
                             entry.poll_breach(&id, &db);
                         }
                     }
@@ -657,10 +810,7 @@ impl Daemon {
                             // line. Without a guard the tree RSS is the whole
                             // truth — recorded as both, so the series has one
                             // shape regardless of budget.
-                            let cgroup = entry
-                                .guard
-                                .as_ref()
-                                .and_then(|guard| guard.pressure().current);
+                            let cgroup = entry.guard_pressure().and_then(|p| p.current);
                             let total = cgroup.unwrap_or(sample.rss_bytes);
                             let _ = store.metrics_record(&arreo_core::store::MetricsSample {
                                 pane: id.clone(),
@@ -679,8 +829,7 @@ impl Daemon {
                             // rather than a series point (a graph cannot show
                             // "the kernel killed someone" as a number going up
                             // and down — the audit row names who and when).
-                            if let Some(guard) = entry.guard.as_ref() {
-                                let pressure = guard.pressure();
+                            if let Some(pressure) = entry.guard_pressure() {
                                 if pressure.oom_kill.unwrap_or(0) > 0 {
                                     let _ = store.record(&arreo_core::store::AuditEvent {
                                         device: "daemon".to_string(),
@@ -854,6 +1003,71 @@ fn now_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+/// The graded-alert level a wire string names, if any.
+///
+/// The inverse of `AlertLevel::as_str`, and the only reason it exists: the
+/// handoff carries the episode as the same string the `Panes` reply uses, and
+/// rebuilding it goes through `AlertState::check` rather than a new setter.
+fn alert_level_of(name: &str) -> Option<arreo_core::enforce::AlertLevel> {
+    match name {
+        "warn" => Some(arreo_core::enforce::AlertLevel::Warn),
+        "critical" => Some(arreo_core::enforce::AlertLevel::Critical),
+        "breach" => Some(arreo_core::enforce::AlertLevel::Breach),
+        _ => None,
+    }
+}
+
+/// One pane's entry in the handoff manifest (T-0038 stage 2).
+///
+/// **Call this with the pane paused** ([`arreo_core::pty::Pane::pause`]): the
+/// scrollback and journal it reads are complete only then, because a byte in the
+/// pump's read→push window is in neither the ring nor the terminal's buffer.
+///
+/// What it does *not* copy is as deliberate as what it does: the engine's state
+/// and `fed` are derived on the far side from `raw`, and the sampler is derived
+/// from `/proc`. `dropped`/`dropped_bytes` *are* copied — they count evictions
+/// the surviving lines cannot show.
+fn handoff_pane(id: &str, entry: &PaneEntry) -> arreo_core::proto::message::HandoffPane {
+    let pane = &entry.pane;
+    let spec = pane.spawn_spec();
+    let (cols, rows) = pane
+        .size()
+        .unwrap_or((arreo_core::pty::DEFAULT_COLS, arreo_core::pty::DEFAULT_ROWS));
+    let scrollback = pane.scrollback();
+    arreo_core::proto::message::HandoffPane {
+        id: id.to_string(),
+        program: spec.program,
+        args: spec.args,
+        cols,
+        rows,
+        child_pid: pane.child_pid(),
+        lines: scrollback.lines,
+        pending: scrollback.pending,
+        raw: scrollback.raw,
+        raw_truncated: scrollback.raw_truncated,
+        dropped: scrollback.dropped,
+        dropped_bytes: scrollback.dropped_bytes,
+        guard_path: entry
+            .guard
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .map(|guard| guard.path().to_string_lossy().into_owned()),
+        kill_on_breach: entry.kill_on_breach,
+        alert: entry
+            .alert_state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .level()
+            .map(|level| level.as_str().to_string()),
+        alert_line: entry
+            .last_alert_line
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone(),
+    }
 }
 
 async fn write_message(
@@ -2380,6 +2594,11 @@ async fn serve_handoff_request(
             server_protocol: VERSION,
             panes,
             nonce: nonce.to_vec(),
+            // Stage 2: this daemon carries the panes themselves. The incoming
+            // daemon requires it before it commits a cut that has panes, because
+            // a stage-1 sender (no manifest) exits on the commit and orphans
+            // every child — refusing is a deferred update, never a half-handoff.
+            manifest: true,
         },
     )
     .await
@@ -2387,61 +2606,44 @@ async fn serve_handoff_request(
     {
         return HandoffSessionOutcome::Gone;
     }
-    // 4. Accept one connection there with a deadline.
-    let _ = transfer_socket.listener.set_nonblocking(true);
-    let deadline = std::time::Instant::now() + crate::handoff::DEFAULT_HANDOFF_TIMEOUT;
-    let conn = loop {
-        match transfer_socket.listener.accept() {
-            Ok((conn, _)) => break Some(conn),
-            Err(e)
-                if e.kind() == std::io::ErrorKind::WouldBlock
-                    || e.kind() == std::io::ErrorKind::Interrupted =>
-            {
-                if std::time::Instant::now() >= deadline {
-                    break None;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-            }
-            Err(_) => break None,
-        }
+    // 4. **The rest of the handoff runs on a blocking thread.** Everything from
+    // here on is synchronous socket work with real deadlines (accept, nonce,
+    // descriptor sends, the pause, the manifest, the commit wait) and it used to
+    // run *inside* this async task — where it blocked a runtime worker for the
+    // whole transfer. That is not a style point: measured here, a client
+    // connecting to the daemon while a worker sat in the commit wait was
+    // **queued and never answered**, which is exactly what "the socket never
+    // goes dead" must not mean. `spawn_blocking` is the honest home for blocking
+    // syscalls: the accept loop and every live session keep running while the
+    // cut is negotiated, and the panes' pumps are paused by a thread that is
+    // allowed to wait.
+    //
+    // The failure rows move to the caller with it: `failures` is borrowed from
+    // the session loop, so the transfer returns the reason and this side records
+    // it.
+    let entries: Vec<(String, Arc<PaneEntry>)> = {
+        let registry = registry.read().await;
+        let mut entries: Vec<(String, Arc<PaneEntry>)> = registry
+            .iter()
+            .map(|(id, entry)| (id.clone(), Arc::clone(entry)))
+            .collect();
+        // Sorted, so the manifest's order and the order of the pane descriptors
+        // are the same list: the incoming daemon matches them by position, and
+        // there is no second source of truth to disagree with the first.
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        entries
     };
-    let Some(conn) = conn else {
-        let detail = "the new daemon never connected for the descriptors".to_string();
-        failures.abort(db, &detail);
-        write_message(
-            writer,
-            &Message::Error {
-                v: VERSION,
-                message: format!("handoff aborted: {detail}"),
-            },
-        )
-        .await
-        .ok();
-        return HandoffSessionOutcome::Answered;
-    };
-    // The transfer socket stays blocking for the steps below; the *reads* carry
-    // their own timeouts, so no wait here is unbounded.
-    let _ = conn.set_nonblocking(false);
-    // The peer must be this user (F1). On a platform that cannot answer
-    // (`peer_uid` → `None`) this defers to the nonce and the socket's
-    // permissions, which is why the transfer also requires the nonce.
-    if let Err(detail) = crate::handoff::check_peer_uid(&conn) {
-        failures.abort(db, &detail);
-        write_message(
-            writer,
-            &Message::Error {
-                v: VERSION,
-                message: format!("handoff aborted: {detail}"),
-            },
-        )
-        .await
-        .ok();
-        return HandoffSessionOutcome::Answered;
-    }
-    let presented = match crate::handoff::recv_nonce(&conn, crate::handoff::DEFAULT_HANDOFF_TIMEOUT)
-    {
-        Ok(presented) => presented,
-        Err(detail) => {
+    // Owned dups, because the closure must be `'static`: `send_fd` only borrows
+    // the descriptor (the kernel dups it into the peer), so the loop keeps its
+    // own either way.
+    use std::os::unix::io::AsFd;
+    let (listener_fd, lock_fd) = match (
+        ctx.listener_fd.as_fd().try_clone_to_owned(),
+        ctx.lock_fd.as_fd().try_clone_to_owned(),
+    ) {
+        (Ok(listener), Ok(lock)) => (listener, lock),
+        _ => {
+            let detail = "the listener/lock descriptors could not be duplicated".to_string();
             failures.abort(db, &detail);
             write_message(
                 writer,
@@ -2455,37 +2657,210 @@ async fn serve_handoff_request(
             return HandoffSessionOutcome::Answered;
         }
     };
+    let handoff_socket = ctx.socket.clone();
+    let handoff_stop = Arc::clone(&ctx.stop_accepting);
+    let handoff_db = db.to_path_buf();
+    let transfer = tokio::task::spawn_blocking(move || {
+        run_transfer(TransferPhase {
+            transfer_socket,
+            listener_fd,
+            lock_fd,
+            nonce,
+            entries,
+            db: handoff_db,
+            socket: handoff_socket,
+            stop_accepting: handoff_stop,
+            incoming_protocol,
+            timeout: crate::handoff::DEFAULT_HANDOFF_TIMEOUT,
+        })
+    })
+    .await;
+    match transfer {
+        Ok(Ok(())) => HandoffSessionOutcome::Committed,
+        Ok(Err(detail)) => {
+            failures.abort(db, &detail);
+            write_message(
+                writer,
+                &Message::Error {
+                    v: VERSION,
+                    message: format!("handoff aborted: {detail}"),
+                },
+            )
+            .await
+            .ok();
+            HandoffSessionOutcome::Answered
+        }
+        // A panic in the blocking task: the panes are the only thing that could
+        // have been damaged, and `PausedPanes`'s `Drop` runs while unwinding, so
+        // the pumps are resumed. Reported rather than swallowed — the cut did not
+        // happen and the operator has to know.
+        Err(join) => {
+            let detail = format!("the transfer task failed: {join}");
+            failures.abort(db, &detail);
+            write_message(
+                writer,
+                &Message::Error {
+                    v: VERSION,
+                    message: format!("handoff aborted: {detail}"),
+                },
+            )
+            .await
+            .ok();
+            HandoffSessionOutcome::Answered
+        }
+    }
+}
+
+/// Everything the transfer phase needs, owned and `'static`: it runs on a
+/// blocking thread (see [`serve_handoff_request`] step 4).
+struct TransferPhase {
+    /// The bound `<socket>.handoff` listener. Moved in, so its `Drop` (which
+    /// unlinks the path) runs on whichever thread finishes the transfer.
+    transfer_socket: TransferSocket,
+    listener_fd: std::os::unix::io::OwnedFd,
+    lock_fd: std::os::unix::io::OwnedFd,
+    nonce: [u8; crate::handoff::NONCE_BYTES],
+    entries: Vec<(String, Arc<PaneEntry>)>,
+    db: PathBuf,
+    socket: PathBuf,
+    stop_accepting: Arc<std::sync::atomic::AtomicBool>,
+    incoming_protocol: u32,
+    timeout: std::time::Duration,
+}
+
+/// Steps 4–8 of the outgoing handoff, on a blocking thread: accept the transfer
+/// connection, authenticate it, send the descriptors and the panes, wait for the
+/// commit.
+///
+/// `Ok(())` means the cut committed — the panes stay parked and the caller stops
+/// accepting. `Err(detail)` means it did not, and **every path that returns an
+/// error has already resumed every pump it paused** (`PausedPanes`'s `Drop` is
+/// the mechanism; see its doc for the ~8–12 KiB a paused pty absorbs before the
+/// child blocks).
+///
+/// The panes are paused *before* the snapshot and never before the peer is
+/// authenticated: a pause is a stop, and stopping the machine's agents for a peer
+/// that turns out to be a stranger is not something to do speculatively.
+fn run_transfer(phase: TransferPhase) -> Result<(), String> {
+    use std::os::unix::io::AsFd;
+    let TransferPhase {
+        transfer_socket,
+        listener_fd,
+        lock_fd,
+        nonce,
+        entries,
+        db,
+        socket,
+        stop_accepting,
+        incoming_protocol,
+        timeout,
+    } = phase;
+    // 4. Accept one connection there with a deadline.
+    let _ = transfer_socket.listener.set_nonblocking(true);
+    let deadline = std::time::Instant::now() + timeout;
+    let conn = loop {
+        match transfer_socket.listener.accept() {
+            Ok((conn, _)) => break Some(conn),
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::Interrupted =>
+            {
+                if std::time::Instant::now() >= deadline {
+                    break None;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            Err(_) => break None,
+        }
+    };
+    let Some(conn) = conn else {
+        return Err("the new daemon never connected for the descriptors".to_string());
+    };
+    // The transfer socket stays blocking for the steps below; the *reads* carry
+    // their own timeouts, so no wait here is unbounded.
+    let _ = conn.set_nonblocking(false);
+    // The peer must be this user (F1). On a platform that cannot answer
+    // (`peer_uid` → `None`) this defers to the nonce and the socket's
+    // permissions, which is why the transfer also requires the nonce.
+    crate::handoff::check_peer_uid(&conn)?;
+    let presented = crate::handoff::recv_nonce(&conn, timeout)?;
     if presented != nonce {
-        let detail = "the transfer connection presented the wrong handoff nonce".to_string();
-        failures.abort(db, &detail);
-        write_message(
-            writer,
-            &Message::Error {
-                v: VERSION,
-                message: format!("handoff aborted: {detail}"),
-            },
-        )
-        .await
-        .ok();
-        return HandoffSessionOutcome::Answered;
+        return Err("the transfer connection presented the wrong handoff nonce".to_string());
     }
     // 5. The listener first, then the lock — the order is the contract.
-    use std::os::unix::io::AsFd;
-    if crate::handoff::send_one(&conn, ctx.listener_fd.as_fd()).is_err()
-        || crate::handoff::send_one(&conn, ctx.lock_fd.as_fd()).is_err()
-    {
-        let detail = "the descriptor transfer failed".to_string();
-        failures.abort(db, &detail);
-        write_message(
-            writer,
-            &Message::Error {
-                v: VERSION,
-                message: format!("handoff aborted: {detail}"),
-            },
-        )
-        .await
-        .ok();
-        return HandoffSessionOutcome::Answered;
+    //
+    // **Every outgoing write from here on is bounded by one total deadline**
+    // (F1 of the stage-2 review, reproduced): a peer that takes the descriptors
+    // and then stops reading used to block this thread in `send_manifest` /
+    // `send_pane_count` / `send_one` for ever — with the panes paused and the
+    // one-handoff lock held, which is the whole machine stuck on a peer that is
+    // not even serving. `bound_write` arms each write with what is left of the
+    // shared deadline (the `recv_fd` model: one bound for the whole of the
+    // phase, not one per call), and giving up is an abort like any other —
+    // `PausedPanes`'s `Drop` resumes every pump, `.handoff` is unlinked by the
+    // `TransferSocket`, and the `handoff.abort` row goes to the store.
+    let write_deadline = std::time::Instant::now() + timeout;
+    crate::handoff::bound_write(&conn, write_deadline)?;
+    crate::handoff::send_one(&conn, listener_fd.as_fd()).map_err(|e| e.to_string())?;
+    crate::handoff::bound_write(&conn, write_deadline)?;
+    crate::handoff::send_one(&conn, lock_fd.as_fd()).map_err(|e| e.to_string())?;
+    // 5b. **The panes.** Pause every reader pump and wait, bounded, for each
+    // acknowledgement — only then is no byte in flight, and only then is a
+    // snapshot complete. Order matters: pause, *then* snapshot, then send. A pane
+    // that does not acknowledge fails the whole handoff (its `Drop` resumes every
+    // pump already stopped), because a snapshot taken with a byte in the
+    // read→push window would lose it — the byte is in neither the ring nor the
+    // terminal's buffer at that instant.
+    let paused = crate::handoff::PausedPanes::pause_all(
+        entries
+            .iter()
+            .map(|(_, entry)| Arc::clone(&entry.pane))
+            .collect(),
+        timeout,
+    )?;
+    let manifest: Vec<arreo_core::proto::message::HandoffPane> = entries
+        .iter()
+        .map(|(id, entry)| handoff_pane(id, entry))
+        .collect();
+    let encoded = arreo_core::proto::message::encode_manifest(&manifest)
+        .map_err(|e| format!("the pane manifest could not be encoded: {e}"))?;
+    // The manifest's own bound, checked here rather than discovered by the peer:
+    // a transfer that cannot arrive is refused, never truncated. (The journals
+    // inside it are capped by the ring, not by this — see the module doc's cost
+    // note.)
+    if encoded.len() > arreo_core::proto::message::MAX_MANIFEST_BYTES {
+        return Err(format!(
+            "the pane manifest is {} bytes (limit {})",
+            encoded.len(),
+            arreo_core::proto::message::MAX_MANIFEST_BYTES
+        ));
+    }
+    // The manifest, then the count, then one descriptor per pane — the order the
+    // incoming daemon reads. The count is what bounds its read of descriptors
+    // (never "read until EOF": an attacker controls that), and it is checked
+    // against the manifest on the far side. `send_manifest` re-arms the write
+    // budget itself before every syscall (see `write_all_bounded` — a single
+    // armed timeout would let the peer hold the panes paused for 2× it).
+    crate::handoff::send_manifest(&conn, &encoded, write_deadline)
+        .map_err(|_| "the pane manifest did not reach the incoming daemon".to_string())?;
+    crate::handoff::bound_write(&conn, write_deadline)?;
+    crate::handoff::send_pane_count(&conn, entries.len())
+        .map_err(|_| "the pane count did not reach the incoming daemon".to_string())?;
+    for (id, entry) in &entries {
+        let Some(raw) = entry.pane.master_fd() else {
+            return Err(format!("pane {id:?} has no master descriptor to transfer"));
+        };
+        // # Soundness
+        //
+        // `raw` came from the master of a pane this call holds an `Arc` to, and
+        // `entries` (which owns that `Arc`) outlives this borrow — so the
+        // descriptor is open for the whole of `send_one`, which only reads it
+        // (the kernel dups it into the peer). Nothing here closes it or hands
+        // ownership on.
+        let borrowed = unsafe { std::os::unix::io::BorrowedFd::borrow_raw(raw) };
+        crate::handoff::bound_write(&conn, write_deadline)?;
+        crate::handoff::send_one(&conn, borrowed)
+            .map_err(|_| format!("the descriptor for pane {id:?} did not transfer"))?;
     }
     // 6. Wait for the commit **marker byte**. It is *authorisation*, not proof
     // that a server is behind it: only the process this daemon answered can
@@ -2494,40 +2869,38 @@ async fn serve_handoff_request(
     // `handoff::wait_for_commit` for why a probe was rejected). End-of-stream is
     // an abort: a peer that connected and half-closed never served anything, and
     // committing on that left the socket with no listener.
-    if let Err(detail) =
-        crate::handoff::wait_for_commit(&conn, crate::handoff::DEFAULT_HANDOFF_TIMEOUT)
-    {
-        failures.abort(db, &detail);
-        write_message(
-            writer,
-            &Message::Error {
-                v: VERSION,
-                message: format!("handoff aborted: {detail}"),
-            },
-        )
-        .await
-        .ok();
-        return HandoffSessionOutcome::Answered;
-    }
+    crate::handoff::wait_for_commit(&conn, timeout)?;
     // 7. The audit row, written by the outgoing daemon before it exits — with
     // the two protocol versions, the pane count, and this process's pid as the
     // agent (the incoming daemon's pid is not known here; its own
     // `handoff complete` line carries it for the operator).
-    crate::handoff::record_handoff(db, VERSION, incoming_protocol, panes, std::process::id());
+    crate::handoff::record_handoff(
+        &db,
+        VERSION,
+        incoming_protocol,
+        entries.len() as u64,
+        std::process::id(),
+    );
+    // The cut is committed: the pumps stay parked for ever. The incoming daemon
+    // has adopted these panes and is reading them through its own dups of the
+    // same terminals, so resuming *here* would put two readers on one master —
+    // and this process is about to `exit(0)` without running destructors, so
+    // nothing below this line would resume them anyway. `commit` is what keeps
+    // `PausedPanes`'s `Drop` from undoing that during the teardown.
+    paused.commit();
     // 8. Stop accepting. The accept loop ends after its current `accept` and
     // drops *this* process's listener fd; the incoming daemon holds a dup, and
-    // the socket file stays. This session returns `Committed` so the session
-    // loop ends it — the caller (`main`) exits 0 after `serve` returns.
+    // the socket file stays. The session returns `Committed` so the session loop
+    // ends it — the caller (`main`) exits 0 after `serve` returns.
     //
     // The loop may be parked in `accept` with nobody connecting, so the flag
     // alone would leave it parked: wake it with a connect to our own socket.
     // The wakeup connection is accepted (or refused — either way the loop
     // observes the flag next iteration) and handled as an ordinary session,
     // which ends at its handshake timeout with no side effects.
-    ctx.stop_accepting
-        .store(true, std::sync::atomic::Ordering::SeqCst);
-    let _ = std::os::unix::net::UnixStream::connect(&ctx.socket);
-    HandoffSessionOutcome::Committed
+    stop_accepting.store(true, std::sync::atomic::Ordering::SeqCst);
+    let _ = std::os::unix::net::UnixStream::connect(&socket);
+    Ok(())
 }
 
 /// Watch a pane until it reaches `state` or the timeout elapses. Answers

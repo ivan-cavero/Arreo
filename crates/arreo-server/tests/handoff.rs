@@ -326,6 +326,18 @@ struct FakeOutgoing {
     /// The accepted transfer connection, once [`FakeOutgoing::serve_handshake`]
     /// has run.
     transfer: Option<std::os::unix::net::UnixStream>,
+    /// The pane manifest this fake will send (T-0038 stage 2). Empty by default
+    /// — the existing refusal tests are about the descriptors, not the panes.
+    manifest: Vec<arreo_core::proto::message::HandoffPane>,
+    /// The panes whose master descriptors to send, in manifest order. Held as
+    /// `Arc<Pane>` rather than as owned descriptors: `send_fd` only borrows, and
+    /// the handle is what keeps the descriptor open for the borrow.
+    panes: Vec<std::sync::Arc<arreo_core::pty::Pane>>,
+    /// Send this count instead of `manifest.len()`, for the mismatch test.
+    count_override: Option<usize>,
+    /// Send this length prefix verbatim instead of a manifest's own, so a peer
+    /// that names more bytes than it sends can be simulated.
+    manifest_length_override: Option<u32>,
 }
 
 impl FakeOutgoing {
@@ -341,6 +353,10 @@ impl FakeOutgoing {
             control,
             lock,
             transfer: None,
+            manifest: Vec::new(),
+            panes: Vec::new(),
+            count_override: None,
+            manifest_length_override: None,
         }
     }
 
@@ -385,8 +401,11 @@ impl FakeOutgoing {
                 v: VERSION,
                 protocol: VERSION,
                 server_protocol: VERSION,
-                panes: 0,
+                panes: self.manifest.len() as u64,
                 nonce: FAKE_NONCE.to_vec(),
+                // Stage 2: the fake carries panes like the real daemon does, so
+                // every existing refusal test runs through the new read path.
+                manifest: true,
             })
             .expect("ready"),
         )
@@ -408,15 +427,63 @@ impl FakeOutgoing {
         self.transfer = Some(transfer);
     }
 
-    /// Send the two descriptors in the contract's order.
+    /// Send the two descriptors in the contract's order, then the pane manifest,
+    /// the count and one master descriptor per pane (T-0038 stage 2) — the whole
+    /// of what a real outgoing daemon sends before it waits for the commit.
+    ///
+    /// **Best-effort after the first send**, deliberately: an incoming daemon
+    /// that refuses what it received closes the connection, and a send to a
+    /// closed peer fails. That is not a test failure — the refusal is the thing
+    /// under test, and it happens *before* the later sends are read. A helper
+    /// that panicked here would report the test's own race as a product defect.
     fn send_descriptors(
         &self,
         listener: std::os::unix::io::BorrowedFd<'_>,
         lock: std::os::unix::io::BorrowedFd<'_>,
     ) {
-        let transfer = self.transfer.as_ref().expect("the handshake was served");
-        arreo_core::pty::adopt::send_fd(transfer, listener).expect("send the listener descriptor");
-        arreo_core::pty::adopt::send_fd(transfer, lock).expect("send the lock descriptor");
+        let mut transfer = self
+            .transfer
+            .as_ref()
+            .expect("the handshake was served")
+            .try_clone()
+            .expect("clone the transfer connection");
+        arreo_core::pty::adopt::send_fd(&transfer, listener).expect("send the listener descriptor");
+        if arreo_core::pty::adopt::send_fd(&transfer, lock).is_err() {
+            return;
+        }
+        let encoded = arreo_core::proto::message::encode_manifest(&self.manifest)
+            .expect("encode the manifest");
+        match self.manifest_length_override {
+            // A hostile length, sent verbatim: the body behind it is whatever
+            // the sender feels like, and the receiver must refuse the length
+            // before it reads any of it.
+            Some(length) => {
+                transfer.write_all(&length.to_le_bytes()).expect("length");
+                transfer.write_all(&encoded).expect("body");
+            }
+            None => {
+                // The fake sends to a real incoming daemon that reads promptly;
+                // the deadline only has to be generous, never exact.
+                let deadline = std::time::Instant::now() + Duration::from_secs(20);
+                if arreo_server::handoff::send_manifest(&transfer, &encoded, deadline).is_err() {
+                    return;
+                }
+            }
+        }
+        let count = self.count_override.unwrap_or(self.manifest.len());
+        if arreo_server::handoff::send_pane_count(&transfer, count).is_err() {
+            return;
+        }
+        for pane in &self.panes {
+            let raw = pane.master_fd().expect("the pane has a master descriptor");
+            // # Soundness
+            //
+            // `raw` belongs to a pane this `FakeOutgoing` holds an `Arc` to, so
+            // the descriptor is open for the whole of `send_fd`, which only reads
+            // it (the kernel dups it into the peer). Nothing here closes it.
+            let borrowed = unsafe { std::os::unix::io::BorrowedFd::borrow_raw(raw) };
+            arreo_core::pty::adopt::send_fd(&transfer, borrowed).expect("send a pane descriptor");
+        }
     }
 
     /// The audit store the incoming daemon records into.
@@ -430,11 +497,25 @@ impl FakeOutgoing {
         let transfer = self.transfer.as_mut().expect("the handshake was served");
         let mut byte = [0u8; 1];
         match transfer.read(&mut byte) {
+            // End-of-stream: the incoming daemon gave up and closed.
             Ok(0) => {}
             Ok(_) => panic!(
                 "the incoming daemon committed ({:#04x}) after refusing",
                 byte[0]
             ),
+            // A reset is also not a commit: the peer closed with data it never
+            // read (an oversized manifest, a descriptor nobody wanted), and the
+            // kernel reports that as a broken connection rather than as a clean
+            // end. What must not happen is a *byte*, so anything but a byte is
+            // accepted here — except a timeout, which would mean the peer neither
+            // committed nor closed and this assertion never actually ran.
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::BrokenPipe
+                        | std::io::ErrorKind::UnexpectedEof
+                ) => {}
             Err(e) => panic!("reading the transfer connection: {e}"),
         }
     }
@@ -447,6 +528,22 @@ fn start_incoming(fake: &mut FakeOutgoing) -> Guard {
         &fake.socket,
         &["--handoff-timeout-secs", "10"],
         std::process::Stdio::piped(),
+    );
+    fake.serve_handshake();
+    incoming
+}
+
+/// [`start_incoming`], but with the incoming daemon's stderr discarded.
+///
+/// For tests where the incoming daemon **keeps serving**: a piped stderr has no
+/// end-of-file until the process exits, so reading it would block the test for
+/// ever on the success path. The refusal tests, where the daemon does exit, keep
+/// the pipe so they can assert what it said.
+fn start_incoming_quiet(fake: &mut FakeOutgoing) -> Guard {
+    let incoming = spawn_handoff(
+        &fake.socket,
+        &["--handoff-timeout-secs", "10"],
+        std::process::Stdio::null(),
     );
     fake.serve_handshake();
     incoming
@@ -2093,6 +2190,1531 @@ fn handoff_refusals_are_recorded_once_per_session() {
         rows.len(),
         1,
         "one refusal row per session, not one per frame: {rows:?}"
+    );
+    drop(session);
+    cleanup(&socket);
+}
+
+// ---------------------------------------------------------------------------
+// T-0038 stage 2 — the panes themselves cross the cut.
+//
+// The criterion: 8 panes emitting a monotonic marker stream; a handoff under
+// load leaves every pane's pid unchanged, loses no marker, duplicates none and
+// reorders none across the cut, and lines written before the cut are still
+// readable after it. Everything below is real: real daemon processes, real PTY
+// children, pid-scoped socket paths, `Drop` guards, polled readiness — and a
+// leaked process is a failure, not a warning.
+// ---------------------------------------------------------------------------
+
+/// The pid a pane prints about itself, read from `/proc`. Used to assert a child
+/// is *still running* — the criterion-4 hazard is a child blocked on a full
+/// terminal buffer, which is alive but not producing.
+fn process_alive(pid: u32) -> bool {
+    std::path::Path::new(&format!("/proc/{pid}")).exists()
+}
+
+/// A pane program that prints its own pid and then a monotonic tick stream for
+/// ever. The pid rides on **every** line, so "the pid is unchanged across the
+/// cut" is checkable from any line that survived it, not only from the banner.
+fn ticker_program() -> String {
+    r#"echo "pid=$$"; i=0; while true; do i=$((i+1)); echo "tick-$i pid=$$"; sleep 0.05; done"#
+        .to_string()
+}
+
+/// `(tick, pid)` for every well-formed ticker line, in the order they arrived.
+///
+/// Lines that do not match are dropped rather than guessed at: the last line in
+/// the ring can be a partial write (`RingBuffer::drain` flushes a partial as a
+/// line), and a prefix is not a line the pane finished writing.
+fn ticks(lines: &[String]) -> Vec<(u64, u32)> {
+    lines
+        .iter()
+        .filter_map(|line| {
+            let rest = line.strip_prefix("tick-")?;
+            let (tick, pid) = rest.split_once(" pid=")?;
+            Some((tick.parse().ok()?, pid.parse().ok()?))
+        })
+        .collect()
+}
+
+/// The tick numbers are `1..=n` in order: **no gap, no duplicate, no reorder**.
+///
+/// This is the assertion the stage criterion rests on, and it is deliberately
+/// strict — a single lost line makes it fail with the exact number that went
+/// missing, which is what makes the failure readable rather than "the streams
+/// differ".
+fn assert_contiguous_from_one(seen: &[(u64, u32)], what: &str) {
+    assert!(
+        !seen.is_empty(),
+        "{what}: no marker line at all — the pane produced nothing to check"
+    );
+    for (index, (tick, _)) in seen.iter().enumerate() {
+        assert_eq!(
+            *tick,
+            index as u64 + 1,
+            "{what}: the marker stream is not contiguous from 1 — got {seen:?}"
+        );
+    }
+}
+
+/// One `Spawn` on the daemon serving `socket`, and the reply.
+fn spawn_pane(socket: &Path, id: &str, program: &str, args: &[&str]) -> Message {
+    raw_request(
+        socket,
+        &Message::Spawn {
+            v: VERSION,
+            id: id.to_string(),
+            program: program.to_string(),
+            args: args.iter().map(|a| a.to_string()).collect(),
+            cols: 80,
+            rows: 24,
+            memory_max: None,
+            pids_max: None,
+            kill_on_breach: false,
+        },
+    )
+}
+
+/// All of a pane's buffered lines, read through the protocol a client uses.
+fn read_pane(socket: &Path, id: &str) -> Vec<String> {
+    match raw_request(
+        socket,
+        &Message::Read {
+            v: VERSION,
+            id: id.to_string(),
+            from_line: 0,
+        },
+    ) {
+        Message::Delta { lines, .. } => lines,
+        other => panic!("read {id}: unexpected {other:?}"),
+    }
+}
+
+/// Poll `read_pane` until `want` matches, returning the lines. Bounded, never a
+/// sleep-and-hope.
+fn read_pane_until(
+    socket: &Path,
+    id: &str,
+    limit: Duration,
+    mut want: impl FnMut(&[String]) -> bool,
+) -> Vec<String> {
+    let deadline = std::time::Instant::now() + limit;
+    loop {
+        let last = read_pane(socket, id);
+        if want(&last) {
+            return last;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "pane {id}: nothing matched within {limit:?}; last lines: {:?}",
+            &last[last.len().saturating_sub(4)..]
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// The pid a pane announced for itself: from its first ticker line if it is
+/// ticking, else from the `pid=<n>` banner a one-shot pane prints.
+fn pane_pid(lines: &[String], what: &str) -> u32 {
+    if let Some((_, pid)) = ticks(lines).first() {
+        return *pid;
+    }
+    lines
+        .iter()
+        .find_map(|line| line.strip_prefix("pid="))
+        .and_then(|pid| pid.trim().parse().ok())
+        .unwrap_or_else(|| panic!("{what}: no line carrying the pane's pid: {lines:?}"))
+}
+
+/// Criterion 1 — **8 panes, a monotonic marker stream, and a handoff under
+/// load.**
+///
+/// Eight real panes tick continuously; the cut happens while they are writing.
+/// Across it, for every pane:
+///
+/// - the pid is unchanged (each line carries `pid=$$`, and it must be the same
+///   number before and after the cut — a restarted child would have a new one);
+/// - the marker sequence is contiguous from 1 (no loss, no duplicate, no
+///   reorder) — the assertion is strict, so a single lost line fails it;
+/// - lines written **before** the cut are still readable after it: the ring is
+///   seeded from the manifest, and the post-cut read must still contain every
+///   tick the pre-cut read saw.
+///
+/// What removal turns red: not transferring the pane at all (the panes are gone
+/// from the new daemon and the read fails); not seeding the scrollback (the
+/// post-cut read starts at 1 with a fresh ring, so the pre-cut ticks are gone);
+/// seeding the lines but not the ring's *partial*/journal bookkeeping (the
+/// sequence restarts and the contiguity assert names the first missing tick);
+/// resuming the pumps before the cut (duplicate lines); pausing and never
+/// resuming (the stream stops and the contiguity assert times out).
+#[test]
+fn eight_panes_cross_the_cut_with_their_streams_intact() {
+    let socket = temp_socket("stage2-eight");
+    cleanup(&socket);
+    let mut old = spawn_daemon(&socket, &[], std::process::Stdio::null());
+    wait_serving(&mut old, &socket, Duration::from_secs(10));
+
+    let program = ticker_program();
+    let ids: Vec<String> = (1..=8).map(|n| format!("p{n}")).collect();
+    for id in &ids {
+        let reply = spawn_pane(&socket, id, "sh", &["-c", &program]);
+        assert!(matches!(reply, Message::Ok { .. }), "spawn {id}: {reply:?}");
+    }
+
+    // Every pane is producing before the cut, and we remember what we saw: the
+    // pre-cut ticks are what must survive into the post-cut scrollback.
+    let mut before: Vec<(String, Vec<(u64, u32)>)> = Vec::new();
+    for id in &ids {
+        let lines = read_pane_until(&socket, id, Duration::from_secs(10), |lines| {
+            ticks(lines).len() >= 3
+        });
+        let seen = ticks(&lines);
+        assert_contiguous_from_one(&seen, &format!("{id} before the cut"));
+        before.push((id.clone(), seen));
+    }
+
+    // The cut, with all eight panes writing. `null` stderr, not a pipe: this
+    // daemon goes on serving, so reading its stderr would block until it exits
+    // — which, on the success path, is never.
+    let mut incoming = spawn_handoff(
+        &socket,
+        &["--handoff-timeout-secs", "20"],
+        std::process::Stdio::null(),
+    );
+    assert!(
+        until(Duration::from_secs(30), || matches!(
+            old.try_wait(),
+            Ok(Some(_))
+        )),
+        "the cut completes and the outgoing daemon exits"
+    );
+    let status = old.try_wait().expect("try_wait").expect("exited");
+    assert!(
+        status.success(),
+        "the outgoing daemon exits 0, got {status}"
+    );
+    assert!(
+        !exited_within(&mut incoming, Duration::from_millis(200)),
+        "the incoming daemon is serving, not exiting: it owns the panes now"
+    );
+
+    for (id, pre) in &before {
+        let post = read_pane_until(&socket, id, Duration::from_secs(15), |lines| {
+            ticks(lines).len() > pre.len()
+        });
+        let seen = ticks(&post);
+        assert_contiguous_from_one(&seen, &format!("{id} across the cut"));
+
+        // The pid did not change, and it is the one the pane announced before
+        // the cut: every line carries it, so any line proves it.
+        let pid = pane_pid(&post, id);
+        assert_eq!(
+            pid, pre[0].1,
+            "{id}: the pane's pid changed across the cut — the child was restarted"
+        );
+        assert!(
+            post.iter()
+                .all(|line| match ticks(std::slice::from_ref(line)) {
+                    seen if seen.is_empty() => true,
+                    seen => seen[0].1 == pid,
+                }),
+            "{id}: two different pids in one pane's post-cut stream"
+        );
+
+        // Lines written before the cut are still readable after it: the exact
+        // ticks we saw pre-cut are still there, in order, at the front.
+        let pre_ticks: Vec<u64> = pre.iter().map(|(tick, _)| *tick).collect();
+        let post_ticks: Vec<u64> = seen.iter().map(|(tick, _)| *tick).collect();
+        assert!(
+            post_ticks.starts_with(&pre_ticks),
+            "{id}: the pre-cut ticks are not intact after the cut \
+             (before {:?}, after {:?})",
+            &pre_ticks[..pre_ticks.len().min(8)],
+            &post_ticks[..post_ticks.len().min(8)]
+        );
+        assert!(
+            post_ticks.len() > pre_ticks.len(),
+            "{id}: the pane produced nothing after the cut — its pump never resumed"
+        );
+    }
+
+    cleanup(&socket);
+}
+
+/// A by-hand **incoming daemon** for a real outgoing one: it speaks the whole
+/// transfer grammar and then stops wherever the test wants.
+///
+/// This is the only way to hold a handoff open at a chosen point — the outgoing
+/// daemon pauses its pumps and waits for the commit, and the commit is the
+/// incoming side's to withhold. Everything here is real except that the
+/// descriptors are received and not served: the handshake, the nonce, the
+/// transfer connection, the manifest, the pane descriptors.
+struct HeldTransfer {
+    /// The client-socket session that requested the handoff; it must outlive the
+    /// transfer, because the outgoing daemon serves the transfer from it. Held
+    /// for its lifetime, never read — dropping it ends the session that is
+    /// serving the transfer, which is the abort this struct exists to time.
+    _session: std::os::unix::net::UnixStream,
+    /// The transfer connection itself. Dropping it is the abort (EOF, exactly
+    /// what a killed incoming daemon produces); keeping it is the hold. Held for
+    /// its lifetime and never read — the whole point of this value is that the
+    /// socket stays open until the test chooses to drop it.
+    _transfer: std::os::unix::net::UnixStream,
+    /// The listener and lock descriptors. Held (not dropped) for the whole test:
+    /// dropping the listener would close *this process's* dup, which is not the
+    /// outgoing daemon's — but keeping them is what a real incoming daemon does.
+    _listener_fd: std::os::unix::io::OwnedFd,
+    _lock_fd: std::os::unix::io::OwnedFd,
+    /// The pane masters, in manifest order — kept open so the terminal has a
+    /// reader-side owner while the test holds the handoff.
+    _pane_fds: Vec<std::os::unix::io::OwnedFd>,
+    manifest: Vec<arreo_core::proto::message::HandoffPane>,
+}
+
+impl HeldTransfer {
+    /// Request a handoff and receive everything the outgoing daemon sends,
+    /// stopping **before the commit** — the point at which the panes are paused
+    /// and the cut is still the test's to take or abandon.
+    fn receive(socket: &Path, panes: usize) -> Self {
+        let (session, reply) = handoff_session(socket, VERSION, "stage2-held");
+        let nonce = match reply {
+            Message::HandoffReady {
+                nonce, manifest, ..
+            } => {
+                assert!(manifest, "the outgoing daemon carries panes");
+                nonce
+            }
+            other => panic!("the handoff request is accepted: {other:?}"),
+        };
+        let handoff_path = arreo_server::handoff::handoff_path_for(socket);
+        let mut transfer = std::os::unix::net::UnixStream::connect(&handoff_path)
+            .expect("connect to the transfer socket");
+        transfer
+            .set_read_timeout(Some(Duration::from_secs(20)))
+            .expect("timeout");
+        transfer.write_all(&nonce).expect("present the nonce");
+        let listener_fd = arreo_server::handoff::recv_one(&transfer, Duration::from_secs(20))
+            .expect("the listener descriptor");
+        let lock_fd = arreo_server::handoff::recv_one(&transfer, Duration::from_secs(20))
+            .expect("the lock descriptor");
+        let encoded = arreo_server::handoff::recv_manifest(&transfer, Duration::from_secs(20))
+            .expect("the manifest");
+        let manifest =
+            arreo_core::proto::message::decode_manifest(&encoded).expect("the manifest decodes");
+        assert_eq!(manifest.len(), panes, "the manifest names every pane");
+        let count = arreo_server::handoff::recv_pane_count(&transfer, Duration::from_secs(20))
+            .expect("the pane count");
+        assert_eq!(count, manifest.len(), "the count agrees with the manifest");
+        let mut pane_fds = Vec::with_capacity(count);
+        for _ in 0..count {
+            pane_fds.push(
+                arreo_server::handoff::recv_one(&transfer, Duration::from_secs(20))
+                    .expect("a pane descriptor"),
+            );
+        }
+        Self {
+            _session: session,
+            _transfer: transfer,
+            _listener_fd: listener_fd,
+            _lock_fd: lock_fd,
+            _pane_fds: pane_fds,
+            manifest,
+        }
+    }
+
+    /// The pane id at `index` of the manifest.
+    fn id(&self, index: usize) -> &str {
+        &self.manifest[index].id
+    }
+}
+
+/// Criterion 2 — **output written during the paused window still arrives.**
+///
+/// The handoff is held at exactly the point the design calls atomic: every pane
+/// is paused (the outgoing daemon is waiting for the commit) and nothing has
+/// been read from any terminal. In that window the pane is made to write a
+/// marker; the handoff is then abandoned, and the outgoing daemon — which must
+/// resume — has to deliver that marker, once, in order, with the rest of the
+/// stream intact.
+///
+/// This is what separates "atomic" from "quiet": a pause that merely stopped
+/// reading and did not resume loses the marker, and one that lost a byte in the
+/// read→push window loses it even with the resume.
+///
+/// What removal turns red: no unpause-on-abort (the marker never arrives and the
+/// poll times out); resuming *before* the snapshot rather than after (the marker
+/// arrives twice — the second assert); a pause that does not stop the pump (the
+/// pre-pause/post-pause split moves and the exactly-once assert fails).
+#[test]
+fn output_written_while_the_panes_are_paused_still_arrives() {
+    let socket = temp_socket("stage2-paused");
+    cleanup(&socket);
+    let mut old = spawn_daemon(&socket, &[], std::process::Stdio::null());
+    wait_serving(&mut old, &socket, Duration::from_secs(10));
+
+    // A pane that answers `mark` with a numbered burst, and nothing else.
+    let program = r#"echo "pid=$$"; while IFS= read -r line; do case "$line" in mark) echo "mark-1"; echo "mark-2"; echo "mark-done";; esac; done"#;
+    let reply = spawn_pane(&socket, "p0", "sh", &["-c", program]);
+    assert!(matches!(reply, Message::Ok { .. }), "spawn: {reply:?}");
+    let lines = read_pane_until(&socket, "p0", Duration::from_secs(10), |lines| {
+        lines.iter().any(|line| line.starts_with("pid="))
+    });
+    let pid = pane_pid(&lines, "p0");
+
+    // Held at the transfer point: the pane's pump is paused and the cut has not
+    // committed.
+    let held = HeldTransfer::receive(&socket, 1);
+    assert_eq!(held.id(0), "p0");
+
+    // Output written *while paused*.
+    let reply = try_round_trip(
+        &socket,
+        &Message::Send {
+            v: VERSION,
+            id: "p0".to_string(),
+            data: "mark\n".to_string(),
+        },
+    );
+    assert!(matches!(reply, Ok(Message::Ok { .. })), "send: {reply:?}");
+    // The pane is running: its pid is alive. (It is not necessarily producing —
+    // that is exactly what the pause means.)
+    assert!(
+        process_alive(pid),
+        "the child is still running while paused"
+    );
+
+    // Abandon the handoff. Dropping the transfer connection is what a killed
+    // incoming daemon looks like from the outgoing side: EOF, not a commit.
+    drop(held);
+
+    let after = read_pane_until(&socket, "p0", Duration::from_secs(15), |lines| {
+        lines.iter().any(|line| line == "mark-done")
+    });
+    // The programme's own output only: the terminal echoes the `mark` line we
+    // typed, and an echo is not the pane's output.
+    let marks: Vec<String> = after
+        .iter()
+        .filter(|line| {
+            line.strip_prefix("mark-")
+                .is_some_and(|rest| rest == "done" || rest.parse::<u64>().is_ok())
+        })
+        .cloned()
+        .collect();
+    assert_eq!(
+        marks,
+        vec!["mark-1", "mark-2", "mark-done"],
+        "the markers written during the pause arrived exactly once and in order"
+    );
+    assert!(
+        after.iter().any(|line| line.starts_with("pid=")),
+        "and the pane's own history is intact: {after:?}"
+    );
+    assert!(
+        old.try_wait().expect("try_wait").is_none(),
+        "the outgoing daemon still serves"
+    );
+    cleanup(&socket);
+}
+
+/// Criterion 4 — **a child that writes more than a terminal buffer while paused
+/// is not left blocked.**
+///
+/// A pty with no reader absorbs only ~8–12 KiB (measured; *not* a pipe's
+/// 64 KiB — see `.loop/evidence/T-0038/stage2-pty-buffer.txt`), so a paused pane
+/// whose child keeps writing blocks the child within a couple of screens of
+/// output. The handoff is held at the transfer point while the pane writes well
+/// over 64 KiB, and is then abandoned: the outgoing daemon must resume, and the
+/// child must be running and its output complete.
+///
+/// Without an unpause-on-abort this test does not pass slowly — it fails: the
+/// child stays blocked for ever, so the burst never completes and the poll
+/// times out.
+///
+/// What removal turns red: no resume on the abort path (the poll times out);
+/// resuming a pane that was never paused (nothing to assert — the burst arrives
+/// before the abort, which the pre-abort assert catches).
+#[test]
+fn a_child_that_fills_the_terminal_buffer_while_paused_is_not_left_blocked() {
+    let socket = temp_socket("stage2-blocked");
+    cleanup(&socket);
+    let mut old = spawn_daemon(&socket, &[], std::process::Stdio::null());
+    wait_serving(&mut old, &socket, Duration::from_secs(10));
+
+    // 480 lines of ~215 bytes: ~100 KiB, comfortably past the ~12 KiB a pty
+    // absorbs, and inside the 512-line ring so "complete" is checkable exactly
+    // rather than as "the last 512 lines are contiguous".
+    let filler = "x".repeat(200);
+    let program = format!(
+        r#"echo "pid=$$"; while IFS= read -r line; do case "$line" in burst) i=0; while [ "$i" -lt 480 ]; do i=$((i+1)); echo "burst-$i|{filler}"; done; echo "burst-done";; esac; done"#
+    );
+    let reply = spawn_pane(&socket, "p0", "sh", &["-c", &program]);
+    assert!(matches!(reply, Message::Ok { .. }), "spawn: {reply:?}");
+    let lines = read_pane_until(&socket, "p0", Duration::from_secs(10), |lines| {
+        lines.iter().any(|line| line.starts_with("pid="))
+    });
+    let pid = pane_pid(&lines, "p0");
+
+    let held = HeldTransfer::receive(&socket, 1);
+    let reply = raw_request(
+        &socket,
+        &Message::Send {
+            v: VERSION,
+            id: "p0".to_string(),
+            data: "burst\n".to_string(),
+        },
+    );
+    assert!(matches!(reply, Message::Ok { .. }), "send: {reply:?}");
+
+    // **The hazard has to be actually set up before it means anything.** Nothing
+    // reads the terminal while the pane is paused, so the child fills the ~8–12
+    // KiB a pty absorbs and blocks. The direct evidence of that is the ring: it
+    // is fed *only* by the pump, so a ring with no burst line in it — after the
+    // child has been given a burst to write — is the pump being stopped. That is
+    // a fact about the mechanism rather than about timing, and a slow machine
+    // cannot fake it.
+    std::thread::sleep(Duration::from_millis(500));
+    let paused_lines = read_pane(&socket, "p0");
+    assert!(
+        !paused_lines.iter().any(|line| line.starts_with("burst-")),
+        "the ring holds burst output while the pane is paused ({} lines) — the \
+         pump is still reading, so a snapshot taken now would not be quiescent",
+        paused_lines.len()
+    );
+    assert!(process_alive(pid), "the child is alive while blocked");
+
+    // Abandon the handoff: the outgoing daemon resumes and must drain the rest.
+    drop(held);
+
+    let after = read_pane_until(&socket, "p0", Duration::from_secs(30), |lines| {
+        lines.iter().any(|line| line == "burst-done")
+    });
+    let burst: Vec<u64> = after
+        .iter()
+        .filter_map(|line| {
+            let rest = line.strip_prefix("burst-")?;
+            let (n, _) = rest.split_once('|')?;
+            n.parse().ok()
+        })
+        .collect();
+    assert_eq!(
+        burst.len(),
+        480,
+        "every burst line arrived — {} of 480 (the child was left blocked)",
+        burst.len()
+    );
+    assert_eq!(
+        burst,
+        (1..=480).collect::<Vec<u64>>(),
+        "and in order, with nothing lost or duplicated"
+    );
+    assert!(
+        process_alive(pid),
+        "the child is still running after the abort"
+    );
+
+    // And it is not merely alive — it is still answering, which is the
+    // difference between "not blocked" and "not dead".
+    let reply = raw_request(
+        &socket,
+        &Message::Send {
+            v: VERSION,
+            id: "p0".to_string(),
+            data: "burst\n".to_string(),
+        },
+    );
+    assert!(matches!(reply, Message::Ok { .. }), "send again: {reply:?}");
+    read_pane_until(&socket, "p0", Duration::from_secs(30), |lines| {
+        lines.iter().filter(|line| *line == "burst-done").count() >= 2
+    });
+    cleanup(&socket);
+}
+
+/// Criterion 3 — **an abort mid-transfer resumes the outgoing daemon.**
+///
+/// The peer dies after it has received everything (listener, lock, manifest and
+/// the pane descriptors) and before the commit. From the outgoing daemon that is
+/// indistinguishable from the incoming process being killed at that instant —
+/// EOF is what a `SIGKILL` produces on the other end of a socket — and it is the
+/// window the ADR names as the interesting one.
+///
+/// The outgoing daemon must then: keep serving, keep its panes producing, keep
+/// the marker sequence contiguous, and be handable over on a retry.
+///
+/// What removal turns red: not resuming the pumps on this path (the pane stops
+/// producing, so the "still producing" assert times out); treating EOF as a
+/// commit (the outgoing daemon exits 0, and the "still serving" assert fails);
+/// not clearing the paused state (the retry transfers a paused pane and the
+/// incoming daemon's pumps never start).
+#[test]
+fn an_abort_mid_transfer_resumes_the_outgoing_daemon() {
+    let socket = temp_socket("stage2-abort");
+    cleanup(&socket);
+    let mut old = spawn_daemon(&socket, &[], std::process::Stdio::null());
+    wait_serving(&mut old, &socket, Duration::from_secs(10));
+
+    let program = ticker_program();
+    let reply = spawn_pane(&socket, "p0", "sh", &["-c", &program]);
+    assert!(matches!(reply, Message::Ok { .. }), "spawn: {reply:?}");
+    let lines = read_pane_until(&socket, "p0", Duration::from_secs(10), |lines| {
+        ticks(lines).len() >= 3
+    });
+    let pre = ticks(&lines);
+    assert_contiguous_from_one(&pre, "p0 before the abort");
+
+    // Receive everything, commit nothing, die.
+    let held = HeldTransfer::receive(&socket, 1);
+    drop(held);
+
+    // Still serving, and the pane is still producing.
+    let after = read_pane_until(&socket, "p0", Duration::from_secs(15), |lines| {
+        ticks(lines).len() > pre.len()
+    });
+    assert_contiguous_from_one(&ticks(&after), "p0 after the abort");
+    assert!(
+        old.try_wait().expect("try_wait").is_none(),
+        "the outgoing daemon keeps serving after the abort"
+    );
+    let reply = raw_request(
+        &socket,
+        &Message::Panes {
+            v: VERSION,
+            panes: vec![],
+        },
+    );
+    match reply {
+        Message::Panes { panes, .. } => assert_eq!(panes.len(), 1, "the pane is still there"),
+        other => panic!("a client is still served: {other:?}"),
+    }
+    assert!(
+        handoff_rows(&socket, arreo_core::store::actions::HANDOFF).is_empty(),
+        "no cut is recorded for an abort"
+    );
+    assert!(
+        until(Duration::from_secs(15), || !handoff_rows(
+            &socket,
+            arreo_core::store::actions::HANDOFF_ABORT
+        )
+        .is_empty()),
+        "the abort is on the record"
+    );
+
+    // The retry: a real handoff, which must now succeed and carry the pane.
+    let mut incoming = spawn_handoff(
+        &socket,
+        &["--handoff-timeout-secs", "20"],
+        // A pipe here would block: this daemon serves on, and reading a live
+        // process's stderr waits for end-of-file.
+        std::process::Stdio::null(),
+    );
+    assert!(
+        until(Duration::from_secs(30), || matches!(
+            old.try_wait(),
+            Ok(Some(_))
+        )),
+        "the retry commits and the outgoing daemon exits"
+    );
+    let status = old.try_wait().expect("try_wait").expect("exited");
+    assert!(status.success(), "the retry exits 0, got {status}");
+    let _ = &mut incoming;
+    let retried = read_pane_until(&socket, "p0", Duration::from_secs(20), |lines| {
+        ticks(lines).len() > after_ticks(&after)
+    });
+    assert_contiguous_from_one(&ticks(&retried), "p0 after the retry");
+    cleanup(&socket);
+}
+
+/// The tick count of a read, as a number, for "more than before" comparisons.
+fn after_ticks(lines: &[String]) -> usize {
+    ticks(lines).len()
+}
+
+/// F1 (HIGH, reproduced): **a peer that takes the descriptors and then stops
+/// reading cannot freeze the outgoing daemon.**
+///
+/// The reported sequence, exactly: the peer presents the nonce, takes the
+/// listener and lock descriptors, and then reads nothing more. The outgoing
+/// daemon pauses every pump, and its `send_manifest` blocks on a socket nobody
+/// drains. The pane's journal here is a megabyte (the ring's own cap) against a
+/// send buffer measured at ~425 KiB on this kernel, so the write cannot
+/// complete — it used to sit in that write for ever (the review wedged a thread
+/// in `sock_alloc_send_pskb`): the panes stayed paused, the one-handoff lock
+/// stayed held, and a retry was refused. The fix is a **total write deadline**
+/// on the transfer connection ([`arreo_server::handoff::bound_write`], the
+/// `recv_fd` model: one deadline for the whole of the writes, not one per
+/// call), and giving up is an abort: `PausedPanes` drops (pumps resume),
+/// `.handoff` is unlinked, an `handoff.abort` row is written, and a retry
+/// succeeds.
+///
+/// What removal turns red: dropping the write deadline (the Error reply never
+/// comes within the bound — the session read times out, with the panes paused
+/// the whole time); giving up without resuming the pumps (the tick-count
+/// assert fails); leaving the one-handoff lock held (the retry is refused with
+/// "another handoff holds").
+#[test]
+fn a_peer_that_stops_reading_aborts_the_transfer_within_the_bound() {
+    let socket = temp_socket("stage2-stops-reading");
+    cleanup(&socket);
+    let mut old = spawn_daemon(&socket, &[], std::process::Stdio::null());
+    wait_serving(&mut old, &socket, Duration::from_secs(10));
+
+    // A pane whose journal is ~1 MiB before the handoff even starts — a
+    // manifest larger than the transfer socket's send buffer, which is what
+    // makes `send_manifest` block instead of completing. Then it ticks, so
+    // "the pumps resumed" is an observation, not a guess.
+    let program = r#"dd if=/dev/zero bs=1200000 count=1 2>/dev/null | tr '\0' 'x'; i=0; while true; do i=$((i+1)); echo "tick-$i pid=$$"; sleep 0.05; done"#;
+    assert!(spawn_pane(&socket, "p0", "sh", &["-c", program]).is_ok_message());
+    let before = read_pane_until(&socket, "p0", Duration::from_secs(20), |lines| {
+        ticks(lines).len() >= 2
+    });
+    let before_ticks = ticks(&before).len();
+
+    let (mut session, reply) = handoff_session(&socket, VERSION, "stops-reading");
+    let nonce = match reply {
+        Message::HandoffReady { nonce, .. } => nonce,
+        other => panic!("the request is accepted: {other:?}"),
+    };
+    let handoff_path = arreo_server::handoff::handoff_path_for(&socket);
+    let mut transfer = std::os::unix::net::UnixStream::connect(&handoff_path)
+        .expect("connect to the transfer socket");
+    transfer
+        .set_read_timeout(Some(Duration::from_secs(15)))
+        .expect("timeout");
+    transfer.write_all(&nonce).expect("present the nonce");
+    let listener_fd = arreo_server::handoff::recv_one(&transfer, Duration::from_secs(15))
+        .expect("the listener descriptor");
+    let lock_fd = arreo_server::handoff::recv_one(&transfer, Duration::from_secs(15))
+        .expect("the lock descriptor");
+    // **Stop reading.** The pane is paused and no commit is coming: the
+    // outgoing daemon can only give up on its own time, within the bound.
+    let started = std::time::Instant::now();
+    session
+        .set_read_timeout(Some(Duration::from_secs(20)))
+        .expect("timeout");
+    let reply = read_one_soft(&mut session).expect("the daemon answers the abort");
+    let elapsed = started.elapsed();
+    let Message::Error { message, .. } = &reply else {
+        panic!("an abort, not a commit: {reply:?}");
+    };
+    assert!(
+        message.contains("aborted"),
+        "the reply names the abort: {message}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(15),
+        "the abort lands within the 10 s bound — took {elapsed:?}: {message}"
+    );
+    assert!(
+        !handoff_rows(&socket, arreo_core::store::actions::HANDOFF_ABORT).is_empty(),
+        "an abort row is written"
+    );
+    // `.handoff` is unlinked on the abort (the `TransferSocket`'s Drop), so
+    // the retry below can bind it afresh — asserted here, not only implied.
+    assert!(
+        !handoff_path.exists(),
+        "the abort unlinked the transfer socket"
+    );
+
+    // The pumps resumed: p0 produces past where it was when the freeze began.
+    let after = read_pane_until(&socket, "p0", Duration::from_secs(20), |lines| {
+        ticks(lines).len() > before_ticks
+    });
+    assert!(
+        ticks(&after).len() > before_ticks,
+        "the pane produced after the abort ({} ticks now vs {before_ticks} before)",
+        ticks(&after).len()
+    );
+    assert!(
+        matches!(
+            try_round_trip(
+                &socket,
+                &Message::Panes {
+                    v: VERSION,
+                    panes: vec![],
+                }
+            ),
+            Ok(Message::Panes { .. })
+        ),
+        "the daemon still serves"
+    );
+    assert!(
+        old.try_wait().expect("try_wait").is_none(),
+        "and it is still the old daemon"
+    );
+
+    // A retry succeeds: the real incoming daemon takes the socket over.
+    let mut incoming = spawn_handoff(
+        &socket,
+        &["--handoff-timeout-secs", "20"],
+        std::process::Stdio::null(),
+    );
+    assert!(
+        until(Duration::from_secs(30), || matches!(
+            old.try_wait(),
+            Ok(Some(_))
+        )),
+        "the retry commits and the outgoing daemon exits"
+    );
+    let status = old.try_wait().expect("try_wait").expect("exited");
+    assert!(status.success(), "the retry exits 0, got {status}");
+    assert!(
+        until(Duration::from_secs(20), || something_serves(&socket)),
+        "the retry serves"
+    );
+    let _ = &mut incoming;
+    drop((listener_fd, lock_fd, transfer));
+    drop(session);
+    cleanup(&socket);
+}
+
+/// F2 (MEDIUM, reproduced) end to end: **a manifest naming a guard path
+/// outside this machine's cgroup scope is refused before the cut.**
+///
+/// The reported sequence, exactly: the outgoing side names an arbitrary empty
+/// directory — not a cgroup, not under the scope — in the manifest. The
+/// incoming daemon used to commit, and when the pane was killed, `Guard::drop`
+/// **removed the directory**; worse, the pane reported `has_guard() == true`
+/// and the handoff reported success while `breached()`/`pressure()` read
+/// nothing — agents served without their ceiling, silently. The refusal lands
+/// **before** the cut, naming the path, and the outgoing daemon keeps serving
+/// with the directory untouched.
+///
+/// What removal turns red: the pre-commit check going back to a bare
+/// is-a-directory test (the handoff commits — the pane is adopted and the
+/// directory is one kill away from being removed); dropping the check entirely
+/// (same).
+#[test]
+fn a_manifest_naming_a_guard_outside_the_scope_is_refused_before_the_cut() {
+    let socket = temp_socket("stage2-guard-f2");
+    cleanup(&socket);
+    let pane = std::sync::Arc::new(
+        arreo_core::pty::Pane::spawn("sh", &["-c", "echo pid=$$; sleep 60"], 80, 24)
+            .expect("spawn the pane to hand over"),
+    );
+    let child = pane.child_pid().expect("the pane has a pid");
+    // An arbitrary empty directory outside the scope — the review's input.
+    let foreign = std::env::temp_dir().join(format!(
+        "arreo-handoff-foreign-dir-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let _ = std::fs::remove_dir_all(&foreign);
+    std::fs::create_dir_all(&foreign).expect("an arbitrary empty directory");
+
+    let mut fake = FakeOutgoing::bind(&socket);
+    let mut entry = pane_description("p0", Some(foreign.display().to_string()));
+    entry.child_pid = Some(child);
+    fake.manifest = vec![entry];
+    fake.panes = vec![std::sync::Arc::clone(&pane)];
+    let mut incoming = start_incoming(&mut fake);
+    fake.send_descriptors(fake.control.as_fd(), fake.lock.fd());
+    fake.assert_no_commit();
+    assert!(
+        exited_within(&mut incoming, Duration::from_secs(20)),
+        "the incoming daemon refuses and exits"
+    );
+    let text = stderr_of(&mut incoming);
+    assert!(
+        text.contains("cannot be adopted"),
+        "the refusal names the guard: {text:?}"
+    );
+    assert!(
+        text.contains(&foreign.display().to_string()),
+        "and the path: {text:?}"
+    );
+    assert!(
+        text.contains("cgroup scope"),
+        "and the rule it broke: {text:?}"
+    );
+    assert!(
+        std::os::unix::net::UnixStream::connect(&socket).is_ok(),
+        "the outgoing daemon still serves"
+    );
+    assert!(
+        foreign.exists(),
+        "nothing removed the directory the manifest named"
+    );
+    let _ = pane.kill_shared();
+    let _ = pane.wait_timeout(Duration::from_secs(5));
+    let _ = std::fs::remove_dir_all(&foreign);
+    cleanup(&socket);
+}
+
+/// Criterion 5 — **the guard survives the cut.**
+///
+/// A pane with a cgroup budget must arrive with its guard re-opened on the same
+/// cgroup — and the assertion is not a proxy: the incoming daemon *holds* a
+/// `Guard` on that directory, and `Guard::drop` removes it, so killing the pane
+/// after the cut must remove exactly that directory. A daemon that quietly
+/// dropped the guard (or adopted a different one) leaves it behind.
+///
+/// The guard is a **real** child cgroup of this machine's scope, made by
+/// [`arreo_core::enforce::Guard::create`]: the F2 rule refuses anything else —
+/// an arbitrary directory is not adoptable, which is the point of the rule.
+/// That needs cgroup delegation, so the test skips where `create` fails (the
+/// harness scope here exposes controllers but denies writes — the same probe
+/// and the same honesty as `cgroup_v2_live()` in
+/// `crates/arreo-core/tests/enforce.rs`; skip, never fake). What it cannot
+/// check where it skips is the *kernel* counters staying live through the new
+/// daemon.
+///
+/// What removal turns red: not re-opening the guard at all (the directory
+/// survives the kill); re-opening a *different* path (same assert, and the
+/// manifest's path is the one the test created); dropping the guard before the
+/// pane is killed (same).
+#[test]
+fn a_guard_survives_the_cut() {
+    let socket = temp_socket("stage2-guard");
+    cleanup(&socket);
+    let Some((cgroup, _owner)) = real_guard("survive") else {
+        return;
+    };
+
+    // A real pane to hand over: this test is the outgoing side, so it owns a
+    // child whose master it passes.
+    let pane = std::sync::Arc::new(
+        arreo_core::pty::Pane::spawn("sh", &["-c", "echo pid=$$; sleep 60"], 80, 24)
+            .expect("spawn the pane to hand over"),
+    );
+    let child = pane.child_pid().expect("the pane has a pid");
+    // Poll for the banner: `drain` reads what the pump has buffered, and a
+    // freshly forked child has not written yet.
+    assert!(
+        until(Duration::from_secs(10), || {
+            pane.drain().iter().any(|line| line.starts_with("pid="))
+        }),
+        "the pane is producing"
+    );
+
+    let mut fake = FakeOutgoing::bind(&socket);
+    fake.manifest = vec![arreo_core::proto::message::HandoffPane {
+        id: "p0".to_string(),
+        program: "sh".to_string(),
+        args: vec!["-c".to_string(), "echo pid=$$; sleep 60".to_string()],
+        cols: 80,
+        rows: 24,
+        child_pid: Some(child),
+        lines: pane.scrollback().lines,
+        pending: pane.scrollback().pending,
+        raw: pane.scrollback().raw,
+        raw_truncated: false,
+        dropped: 0,
+        dropped_bytes: 0,
+        guard_path: Some(cgroup.display().to_string()),
+        kill_on_breach: false,
+        alert: None,
+        alert_line: None,
+    }];
+    fake.panes = vec![std::sync::Arc::clone(&pane)];
+    let mut incoming = start_incoming_quiet(&mut fake);
+    fake.send_descriptors(fake.control.as_fd(), fake.lock.fd());
+    // Commit as a real incoming daemon would — the panes are adopted, the accept
+    // loop is live. (The fake's own control listener stops accepting here: the
+    // incoming daemon serves on the inherited dup.)
+    fake.transfer
+        .as_ref()
+        .expect("the handshake was served")
+        .write_all(&[arreo_core::pty::adopt::HANDOFF_COMMIT_BYTE])
+        .expect("commit");
+
+    assert!(
+        until(Duration::from_secs(20), || something_serves(&socket)),
+        "the incoming daemon serves after the commit"
+    );
+    // The pane crossed the cut: it is there, with its pid.
+    let panes = read_panes(&socket);
+    assert_eq!(panes.len(), 1, "one pane arrived: {panes:?}");
+    assert_eq!(panes[0].id, "p0");
+    assert!(panes[0].alive, "and it is alive");
+    let _ = &mut incoming;
+
+    // **The guard is the incoming daemon's, on that exact cgroup**: killing the
+    // pane drops the entry, whose `Guard::drop` removes the directory.
+    assert!(
+        raw_request(
+            &socket,
+            &Message::Kill {
+                v: VERSION,
+                id: "p0".to_string(),
+            }
+        )
+        .is_ok_message(),
+        "the kill is accepted"
+    );
+    assert!(
+        until(Duration::from_secs(20), || !cgroup.exists()),
+        "the incoming daemon holds a guard on {} — killing the pane must remove it",
+        cgroup.display()
+    );
+
+    // Nothing is left behind: the child was killed through the daemon's own
+    // kill path, and the test's own pane handle is dropped with it. The test's
+    // own `Guard` (from `real_guard`) drops last: its rmdir finds the group
+    // already gone and merely logs, like any double-drop of one cgroup.
+    let _ = pane.wait_timeout(Duration::from_secs(5));
+    drop(_owner);
+    cleanup(&socket);
+    let _ = std::fs::remove_dir_all(&cgroup);
+}
+
+/// A real guard to hand over: a child cgroup of this machine's scope with
+/// readable budget files, made by [`arreo_core::enforce::Guard::create`] — the
+/// only kind of guard path the F2 rule accepts. `None` (with a SKIP note) on a
+/// box without cgroup delegation, where no guard can exist; the tests that
+/// need one skip there, exactly like `cgroup_v2_live()` in
+/// `crates/arreo-core/tests/enforce.rs` — skip, never fake.
+fn real_guard(tag: &str) -> Option<(PathBuf, arreo_core::enforce::Guard)> {
+    match arreo_core::enforce::Guard::create(
+        &format!("handoff-{tag}-{}", std::process::id()),
+        arreo_core::enforce::Budget::unlimited(),
+    ) {
+        Ok(guard) => {
+            let path = guard.path().to_path_buf();
+            Some((path, guard))
+        }
+        Err(e) => {
+            eprintln!("SKIP: no cgroup v2 delegation ({e})");
+            None
+        }
+    }
+}
+
+/// The `Panes` reply, as a list.
+fn read_panes(socket: &Path) -> Vec<arreo_core::proto::PaneInfo> {
+    match raw_request(
+        socket,
+        &Message::Panes {
+            v: VERSION,
+            panes: vec![],
+        },
+    ) {
+        Message::Panes { panes, .. } => panes,
+        other => panic!("panes: unexpected {other:?}"),
+    }
+}
+
+/// A tiny helper so `Kill`'s reply can be asserted without a match arm at every
+/// call site.
+trait IsOkMessage {
+    fn is_ok_message(&self) -> bool;
+}
+
+impl IsOkMessage for Message {
+    fn is_ok_message(&self) -> bool {
+        matches!(self, Message::Ok { .. })
+    }
+}
+
+/// Criterion 5, the refusal half — **a guard that cannot be re-opened is
+/// explicit, never a pane served unprotected.**
+///
+/// A manifest naming a guard path that is not a valid guard path — under the
+/// F2 rule, a direct child of this machine's cgroup scope that reads like a
+/// cgroup — is refused before the cut commits: the outgoing daemon keeps
+/// serving and no cut is recorded. Silently serving the pane without its
+/// ceiling would be a security-relevant regression that the handoff claimed
+/// was fine.
+///
+/// What removal turns red: ignoring `guard_path` (the handoff commits and the
+/// outgoing daemon exits); the pre-commit check going back to a bare
+/// is-a-directory test (an arbitrary directory is adopted and reported as a
+/// guard).
+#[test]
+fn a_guard_that_cannot_be_re_opened_refuses_the_handoff() {
+    let socket = temp_socket("stage2-guard-refuse");
+    cleanup(&socket);
+    let pane = std::sync::Arc::new(
+        arreo_core::pty::Pane::spawn("sh", &["-c", "echo pid=$$; sleep 60"], 80, 24)
+            .expect("spawn the pane to hand over"),
+    );
+    let child = pane.child_pid().expect("the pane has a pid");
+    let missing = std::env::temp_dir().join(format!(
+        "arreo-handoff-no-cgroup-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let _ = std::fs::remove_dir_all(&missing);
+
+    let mut fake = FakeOutgoing::bind(&socket);
+    fake.manifest = vec![arreo_core::proto::message::HandoffPane {
+        id: "p0".to_string(),
+        program: "sh".to_string(),
+        args: vec!["-c".to_string(), "echo pid=$$; sleep 60".to_string()],
+        cols: 80,
+        rows: 24,
+        child_pid: Some(child),
+        lines: Vec::new(),
+        pending: String::new(),
+        raw: Vec::new(),
+        raw_truncated: false,
+        dropped: 0,
+        dropped_bytes: 0,
+        guard_path: Some(missing.display().to_string()),
+        kill_on_breach: true,
+        alert: None,
+        alert_line: None,
+    }];
+    fake.panes = vec![std::sync::Arc::clone(&pane)];
+    let mut incoming = start_incoming(&mut fake);
+    fake.send_descriptors(fake.control.as_fd(), fake.lock.fd());
+    fake.assert_no_commit();
+    assert!(
+        exited_within(&mut incoming, Duration::from_secs(20)),
+        "the incoming daemon refuses and exits"
+    );
+    let text = stderr_of(&mut incoming);
+    assert!(
+        text.contains("cannot be adopted"),
+        "the refusal names the guard: {text:?}"
+    );
+    assert!(
+        text.contains(&missing.display().to_string()),
+        "and the path it could not use: {text:?}"
+    );
+    assert!(
+        text.contains("cgroup scope"),
+        "and the rule it broke: {text:?}"
+    );
+    // The fake outgoing side is still intact: nothing was taken.
+    assert!(
+        std::os::unix::net::UnixStream::connect(&socket).is_ok(),
+        "the outgoing daemon is still serving"
+    );
+    let _ = pane.kill_shared();
+    let _ = pane.wait_timeout(Duration::from_secs(5));
+    cleanup(&socket);
+}
+
+/// Criterion 5, the ordering half — **the guard is not adopted before the
+/// commit.**
+///
+/// `Guard`'s `Drop` removes the cgroup, so an incoming daemon that re-opened a
+/// guard and *then* aborted would `rmdir` the group of a pane the outgoing
+/// daemon is still serving: it would strip a live agent's memory ceiling while
+/// reporting that the handoff did not happen. This test holds the handoff at the
+/// transfer point, abandons it, and asserts the cgroup directory is still
+/// there — which is only true if the guard was never adopted.
+///
+/// The guard is a real child cgroup (as in `a_guard_survives_the_cut`): the F2
+/// rule refuses an arbitrary directory, so the only path that can get past the
+/// pre-commit validation is one `Guard::create` made — requiring delegation,
+/// and skipping where it is missing.
+///
+/// What removal turns red: re-opening the guard anywhere before the commit (the
+/// directory is gone when the transfer is dropped).
+#[test]
+fn a_refused_handoff_leaves_the_guard_where_it_is() {
+    let socket = temp_socket("stage2-guard-order");
+    cleanup(&socket);
+    let Some((cgroup, _owner)) = real_guard("order") else {
+        return;
+    };
+
+    // A real pane to hand over, with a real guard path in the manifest. The
+    // outgoing side here is the fake, because what this test needs is the one
+    // thing a real daemon cannot be asked for: a *held* transfer whose panes
+    // were adopted and then abandoned.
+    let pane = std::sync::Arc::new(
+        arreo_core::pty::Pane::spawn("sh", &["-c", "echo pid=$$; sleep 60"], 80, 24)
+            .expect("spawn the pane to hand over"),
+    );
+    let child = pane.child_pid().expect("the pane has a pid");
+    let mut fake = FakeOutgoing::bind(&socket);
+    let mut entry = pane_description("p0", Some(cgroup.display().to_string()));
+    entry.child_pid = Some(child);
+    entry.lines = pane.drain();
+    fake.manifest = vec![entry];
+    fake.panes = vec![std::sync::Arc::clone(&pane)];
+    let mut incoming = start_incoming(&mut fake);
+    fake.send_descriptors(fake.control.as_fd(), fake.lock.fd());
+    // Everything arrived — manifest, count, pane descriptor — and the cut has
+    // not committed. Abandon it: the incoming daemon's only way out is the
+    // failure path, and that path must not have touched the cgroup.
+    drop(fake.transfer.take());
+    assert!(
+        exited_within(&mut incoming, Duration::from_secs(20)),
+        "the incoming daemon gives up when the transfer dies"
+    );
+    let _ = stderr_of(&mut incoming);
+    assert!(
+        cgroup.exists(),
+        "the guard was adopted before the commit and its Drop removed {}: \
+         a live agent's ceiling was stripped by a handoff that did not happen",
+        cgroup.display()
+    );
+    let _ = pane.kill_shared();
+    let _ = pane.wait_timeout(Duration::from_secs(5));
+    // The test's own `Guard` — the incoming daemon never touched the group.
+    drop(_owner);
+    let _ = std::fs::remove_dir_all(&cgroup);
+    cleanup(&socket);
+}
+
+/// Criterion 6 — **a manifest whose pane count disagrees with the descriptors is
+/// refused.**
+///
+/// Two shapes, both refusals rather than guesses: fewer descriptors than the
+/// count claims (the sender lost a pane — and every descriptor after the loss
+/// would be matched to the wrong manifest entry), and more (descriptors nobody
+/// named). A receiver that read "until EOF" instead of a validated length would
+/// accept both.
+///
+/// What removal turns red: not comparing the count with the manifest (the
+/// handoff commits with panes mismatched to their ids); reading descriptors
+/// until end-of-stream (the "more than claimed" case hangs until the timeout
+/// instead of refusing).
+#[test]
+fn a_manifest_whose_pane_count_disagrees_with_the_descriptors_is_refused() {
+    // Fewer descriptors than the count claims.
+    let socket = temp_socket("stage2-count-fewer");
+    cleanup(&socket);
+    let mut fake = FakeOutgoing::bind(&socket);
+    fake.manifest = vec![pane_description("p0", None), pane_description("p1", None)];
+    fake.count_override = Some(3);
+    let mut incoming = start_incoming(&mut fake);
+    fake.send_descriptors(fake.control.as_fd(), fake.lock.fd());
+    fake.assert_no_commit();
+    assert!(
+        exited_within(&mut incoming, Duration::from_secs(20)),
+        "a count with no descriptors behind it is refused, not waited on"
+    );
+    let text = stderr_of(&mut incoming);
+    assert!(
+        text.contains("claims 3 pane descriptor(s) but its manifest names 2"),
+        "the refusal names both numbers: {text:?}"
+    );
+    cleanup(&socket);
+
+    // More descriptors than the manifest names.
+    let socket = temp_socket("stage2-count-more");
+    cleanup(&socket);
+    let pane = std::sync::Arc::new(
+        arreo_core::pty::Pane::spawn("sh", &["-c", "sleep 60"], 80, 24).expect("a spare pane"),
+    );
+    let mut fake = FakeOutgoing::bind(&socket);
+    fake.manifest = vec![pane_description("p0", None)];
+    fake.panes = vec![std::sync::Arc::clone(&pane)];
+    fake.count_override = Some(0);
+    let mut incoming = start_incoming(&mut fake);
+    fake.send_descriptors(fake.control.as_fd(), fake.lock.fd());
+    fake.assert_no_commit();
+    assert!(
+        exited_within(&mut incoming, Duration::from_secs(20)),
+        "a count that disagrees is refused"
+    );
+    let text = stderr_of(&mut incoming);
+    assert!(
+        text.contains("claims 0 pane descriptor(s) but its manifest names 1"),
+        "the refusal names both numbers: {text:?}"
+    );
+    let _ = pane.kill_shared();
+    let _ = pane.wait_timeout(Duration::from_secs(5));
+    cleanup(&socket);
+}
+
+/// A manifest entry naming a pane that does not exist, for the count tests: the
+/// refusal happens at the count, so nothing here is ever adopted.
+fn pane_description(
+    id: &str,
+    guard_path: Option<String>,
+) -> arreo_core::proto::message::HandoffPane {
+    arreo_core::proto::message::HandoffPane {
+        id: id.to_string(),
+        program: "sh".to_string(),
+        args: vec!["-c".to_string(), "sleep 60".to_string()],
+        cols: 80,
+        rows: 24,
+        child_pid: None,
+        lines: Vec::new(),
+        pending: String::new(),
+        raw: Vec::new(),
+        raw_truncated: false,
+        dropped: 0,
+        dropped_bytes: 0,
+        guard_path,
+        kill_on_breach: false,
+        alert: None,
+        alert_line: None,
+    }
+}
+
+/// Criterion 7 — **a pane that dies during the cut is handled.**
+///
+/// The pane's child exits before the transfer, so the inherited master reports
+/// end-of-stream the moment the incoming daemon reads it. The daemon must report
+/// that pane as gone — not hang waiting for output that will never come, and not
+/// claim a clean exit code it cannot know (an adopted pane's status died with
+/// the daemon that forked it).
+///
+/// What removal turns red: a pump that blocks on a dead master (the daemon never
+/// reaches readiness, so the commit never happens and the incoming daemon exits
+/// with a timeout); a `try_wait` that ignores end-of-stream (the pane reports
+/// alive for ever).
+#[test]
+fn a_pane_that_dies_during_the_cut_does_not_hang_the_incoming_daemon() {
+    let socket = temp_socket("stage2-dead-pane");
+    cleanup(&socket);
+
+    // A real pane whose child has already exited: the master is still open, and
+    // its slave side is gone.
+    let pane = std::sync::Arc::new(
+        arreo_core::pty::Pane::spawn("sh", &["-c", "echo bye"], 80, 24)
+            .expect("spawn a short-lived pane"),
+    );
+    let child = pane.child_pid().expect("the pane has a pid");
+    let exited = pane
+        .wait_timeout(Duration::from_secs(10))
+        .expect("the short-lived pane exits");
+    assert!(
+        matches!(exited, arreo_core::pty::ExitState::Exited(_)),
+        "the pane is gone before the cut: {exited:?}"
+    );
+    // The child exiting and the pump having *pushed* its last bytes are two
+    // different moments: `try_wait` reports the former, the ring holds the
+    // latter. Poll for the output before snapshotting, or this test would
+    // sometimes transfer an empty ring and then assert on history that was never
+    // sent.
+    assert!(
+        until(Duration::from_secs(10), || pane
+            .drain()
+            .iter()
+            .any(|line| line.contains("bye"))),
+        "the pane's output reached the ring before the cut"
+    );
+    let lines = pane.drain();
+
+    let mut fake = FakeOutgoing::bind(&socket);
+    let mut entry = pane_description("p0", None);
+    entry.child_pid = Some(child);
+    entry.lines = lines;
+    entry.raw = pane.scrollback().raw;
+    fake.manifest = vec![entry];
+    fake.panes = vec![std::sync::Arc::clone(&pane)];
+    let mut incoming = start_incoming_quiet(&mut fake);
+    fake.send_descriptors(fake.control.as_fd(), fake.lock.fd());
+    fake.transfer
+        .as_ref()
+        .expect("the handshake was served")
+        .write_all(&[arreo_core::pty::adopt::HANDOFF_COMMIT_BYTE])
+        .expect("commit");
+
+    // It serves, it answers, and it says the pane is gone — no hang.
+    assert!(
+        until(Duration::from_secs(20), || something_serves(&socket)),
+        "the incoming daemon serves even though one of its panes was dead on arrival"
+    );
+    let panes = read_panes(&socket);
+    assert_eq!(panes.len(), 1, "the pane is there: {panes:?}");
+    // Polled, because the two signals are not simultaneous: the pump only sees
+    // end-of-stream once it is reading (it starts parked, and resumes after the
+    // commit), and the pid — when the terminal confirmed one — is reported gone
+    // by its pidfd. Either way the pane must settle to "gone" rather than stay
+    // "alive" for ever, and a single read could land in that window.
+    assert!(
+        until(Duration::from_secs(20), || {
+            !read_panes(&socket)
+                .first()
+                .map(|pane| pane.alive)
+                .unwrap_or(true)
+        }),
+        "the pane settles to gone — end-of-stream on the inherited master is the \
+         signal, since the child was never this daemon's to wait for"
+    );
+    // A read of the dead pane answers from the ring rather than hanging, and the
+    // history it carried is readable.
+    let read = read_pane(&socket, "p0");
+    assert!(
+        read.iter().any(|line| line.contains("bye")),
+        "the pane's history crossed the cut: {read:?}"
+    );
+    let _ = &mut incoming;
+    cleanup(&socket);
+}
+
+/// The manifest is a **bounded** read: a peer-supplied length is checked before
+/// it becomes an allocation.
+///
+/// What removal turns red: allocating `vec![0; length]` before the bound check —
+/// the incoming daemon tries to allocate 4 GiB for a 4-byte prefix and dies
+/// (the process exits non-zero without a typed refusal), instead of refusing.
+#[test]
+fn a_manifest_length_beyond_the_limit_is_refused_before_it_is_read() {
+    let socket = temp_socket("stage2-manifest-huge");
+    cleanup(&socket);
+    let mut fake = FakeOutgoing::bind(&socket);
+    // A length no pane set can justify, with a short body behind it: the
+    // receiver must refuse the length before it allocates or reads.
+    fake.manifest_length_override = Some(u32::MAX);
+    let mut incoming = start_incoming(&mut fake);
+    fake.send_descriptors(fake.control.as_fd(), fake.lock.fd());
+    fake.assert_no_commit();
+    assert!(
+        exited_within(&mut incoming, Duration::from_secs(20)),
+        "an oversized manifest is refused, not allocated"
+    );
+    let text = stderr_of(&mut incoming);
+    assert!(
+        text.contains("the manifest claims 4294967295 bytes"),
+        "the refusal names the length: {text:?}"
+    );
+    assert!(
+        text.contains("limit"),
+        "and the limit it exceeded: {text:?}"
+    );
+    cleanup(&socket);
+}
+
+/// F3 (MEDIUM, reproduced): **a manifest over the entry bound is refused by
+/// name+count before the incoming daemon allocates it.**
+///
+/// The review's reproduction: 200,000 minimal entries (3.8 MB on the wire)
+/// decoded to ~55 MB of RSS in the incoming daemon, and the full 64 MiB byte
+/// budget of minimal entries is on the order of a gigabyte — a pre-commit OOM
+/// on a memory-constrained box, before the pane count was even read. The fix
+/// is a structure bound ([`arreo_core::proto::message::MAX_MANIFEST_ENTRIES`]),
+/// checked against the encoded array header before the decode allocates, and
+/// this test drives it through the real incoming daemon: 4097 minimal entries
+/// arrive (a few hundred kilobytes, far under the byte bound — which is
+/// exactly the point), the daemon refuses naming both numbers, and the outgoing
+/// side keeps serving. The entry bound is also the fix for F5 (N entries = N
+/// threads + ~5–6 fds each): the count bound is what makes N finite.
+///
+/// What removal turns red: decoding before the count check (a 4097-entry
+/// `Vec` is allocated and the handoff commits — `assert_no_commit` sees the
+/// commit byte); the count check reading the wrong number (the refusal no
+/// longer names the two numbers the test asserts).
+#[test]
+fn a_manifest_over_the_entry_bound_is_refused_by_name_and_count() {
+    let socket = temp_socket("stage2-manifest-entries");
+    cleanup(&socket);
+    let mut fake = FakeOutgoing::bind(&socket);
+    fake.manifest = (0..=arreo_core::proto::message::MAX_MANIFEST_ENTRIES)
+        .map(|i| pane_description(&format!("p{i}"), None))
+        .collect();
+    let mut incoming = start_incoming(&mut fake);
+    fake.send_descriptors(fake.control.as_fd(), fake.lock.fd());
+    fake.assert_no_commit();
+    assert!(
+        exited_within(&mut incoming, Duration::from_secs(20)),
+        "a manifest over the entry bound is refused, not allocated"
+    );
+    let text = stderr_of(&mut incoming);
+    assert!(
+        text.contains(&(arreo_core::proto::message::MAX_MANIFEST_ENTRIES + 1).to_string()),
+        "the refusal names the count that arrived: {text:?}"
+    );
+    assert!(
+        text.contains(&arreo_core::proto::message::MAX_MANIFEST_ENTRIES.to_string()),
+        "and the limit it exceeded: {text:?}"
+    );
+    assert!(
+        std::os::unix::net::UnixStream::connect(&socket).is_ok(),
+        "the fake outgoing side is still intact"
+    );
+    cleanup(&socket);
+}
+
+/// Criterion 1, the half stage 1 could not see — **the daemon answers clients
+/// while the panes are in flight.**
+///
+/// The socket staying *open* is not the same as it staying *served*: a connect
+/// succeeds from the listener's backlog even if nothing is accepting. This test
+/// drives a real transfer to the point where the panes are paused and the
+/// outgoing daemon is waiting for the commit, and completes a Hello→Welcome on
+/// the client socket at every step — including the commit wait, where the
+/// transfer is doing synchronous socket I/O.
+///
+/// What removal turns red: running the transfer's blocking I/O inside the async
+/// session task (measured: the accept loop stops, the connect is queued, and the
+/// Welcome never arrives — the probe after the listener times out).
+#[test]
+fn the_daemon_answers_clients_while_the_panes_are_in_flight() {
+    let socket = temp_socket("stage2-still-serving");
+    cleanup(&socket);
+    let mut old = spawn_daemon(&socket, &[], std::process::Stdio::null());
+    wait_serving(&mut old, &socket, Duration::from_secs(10));
+    let program = ticker_program();
+    assert!(spawn_pane(&socket, "p0", "sh", &["-c", &program]).is_ok_message());
+    read_pane_until(&socket, "p0", Duration::from_secs(10), |lines| {
+        ticks(lines).len() >= 2
+    });
+
+    // A fresh Hello→Welcome round trip on the client socket, bounded.
+    let probe = |what: &str| {
+        let mut stream = std::os::unix::net::UnixStream::connect(&socket)
+            .unwrap_or_else(|e| panic!("connect after {what}: {e}"));
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("timeout");
+        let hello = Message::Hello {
+            v: VERSION,
+            client: "stage2-probe".to_string(),
+            wants: arreo_core::proto::client_versions(),
+        };
+        stream
+            .write_all(&codec::encode_frame(&hello).expect("hello"))
+            .expect("write");
+        assert!(
+            matches!(read_one_soft(&mut stream), Ok(Message::Welcome { .. })),
+            "a client is answered after {what}"
+        );
+    };
+    probe("nothing");
+
+    // The whole transfer by hand, probing between every step.
+    let (session, reply) = handoff_session(&socket, VERSION, "stage2-probe");
+    let nonce = match reply {
+        Message::HandoffReady { nonce, .. } => nonce,
+        other => panic!("the request is accepted: {other:?}"),
+    };
+    probe("HandoffReady");
+
+    let handoff_path = arreo_server::handoff::handoff_path_for(&socket);
+    let mut transfer = std::os::unix::net::UnixStream::connect(&handoff_path)
+        .expect("connect to the transfer socket");
+    transfer
+        .set_read_timeout(Some(Duration::from_secs(20)))
+        .expect("timeout");
+    transfer.write_all(&nonce).expect("present the nonce");
+    probe("the nonce");
+
+    let listener_fd = arreo_server::handoff::recv_one(&transfer, Duration::from_secs(20))
+        .expect("the listener descriptor");
+    probe("the listener");
+
+    let lock_fd = arreo_server::handoff::recv_one(&transfer, Duration::from_secs(20))
+        .expect("the lock descriptor");
+    probe("the lock");
+
+    let encoded = arreo_server::handoff::recv_manifest(&transfer, Duration::from_secs(20))
+        .expect("the manifest");
+    let manifest = arreo_core::proto::message::decode_manifest(&encoded).expect("decode");
+    assert_eq!(manifest.len(), 1, "the manifest names the pane");
+    probe("the manifest");
+
+    let count = arreo_server::handoff::recv_pane_count(&transfer, Duration::from_secs(20))
+        .expect("the pane count");
+    assert_eq!(count, manifest.len());
+    let pane_fd = arreo_server::handoff::recv_one(&transfer, Duration::from_secs(20))
+        .expect("the pane descriptor");
+
+    // **The window that used to be dead**: the panes are paused and the outgoing
+    // daemon is in its commit wait, doing synchronous socket I/O.
+    probe("the pane descriptors (the panes are paused)");
+    probe("the commit wait again");
+
+    // Abandon it: the pumps must resume and the daemon must go on serving.
+    drop((pane_fd, listener_fd, lock_fd, transfer));
+    assert!(
+        until(Duration::from_secs(20), || {
+            let lines = read_pane(&socket, "p0");
+            ticks(&lines).len() >= 4
+        }),
+        "the pane keeps producing after the abandoned transfer"
+    );
+    probe("the abort");
+    assert!(
+        old.try_wait().expect("try_wait").is_none(),
+        "the outgoing daemon never stopped serving"
     );
     drop(session);
     cleanup(&socket);

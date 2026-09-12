@@ -618,7 +618,21 @@ pub fn run(rest: &[String]) -> ExitCode {
     // A long question is cut to the sidebar's width — marked with an ellipsis
     // rather than wrapped, because a wrapped line would push every pane below it
     // off the screen. The mark is the promise that this is the same text, shorter.
-    let cut_marked = sidebar_holds(&by_name.screen(), "Proceed with the dep…");
+    //
+    // The *exact* cut point is guessed at by no test: it moved when T-0076
+    // retuned the question's indent (four spaces dropped to three so the line
+    // aligns with the pane-id gutter), and pinning a specific cut would pin the
+    // sidebar's geometry rather than the contract. What is pinned is the
+    // contract: the sidebar holds the question's prefix, cut, with the mark —
+    // at the sidebar's left edge, so the pane view's own copy cannot satisfy it.
+    // The sidebar renders inside box borders, so the ellipsis is mid-line
+    // (`│   Proceed with the depl… │`), not at its end — "ends_with" would be
+    // wrong even when the cut is right. The check is the contract: a line near
+    // the sidebar's left edge carries the question's text *and* a cut mark.
+    let cut_marked = by_name.screen().split('\n').any(|line| {
+        line.find("Proceed")
+            .is_some_and(|at| at <= 8 && line[at..].contains('…'))
+    });
     check(
         "the hung remote agent's question is shown in the sidebar",
         asking && in_sidebar,

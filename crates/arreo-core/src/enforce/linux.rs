@@ -15,6 +15,7 @@
 use super::{Breach, Budget, EnforceError, Pressure};
 use std::path::PathBuf;
 
+#[derive(Debug)]
 pub struct Guard {
     path: PathBuf,
 }
@@ -33,6 +34,46 @@ impl Guard {
             })
             .ok_or_else(|| EnforceError::Unavailable("no cgroup v2 scope".to_string()))?;
         Ok(PathBuf::from(format!("/sys/fs/cgroup{path}")))
+    }
+
+    /// The one rule for what a guard path may be — the single definition of "a
+    /// valid guard path", shared by [`Guard::create`] (which builds under our
+    /// scope) and [`Guard::reopen`] (which adopts a peer-supplied one). One
+    /// rule, one home (F2 of the stage-2 review).
+    ///
+    /// A guard path must be:
+    ///
+    /// - **a direct child of this machine's cgroup scope** — the same
+    ///   [`own_scope`] `create` builds under. A hostile outgoing daemon used to
+    ///   name any empty directory it liked in the manifest, and `Guard::drop`'s
+    ///   `rmdir` removed it when the pane died — worse, the pane reported
+    ///   `has_guard() == true` while `breached()`/`pressure()` read nothing, so
+    ///   agents served without their ceiling, silently. A path that is not
+    ///   directly under the scope is either someone else's cgroup or not a
+    ///   cgroup at all, and neither is adoptable.
+    /// - **a directory that reads like a cgroup** — at least one of
+    ///   `memory.max`/`pids.max` must be readable, because a guard whose budget
+    ///   files cannot be read enforces nothing.
+    ///
+    /// Refuses naming the path and the scope.
+    fn valid_guard_path(path: &std::path::Path) -> Result<(), EnforceError> {
+        let scope = Self::own_scope()?;
+        if path.parent() != Some(scope.as_path()) {
+            return Err(EnforceError::Unavailable(format!(
+                "{} is not a direct child of this daemon's cgroup scope {}",
+                path.display(),
+                scope.display()
+            )));
+        }
+        let memory_readable = std::fs::read_to_string(path.join("memory.max")).is_ok();
+        let pids_readable = std::fs::read_to_string(path.join("pids.max")).is_ok();
+        if !memory_readable && !pids_readable {
+            return Err(EnforceError::Unavailable(format!(
+                "{} does not read like a cgroup (neither memory.max nor pids.max is readable)",
+                path.display()
+            )));
+        }
+        Ok(())
     }
 
     /// Create `arreo-<name>-<pid>` under our scope with the budget applied.
@@ -57,6 +98,11 @@ impl Guard {
                 .map(|p| p.to_string())
                 .unwrap_or_else(|| "max".to_string()),
         )?;
+        // The same rule `reopen` will apply to this very path after a handoff:
+        // a guard `create` just built must be a path `reopen` accepts, or the
+        // next daemon would refuse the enforcement this one attached (F2's
+        // shared rule, checked on both sides of the cut).
+        Self::valid_guard_path(&guard.path)?;
         Ok(guard)
     }
 
@@ -80,10 +126,13 @@ impl Guard {
     /// `std::process::exit`, which runs no destructors, so the group outlives it
     /// by construction and the adopting daemon becomes its owner.
     ///
-    /// Refuses a path that is not an existing directory: a pane that arrived with
-    /// a guard path that cannot be re-opened must be reported, never served
-    /// unprotected while the handoff claims success.
+    /// Refuses a path that is not a valid guard path ([`Guard::valid_guard_path`]
+    /// — a direct child of this machine's cgroup scope that reads like a cgroup),
+    /// or not an existing directory. A pane that arrived with a guard path that
+    /// cannot be re-opened must be reported, never served unprotected while the
+    /// handoff claims success.
     pub fn reopen(path: PathBuf) -> Result<Self, EnforceError> {
+        Self::valid_guard_path(&path)?;
         match std::fs::metadata(&path) {
             Ok(meta) if meta.is_dir() => Ok(Self { path }),
             Ok(_) => Err(EnforceError::Unavailable(format!(
@@ -95,6 +144,19 @@ impl Guard {
                 path.display()
             ))),
         }
+    }
+
+    /// The validate-only half of [`Guard::reopen`]: is `path` a path `reopen`
+    /// would adopt?
+    ///
+    /// The incoming daemon calls this **before the cut**. Adopting — and the
+    /// `Drop`-time `rmdir` that comes with a `Guard` — before the handoff
+    /// commits could remove the group of a pane the outgoing daemon still
+    /// serves if the handoff then aborted, so the pre-commit decision has to be
+    /// a question, never an adoption. [`Guard::reopen`] runs the same rule
+    /// again, which is what makes the two answers agree.
+    pub fn validate(path: &std::path::Path) -> Result<(), EnforceError> {
+        Self::valid_guard_path(path)
     }
 
     fn write(&self, file: &str, value: &str) -> Result<(), EnforceError> {
@@ -231,6 +293,18 @@ mod tests {
     use super::parse_breach;
     use crate::enforce::Breach;
 
+    /// The scope this box runs in, for tests that need a real child of it.
+    fn scope_or_skip() -> Option<std::path::PathBuf> {
+        let scope = super::Guard::own_scope().ok()?;
+        if !std::fs::metadata(&scope)
+            .map(|m| m.is_dir())
+            .unwrap_or(false)
+        {
+            return None;
+        }
+        Some(scope)
+    }
+
     #[test]
     fn breach_parser_reads_kernel_counters() {
         assert_eq!(
@@ -251,5 +325,132 @@ mod tests {
             parse_breach(Some("max 1\n"), Some("max 1\n")),
             Some(Breach::Memory)
         );
+    }
+
+    /// F2 (stage-2 review, reproduced): `reopen` refuses a path that is not a
+    /// **direct child of this machine's cgroup scope**, naming the path and
+    /// the scope. The old `reopen` accepted any directory, and `Drop`'s
+    /// `rmdir` removed it when the pane died — a hostile outgoing daemon could
+    /// name an arbitrary empty directory and the pane would report itself
+    /// guarded while enforcement read nothing.
+    ///
+    /// What removal turns red: dropping the scope check — an empty `/tmp`
+    /// directory is adopted, and this `expect_err` sees `Ok`.
+    #[test]
+    fn reopen_refuses_a_path_outside_the_cgroup_scope() {
+        // Skipped when the scope itself cannot be named: then no guard can
+        // exist anywhere and the rule's answer everywhere is the same refusal.
+        let Some(scope) = scope_or_skip() else {
+            eprintln!("no cgroup v2 scope on this box: skipping");
+            return;
+        };
+        let foreign = std::env::temp_dir().join(format!(
+            "arreo-guard-foreign-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&foreign);
+        std::fs::create_dir_all(&foreign).expect("an arbitrary empty directory");
+        let err = super::Guard::reopen(foreign.clone())
+            .expect_err("a directory that is not under the scope is not a guard");
+        let text = err.to_string();
+        assert!(
+            text.contains(&foreign.display().to_string()),
+            "the refusal names the path: {text}"
+        );
+        assert!(
+            text.contains(&scope.display().to_string()),
+            "and the scope it must live under: {text}"
+        );
+        let _ = std::fs::remove_dir_all(&foreign);
+    }
+
+    /// F2: a **direct child of the scope** that does not read like a cgroup is
+    /// refused too — at least one of `memory.max`/`pids.max` must be readable,
+    /// or the guard enforces nothing while the pane claims it does.
+    #[test]
+    fn reopen_refuses_a_child_of_the_scope_that_does_not_read_like_a_cgroup() {
+        let Some(scope) = scope_or_skip() else {
+            eprintln!("no cgroup v2 scope on this box: skipping");
+            return;
+        };
+        let dir = scope.join(format!(
+            "arreo-guard-not-cgroup-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        if let Err(e) = std::fs::create_dir(&dir) {
+            eprintln!(
+                "the scope is not writable ({}): skipping ({e})",
+                scope.display()
+            );
+            return;
+        }
+        // No memory.max/pids.max: not a cgroup, by the rule's own test.
+        let err = super::Guard::reopen(dir.clone())
+            .expect_err("a directory with no budget files does not read like a cgroup");
+        assert!(
+            err.to_string().contains("does not read like a cgroup"),
+            "the refusal names the missing evidence: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// F2: `reopen` on a real child of the scope that reads like a cgroup
+    /// succeeds — the success half of the rule, and the one `Guard::create`
+    /// itself must agree with.
+    ///
+    /// The child is `Guard::create`'s own: a real cgroup directly under the scope
+    /// whose `memory.max`/`pids.max` the kernel made readable. That requires
+    /// cgroup delegation (the harness scope here exposes controllers but denies
+    /// writes, so `create` fails and the test skips, exactly like
+    /// `cgroup_v2_live()` in `tests/enforce.rs` — skip, never fake).
+    ///
+    /// What removal turns red: `reopen` going back to a bare is-directory check —
+    /// the `/tmp` directory from the refusal test would be adopted.
+    #[test]
+    fn reopen_accepts_a_real_child_of_the_scope_that_reads_like_a_cgroup() {
+        let made = match super::Guard::create("f2-reopen", crate::enforce::Budget::unlimited()) {
+            Ok(guard) => guard,
+            Err(e) => {
+                eprintln!("SKIP: no cgroup v2 delegation ({e})");
+                return;
+            }
+        };
+        let path = made.path().to_path_buf();
+        let reopened = super::Guard::reopen(path.clone())
+            .expect("a direct child of the scope that reads like a cgroup is adopted");
+        assert_eq!(reopened.path(), path.as_path());
+        // Both handles own the same group; the second rmdir finds nothing and
+        // merely logs (like any double-drop of one cgroup).
+        drop(reopened);
+        drop(made);
+    }
+
+    /// `create` and `reopen` agree about what a valid guard path is (F2's
+    /// shared rule): a guard `create` builds is directly under the scope and
+    /// reads like a cgroup, so `validate` — the pre-commit question the
+    /// incoming daemon asks — accepts what `create` built. Skipped when the
+    /// scope is not writable (then `create` fails on this box and there is
+    /// nothing to hand over, which is exactly what the runtime reports).
+    #[test]
+    fn create_and_validate_agree_on_a_valid_guard_path() {
+        let guard = match super::Guard::create("f2-agree", crate::enforce::Budget::unlimited()) {
+            Ok(guard) => guard,
+            Err(e) => {
+                eprintln!("no writable delegated scope ({e}): skipping");
+                return;
+            }
+        };
+        let path = guard.path().to_path_buf();
+        assert!(
+            super::Guard::validate(&path).is_ok(),
+            "create built a path its own reopen rule accepts"
+        );
+        // `create`'s dir has real kernel controller files (memory.max/pids.max
+        // were written into it), so Drop's rmdir may need the members gone —
+        // there are none here.
+        drop(guard);
     }
 }

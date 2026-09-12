@@ -1,9 +1,9 @@
-┌peer-machine · relay──────┐┌(no focus — Enter on a sidebar row)───────────────────────────────────────────────────────┐
-│◉ question                ││                                                                                          │
-│  asking-pane   3M █░░░░░░││                                                                                          │
-│    Proceed with the dep… ││                                                                                          │
-│● working                 ││                                                                                          │
-│  remote-pane   3M █░░░░░░││                                                                                          │
+┌peer-machine · relay──────┐┌(no pane attached — Enter on a sidebar row)───────────────────────────────────────────────┐
+│  ◉ question              ││                                                                                          │
+│▶  asking-pane   3M █░░░░░││                                                                                          │
+│   Proceed with the depl… ││                                                                                          │
+│  ● working               ││                                                                                          │
+│   remote-pane   3M █░░░░░││                                                                                          │
 │                          ││                                                                                          │
 │                          ││                                                                                          │
 │                          ││                                                                                          │
@@ -27,4 +27,4 @@
 │                          ││                                                                                          │
 │                          ││                                                                                          │
 └──────────────────────────┘└──────────────────────────────────────────────────────────────────────────────────────────┘
-2 panes · j/k move · Enter attach · w wall · t theme · / search · q quit
+2 panes · j/k move · Enter attach · Tab cycle · w wall · t theme · / search · ? keys · q quit

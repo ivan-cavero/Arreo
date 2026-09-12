@@ -22,6 +22,7 @@
 
 use arreo_server::lifecycle::SHUTDOWN_DEADLINE;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 #[tokio::main]
 async fn main() {
@@ -512,14 +513,15 @@ async fn run_handoff_inner(
         Ok(ready) => ready,
         Err(e) => return fail(format!("no HandoffReady: {e}")),
     };
-    let (agreed, old_protocol, panes, nonce) = match ready {
+    let (agreed, old_protocol, panes, nonce, carries_panes) = match ready {
         Message::HandoffReady {
             protocol,
             server_protocol,
             panes,
             nonce,
+            manifest,
             ..
-        } => (protocol, server_protocol, panes, nonce),
+        } => (protocol, server_protocol, panes, nonce, manifest),
         Message::Error { message, .. } => {
             // A refusal: the outgoing daemon audited it and keeps serving — a
             // deferred update, never a failure of the running machine.
@@ -600,6 +602,127 @@ async fn run_handoff_inner(
         Ok(lock) => lock,
         Err(e) => return refuse(format!("the lock descriptor was refused: {e}")),
     };
+    // 3b. **The panes** (T-0038 stage 2): the manifest, the count, and one
+    // master descriptor per entry — in that order, which is the grammar.
+    //
+    // A sender that does not carry panes is accepted only when it says it has
+    // none. A stage-1 outgoing daemon exits on the commit and its children are
+    // orphaned, so committing over a cut that has panes and no manifest would
+    // kill every agent on the machine; with no panes there is nothing to lose
+    // and the cut is exactly what stage 1 promised. That distinction is the
+    // N−1 gate, and it lives in `HandoffReady::manifest`.
+    let manifest = if carries_panes {
+        let encoded = match arreo_server::handoff::recv_manifest(&transfer, timeout) {
+            Ok(encoded) => encoded,
+            Err(detail) => return refuse(format!("the pane manifest did not arrive: {detail}")),
+        };
+        let manifest = match arreo_core::proto::message::decode_manifest(&encoded) {
+            Ok(manifest) => manifest,
+            Err(e) => return refuse(format!("the pane manifest did not decode: {e}")),
+        };
+        let count = match arreo_server::handoff::recv_pane_count(&transfer, timeout) {
+            Ok(count) => count,
+            Err(detail) => return refuse(format!("the pane count did not arrive: {detail}")),
+        };
+        // **The count is validated against the manifest, never trusted as a
+        // loop bound.** Fewer descriptors than entries means the sender lost a
+        // pane (and the ones after the loss would be matched to the wrong
+        // entries); more means descriptors nobody named. Either way it is a
+        // refusal rather than a guess — and a refusal is safe, because the
+        // outgoing daemon keeps serving and a retry is the remedy.
+        if count != manifest.len() {
+            return refuse(format!(
+                "the transfer claims {count} pane descriptor(s) but its manifest names {}",
+                manifest.len()
+            ));
+        }
+        manifest
+    } else {
+        if panes > 0 {
+            return refuse(format!(
+                "the outgoing daemon is not transferring its {panes} pane(s) \
+                 (an older build: committing would orphan every agent)"
+            ));
+        }
+        Vec::new()
+    };
+    // Every check that can still refuse runs **before** the first adoption, and
+    // every adoption before the commit: nothing here has read a byte from an
+    // inherited terminal yet, so an abort at any point below leaves the outgoing
+    // daemon with exactly the panes it had.
+    let mut adopted: Vec<(String, Arc<arreo_server::daemon::PaneEntry>)> =
+        Vec::with_capacity(manifest.len());
+    for entry in &manifest {
+        // The guard is validated here but *adopted* after the commit (see
+        // below): a `Guard`'s `Drop` removes the cgroup, so adopting one and
+        // then aborting would strip a live agent's memory ceiling while
+        // reporting that nothing happened. Checking the path now keeps the
+        // refusal on the safe side of the cut.
+        //
+        // The check is the same rule `Guard::reopen` will apply after the
+        // commit (F2, stage-2 review): the path must be a direct child of this
+        // machine's cgroup scope and read like a cgroup. An arbitrary empty
+        // directory used to be adopted, reported as a guard, and `rmdir`'d
+        // when the pane died — a hostile outgoing daemon's path to deleting a
+        // directory and serving an agent without its ceiling, silently.
+        if let Some(path) = &entry.guard_path {
+            if let Err(e) = arreo_core::enforce::Guard::validate(std::path::Path::new(path)) {
+                return refuse(format!(
+                    "pane {:?} arrived with a guard path that cannot be adopted: {e}",
+                    entry.id
+                ));
+            }
+        }
+        let fd = match arreo_server::handoff::recv_one(&transfer, timeout) {
+            Ok(fd) => fd,
+            Err(e) => {
+                return refuse(format!(
+                    "the descriptor for pane {:?} did not arrive: {e}",
+                    entry.id
+                ))
+            }
+        };
+        // **Paused**: the pump parks before its first read, so this process
+        // consumes nothing until the cut is committed. Bytes the outgoing
+        // daemon never read stay in the terminal's buffer for whoever ends up
+        // owning the pane.
+        let seed = arreo_core::pty::AdoptSeed {
+            child_pid: entry.child_pid,
+            size: arreo_core::pty::adopt::AdoptSize {
+                cols: entry.cols,
+                rows: entry.rows,
+            },
+            spec: arreo_core::pty::SpawnSpec {
+                program: entry.program.clone(),
+                args: entry.args.clone(),
+            },
+            scrollback: arreo_core::pty::Scrollback {
+                lines: entry.lines.clone(),
+                pending: entry.pending.clone(),
+                raw: entry.raw.clone(),
+                raw_truncated: entry.raw_truncated,
+                dropped: entry.dropped,
+                dropped_bytes: entry.dropped_bytes,
+            },
+        };
+        let pane = match arreo_core::pty::Pane::adopt_seeded(fd, seed) {
+            Ok(pane) => Arc::new(pane),
+            Err(e) => return refuse(format!("pane {:?} was refused: {e}", entry.id)),
+        };
+        // The entry is rebuilt, not transferred: a fresh engine fed the
+        // transferred journal (which is why the journal travels), a fresh
+        // sampler, and the alert episode reconstructed through `AlertState`'s
+        // own rule. The guard joins it after the commit.
+        adopted.push((
+            entry.id.clone(),
+            Arc::new(arreo_server::daemon::PaneEntry::adopted(
+                pane,
+                entry.alert.as_deref(),
+                entry.alert_line.as_deref(),
+                entry.kill_on_breach,
+            )),
+        ));
+    }
     // 4. Build the daemon around the inherited listener and lock: no bind, no
     // acquire. The descriptor becomes a non-blocking tokio listener first.
     let std_listener = arreo_server::handoff::std_listener_from_fd(listener_fd);
@@ -621,6 +744,10 @@ async fn run_handoff_inner(
     // exists to prevent.
     let daemon = arreo_server::Daemon::new(socket);
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
+    // The entries are cloned into the serving task (an `Arc` clone each) and
+    // kept here too: this thread is the one that starts the pumps, and it may
+    // only do that once the cut is committed.
+    let serving_panes = adopted.clone();
     let server_task = tokio::spawn(async move {
         // Readiness means "the accept loop owns the listener and is about to
         // accept" (the signal fires inside `serve_on`, after the lock check,
@@ -629,7 +756,7 @@ async fn run_handoff_inner(
         // the outgoing daemon exits on our commit, this loop is the thing
         // draining them.
         let _ = daemon
-            .serve_inherited(tokio_listener, lock, Some(ready_tx))
+            .serve_inherited(tokio_listener, lock, serving_panes, Some(ready_tx))
             .await;
     });
     // Bounded (F8): an incoming daemon that never starts accepting must not
@@ -659,8 +786,74 @@ async fn run_handoff_inner(
         return refuse(format!("cannot send the commit marker: {e}"));
     }
     drop(transfer);
+    // 7. **Now the panes are ours, and only now.** Two things follow the commit
+    // and nothing may do them earlier:
+    //
+    // - **The guards are re-opened.** `Guard`'s `Drop` removes the cgroup, so
+    //   adopting one before the commit and then aborting would `rmdir` the group
+    //   of a pane the outgoing daemon is still serving — silently removing a
+    //   live agent's memory ceiling while reporting that the handoff did not
+    //   happen. After the commit this process owns the pane, and removal-on-drop
+    //   is exactly right. Nothing removes the group on the outgoing side: that
+    //   process exits via `std::process::exit`, which runs no destructors, so the
+    //   group outlives it and this daemon is its genuine owner.
+    // - **The pumps start.** They have been parked since adoption, which is what
+    //   kept this process from consuming a byte before the cut. From here the
+    //   bytes that arrived while parked are read from the terminals' buffers, so
+    //   the criterion-2 case (output written *during* the pause) arrives rather
+    //   than being lost.
+    for (id, entry) in &adopted {
+        if let Some(path) = manifest
+            .iter()
+            .find(|pane| &pane.id == id)
+            .and_then(|pane| pane.guard_path.as_ref())
+        {
+            match arreo_core::enforce::Guard::reopen(std::path::PathBuf::from(path)) {
+                Ok(guard) => entry.adopt_guard(guard),
+                // Committed, so there is no safe way back: refusing here would
+                // leave the machine with no serving daemon at all, which is the
+                // half-dead state ADR 0021 §2 exists to prevent. What is *not*
+                // acceptable is silence — a pane served without the ceiling it
+                // was running under is a security-relevant regression, and it is
+                // said out loud and on the audit trail rather than hidden.
+                Err(e) => {
+                    eprintln!(
+                        "arreo-server: pane {id} lost its enforcement guard across the handoff \
+                         ({path}): {e} — serving it WITHOUT its budget"
+                    );
+                    arreo_server::handoff::record_incoming_abort(
+                        &db,
+                        &format!("pane {id} lost its guard across the handoff: {e}"),
+                    );
+                }
+            }
+        }
+        // F6 (stage-2 review): the geometry repair, moved here from the
+        // adoption — a 0×0 inherited terminal is the sender's numbers to set,
+        // but only once this process owns the pane. Before the commit it would
+        // mutate a terminal the outgoing daemon gets back on an abort; after
+        // the commit it is exactly the repair the pane needs, and a failure is
+        // reported, never a refusal (there is no way back). The manifest's
+        // claim is what the sender reported for this very pane.
+        if let Some(claimed) = manifest.iter().find(|pane| &pane.id == id) {
+            if let Err(e) = entry.pane.repair_geometry(claimed.cols, claimed.rows) {
+                eprintln!(
+                    "arreo-server: pane {id} could not repair its geometry after the handoff: {e}"
+                );
+            }
+        }
+        entry.pane.resume();
+    }
+    let adopted_count = adopted.len();
+    // **The local handles are dropped.** The registry owns these entries now,
+    // and an `Arc` kept alive here would keep each `PaneEntry` — and with it each
+    // `Guard` — from ever dropping: `Guard::drop` removes the cgroup, so a pane
+    // killed after the cut would leave its group behind, which is exactly the
+    // leak `a_guard_survives_the_cut` asserts against.
+    drop(adopted);
     eprintln!(
-        "arreo-server: handoff complete (protocol {old_protocol} -> {agreed}, panes {panes}, pid {})",
+        "arreo-server: handoff complete (protocol {old_protocol} -> {agreed}, panes {panes}, \
+         adopted {adopted_count}, pid {})",
         std::process::id()
     );
     // Keep serving: success means this process never exits. A server task that

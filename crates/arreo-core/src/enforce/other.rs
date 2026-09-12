@@ -22,6 +22,13 @@ impl Guard {
         Err(EnforceError::Unimplemented("T-0019 (resource enforcement)"))
     }
 
+    /// The validate-only half of [`Guard::reopen`], used by the incoming daemon
+    /// before the cut: no group exists on this OS, so no path is adoptable, and
+    /// the pre-commit check must refuse with the same honesty `reopen` would.
+    pub fn validate(_path: &std::path::Path) -> Result<(), EnforceError> {
+        Err(EnforceError::Unimplemented("T-0019 (resource enforcement)"))
+    }
+
     pub fn attach(&self, _pid: u32) -> Result<(), EnforceError> {
         Err(EnforceError::Unimplemented("T-0019 (resource enforcement)"))
     }

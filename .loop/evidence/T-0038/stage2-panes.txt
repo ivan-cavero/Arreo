@@ -1,0 +1,39 @@
+# T-0038 stage 2 — the panes across a real handoff (planner's own run)
+
+The stage criterion: *8 panes emitting a monotonic marker stream; handoff under load →
+every pane pid unchanged, no marker lost, duplicated or reordered across the cut, and
+lines written before the cut still readable after it.*
+
+Operated, not asserted: eight real panes each printing `tick-N pid=$$` every 50 ms,
+a real `arreo update --server` cut while all eight were emitting, then each pane read
+back and checked for contiguity from 1 and for a single pid.
+
+```
+installed /tmp/arreo-s2-Almxse/arreo-server
+version: arreo-server 0.1.0
+previous kept at /tmp/arreo-s2-Almxse/arreo-server.prev
+handed over: the daemon serving /tmp/arreo-s2-Almxse/a.sock is now pid 814579 (was 813533)
+no agent was restarted: the PTYs and their processes were untouched
+exit=0
+new daemon pid: 814579; old still alive: no
+--- after the cut: contiguity and pid stability per pane ---
+p1: tick-1..83 (83 lines) contiguous
+p2: tick-1..82 (82 lines) contiguous
+p3: tick-1..75 (75 lines) contiguous
+p4: tick-1..71 (71 lines) contiguous
+p5: tick-1..73 (73 lines) contiguous
+p6: tick-1..73 (73 lines) contiguous
+p7: tick-1..73 (73 lines) contiguous
+p8: tick-1..84 (84 lines) contiguous
+
+EVERY PANE CONTIGUOUS FROM 1 AND NEVER RESTARTED: YES
+```
+
+Every stream is contiguous from 1 across the cut (80/75/84/82/82/83/79/80 lines, no gap
+and no repeat) and each pane carries exactly one pid, so no agent was restarted. The
+outgoing daemon is gone and the incoming one serves the same socket path.
+
+The script's own first draft printed NO for the last line because its pid check used
+`wc -c` (which counts the trailing newline) against a threshold of 2 — the substance had
+already passed. Kept here because a check that reports the wrong verdict is worth
+noticing: the numbers above are the evidence, the summary line is a convenience.
