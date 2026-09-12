@@ -16,7 +16,7 @@
 //! must survive a restart); the legacy `--pairing-*` form needs no state at all,
 //! because the mailbox is deliberately in-memory (T-0024's honest gap).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 fn main() {
@@ -70,14 +70,7 @@ fn pairing(args: &[String]) {
     let mailbox = Arc::new(arreo_relay::Mailbox::new());
     let mut handles = Vec::new();
     if let Some(path) = socket {
-        let mailbox = Arc::clone(&mailbox);
-        eprintln!("arreo-relay: pairing mailbox on unix://{}", path.display());
-        handles.push(std::thread::spawn(move || {
-            if let Err(e) = arreo_relay::pairing::serve_unix(&path, mailbox) {
-                eprintln!("arreo-relay: unix listener died: {e}");
-                std::process::exit(1);
-            }
-        }));
+        spawn_unix_mailbox(&path, &mailbox, &mut handles);
     }
     if let Some(addr) = tcp {
         let mailbox = Arc::clone(&mailbox);
@@ -92,6 +85,45 @@ fn pairing(args: &[String]) {
     for handle in handles {
         let _ = handle.join();
     }
+}
+
+/// Start the mailbox on a unix socket, where unix sockets exist.
+///
+/// On Windows there are none (T-0062), so `--pairing-socket` is **refused by
+/// name** rather than compiled out silently: a flag that is accepted and then
+/// ignored is the worst of the three behaviors, because the operator sees a
+/// listener that is not there. The message names the alternative that does work
+/// on every platform, so the refusal is actionable.
+#[cfg(unix)]
+fn spawn_unix_mailbox(
+    path: &Path,
+    mailbox: &Arc<arreo_relay::Mailbox>,
+    threads: &mut Vec<std::thread::JoinHandle<()>>,
+) {
+    let mailbox = Arc::clone(mailbox);
+    let path = path.to_path_buf();
+    eprintln!("arreo-relay: pairing mailbox on unix://{}", path.display());
+    threads.push(std::thread::spawn(move || {
+        if let Err(e) = arreo_relay::pairing::serve_unix(&path, mailbox) {
+            eprintln!("arreo-relay: unix listener died: {e}");
+            std::process::exit(1);
+        }
+    }));
+}
+
+#[cfg(not(unix))]
+fn spawn_unix_mailbox(
+    path: &Path,
+    _mailbox: &Arc<arreo_relay::Mailbox>,
+    _threads: &mut Vec<std::thread::JoinHandle<()>>,
+) {
+    eprintln!(
+        "arreo-relay: --pairing-socket {} is not available on this platform (there are no unix \
+         sockets on Windows). Use --pairing-tcp HOST:PORT, which serves the same mailbox on \
+         every platform",
+        path.display()
+    );
+    std::process::exit(2);
 }
 
 /// The router: QUIC on `--listen`, plus any pairing listeners asked for.
@@ -150,14 +182,7 @@ fn serve(args: &[String]) {
     let mailbox = Arc::new(arreo_relay::Mailbox::new());
     let mut pairing_threads = Vec::new();
     if let Some(path) = pairing_socket {
-        let mailbox = Arc::clone(&mailbox);
-        eprintln!("arreo-relay: pairing mailbox on unix://{}", path.display());
-        pairing_threads.push(std::thread::spawn(move || {
-            if let Err(e) = arreo_relay::pairing::serve_unix(&path, mailbox) {
-                eprintln!("arreo-relay: unix listener died: {e}");
-                std::process::exit(1);
-            }
-        }));
+        spawn_unix_mailbox(&path, &mailbox, &mut pairing_threads);
     }
     if let Some(addr) = pairing_tcp {
         let mailbox = Arc::clone(&mailbox);

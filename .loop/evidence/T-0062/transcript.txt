@@ -1,0 +1,16 @@
+T-0062 — the Windows build
+=========================
+
+Without the fix, rustc on our own code for x86_64-pc-windows-msvc:
+  error[E0433]: cannot find `unix` in `os` (crates/arreo-relay/src/pairing.rs:31)
+  (proven by compiling the crate for the Windows target: the only rustc error
+  in our files is the ungated std::os::unix import)
+
+With the fix:
+error: failed to run custom build command for `ring v0.17.14`
+error: failed to run custom build command for `libsqlite3-sys v0.28.0`
+
+Only the two C build-script failures remain (ring, libsqlite3-sys: lib.exe — the
+SDK marker check-targets classifies as SKIP). check-targets:
+check-targets: x86_64-pc-windows-msvc SKIP (pure-Rust (arreo-core, no sqlite) PASS; C deps need SDK (lib.exe) — CI covers)
+check-targets: 1 pass, 1 skip (CI matrix is authority for skipped)

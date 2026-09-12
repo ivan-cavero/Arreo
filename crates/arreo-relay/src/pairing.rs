@@ -28,7 +28,15 @@ use arreo_core::pairing::{MailboxRequest, MailboxResponse, Slot};
 use std::collections::{HashMap, VecDeque};
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpListener;
+// Unix-only, and gated as such (T-0062): this crate must compile for
+// `x86_64-pc-windows-msvc` because the workspace is built and tested there, and
+// `std::os::unix` does not exist on Windows. The *mailbox rules above are
+// platform-independent* — the TCP listener below serves them everywhere; only
+// the unix-socket entry points are gated, exactly as `arreo_core`'s client half
+// gates its own (`crates/arreo-core/src/pairing/wire.rs`).
+#[cfg(unix)]
 use std::os::unix::net::{UnixListener, UnixStream};
+#[cfg(unix)]
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -217,6 +225,7 @@ impl Mailbox {
 /// Blocking and single-request-at-a-time on purpose: the mailbox carries four
 /// small frames between two clients, and a simple loop is auditable. The read
 /// timeout bounds how long one stalled client can hold it.
+#[cfg(unix)]
 pub fn serve_unix(path: &Path, mailbox: Arc<Mailbox>) -> std::io::Result<()> {
     let _ = std::fs::remove_file(path);
     let listener = UnixListener::bind(path)?;
@@ -313,6 +322,7 @@ fn read_frame<R: BufRead>(reader: &mut R) -> std::io::Result<Option<String>> {
 
 /// Connect, send one request, read the reply (used by the relay's own tests
 /// and by anything scripting the mailbox).
+#[cfg(unix)]
 pub fn request_unix(path: &Path, request: &MailboxRequest) -> std::io::Result<MailboxResponse> {
     let stream = UnixStream::connect(path)?;
     stream.set_read_timeout(Some(READ_TIMEOUT))?;
@@ -528,6 +538,10 @@ mod tests {
     /// The store rules are tested above; this drives the same rules through the
     /// real socket path a client uses, so framing bugs cannot hide behind a
     /// direct `handle` call.
+    ///
+    /// Gated like the entry point it exercises (T-0062): the unix socket, and
+    /// therefore this test, exists only where unix sockets do.
+    #[cfg(unix)]
     #[test]
     fn the_socket_path_serves_the_same_lifecycle() {
         let dir = std::env::temp_dir().join(format!("arreo-mailbox-{}", std::process::id()));
