@@ -1,0 +1,22 @@
+T-0066 — Phase 2's exit criterion, exercised
+=============================================
+
+ROADMAP §6: 'a stranger pairs a second machine in < 5 min without docs help'
+
+## Attempt 1: the documented flow, timed (303 s, FAILED)
+
+Following only the docs: relay + account + config + daemon. The daemon refused to
+join the relay and told the operator to 'pair this machine first (arreo pair)'.
+Running 'arreo pair' waited the full 300 s TTL for a joiner that never comes:
+  {"paired":false,"reason":"the pairing window closed while waiting for slot B"}
+
+## Attempt 2: the mechanism does exist — self-admission (3.5 s)
+
+  code=[button scroll silver quilt]
+  paired with this server as viewer (dev_2f0e21f000a4bf7752559742dcf57649)
+  certificate: /tmp/boot2/a/identity/devices/2f0e21f000a4bf7752559742dcf57649.cert
+
+Conclusion: a discoverability defect, not a missing capability. The one step a
+stranger must take first is named by no document and no error message.
+
+Scripts: stranger-pair.sh (attempt 1), self-admit.sh (attempt 2).
