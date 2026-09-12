@@ -1,27 +1,31 @@
 ## State snapshot          ← REWRITTEN (not appended) at every checkpoint
-Task: **T-0053 · the relay's own audit trail — DONE.** Both halves of §4's audit story now exist and
-agree: the machine's log (T-0033) and the relay's (`relay_audit`, schema v5), in two databases in two
-processes, sharing one export renderer, one filter vocabulary and one truncation rule.
-Where you are: the relay records what it *did* — `session.connect`/`disconnect`, `relay.refuse`
-(unknown account, bad certificate, bad proof, handshake budget), `inbox.drop`, `inbox.expire`,
-`audit.prune` — and never what it carried. Peers truncated at write (/24, /48). Ordered by
-`(ts_ms, rowid)`. Read with `arreo-relay audit export|prune`, byte-identical to the machine's export
-for the same rows. 468 tests, all green; relay slice 20/20, bench 6/6.
-Next step: **T-0047** (the mesh e2e slice — the referee for T-0043…T-0046, and where the
-`cross_machine_attach_ms` budget row lives) or **T-0048** (OSS launch readiness).
-Open workers: (none)
-Known broken: (none) · Parked: (none)
+Task: **T-0048 · OSS launch readiness — needs-human (the handoff is the criterion).**
+The batch is integrated: 4 workers' surfaces + the release-check gate + the stranger
+tour + the scan verdict. The repo's public text is now honest (137 claims audited,
+false ones fixed in place); the gate runs green (9 pass, 1 skip locally — reuse needs
+a Python toolchain this box lacks, CI installs it); the scan is clean (0 findings with
+the triaged allowlist, negative-controlled).
+Where you are: T-0062 (Windows build) done and committed; the macOS clippy failure
+fixed (2 new stable-only lints in my own gate file); CI pinned to 1.98.0 so one lint
+set holds everywhere. T-0063 (p1) carries the CI investigation: Windows leg fixed,
+macOS leg fixed, ubuntu test leg unidentified (needs log access). The readiness.md
+handoff names the two human actions (read the ubuntu log; decide the launch).
+Next step: human gate on T-0048; T-0063 is the highest-priority actionable task but
+needs repo admin (CI logs) — otherwise T-0047 (mesh slice).
+Open workers: (none — all four delivered)
+Known broken: CI red on ubuntu test leg (T-0063) · Parked: T-0048 needs-human (launch decision)
 Findings:
-- **A `u64` epoch cast to `i64` wraps negative** — a `--since` of `u64::MAX` matched everything, a
-  `--before` of the same deleted nothing. Both the opposite of the request. Reach for that cast
-  anywhere a timestamp is compared.
-- **Recording from inside a store's own transaction deadlocks** when the writer takes the same mutex.
-  Release the lock before writing the trail, even though the trail is "part of" the operation.
-- **A vanished QUIC client is noticed at ~15 s** (idle timeout), not when its socket closes.
-- **A `&& b && c || d` condition reads as "all three, or d"** — this repo has now paid for that once
-  (the machine's redaction) and the same shape appeared in my own export test's key extraction.
-- **`cargo xtask e2e --slice X` does not rebuild every binary** — it cost a stale-TUI round in T-0061
-  and a stale-relay round here.
+- **The repo is already public** (since 2026-09-10) serving the OLD false README — landing
+  this batch is itself a launch-blocking fix.
+- **CI has never passed (90/90 red)** — three different failures, not one cause. Windows:
+  ungated unix import (T-0062, fixed). macOS: stable-only clippy lints (fixed). Ubuntu:
+  test exit 101, unidentified without log access (T-0063).
+- **A repo that pins its toolchain but lets CI install @stable has two lint sets.**
+  Pinned CI to 1.98.0.
+- **gitleaks allowlists must be value-scoped, not rule-scoped** — proven by negative
+  control (live-shaped ghp_ fires, dummy ghp_AAAA does not).
+- **The REUSE gate missed continuation lines** of multi-line TOML arrays — fixed, proven
+  with a probe.
 ## Event log               ← append-only; newest last; never rewrite
 - 2026-09-10 [turn 1] ledger created; repo at e489fac (docs only); T-0001 + T-0022 (AGENTS.md gardened) done
 - 2026-09-10 [turn 2] T-0002 PTY manager done+pushed (342606c; 9 tests); PROMPT.md v2 synced + ADR 0001 (ef6c595)
@@ -103,3 +107,5 @@ Findings:
 - 2026-09-12 [turn 52] T-0061 done: `arreo-tui --machine NAME [--config PATH]` (mutually exclusive with `--remote/--peer/--socket`), the name resolved through `arreo_core::mesh::resolve` — the resolver moved out of `arreo-cli` because two clients resolve names and the TUI may not depend on a binary crate; the error became a typed `ResolveError` (Usage/UnknownMachine/Unreachable) that the CLI maps to its exit codes and the TUI to one message. The sidebar title is the session label ("peer-machine · relay" / "this machine · socket" / "device ab12cd34 · relay"), and a `question` pane shows the line it is waiting on, indented, cut with `…` to the sidebar's width, whole in the pane view. `arreo_tui::client::asking_line` is the one read on either transport, fetched only for a pane already known to be asking. Proof: the relay slice drives the real TUI on a pty to a peer reached **by name** and checks the machine, the link, the question in the sidebar, the marked cut and the whole question in the pane (20/20); a relay test asserts the read is identical over the relay and over the peer's own socket; mutation (suppressing the question line) fails two slice checks. Findings: `Target` cannot honestly name a machine (the name is the directory's, the target has a device id) so `machine()` was deleted in favour of `link()` plus the resolver's `Resolved::name`; two TUIs of one device id displace each other at the relay (T-0060) so the slice serializes them; byte offsets from different lines are not comparable in a box-drawing frame; and `cargo xtask e2e --slice tui` does not rebuild `arreo-tui`, which cost a stale-binary round. 456 tests, clippy/fmt clean.
 
 - 2026-09-12 [turn 53] T-0053 done: the relay's audit trail. `relay_audit` (relay schema v5) with one append-only writer (`RelayStore::record`, no update/delete API), written at the router's connect/disconnect/refusal sites and the mailbox's own eviction/expiry, read by `arreo-relay audit export|prune`. Shared with the machine's log rather than mirrored: `render_export` was extracted from `arreo_core`'s `audit_export` so both logs emit identical bytes, `truncate_peer` does both redactions, and `AuditQuery` is the filter type for both. `accept_connection` gained a typed `Accepted` return (open, or the address over its budget) because the rate-limit refusal is an audit row and the address was otherwise only in a log line. Two real bugs found by the tests: a `u64`→`i64` cast that made `--since u64::MAX` match everything and `--before u64::MAX` delete nothing, and a deadlock from recording while holding the store mutex. Also measured: a vanished QUIC client is noticed at ~15 s (idle timeout). 468 tests, clippy/fmt clean, vet/deny/audit/check-targets clean, 8 slices green, bench 6/6. Evidence `.loop/evidence/T-0053/`.
+
+- 2026-09-12 [turn 54] T-0048 batch integrated: 4 workers delivered (furniture with API-verified labels + honest SECURITY.md gap; docs with 123-row link/command table and the false-claim fixes; scan with 8/8 false positives disproved; claims/license with the 137-claim audit and NOTICE fixes). Planner's slice: `cargo xtask release-check [--public]` (10 items, fail-closed on missing tools in --public), CI `public-readiness` job (fetch-depth: 0, pinned scanners, pinned toolchain), `.gitleaks.toml` (value-scoped, negative-controlled), stranger tour from a clean clone (build 1m39s, first pane, api slice green). Two tasks filed: T-0062 (Windows ungated unix import — FIXED, committed 3490dee) and T-0063 (p1, CI investigation: Windows fixed, macOS clippy fixed in 08ca7db, ubuntu test leg needs log access). Also fixed: REUSE.toml dead paths + LICENSE double-annotation + gate continuation-line blind spot, Cargo.toml repository URL, CODE_OF_CONDUCT contact. Gate: 9 pass / 1 skip locally. T-0048 → needs-human with readiness.md.

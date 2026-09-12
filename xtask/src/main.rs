@@ -1,7 +1,8 @@
 //! Arreo developer tooling: e2e battery, benchmarks, smoke tests.
 //!
 //! Verbs: `e2e` (battery, T-0008+), `bench` (budgets, T-0008), `conpty-smoke`
-//! (T-0007, real), `check-targets` (T-0010, real). By contract (T-0001 notes):
+//! (T-0007, real), `check-targets` (T-0010, real), `release-check` (T-0048,
+//! the public-readiness gate). By contract (T-0001 notes):
 //! unimplemented verbs print "not implemented" and exit 0 — except with
 //! `--enforce`, which exits non-zero so CI gates distinguish "stub" from "gate".
 
@@ -21,6 +22,7 @@ mod lifecycle_slice;
 mod package;
 mod persistence_slice;
 mod relay_slice;
+mod release_check;
 mod theme_slice;
 mod tui_slice;
 
@@ -41,6 +43,7 @@ fn main() -> ExitCode {
         "check-targets" => check_targets::check_targets(rest),
         "adapters" => adapters_check::run(rest),
         "package" => package::package(rest),
+        "release-check" => release_check::release_check(rest),
         other => {
             eprintln!("unknown xtask command: {other}");
             eprintln!("usage: xtask <e2e|bench|conpty-smoke|check-targets> [options]");

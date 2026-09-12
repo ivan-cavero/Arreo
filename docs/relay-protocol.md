@@ -560,9 +560,10 @@ device that sends `kind = "peergone"` is refused per-envelope (§4.2).
 | Auth | the signature is not 64 bytes, or it does not verify over the proof payload | `AuthReply::Refused` | `the peer did not prove it holds its key` |
 
 The unknown-account refusal and every failed-`Auth` refusal are also logged to
-the relay's stderr with the peer address and the account. The version and
-root-key rows above are not logged. (Durable audit rows are T-0033; today stderr
-is the whole record.)
+the relay's stderr with the peer address and the account, and written as rows in
+the relay's own `relay_audit` table (`relay.refuse`, relay schema v5); the version
+and root-key rows above are not logged. `arreo-relay audit export` reads those rows
+back with a truncated peer address and a bounded reason — never a payload.
 
 ### 5.2 Per-envelope refusals
 
@@ -695,10 +696,17 @@ guessed at.**
   makes one delivery — nothing in the relay enforces that. There is also no push
   wakeup, and inside the bounds (§6) a message can be evicted or expire, which
   is counted rather than silent but is still a message that was lost.
-- **No presence (T-0031).** `relay_device` records first/last seen, but nothing
-  derives online/offline from it yet, so there is no "last seen 2 days ago"
-  answer and no way to tell a device that is asleep from one that is gone.
-- **No durable audit rows (T-0033).** Refusals are written to stderr.
+- **Presence is derived at read time, not pushed (T-0031).** `relay_device` records
+  first/last seen, and one rule (`presence_of`, which the relay re-exports as
+  `presence_at`) turns `last_seen_ms` into `online`/`offline`/`stale`. Nothing
+  subscribes: there is no wakeup when a device goes quiet, and the age is computed
+  against the reader's clock rather than stored.
+- **Refusals are durable, in the relay's own table (T-0053).** Session opens,
+  refusals, inbox drops and expiries write rows to `relay_audit` in the relay's
+  `relay.db` — separately from the machine's audit log, and holding no payload:
+  ids, an outcome, a truncated peer address and a bounded `detail`.
+  `arreo-relay audit export`/`prune` read it with the machine-side verbs' filter
+  semantics.
 - **The transport's TLS is unauthenticated.** A middlebox that terminates TLS
   can drop or delay traffic — a denial-of-service surface — but can never read
   or forge an envelope, because the trust decision happens above it.

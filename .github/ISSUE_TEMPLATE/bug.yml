@@ -1,0 +1,122 @@
+name: Bug report
+description: Arreo did something other than what its docs or its output say it should. Daemon, CLI, TUI, socket API, adapters, build.
+title: "[bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Two things before the form:
+
+        - **Security issues never go here.** `SECURITY.md` describes the private channel
+          and its current state — it is not switched on in the repository settings yet —
+          and the checkbox at the bottom is the promise that you are not about to publish
+          a vulnerability in this issue.
+        - **Nothing is released yet.** There are no installers, no release archives
+          and no `arreo.dev`, so every build today comes from source. Say which commit.
+
+  - type: input
+    id: version
+    attributes:
+      label: Output of `arreo --version`
+      description: Paste the exact line (`cargo run -p arreo-cli -- --version` if you have not installed the binary).
+      placeholder: the line your build prints
+    validations:
+      required: true
+
+  - type: input
+    id: commit
+    attributes:
+      label: Commit you built from
+      description: "`git rev-parse HEAD` in that checkout — a version line does not identify a commit, and the repo is pre-1.0."
+      placeholder: output of git rev-parse HEAD
+    validations:
+      required: true
+
+  - type: dropdown
+    id: os
+    attributes:
+      label: OS
+      options:
+        - Linux
+        - macOS
+        - Windows
+        - WSL
+        - Other (say which under "What happened instead")
+    validations:
+      required: true
+
+  - type: input
+    id: terminal
+    attributes:
+      label: Terminal and shell
+      description: Terminal emulator (and version) plus shell — pane and rendering bugs usually live here.
+      placeholder: "Windows Terminal + PowerShell 7, or Alacritty + zsh"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: install
+    attributes:
+      label: How was it built?
+      options:
+        - "From source: git clone + cargo build --workspace"
+        - "From source at a tag or someone else's commit (name it above)"
+        - Other (say which under "What happened instead")
+    validations:
+      required: true
+
+  - type: textarea
+    id: commands
+    attributes:
+      label: Exact commands
+      description: The smallest sequence that shows the bug, starting with how the daemon was started.
+      render: shell
+      placeholder: |
+        cargo run -p arreo-server -- --socket /tmp/arreo.sock
+        cargo run -p arreo-cli -- spawn p1 /bin/sh
+        cargo run -p arreo-cli -- wait p1 --state done --timeout 10s
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected
+      description: Quote the doc, the usage text or the previous behavior you are comparing against when you can.
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: What happened instead
+      description: The real output, exit code or pane bytes — not a paraphrase. TUI bugs are much easier with a capture.
+      render: shell
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Daemon log and audit trail (when relevant)
+      description: |
+        The daemon logs to stderr — capture it where you started it; for the service unit
+        installed by `arreo service install` on Linux that is `journalctl --user -u arreo`
+        (unit file: `~/.config/systemd/user/arreo.service`).
+        `arreo audit --json` prints the append-only action log of the daemon holding your
+        socket; secrets are redacted before they reach that log (see `docs/audit.md`).
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: confirmations
+    attributes:
+      label: Confirmations
+      options:
+        - label: "This is **not** a security issue. Security reports use the private channel in `SECURITY.md` and never a public issue."
+          required: true
+        - label: "I searched the open issues for the same symptom."
+          required: false
+        - label: "There are no credentials, keys or tokens in anything I pasted above."
+          required: true

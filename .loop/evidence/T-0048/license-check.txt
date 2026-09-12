@@ -1,0 +1,256 @@
+license-check.txt — T-0048, criterion 1 (the license story), verified mechanically
+==============================================================================
+repo      : /home/dev/dev/Arreo  (git 4c249cc + the working-tree changes of this batch)
+date      : 2026-09-12T02:17:48Z
+author    : ClaimsLicense (T-0048 worker)
+method    : hand-checks of the actual files; scratch scripts kept under /tmp/t0048/
+            (licenses.py = manifests + Cargo.lock + digests, reuse_coverage.py =
+            REUSE.toml coverage, links.py = markdown link check).
+            `cargo build/test/clippy/fmt` NOT run (shared checkout, T-0048 rule).
+
+
+1. THE TWO LICENSE TEXTS, VERIFIED BY CONTENT (not by filename)
+---------------------------------------------------------------
+LICENSE
+  first line   : "                                 Apache License"
+  line 2-3     : "Version 2.0, January 2004" / "http://www.apache.org/licenses/"
+  hallmarks    : "TERMS AND CONDITIONS FOR USE, REPRODUCTION, AND DISTRIBUTION"  1x
+                 "9. Accepting Warranty or Additional Liability"                  1x
+                 "END OF TERMS AND CONDITIONS"                                    1x
+                 "APPENDIX: How to apply the Apache License to your work"         1x
+  size         : 11358 bytes, 202 lines
+  sha256       : cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30
+  VERDICT      : the unmodified Apache-2.0 text. The digest is byte-identical to
+                 Debian's canonical copy at /usr/share/common-licenses/Apache-2.0
+                 (independently hashed: cfc7749b…523d30). No project-specific
+                 copyright line, no appendix edits.
+
+LICENSE-RELAY
+  first line   : "                    GNU AFFERO GENERAL PUBLIC LICENSE"
+  line 2       : "Version 3, 19 November 2007"
+  hallmarks    : "GNU AFFERO GENERAL PUBLIC LICENSE"                              1x
+                 "13. Remote Network Interaction"                                 1x
+                 "END OF TERMS AND CONDITIONS"                                    1x
+                 "How to Apply These Terms to Your New Programs"                  1x
+  size         : 34523 bytes, 661 lines
+  sha256       : 0d96a4ff68ad6d4b6f1f30f713b18d5184912ba8dd389f86aa7710db079abcb0
+  VERDICT      : the unmodified AGPL-3.0 text. The digest is byte-identical to
+                 https://www.gnu.org/licenses/agpl-3.0.txt (fetched 2026-09-12,
+                 same 34523 bytes, same sha256). Not the GPL-3.0 text: it carries
+                 §13 ("Remote Network Interaction"), which GPL-3.0 does not.
+
+Both texts are complete license grants. There is no LICENSE-MIT and none is
+needed: every shipped crate is Apache-2.0 or AGPL-3.0-or-later (section 2).
+
+
+2. EVERY CRATE'S `license` FIELD vs ROADMAP §7
+----------------------------------------------
+ROADMAP §7 states: "Server + TUI + CLI under Apache-2.0; relay under AGPL-3.0…";
+§9's decisions log: "Apache-2.0 core + AGPL-3.0 relay". REQUIREMENT for this
+audit: Apache-2.0 for every crate except crates/arreo-relay → AGPL-3.0-or-later.
+
+workspace default  Cargo.toml [workspace.package]  license = "Apache-2.0"
+                   (so `license.workspace = true` resolves to Apache-2.0)
+
+crate                 manifest field                        resolves to            vs §7
+--------------------  ------------------------------------  ---------------------  ------
+arreo-core            license.workspace = true              Apache-2.0             OK
+arreo-server          license.workspace = true              Apache-2.0             OK
+arreo-cli             license.workspace = true              Apache-2.0             OK
+arreo-tui             license.workspace = true              Apache-2.0             OK
+arreo-plugin-api      license.workspace = true              Apache-2.0             OK
+arreo-relay           license = "AGPL-3.0-or-later"         AGPL-3.0-or-later      OK
+                      (explicit override, no license.workspace line)
+xtask                 license.workspace = true              Apache-2.0             OK
+                      (dev tooling, never shipped; excluded by the gate on purpose)
+
+INHERITANCE vs OVERRIDE: exactly one crate overrides — arreo-relay — and the
+override is the required one. The other six inherit, and the inherited value is
+Apache-2.0, so the inheritance is what the policy says. The relay manifest even
+carries the reason in a comment ("AGPL-3.0-or-later, NOT the workspace default
+… inheriting the workspace default would silently license it Apache").
+NOTE (§7 wording vs the field): §7 and README say "AGPL-3.0"; the field, NOTICE,
+CONTRIBUTING, docs/relay-deploy.md §9.0 and the SPDX map say
+"AGPL-3.0-or-later". The field is the operative one and this audit's requirement;
+it is also the stricter-compatible reading (AGPL-3.0-or-later ⊃ 3.0). No defect,
+but the shorthand appears in three places a doc writer may want to align.
+
+Enforcement, read but not executed: xtask/tests/workspace_deps.rs::
+declared_licenses_are_apache_except_the_relay asserts exactly this table, and
+xtask/src/release_check.rs::license_item re-asserts it at launch time from the
+manifests. Both were read; neither was run (shared checkout).
+
+
+3. DEPENDENCY DIRECTION (nothing Apache-2.0 depends on the relay)
+-----------------------------------------------------------------
+3a. Manifests (path edges only):
+    arreo-core         (no path deps)
+    arreo-server       arreo-core
+    arreo-cli          arreo-core
+    arreo-tui          arreo-core
+    arreo-plugin-api   (no path deps)
+    arreo-relay        arreo-core            <- one-way, AGPL → Apache, allowed
+    xtask              arreo-core, arreo-server   (dev tooling, never shipped)
+
+3b. Resolved graph (Cargo.lock, 317 packages) — stronger than the manifest text,
+    because it is what cargo will actually link:
+    arreo-cli   -> arreo-core
+    arreo-relay -> arreo-core
+    arreo-server-> arreo-core
+    arreo-tui   -> arreo-core
+    xtask       -> arreo-core, arreo-server
+    packages whose dependency list contains "arreo-relay": NONE
+
+RESULT: no Apache-2.0 crate depends on the relay, in either the manifests or the
+resolved graph. The only first-party edge into the relay's dependents is
+xtask → arreo-server, and xtask is dev tooling that is never shipped (AGENTS.md,
+workspace_deps.rs's own note).
+
+Gate read: xtask/tests/workspace_deps.rs::nothing_apache_depends_on_the_relay
+plus the_relay_depends_only_on_apache_core. Confirmed as text; not executed here.
+
+
+4. REUSE.toml — PATHS NAMED, AND COVERAGE OF THE TREE
+-----------------------------------------------------
+4a. Paths named by REUSE.toml, checked against the filesystem:
+    crates/arreo-core/**      exists
+    crates/arreo-server/**    exists
+    crates/arreo-cli/**       exists
+    crates/arreo-plugin-api/**exists
+    crates/arreo-tui/**       exists
+    mobile/**                 DOES NOT EXIST
+    web/**                    DOES NOT EXIST
+    adapters/**               exists (5 files)
+    themes/**                 DOES NOT EXIST
+    docs/**                   exists
+    README.md, CONTRIBUTING.md, ROADMAP.md   exist
+    crates/arreo-relay/**     exists
+    LICENSE-RELAY             exists (named twice: relay annotation + texts
+                              annotation — see 4c)
+    LICENSE                   exists
+
+    DEAD MAPPINGS: mobile/**, web/**, themes/** name directories that are not in
+    this repository. They are not typos — ROADMAP §6 puts mobile in Phase 3 and
+    the web client in Phase 4 — but a mapping for a path that is not there is a
+    claim about nothing, and `reuse lint`/the xtask check exist to catch exactly
+    this shape.
+
+    WHY the enforcing test does not catch them today (worth fixing):
+    xtask/tests/workspace_deps.rs::reuse_maps_the_relay_to_agpl_and_names_real_paths
+    iterates `text.lines()` and only inspects lines whose *trimmed* form starts
+    with "path". The Apache annotation's array is wrapped over three source
+    lines, so only the first fragment is parsed and existence-checked
+    (crates/arreo-core/**, crates/arreo-server/**, crates/arreo-cli/**); the
+    continuation lines carrying mobile/**, web/**, adapters/**, themes/**,
+    docs/**, README.md, CONTRIBUTING.md, ROADMAP.md are never checked. Fix is in
+    xtask (not this task's file list): parse the array to its closing bracket,
+    or run `reuse lint`.
+
+4b. Coverage hand-check (the `reuse` tool is NOT installed here and there is no
+    pip, so `reuse lint` could not be run — this is a HAND-CHECK, not a lint):
+      * method: `git ls-files` (401 tracked files) matched against every `path`
+        pattern in REUSE.toml with a `**`-aware matcher (`**` crosses /, `*`
+        does not), plus the convention that LICENSE/LICENSE-RELAY license
+        themselves.
+      * covered   : 145 / 401  (143 by pattern + LICENSE + LICENSE-RELAY)
+      * UNCOVERED : 256 / 401  (64%)
+      * uncovered, grouped by top-level path:
+          .loop/    117   (the ledger + per-task evidence)
+          tasks/     62
+          xtask/     25   (incl. xtask/Cargo.toml and every source file)
+          specs/     19   (incl. specs/adr/*)
+          fixtures/  13
+          <root>     12   (AGENTS.md, CODE_OF_CONDUCT.md, Cargo.lock, Cargo.toml,
+                           NOTICE.md, PROMPT.md, REUSE.toml, deny.toml,
+                           perf-budget.toml, rust-toolchain.toml, .gitattributes,
+                           .gitignore)
+          supply-chain/ 3, design/ 2, .github/ 2, .cargo/ 1
+    LIMITATION, stated plainly: this checked *path coverage only*. It did not
+    validate SPDX file headers, `precedence`, DEP5-style per-file rules, or the
+    set of filenames `reuse` exempts by itself. A real `reuse lint` is expected
+    to FAIL on the 256 uncovered files above (mostly evidence/log/JSON fixtures,
+    which a lint can also legitimately be configured to ignore via a fourth
+    annotation rather than per-file headers). The planner must wire the pinned
+    `reuse` 5.0.2 (xtask/src/release_check.rs::reuse_item already knows how) and
+    let it be the authority.
+
+4c. Overlap observed (flag for the real lint): LICENSE-RELAY is named by both
+    the relay annotation ("AGPL-3.0-or-later") and the license-texts annotation
+    ("Apache-2.0 AND AGPL-3.0-or-later"). With `precedence = "aggregate"` the
+    effective expression for LICENSE-RELAY aggregates both, i.e. it would
+    include Apache-2.0 — a statement about a file that is pure AGPL. [INFERENCE:
+    derived from REUSE's documented `aggregate` semantics; not executed because
+    `reuse` is not installed. If `reuse lint` confirms it, LICENSE-RELAY should
+    appear in exactly one annotation.]
+
+
+5. NOTICE.md — EVERY CLAIM CHECKED, AND THE FIXES MADE
+------------------------------------------------------
+Verified TRUE (left in place):
+  * the two-license split and the crate lists → matches section 2 above.
+  * "each dependency keeps its own license and copyright" → Cargo.lock.
+  * the third-party table's surviving rows → each crate is in Cargo.lock, and
+    the license column matches the crate's own manifest in the local registry:
+      alacritty_terminal 0.24.2  license = "Apache-2.0"
+      portable-pty 0.9.0         license = "MIT"
+      ratatui 0.30.2             license = "MIT"
+      crossterm 0.28.1           license = "MIT"
+      quinn 0.11.11              license = "MIT OR Apache-2.0"
+      snow 0.9.6                 license = "Apache-2.0 OR MIT"
+      rusqlite 0.31.0            license = "MIT"
+      tokio 1.53.1               license = "MIT"
+  * the trademark paragraph's premise (Apache-2.0 §6 grants no trademark rights)
+    → LICENSE, Apache-2.0 §6, read in full: correct.
+  * "the bundled SQLite is public domain" (added by the fix) → the vendored SQLite that
+    `rusqlite`'s `bundled` feature compiles carries the SQLite blessing: the header of
+    libsqlite3-sys 0.28.0 (`~/…/libsqlite3-sys-0.28.0/sqlite3/sqlite3.h`) ends its blessing
+    with "the public domain.", and `sqlite3.c` says the same. rusqlite itself declares MIT.
+
+Found FALSE and corrected:
+  * "rust-noise (Apache-2.0 / MIT) — Noise protocol framework", linked to
+    docs.rs/noise-framework. `noise`/`noise-framework` appears 0 times in
+    Cargo.lock; the Noise implementation this tree uses is `snow` 0.9.6
+    (crates/arreo-core/Cargo.toml, optional behind the `transport` feature;
+    Noise-KK params in crates/arreo-core/src/transport/noise.rs:
+    "Noise_KK_25519_ChaChaPoly_BLAKE2s"). ROW REPLACED with snow.
+  * "uniffi … MPL-2.0" and "wasmtime … Apache-2.0 WITH LLVM-exception" as
+    present-tense dependencies. Neither crate is in Cargo.lock (0 matches); there
+    is no mobile/ or web/ directory, and crates/arreo-plugin-api/src/lib.rs is a
+    2-line shell ("Empty shell per T-0001"). ROWS MOVED to an explicitly
+    pre-launch sentence (ROADMAP Phase 3 / Phase 4).
+  * "A complete, machine-generated inventory (cargo deny / SBOM) ships with every
+    release at https://arreo.dev/notices/<version> and in each release archive."
+    There are no releases (`git tag` → 0 tags, workspace version 0.1.0), no
+    arreo.dev (`getent hosts arreo.dev` → NXDOMAIN), and no SBOM artifact is
+    produced anywhere in this repo. REPLACED with what exists today: the
+    cargo-deny license gate configured by deny.toml (run in CI,
+    .github/workflows/ci.yml) plus Cargo.lock, with the generated inventory named
+    as a first-release obligation.
+  * "Forks must rename: see `docs/forking.md`." — docs/ contains agent-skill.md,
+    audit.md, conpty-windows.md, cross-os.md, machines.md, relay-deploy.md,
+    relay-protocol.md, release.md (and tour.md, added by a sibling in this same
+    batch); there is no forking.md, and the author of tour.md confirmed none is
+    planned. REPLACED with CONTRIBUTING.md ("Working on the relay (AGPL)") and
+    ROADMAP §7, both of which exist. NOTE for the planner: the reference was a
+    code span, not a markdown link, so xtask's `links` release-check item does
+    NOT catch it — the gate scans `](…)` and `[x]:` shapes only. A code-span path
+    is a blind spot worth closing.
+  * "rusqlite (SQLite) | MIT / blessing" — rusqlite 0.31.0 declares MIT; "SQLite
+    blessing" is not a license name in this repo or in the crate. REWORDED to
+    "MIT (the bundled SQLite is public domain)".
+  * The Apache bullet's parenthetical listed "the mobile and web clients" as
+    licensed software. Those paths do not exist. REWORDED as an explicit
+    plan-vs-present sentence.
+  * Software lists in the Apache bullet were partly wrong for `themes`: the
+    theme files live at crates/arreo-core/themes/*.json (5 files, embedded via
+    include_str! in crates/arreo-core/src/theme/loader.rs), not at repo-root
+    themes/ (absent). NOTICE now names the path that exists; REUSE.toml still
+    does not (section 4a).
+
+NOTICE.md after the edit: 4 relative links, all resolving (LICENSE, LICENSE-RELAY
+×2, CONTRIBUTING.md); no release claim, no arreo.dev URL, no dead code-span path.
+The external table URLs were fetched: ratatui.rs, tokio.rs, github.com/quinn-rs/
+quinn, github.com/mcginty/snow, github.com/mozilla/uniffi-rs, wasmtime.dev → 200.
+The crates.io HTML pages answer 404 to curl and 200 on the API
+(https://crates.io/api/v1/crates/<name>) for the same four crates — a crates.io
+fetch artifact, not a dead link; do not "fix" those four URLs on that signal.

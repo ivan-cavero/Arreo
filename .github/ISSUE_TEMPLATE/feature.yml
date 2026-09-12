@@ -1,0 +1,54 @@
+name: Feature request
+description: A problem Arreo does not solve yet, and what you would change. Read the roadmap phase first — scope is deliberate here.
+title: "[feature]: "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Arreo is built in agent loops against `ROADMAP.md` phases and `tasks/` files, so the
+        most useful request is a **problem**, not a patch. If your idea overlaps a phase that
+        already has a plan, say so — that shortens the conversation a lot.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What are you trying to do, and what happens instead today? Concrete beats general — "I run 12 agents on a VPS and cannot tell which one asked for approval" is a problem; "better UX" is not.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What you would like to happen
+      description: The smallest change that solves it. If it is a new verb, name the exact command you would type.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Other tools or workarounds you tried (tmux/zellij, an SSH script, a different daemon), or a narrower design you rejected. "None" is a valid answer — say why.
+    validations:
+      required: true
+
+  - type: input
+    id: overlaps
+    attributes:
+      label: Existing overlap (optional)
+      description: Anything in the repo this touches — a `ROADMAP.md` phase, a `specs/adr/` decision, a `tasks/` file, a `docs/` page.
+      placeholder: "e.g. ROADMAP §3.14, specs/adr/0012-machine-directory.md"
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: confirmations
+    attributes:
+      label: Confirmations
+      options:
+        - label: "This is a request, not a security report — those use the private channel in `SECURITY.md`."
+          required: true
+        - label: "I checked `ROADMAP.md` for a phase that already covers this."
+          required: false

@@ -5,8 +5,8 @@ version = 1
 # Apache-2.0: everything except the relay.
 [[annotations]]
 path = ["crates/arreo-core/**", "crates/arreo-server/**", "crates/arreo-cli/**",
-        "crates/arreo-plugin-api/**", "crates/arreo-tui/**", "mobile/**", "web/**",
-        "adapters/**", "themes/**", "docs/**", "README.md", "CONTRIBUTING.md", "ROADMAP.md"]
+        "crates/arreo-plugin-api/**", "crates/arreo-tui/**",
+        "adapters/**", "docs/**", "README.md", "CONTRIBUTING.md", "ROADMAP.md"]
 precedence = "aggregate"
 SPDX-FileCopyrightText = "2026 Arreo contributors"
 SPDX-License-Identifier = "Apache-2.0"
@@ -20,9 +20,18 @@ precedence = "aggregate"
 SPDX-FileCopyrightText = "2026 Arreo contributors"
 SPDX-License-Identifier = "AGPL-3.0-or-later"
 
-# License texts themselves.
+# License texts themselves: each file carries its own license, so each gets its
+# own annotation. (A single annotation naming both files would aggregate to
+# "Apache AND AGPL" for *each* file — claiming LICENSE is AGPL and LICENSE-RELAY
+# is Apache, which is exactly backwards. T-0048.)
 [[annotations]]
-path = ["LICENSE", "LICENSE-RELAY"]
+path = ["LICENSE"]
 precedence = "aggregate"
-SPDX-FileCopyrightText = "Apache Software Foundation / Free Software Foundation"
-SPDX-License-Identifier = "Apache-2.0 AND AGPL-3.0-or-later"
+SPDX-FileCopyrightText = "Apache Software Foundation"
+SPDX-License-Identifier = "Apache-2.0"
+
+[[annotations]]
+path = ["LICENSE-RELAY"]
+precedence = "aggregate"
+SPDX-FileCopyrightText = "Free Software Foundation"
+SPDX-License-Identifier = "AGPL-3.0-or-later"

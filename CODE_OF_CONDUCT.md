@@ -30,8 +30,11 @@ abuse by the person running the loop.
 
 ## Enforcement
 
-Report to **<conduct@arreo.dev>** (confidential, handled by the maintainers; conflicts of
-interest are recused). Consequences follow the
+Report to **the repository owner** (confidential, handled by the maintainers; conflicts of
+interest are recused). Use [GitHub's private vulnerability reporting](../../security/advisories/new)
+for anything security-sensitive — see [SECURITY.md](SECURITY.md). **Pre-launch note:**
+`conduct@arreo.dev` does not exist yet (there is no `arreo.dev`); until it does, the owner
+contact above is the address. Consequences follow the
 [full Contributor Covenant v2.1](https://www.contributor-covenant.org/version/2/1/code_of_conduct/):
 clarification → warning → temporary ban → permanent ban for severe or repeated violations.
 

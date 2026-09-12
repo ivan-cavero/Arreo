@@ -3,7 +3,7 @@ id: T-0048
 title: OSS public-readiness — licenses, stranger path, contributor surface, history scan
 phase: 2
 priority: 3
-status: proposed
+status: needs-human
 depends_on: [T-0020, T-0022]
 scope:
   - README.md

@@ -74,19 +74,26 @@ beside the router flags), which is the usual single-process deployment.
 The state directory holds one file the relay owns: `relay.db`, plus SQLite's
 `-wal` and `-shm` companions while WAL is active. The journal mode is WAL and
 foreign keys are on; the schema is created by an idempotent migration, so a
-restart migrates rather than recreates, and a v1 database gains the v2 and v3
+restart migrates rather than recreates, and an older database gains the later
 additions in place.
 
-`meta.schema_version` is **3** for this build. The tables:
+`meta.schema_version` is **5** for this build. The tables:
 
 | Table | Columns | Who writes it |
 | --- | --- | --- |
 | `meta` | `key`, `value` | the migration; holds `schema_version` |
 | `account` | `account_id` (PK), `created_at_ms`, `root_key` | `account add`. `root_key` is 64 hex characters; it was added in v2, and a row whose `root_key` is NULL or unparseable is treated as an **unknown account** by the router |
-| `relay_device` | `account_id`, `device_id`, `first_seen_ms`, `last_seen_ms`; PK `(account_id, device_id)` | the router, on every successful authentication. `first_seen_ms` is written once and `last_seen_ms` is refreshed — the raw material for presence (T-0031), which does not exist yet |
-| `machine` | `machine_id` (PK), `account_id`, `name`, `name_key`, `presence`, `last_seen_ms`, `proto_version`, `tombstone_until_ms`, `name_conflict`; `UNIQUE(account_id, name_key)` | the machine directory (T-0043). The router does not touch it, and nothing derives the `presence` column yet |
+| `relay_device` | `account_id`, `device_id`, `first_seen_ms`, `last_seen_ms`; PK `(account_id, device_id)` | the router, on every successful authentication. `first_seen_ms` is written once and `last_seen_ms` is refreshed — the raw material for per-device presence (T-0031) |
+| `machine` | `machine_id` (PK), `account_id`, `name`, `name_key`, `presence`, `last_seen_ms`, `proto_version`, `tombstone_until_ms`, `name_conflict`, `daemon_key` (v4, T-0045) | the machine directory (T-0043) and the join handoff. `presence` is derived from `last_seen_ms` at read time by the same rule (`presence_of`) the CLI's `--json` contract is asserted against; `daemon_key` is the machine's dial key, and NULL reads as "not routable" rather than as an error |
 | `inbox` | `device_id`, `seq`, `received_at_ms`, `expires_at_ms`, `bytes`; PK `(device_id, seq)`, with an index on `expires_at_ms` | the router, when a message is queued for a device that is not connected (T-0030, §8). `bytes` is the whole framed envelope exactly as its sender wrote it: the relay never decodes what it stores |
 | `inbox_stats` | `device_id` (PK), `dropped_total`, `expired_total`, `bytes`, `queued`, `dropped_reported` | the router, in the same transaction as every inbox write. The durable per-device counters behind §8; `dropped_reported` is the watermark the last drain already reported |
+| `relay_audit` | `ts_ms`, `action`, `outcome`, `device_id`, `account_id`, `peer`, `proto_version`, `detail` (v5, T-0053) | the relay itself, at the points where it knows a fact about *movement*: `session.connect`/`session.disconnect`, `relay.refuse` (unknown account, bad certificate, bad proof, handshake budget), `inbox.drop`/`inbox.expire` (eviction and TTL), `audit.prune`. No declared primary key, so ordering is `(ts_ms, rowid)` — two rows in one millisecond still read back in the order they were written. `peer` is truncated at write (IPv4 /24, IPv6 /48) and `detail` is a bounded, relay-authored string, never a payload |
+
+The relay's `relay_audit` is deliberately **not** a mirror of the machine's `audit`
+table: the machine knows which pane was touched, the relay knows only that bytes moved
+between two ids. Keeping them apart is what stops the relay's database from becoming
+somewhere content could accumulate; `arreo-relay audit export`/`prune` read it with the
+same filter semantics and the same output shape as `arreo audit` on the machine side.
 
 Everything in this file is **metadata or opaque bytes**. The account id, the
 public key, the device fingerprints and the timestamps are metadata; the
@@ -297,11 +304,15 @@ The queue is bounded, so the failure mode is not unbounded growth — it is
 What to do when a queue is full or a device has stopped draining:
 
 - **Check whether the device is even reachable.** `last_seen_ms` in
-  `relay_device` is the last successful authentication, and it is the only
-  signal there is: presence does not exist yet (T-0031), so there is no "last
-  seen 2 days ago" answer and no way to tell a sleeping device from a gone one.
-  A device that fails to connect is refused at the handshake (§5), and that
-  refusal is logged with its reason.
+  `relay_device` is the last successful authentication, and presence is derived from
+  it by one rule (`arreo_core::mesh::presence_of`, re-exported in the relay as
+  `presence_at`): `online` inside the window, `offline` beyond it, `stale` past the
+  tombstone signal. A *machine* row exposes that rule through `arreo machines list`
+  (`online`/`offline`/`stale`/`unknown`, plus `age_secs` in the `--json` contract).
+  There is no CLI surface that prints a *device's* presence age yet, so to tell a
+  stalled inbox from a sleeping device today, read `relay_device.last_seen_ms`
+  directly. A device that fails to connect is refused at the handshake (§5), and
+  that refusal is both logged and written to `relay_audit`.
 - **Raise the bound, or accept the eviction.** `--inbox-max-messages` and
   `--inbox-max-mb` are the lever, they are per device, and raising them needs a
   restart. Raising them does not bring back anything already evicted.
@@ -840,12 +851,18 @@ These are real gaps, not configuration:
   full queue evicts oldest-first, and a message past the TTL expires. Both are
   counted (`dropped_total`/`expired_total`) and reported on the next drain, but
   the message is gone (§8.4).
-- **No presence yet.** The relay records `first_seen_ms`/`last_seen_ms` per
-  device, but nothing derives online/offline from it, and there is no "last seen
-  2 days ago" answer — so a stalled inbox cannot be told from a device that is
-  merely asleep. Presence is T-0031.
-- **Refusals live only in stderr.** There is no durable audit table to query
-  yet (T-0033), so anything you did not capture is gone.
+- **Presence is derived, not pushed.** The relay records `first_seen_ms`/`last_seen_ms`
+  per device and derives `online`/`offline`/`stale` from `last_seen_ms` by one rule
+  (`presence_of`), which is what `arreo machines list` renders for machines and what
+  `arreo-relay` uses for its own lifecycle. It is a read-time computation against the
+  reader's clock, not a subscription: nothing wakes you when a device goes quiet, and
+  the CLI has no verb that prints a *device's* age yet.
+- **Refusals are durable, in the relay's own table.** Every session open, refusal,
+  inbox drop and expiry is a row in `relay_audit` (v5, T-0053), which
+  `arreo-relay audit export`/`prune` reads and filters with the same semantics and
+  byte-identical output shape as the machine's `arreo audit`. Nothing about a payload
+  is ever in that table: the columns are ids, an outcome, a truncated peer address and
+  a bounded relay-authored `detail`.
 - **No revocation propagation.** The relay verifies the certificate chain and
   the proof of possession, but it has no revocation list (T-0026): revoking a
   device on the server does not stop the relay from admitting its certificate.

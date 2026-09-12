@@ -210,12 +210,28 @@ fn reuse_maps_the_relay_to_agpl_and_names_real_paths() {
         "REUSE.toml must not name crates/arreo-relay-proto/**: that path does not exist"
     );
     // Every globbed path in the file must exist on disk — a mapping for a path
-    // that is not there is a claim about nothing.
+    // that is not there is a claim about nothing. The array spans continuation
+    // lines, so the whole `path = [...]` value is collected first: reading only
+    // the first line would miss every entry after the first comma (T-0048).
+    let mut arrays = String::new();
+    let mut in_path = false;
     for line in text.lines() {
         let line = line.trim();
-        if line.starts_with('#') || !line.starts_with("path") {
+        if line.starts_with('#') {
             continue;
         }
+        if line.starts_with("path") {
+            in_path = true;
+        }
+        if in_path {
+            arrays.push_str(line);
+            arrays.push('\n');
+            if line.contains(']') {
+                in_path = false;
+            }
+        }
+    }
+    for line in arrays.lines() {
         let Some(list) = line.split('=').nth(1) else {
             continue;
         };

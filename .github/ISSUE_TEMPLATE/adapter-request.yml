@@ -1,0 +1,94 @@
+name: Adapter request
+description: Ask for state detection for an agent harness Arreo does not know yet. Adapters are TOML data plus a recorded fixture — both are things you can supply.
+title: "[adapter]: "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        An adapter is data, not Rust: `adapters/*.toml` holds the patterns and each
+        harness's recorded sessions live as flat `fixtures/*.pty` files. The repo ships
+        `adapters/opencode.toml`, `adapters/pi.toml` and `adapters/default.toml` (the
+        universal tier), each with a native-tier hook spec where the harness has one
+        (`adapters/opencode-native.md`, `adapters/pi-native.md`); `docs/agent-skill.md`
+        covers the state vocabulary Arreo itself uses. If your harness prints something a
+        pattern can catch, most of the work below is the evidence this template asks for.
+
+  - type: input
+    id: harness
+    attributes:
+      label: Which harness?
+      description: Its name and, if it has one, its project URL.
+      placeholder: "e.g. opencode (https://opencode.ai), pi, Gemini CLI"
+    validations:
+      required: true
+
+  - type: input
+    id: harness-version
+    attributes:
+      label: Harness version
+      description: The exact version whose output you are quoting — adapters are version-sensitive, and a pattern recorded against one release can miss the next.
+      placeholder: the `--version` line, or an npm/cargo release coordinate
+    validations:
+      required: true
+
+  - type: input
+    id: process
+    attributes:
+      label: How is it launched?
+      description: The command you actually type to start it (`arreo spawn <id> <program> [args...]`). Context only — the adapter TOML keys off terminal output (`question_patterns`, `error_patterns`, `idle_after_ms`, `bell_means_attention` in `adapters/default.toml`), not off the process name.
+      placeholder: "e.g. the harness's own binary, or `node /path/to/harness.js`"
+    validations:
+      required: true
+
+  - type: textarea
+    id: prompt-sample
+    attributes:
+      label: What it prints when it wants you
+      description: |
+        Paste the terminal output around the moment the harness waits for input, verbatim:
+        the last line(s) plus any trailing characters. Note control characters or a bell
+        explicitly — the bytes are the thing the pattern is written against.
+      render: text
+      placeholder: the harness's last line(s) before it waits for input, byte for byte
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: signals
+    attributes:
+      label: What signals does the harness give you?
+      description: Check everything that is true; each line maps onto a real adapter field.
+      options:
+        - label: "Printed text right before it waits for input (a `question_patterns` candidate)"
+        - label: "A bell character (BEL) when it needs attention (`bell_means_attention`)"
+        - label: "Error/failure output that means blocked (`error_patterns`)"
+        - label: "A machine-readable event stream, hook or plugin API — a native tier is possible (see the `*-native.md` specs)"
+        - label: "Only exit codes; the interesting state never appears in the terminal"
+    validations:
+      required: true
+
+  - type: textarea
+    id: blocked-sample
+    attributes:
+      label: Failure output (if any)
+      description: Same rule as above — verbatim bytes of the "something went wrong" shape, or write "none observed".
+    validations:
+      required: false
+
+  - type: textarea
+    id: fixture
+    attributes:
+      label: Can you provide a replayable fixture?
+      description: |
+        A fixture is one flat file, `fixtures/<harness>-<scenario>.pty`, recorded with
+        `arreo record <command> [args...] -o fixtures/<harness>-question.pty` (the recorder
+        is `crates/arreo-core/src/fixtures.rs`; `arreo record` refuses secret-shaped output
+        unless you pass `--allow-secrets` — a session that prints your API key is not one to
+        commit). The harness also has to be listed in `adapter_fixtures()` in
+        `xtask/src/adapters_check.rs` so that `cargo xtask adapters --check` replays it;
+        existing adapters carry question, working, idle and stress fixtures.
+        Answer here: yes / yes with help recording it / no — and attach a raw capture if you
+        cannot record one.
+    validations:
+      required: true

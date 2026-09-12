@@ -359,17 +359,24 @@ fn secrets_item(root: &Path, public: bool) -> Item {
     // A version mismatch is reported, not enforced: the pin belongs to CI, and a
     // developer's slightly newer scanner finding nothing is not a launch blocker.
     // `--public` still requires *a* scan to have run.
+    // The repo's own allowlist travels with the scan: without `-c`, the eight
+    // triaged false positives (dummy test tokens, published public keys —
+    // `.loop/evidence/T-0048/secrets-scan.txt`) would fail every run, and a gate
+    // that fails on known-safe values is a gate people stop running.
+    let config = root.join(".gitleaks.toml");
     let report = std::env::temp_dir().join(format!("arreo-gitleaks-{}.json", std::process::id()));
-    let output = Command::new(&tool)
-        .args(["detect", "--source"])
-        .arg(root)
-        .args([
-            "--log-opts=--all",
-            "--redact",
-            "--no-banner",
-            "--report-format",
-            "json",
-        ])
+    let mut cmd = Command::new(&tool);
+    cmd.args(["detect", "--source"]).arg(root).args([
+        "--log-opts=--all",
+        "--redact",
+        "--no-banner",
+        "--report-format",
+        "json",
+    ]);
+    if config.is_file() {
+        cmd.arg("-c").arg(&config);
+    }
+    let output = cmd
         .arg("--report-path")
         .arg(&report)
         .current_dir(root)

@@ -39,7 +39,7 @@ The log lives in the daemon's sidecar SQLite file, `<socket>.db` — the same WA
 file that holds pane topology, scrollback and the device registry. The default
 socket is `$XDG_RUNTIME_DIR/arreo.sock` when that variable is set, otherwise
 `$TMPDIR/arreo-<uid>.sock`, so the default log is that path with `.db` appended.
-`meta.schema_version` is **6** for this build.
+`meta.schema_version` is **7** for this build.
 
 The `audit` table:
 
@@ -62,7 +62,10 @@ breaks ties in the ordering (§5).
 The version 5 columns arrived in place: v3 added `kind`, v4 added `action`, v5
 added `outcome`, `peer` and `detail`. Rows that predate a column keep the
 migration's honest default — every existing row was an action that happened
-(`ok`) and a prompt (`prompt`), which is exactly what those defaults say.
+(`ok`) and a prompt (`prompt`), which is exactly what those defaults say. The two
+migrations after that (v6, `metrics_series`; v7, `machine_trust`) added tables
+rather than audit columns, so this table is unchanged since v5 — but
+`meta.schema_version` reads **7**.
 
 **The append-only rule.** `SessionStore::record` is the only writer, and the
 store exposes no update and no delete for this table. Re-writing the "same"
@@ -93,6 +96,10 @@ query finds.
 | `auth.reject` | A presented key is refused (no certificate, revoked, or not pinned) | empty | the reason, e.g. `no certificate for this key` | `refused` |
 | `pairing.failed` | A pairing attempt produced no certificate | empty | the reason (wrong code, expired window, peer never completed) | `refused` |
 | `enforce.breach` | The cgroup guard trips a pane's memory or pid budget | pane id | `<memory\|pids> budget breached` | `ok` |
+| `enforce.alert` | A graded cgroup alert fires (T-0041): `warn` at 80% of the ceiling, `critical` at 95%, before any kill | pane id | `memory <warn\|critical> for pane <id>` | `ok` |
+| `trust.grant` | A device is granted access **to this machine** — by `arreo machines trust`, by issuing its certificate here, or by the one-time backfill on upgrade | the machine's name | empty; `detail` is `machine=<id> role=<role> by=<actor>`, plus ` reason=backfill` on the migration | `ok` |
+| `trust.revoke` | This machine's grant to a device is cut, and only the first time (a repeat is not a second row) | the machine's name | empty; `detail` is `machine=<id>` | `ok` |
+| `trust.refuse` | A verb is refused because of this machine's grant: no grant, too low a role, or a revoked grant. Written once per session, not once per refused verb | the machine's name | empty; `detail` names `machine=<id> verb=<Verb> reason=<why>` | `refused` |
 | `audit.prune` | An operator runs `arreo audit prune` | empty | `removed N row(s) older than MS` | `ok` |
 | `prompt` | Nothing writes it today: it is the original T-0018 row and the migration default for rows that predate actions | — | — | `ok` |
 | `unknown` | The vocabulary's fallback for a row whose action an older schema did not record; nothing writes it today | — | — | — |

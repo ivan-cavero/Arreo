@@ -1,0 +1,32 @@
+stranger tour — clean clone, empty state, README commands verbatim
+=====================================================================
+date: 2026-09-12T03:45:29Z
+method: local mirror of origin/main (network-equivalent), HOME/XDG_RUNTIME_DIR/XDG_DATA_HOME pointed at empty dirs
+
+--- prerequisites (bare HOME: rustup has NO default toolchain) ---
+rustc: rustup could not choose a version (no default configured)
+cargo: same — yet the build below works, because rust-toolchain.toml pins 1.98.0.
+  (this is the README's claim working: 'Requires stable Rust, pinned by rust-toolchain.toml')
+
+--- git clone: 0.6s ---
+--- cargo build --workspace: 1m39s wall ---
+Finished dev profile, no errors.
+
+--- first pane (README §'First pane in 60 seconds', commands verbatim) ---
+spawned build
+state=Idle confidence=inferred:silence pattern=None
+read build ->
+$ 
+echo hello-arreo
+hello-arreo
+$ 
+
+--- battery: cargo xtask e2e --slice api: 1m16s wall ---
+api: test result: ok. 5 passed; 0 failed
+api: all verbs green over the real socket
+
+--- daemon shutdown ---
+arreo-server: SIGTERM received, draining...
+arreo-server: drained 1 pane(s), exiting cleanly
+
+verdict: a stranger reaches a first pane and a green slice using only the README.

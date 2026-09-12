@@ -1,0 +1,159 @@
+# docs-check — mechanical link and command verification (T-0048, NewcomerDocs)
+
+Generated: 2026-09-12 against this checkout (no network, no inference).
+
+Method. Every relative markdown link in the listed files was resolved against the
+filesystem from the file's own directory (the same rule `cargo xtask release-check`'s
+`links` item applies: inline `[label](target)` with paren-depth matching, plus
+`[label]: target` reference definitions; `#anchor` stripped; external
+`http(s)://` and `mailto:` skipped). Every `arreo <verb>` and `cargo xtask <cmd>`
+appearing in code spans or fenced blocks was checked against the dispatch it names:
+`arreo` verbs against `crates/arreo-cli/src/main.rs`'s `usage()` + `match verb` arms
+(plus `machines.rs` `usage()` for `machines` subcommands); `cargo xtask` against
+`xtask/src/main.rs`'s top-level match; `--slice` names against the `e2e()` slice arms;
+`cargo` subcommands against cargo itself (`build/test/clippy/fmt/vet/audit/deny/run/check/install`);
+`cargo dist` is the external cargo-dist tool pinned in `[workspace.metadata.dist]`.
+
+Ground truth on this checkout:
+- CLI verbs: record replay metrics read wait split panes spawn attach send service server
+  audit devices pair machines (+ subcommands: devices id|list|issue|rotate|revoke|authorize,
+  machines list|status|rename|remove|add|trust, audit export|prune, service install|uninstall|status,
+  server stop, metrics history)
+- xtask top-level: e2e bench demo conpty-smoke check-targets adapters package release-check
+- e2e slices: chaos api compat lifecycle persistence state enforcement tui theme relay
+  (`xtask e2e` with no slice is a stub that prints `not implemented` and exits 0)
+
+Result: **123 unique file → target rows, 123 EXISTS, 0 MISSING.**
+The release-check gate's own surface (README, CONTRIBUTING, SECURITY.md, NOTICE.md, docs/*.md)
+was re-run with its exact parser: 13 files, 62 relative links, 0 broken.
+
+Note: `arreo relay serve` is named once in CONTRIBUTING.md as a sentence that says it
+does not exist (linking it into the CLI would relicense the CLI); it is recorded as
+ABSENT-BY-DESIGN, not as a MISSING, because the honest statement is that the verb is absent.
+
+| file | link/command | verdict | action taken |
+| --- | --- | --- | --- |
+| CONTRIBUTING.md | `CODE_OF_CONDUCT.md` | EXISTS | - |
+| CONTRIBUTING.md | `ROADMAP.md` | EXISTS | - |
+| CONTRIBUTING.md | `SECURITY.md` | EXISTS | - |
+| CONTRIBUTING.md | `arreo record` | EXISTS | - |
+| CONTRIBUTING.md | `cargo audit` | EXISTS | - |
+| CONTRIBUTING.md | `cargo build` | EXISTS | - |
+| CONTRIBUTING.md | `cargo clippy` | EXISTS | - |
+| CONTRIBUTING.md | `cargo deny` | EXISTS | - |
+| CONTRIBUTING.md | `cargo test` | EXISTS | - |
+| CONTRIBUTING.md | `cargo vet` | EXISTS | - |
+| CONTRIBUTING.md | `cargo xtask adapters` | EXISTS | - |
+| CONTRIBUTING.md | `cargo xtask bench` | EXISTS | - |
+| CONTRIBUTING.md | `cargo xtask check-targets` | EXISTS | - |
+| CONTRIBUTING.md | `cargo xtask conpty-smoke` | EXISTS | - |
+| CONTRIBUTING.md | `cargo xtask e2e` | EXISTS | - |
+| CONTRIBUTING.md | `cargo xtask e2e --slice chaos` | EXISTS | - |
+| CONTRIBUTING.md | `cargo xtask e2e --slice compat` | EXISTS | - |
+| CONTRIBUTING.md | `cargo xtask e2e --slice lifecycle` | EXISTS | - |
+| CONTRIBUTING.md | `cargo xtask e2e --slice state` | EXISTS | - |
+| CONTRIBUTING.md | `cargo xtask release-check` | EXISTS | - |
+| CONTRIBUTING.md | `docs/cross-os.md` | EXISTS | - |
+| CONTRIBUTING.md | `docs/tour.md` | EXISTS | - |
+| README.md | `AGENTS.md` | EXISTS | - |
+| README.md | `CONTRIBUTING.md` | EXISTS | - |
+| README.md | `LICENSE` | EXISTS | - |
+| README.md | `LICENSE-RELAY` | EXISTS | - |
+| README.md | `NOTICE.md` | EXISTS | - |
+| README.md | `REUSE.toml` | EXISTS | - |
+| README.md | `ROADMAP.md` | EXISTS | - |
+| README.md | `ROADMAP.md#10-building-arreo-with-agents-the-repo-is-developed-in-agent-loops` | EXISTS | - |
+| README.md | `SECURITY.md` | EXISTS | - |
+| README.md | `arreo attach` | EXISTS | - |
+| README.md | `arreo audit` | EXISTS | - |
+| README.md | `arreo devices` | EXISTS | - |
+| README.md | `arreo machines` | EXISTS | - |
+| README.md | `arreo metrics` | EXISTS | - |
+| README.md | `arreo pair` | EXISTS | - |
+| README.md | `arreo panes` | EXISTS | - |
+| README.md | `arreo read` | EXISTS | - |
+| README.md | `arreo send` | EXISTS | - |
+| README.md | `arreo server` | EXISTS | - |
+| README.md | `arreo service` | EXISTS | - |
+| README.md | `arreo spawn` | EXISTS | - |
+| README.md | `arreo split` | EXISTS | - |
+| README.md | `arreo wait` | EXISTS | - |
+| README.md | `cargo build` | EXISTS | - |
+| README.md | `cargo xtask bench` | EXISTS | - |
+| README.md | `cargo xtask release-check` | EXISTS | - |
+| README.md | `docs/agent-skill.md` | EXISTS | - |
+| README.md | `docs/audit.md` | EXISTS | - |
+| README.md | `docs/conpty-windows.md` | EXISTS | - |
+| README.md | `docs/cross-os.md` | EXISTS | - |
+| README.md | `docs/machines.md` | EXISTS | - |
+| README.md | `docs/relay-deploy.md` | EXISTS | - |
+| README.md | `docs/relay-protocol.md` | EXISTS | - |
+| README.md | `docs/release.md` | EXISTS | - |
+| README.md | `docs/tour.md` | EXISTS | - |
+| README.md | `specs/adr/` | EXISTS | - |
+| docs/agent-skill.md | `arreo attach` | EXISTS | - |
+| docs/agent-skill.md | `arreo metrics` | EXISTS | - |
+| docs/agent-skill.md | `arreo panes` | EXISTS | - |
+| docs/agent-skill.md | `arreo read` | EXISTS | - |
+| docs/agent-skill.md | `arreo send` | EXISTS | - |
+| docs/agent-skill.md | `arreo server` | EXISTS | - |
+| docs/agent-skill.md | `arreo spawn` | EXISTS | - |
+| docs/agent-skill.md | `arreo split` | EXISTS | - |
+| docs/agent-skill.md | `arreo wait` | EXISTS | - |
+| docs/audit.md | `arreo audit` | EXISTS | - |
+| docs/audit.md | `arreo machines` | EXISTS | - |
+| docs/audit.md | `arreo send` | EXISTS | - |
+| docs/audit.md | `arreo spawn` | EXISTS | - |
+| docs/conpty-windows.md | `cargo run` | EXISTS | - |
+| docs/conpty-windows.md | `cargo xtask conpty-smoke` | EXISTS | - |
+| docs/cross-os.md | `cargo check` | EXISTS | - |
+| docs/cross-os.md | `cargo xtask check-targets` | EXISTS | - |
+| docs/machines.md | `../specs/adr/0018-machine-join-handoff.md` | EXISTS | - |
+| docs/machines.md | `../specs/adr/0019-per-machine-device-trust.md` | EXISTS | - |
+| docs/machines.md | `arreo devices` | EXISTS | - |
+| docs/machines.md | `arreo machines` | EXISTS | - |
+| docs/machines.md | `arreo pair` | EXISTS | - |
+| docs/relay-deploy.md | `arreo audit` | EXISTS | - |
+| docs/relay-deploy.md | `arreo devices` | EXISTS | - |
+| docs/relay-deploy.md | `arreo machines` | EXISTS | - |
+| docs/relay-deploy.md | `arreo pair` | EXISTS | - |
+| docs/relay-deploy.md | `arreo spawn` | EXISTS | - |
+| docs/release.md | `cargo build` | EXISTS | - |
+| docs/release.md | `cargo dist` | EXISTS | - |
+| docs/release.md | `cargo xtask package` | EXISTS | - |
+| docs/release.md | `tour.md` | EXISTS | - |
+| docs/tour.md | `../AGENTS.md` | EXISTS | - |
+| docs/tour.md | `../CONTRIBUTING.md` | EXISTS | - |
+| docs/tour.md | `../ROADMAP.md` | EXISTS | - |
+| docs/tour.md | `../specs/adr/` | EXISTS | - |
+| docs/tour.md | `../tasks/README.md` | EXISTS | - |
+| docs/tour.md | `agent-skill.md` | EXISTS | - |
+| docs/tour.md | `arreo attach` | EXISTS | - |
+| docs/tour.md | `arreo audit` | EXISTS | - |
+| docs/tour.md | `arreo machines` | EXISTS | - |
+| docs/tour.md | `arreo pair` | EXISTS | - |
+| docs/tour.md | `arreo read` | EXISTS | - |
+| docs/tour.md | `arreo send` | EXISTS | - |
+| docs/tour.md | `arreo server` | EXISTS | - |
+| docs/tour.md | `arreo service` | EXISTS | - |
+| docs/tour.md | `arreo spawn` | EXISTS | - |
+| docs/tour.md | `arreo wait` | EXISTS | - |
+| docs/tour.md | `audit.md` | EXISTS | - |
+| docs/tour.md | `cargo build` | EXISTS | - |
+| docs/tour.md | `cargo check` | EXISTS | - |
+| docs/tour.md | `cargo run` | EXISTS | - |
+| docs/tour.md | `cargo xtask adapters` | EXISTS | - |
+| docs/tour.md | `cargo xtask bench` | EXISTS | - |
+| docs/tour.md | `cargo xtask check-targets` | EXISTS | - |
+| docs/tour.md | `cargo xtask conpty-smoke` | EXISTS | - |
+| docs/tour.md | `cargo xtask demo` | EXISTS | - |
+| docs/tour.md | `cargo xtask e2e` | EXISTS | - |
+| docs/tour.md | `cargo xtask package` | EXISTS | - |
+| docs/tour.md | `cargo xtask release-check` | EXISTS | - |
+| docs/tour.md | `conpty-windows.md` | EXISTS | - |
+| docs/tour.md | `cross-os.md` | EXISTS | - |
+| docs/tour.md | `machines.md` | EXISTS | - |
+| docs/tour.md | `relay-deploy.md` | EXISTS | - |
+| docs/tour.md | `relay-protocol.md` | EXISTS | - |
+| docs/tour.md | `release.md` | EXISTS | - |
+

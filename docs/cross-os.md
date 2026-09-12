@@ -8,8 +8,13 @@
 | Layer | Command | Proves | Cost |
 | --- | --- | --- | --- |
 | 1. Local check | `cargo xtask check-targets` | Our Rust code has no cfg/type errors for `x86_64-pc-windows-msvc` (pure-Rust surface incl. tests) + native linux PASS | ~1 min, zero downloads (rustup std only) |
-| 2. CI matrix | `.github/workflows/ci.yml` (`ubuntu/macos/windows`) | Real build + full tests + conpty-smoke on real OSes | Free (public repo runners), per push |
+| 2. CI matrix | `.github/workflows/ci.yml` (`ubuntu/macos/windows`) | Real build + full tests + conpty-smoke on real OSes — **when it is green.** It is not green today: every run in the recorded history failed on all three legs | Free (public repo runners), per push |
 | 3. Full SDKs | xwin (Windows) / osxcross (macOS) locally | C-dep compilation (rusqlite bundled) for foreign targets | GBs of SDK downloads — **deferred** (see below) |
+
+**Layer 2 is the only layer that can prove runtime behavior on a foreign OS, and it
+is currently red** — so macOS and Windows behavior is *unproven*, not proven-bad, and
+no claim about either may be made from a green-looking workflow file. The matrix is
+the authority once it passes.
 
 ## What check-targets does
 

@@ -1,0 +1,40 @@
+# T-0048: the secret scanner's allowlist — every entry names a false positive
+# that was triaged by hand (see `.loop/evidence/T-0048/secrets-scan.txt`).
+#
+# One sentence: gitleaks' stock rules cannot tell a dummy token in a redaction
+# test from a real one, or a published public key from a secret — so the entries
+# below name the exact values and paths that were proven safe, and nothing else.
+#
+# Rules for touching this file:
+# - An entry needs the triage in secrets-scan.txt (commit, path, rule, and WHY
+#   it is safe). An allowlist entry without a triage is a hole, not a fix.
+# - The `regexes` name exact dummy values; the `paths` scope them to the tests
+#   that use them. A value allowlisted only inside its test still fires if it
+#   ever appears anywhere else.
+# - Never extend this to a rule id. A rule that is off is a scanner that is off
+#   for exactly the shape it exists to catch.
+
+[extend]
+useDefault = true
+
+# One global allowlist (gitleaks merges a single [allowlist] table): the dummy
+# literals from the redaction tests, and the two published public keys. Each
+# regex names an exact value that was triaged — not a pattern class — so a real
+# secret in the same shape still fires.
+[allowlist]
+description = "T-0048 triaged false positives: dummy test tokens and published public keys."
+paths = [
+    # The transcripts that publish public keys by design (T-0045's dial key,
+    # T-0024's pairing root key) are not scanned for the key shapes at all:
+    # their whole purpose is showing those keys.
+    '''\.loop/evidence/T-0045/transcript\.txt''',
+    '''\.loop/evidence/T-0024/happy-path\.txt''',
+]
+regexes = [
+    # Dummy OPENAI_API_KEY literal: input to the redaction tests, asserted not
+    # to survive (crates/arreo-core/tests/{audit,store,fixtures}.rs,
+    # crates/arreo-server/tests/audit.rs).
+    '''sk-abc123XYZ4567890abcdef''',
+    # Dummy ghp_ literal: same triage (crates/arreo-core/tests/audit.rs).
+    '''ghp_AAAABBBBCCCCDDDDEEEEFFFF''',
+]
