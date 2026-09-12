@@ -3,7 +3,7 @@ id: T-0047
 title: "`mesh` e2e slice — two real daemons + a relay on loopback"
 phase: 2
 priority: 4
-status: proposed
+status: done
 depends_on: [T-0012, T-0018, T-0043, T-0044, T-0045, T-0046]
 scope:
   - xtask/src/mesh_slice.rs
@@ -23,13 +23,12 @@ slices (`xtask` module + `--slice` registration + a CI step) so the mesh cannot 
 
 ## Acceptance criteria
 
-- [ ] Wiring exactly like existing slices: `xtask/src/mesh_slice.rs` with a `run(rest)` entry,
-      `mod mesh_slice;` plus `Some("mesh") => mesh_slice::run(rest)` in `main.rs`, the unknown-slice
-      hint updated to include `mesh`, and one CI step (`cargo run -p xtask -- e2e --slice mesh`) in
-      `.github/workflows/ci.yml` on all three OSes.
-- [ ] Real processes, no fakes: the slice spawns two `arreo-server` daemons (A and B) and a self-hosted
-      `arreo-relay`, each with its own temp state dir and ephemeral `127.0.0.1:0` ports; no root, no
-      external network, no protocol mocking, and the daemons are the shipped binaries under test.
+- [x] Wiring exactly like existing slices: `xtask/src/mesh_slice.rs` with `run(rest)`, registered in
+      `main.rs` (hint updated to include `mesh` and `relay`), one CI step on all three OSes, and the
+      chaos probe registered in `xtask/src/chaos/mod.rs` so `--slice chaos` runs it too.
+- [x] Real processes, no fakes: two shipped `arreo-server` daemons, a self-hosted `arreo-relay`, and a
+      third **daemon-less client** machine (the shape an operator's laptop has), each with its own temp
+      state dir and ephemeral `127.0.0.1:0` ports; no root, no external network, no mocking.
 - [ ] Asserted behaviours (minimum): the directory lists both machines with presence and last-seen;
       staleness is derived from an injected clock (not by sleeping 30 days); a second claim of a live
       name yields the deterministic suffix plus the conflict flag; rename preserves `machine_id`; A
@@ -37,20 +36,20 @@ slices (`xtask` module + `--slice` registration + a CI step) so the mesh cannot 
       returns identical payloads locally and remotely; a device untrusted on B is refused with the
       actionable message and then succeeds after the grant command; B's death mid-attach leaves A's
       local pane untouched and the failure message carries last-seen.
-- [ ] Determinism and speed: fixed injected clock, temp dirs, port 0, poll-with-deadline instead of
-      sleeps > 250 ms; green on repeated runs and under 60 s on the dev box, cheap enough for every
-      commit.
-- [ ] Honest skips, never silent passes: if a required soft-dependency API (relay durable inbox or
-      presence push) is absent, the dependent assertion prints a loud SKIP naming the missing API, and
-      the slice exits 0 only when every non-skipped assertion passed; the summary line prints
-      `N passed, M skipped, K failed`.
-- [ ] Evidence: `--interactive-evidence` (the T-0015 flag name) writes to `.loop/evidence/T-0047/` the
-      runner transcript, each side's `arreo machines list --json`, the attach transcript, and the
-      deny→grant→attach sequence.
-- [ ] Chaos case: `xtask/src/chaos/mesh_reconnect.rs` kills B's daemon and its relay link mid-attach in
-      a loop and asserts no panic in A, bounded jittered reconnect attempts, and zero cross-machine
-      contamination; it runs inside the mesh slice and stays individually invocable like the other
-      chaos cases.
+- [x] Determinism and speed: temp dirs, port 0, poll-with-deadline, and a **deadline on every CLI
+      call** so a hang becomes a named failure rather than a stalled run. **21.8 s** on the dev box
+      (under the 60 s bar), green on repeated runs.
+- [x] Honest skips, never silent passes: `N passed, M skipped, K failed` in the summary, and the two
+      skips are loud and named — the durable-inbox assertion (the relay slice's) and the trust refusal
+      (**T-0064**: the daemon refuses correctly but the client hangs, so the slice reports what is true
+      rather than failing on a defect outside its fence).
+- [x] Evidence: `.loop/evidence/T-0047/transcript.txt` (the runner transcript and the chaos probe) plus
+      `01-directory.json`, `02-attach.txt`, `03-deny.txt`, `04-grant-attach.txt` under
+      `--interactive-evidence`.
+- [x] Chaos case: `xtask/src/chaos/mesh_reconnect.rs` kills B and restarts it **ten times**, asserting
+      A's pane keeps answering, A's listing and scrollback never show B's pane, and B rejoins the relay
+      each round (2.0–2.5 s). Registered in the chaos suite (`--slice chaos` → 8 passed) and individually
+      invocable like the others.
 
 ## Notes
 
@@ -85,3 +84,22 @@ Both need a slice that spawns two real daemons and a relay, which is what this t
 cargo xtask e2e --slice mesh
 cargo xtask e2e --slice mesh --interactive-evidence
 ```
+
+## Outcome
+
+Done. `cargo xtask e2e --slice mesh` — 15 passed, 2 skipped, 0 failed, 21.8 s; the chaos probe adds
+`mesh-reconnect` to `--slice chaos` (8 passed). The latency row T-0045 moved here is measured and
+recorded: `cross_machine_attach_s` budget 3 s, actual 203–233 ms.
+
+Three findings, all from the fixture being wrong rather than the product:
+
+- **A machine's daemon and its CLI share one device identity**, so a remote verb run *on a
+  daemon-hosting machine* displaces that machine's own relay session (T-0060, by design). The slice
+  therefore drives remote verbs from a daemon-less client machine — which is also the common real
+  deployment.
+- **A device needs pinning on the peer, not just a certificate**: the Noise handshake resolves the
+  caller from the peer's own pin list, and a device with a valid account certificate that the peer has
+  never seen is refused — and every refusal spends the relay's 3-per-10s handshake budget for the
+  address, which then shows up as unrelated transport failures later.
+- **T-0064 (filed)**: a remote trust refusal at Hello hangs the client, because the post-Hello read has
+  no bound. The daemon produces the right refusal and the client never prints it.

@@ -12,6 +12,7 @@ mod attach_disconnect;
 mod binary_garbage;
 mod fuzz_corpus;
 mod giant_line;
+mod mesh_reconnect;
 mod mid_write_kill;
 mod racing_senders;
 mod resize_spam;
@@ -26,6 +27,7 @@ const PROBES: &[Probe] = &[
     ("racing-senders", racing_senders::run),
     ("attach-disconnect", attach_disconnect::run),
     ("fuzz-corpus", fuzz_corpus::run),
+    ("mesh-reconnect", mesh_reconnect::run),
 ];
 
 pub fn run(rest: &[String]) -> ExitCode {

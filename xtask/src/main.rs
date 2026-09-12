@@ -19,6 +19,7 @@ mod demo;
 mod enforcement_slice;
 mod harness;
 mod lifecycle_slice;
+mod mesh_slice;
 mod package;
 mod persistence_slice;
 mod relay_slice;
@@ -63,13 +64,14 @@ fn e2e(rest: &[String]) -> ExitCode {
         Some("compat") => compat_slice::run(rest),
         Some("state") => adapters_check::run(rest),
         Some("lifecycle") => lifecycle_slice::run(rest),
+        Some("mesh") => mesh_slice::run(rest),
         Some("enforcement") => enforcement_slice::run(rest),
         Some("persistence") => persistence_slice::run(rest),
         Some("tui") => tui_slice::run(rest),
         Some("theme") => theme_slice::run(rest),
         Some("relay") => relay_slice::run(rest),
         Some(other) => {
-            eprintln!("xtask e2e: unknown slice {other:?} (have: chaos, api, compat, lifecycle, persistence, state, enforcement, tui, theme)");
+            eprintln!("xtask e2e: unknown slice {other:?} (have: chaos, api, compat, lifecycle, persistence, state, enforcement, tui, theme, relay, mesh)");
             ExitCode::from(2)
         }
         None => stub("e2e", rest),

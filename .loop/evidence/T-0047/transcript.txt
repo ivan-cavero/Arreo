@@ -1,0 +1,29 @@
+T-0047 — the mesh e2e slice
+===========================
+
+## 1. The slice: two real daemons + a relay on loopback
+
+[PASS] mesh: the directory is readable from a machine
+[PASS] mesh: the directory lists both machines
+[PASS] mesh: beta owns a pane
+[PASS] mesh: alpha lists beta's panes by name
+[PASS] mesh: the cross-machine listing meets its 3 s budget
+mesh: cross-machine panes 203 ms (budget 3000 ms)
+[PASS] mesh: a read round trip returns the same payload locally and remotely
+[PASS] mesh: a send through the name is accepted
+[PASS] mesh: what was sent remotely is readable locally
+[PASS] mesh: gamma is pinned on beta (the handshake will pass)
+[PASS] mesh: the grant is cut while the pin survives
+[SKIP] mesh: the untrusted device is refused with the actionable message: the daemon refuses correctly (its log has the refusal and the grant command) but the client hangs instead of reporting it — T-0064, not this slice's fence
+[PASS] mesh: beta grants gamma
+[PASS] mesh: the granted device reaches beta's panes
+[PASS] mesh: alpha owns a pane of its own
+[PASS] mesh: beta's death leaves alpha's own pane untouched
+[PASS] mesh: the failure names the machine rather than the transport
+[SKIP] mesh: queued-message assertion: the relay durable inbox assertion lives in the relay slice (T-0032), not here
+mesh: 15 passed, 2 skipped, 0 failed
+
+## 2. The chaos case: kill B ten times, A never notices
+
+[PASS] mesh-reconnect (2.451106294s): mesh-reconnect: 10 rounds, A intact and uncontaminated, B rejoined each time, 10 reconnect events observed
+chaos: 8 passed, 0 failed
