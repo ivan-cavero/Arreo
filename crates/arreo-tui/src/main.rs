@@ -421,7 +421,12 @@ struct Subscription {
 /// jittered), the attempt counter resets on the first pass that answers, and the
 /// UI is told what is happening instead of being shown a frozen screen. The pane
 /// cursors live in the subscription and are *not* reset, so a resumed read
-/// replays from exactly where the transcript stopped.
+/// replays from exactly where the transcript stopped. **A pass on a fresh
+/// connection (the first one, or a reconnect) runs immediately**, without
+/// waiting for the next tick: a daemon handoff drops the held connection, the
+/// next poll fails, and the re-subscribed `Read`s must reach the screen now —
+/// waiting out the cadence would add another full second to the resume (measured
+/// by the `reattach` slice; T-0038).
 ///
 /// **The drop case is bounded by the far end, not by this loop.** A client that
 /// vanishes is not noticed by the daemon until one of its reads or writes fails,
@@ -438,10 +443,12 @@ async fn poll_daemon(
     let mut attempt: u32 = 0;
     let mut conn: Option<Client> = None;
     loop {
+        let mut just_connected = false;
         if conn.is_none() {
             match Client::connect_to(&target).await {
                 Ok(opened) => {
                     conn = Some(opened);
+                    just_connected = true;
                     let _ = tx
                         .send(Poll::Status(format!("connected to {}", target.describe())))
                         .await;
@@ -454,26 +461,37 @@ async fn poll_daemon(
                 }
             }
         }
-        // The session can also die *between* verbs, which on a remote target is
-        // the difference between a one-second stall and an honest status line —
-        // so the wait for the next tick races the session's own closure signal.
-        let closed = conn.as_ref().and_then(Client::closed);
-        let next_tick = tick.tick();
-        let drop_notice = async {
-            match &closed {
-                Some(closed) => closed.wait().await,
-                // Local connections report a closure by failing the next read.
-                None => std::future::pending::<()>().await,
-            }
-        };
-        tokio::select! {
-            _ = next_tick => {}
-            () = drop_notice => {
-                let delay = report_closed(&tx, &target, attempt).await;
-                conn = None;
-                tokio::time::sleep(delay).await;
-                attempt = attempt.saturating_add(1);
-                continue;
+        // A pass on a *fresh* connection runs immediately instead of waiting for
+        // the next tick. The tick cadence is the sidebar's refresh rate, not a
+        // pre-connect delay — and for a reconnect it is the whole difference
+        // between a ~1 s resume and a ~2 s one: after a daemon handoff the old
+        // connection dies and the next poll fails, the loop reconnects, and
+        // without this the re-subscribed `Read`s would sit until the following
+        // tick (up to another second) before the transcript it came back for
+        // reaches the screen (measured by the `reattach` slice). The one-second
+        // wait for the *next* pass then resumes as normal.
+        if !just_connected {
+            // The session can also die *between* verbs, which on a remote target is
+            // the difference between a one-second stall and an honest status line —
+            // so the wait for the next tick races the session's own closure signal.
+            let closed = conn.as_ref().and_then(Client::closed);
+            let next_tick = tick.tick();
+            let drop_notice = async {
+                match &closed {
+                    Some(closed) => closed.wait().await,
+                    // Local connections report a closure by failing the next read.
+                    None => std::future::pending::<()>().await,
+                }
+            };
+            tokio::select! {
+                _ = next_tick => {}
+                () = drop_notice => {
+                    let delay = report_closed(&tx, &target, attempt).await;
+                    conn = None;
+                    tokio::time::sleep(delay).await;
+                    attempt = attempt.saturating_add(1);
+                    continue;
+                }
             }
         }
         let Some(active) = conn.as_mut() else {

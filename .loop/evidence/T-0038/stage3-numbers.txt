@@ -1,0 +1,11 @@
+T-0038 stage 3 — client reattach across a daemon handoff
+budget: server_handoff_reattach_s = 2s (perf-budget.toml, phase0=true)
+
+cli: last pre-cut tick 17 at 0.020s; first post-cut tick 18 at 0.546s (replay burst through tick 34; t=0 is cut start)
+cli: reattach 0.526s | cut→resume 0.546s | transcript clock ≈ 0.923s (17 missed ticks × 54 ms)
+
+tui: last pre-cut tick 15 shown at 0.003s; first post-cut tick 20 at 1.601s
+tui: reattach 1.598s | cut→resume 1.601s | transcript clock ≈ 0.272s (5 missed ticks × 54 ms)
+
+pane id: "tick" unchanged — `panes` lists it before and after the cut; the CLI transcript carries one pid (Some(1637424)) throughout; CLI ticks contiguous: true
+input during cut: 68 accepted sends, 0 refused (of which 0 retried ok); every accepted send reflected exactly once: true

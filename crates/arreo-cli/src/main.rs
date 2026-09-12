@@ -4,6 +4,7 @@
 
 use arreo_core::proto::codec;
 use arreo_core::proto::{client_versions, AgentState, Message, VERSION};
+use arreo_core::relay::session::backoff_delay;
 use arreo_core::store::{audit_json, AuditQuery, ExportFormat, SessionStore, StoredAudit};
 use std::future::Future;
 use std::path::PathBuf;
@@ -43,7 +44,7 @@ fn usage() -> ExitCode {
     eprintln!("  arreo metrics --pid <PID> [--samples N]");
     eprintln!("  arreo panes [--socket PATH]");
     eprintln!("  arreo spawn <id> <program> [args...] [--socket PATH]");
-    eprintln!("  arreo attach <id> [--socket PATH]   (stream output; Ctrl-C detaches, pane keeps running)");
+    eprintln!("  arreo attach <id> [--socket PATH]   (stream; reconnects across daemon handoffs; Ctrl-C detaches, pane keeps running)");
     eprintln!("  arreo send <id> <text...> [--socket PATH]");
     eprintln!("  arreo read <id> [--from N] [--socket PATH]   (one-shot snapshot)");
     eprintln!("  arreo wait <id> --state <state> [--timeout 5m] [--socket PATH]");
@@ -707,8 +708,39 @@ async fn cmd_send(rest: &[String]) -> ExitCode {
 }
 
 /// Attach: stream append-deltas to stdout until the pane exits (then exit 0)
-/// or the connection breaks. Ctrl-C detaches (exit 0) — the pane keeps
-/// running on the daemon. No full repaints: only NEW lines print (v0 delta).
+/// or the human detaches with Ctrl-C. **A dropped connection is a reconnect,
+/// not an exit** (T-0038): the daemon can be handed over underneath a live
+/// attach — `update --server` swaps the daemon process while the pane keeps
+/// running — and the client must come back to the same pane with the same
+/// transcript. No full repaints: only NEW lines print (v0 delta).
+///
+/// **The resume is an absolute cursor, never a replay.** A reattach sends
+/// `from_line = <lines printed so far>`, and the daemon clamps a stale cursor
+/// to the ring, so the transcript after a reconnect continues exactly where it
+/// broke off; reattaching from 0 would reprint the whole ring (duplication).
+///
+/// **One backoff policy.** Reconnects sleep [`backoff_delay`] — the relay
+/// session's exponential schedule (250 ms base, 30 s cap, jittered), the same
+/// policy the TUI's poll loop uses. A second schedule would be a second answer
+/// to "how fast do we retry", so there is one.
+///
+/// **The retry is bounded by reality, not a counter.** It ends on the pane's
+/// `Exited` (exit 0), on an `Attach` that answers "not found" (the pane died;
+/// retrying could never find it), on Ctrl-C (the daemon keeps the pane), or on
+/// SIGPIPE if the downstream consumer goes away. One deliberate exception: the
+/// *first* connect fails fast — a freshly-invoked `attach` against a daemon
+/// that is not running should say so (exit 1) rather than retry for ever
+/// against a socket nothing serves. Once attached, later drops are reconnects.
+///
+/// Exit codes (the script contract):
+///   0   the pane exited (`Exited`)
+///   1   could not attach, or the pane is gone (it exited, was killed, or was
+///       never there) — the stderr line names which
+///   2   usage
+///   130 the human's Ctrl-C (default SIGINT) — the pane keeps running
+///   141 the downstream pipe went away (default SIGPIPE, like every Unix tool)
+/// stdout carries ONLY the pane's lines, in order, exactly once across
+/// reconnects; reconnect notices go to stderr.
 async fn cmd_attach(rest: &[String]) -> ExitCode {
     let (socket, kept) = take_socket(rest);
     // `--machine <name>`: another machine's pane, by name (T-0045). The same verb
@@ -725,6 +757,18 @@ async fn cmd_attach(rest: &[String]) -> ExitCode {
         return ExitCode::from(2);
     }
     let id = kept[0].clone();
+
+    // The absolute line count this client has printed; on a reconnect it is the
+    // resume cursor (see the doc comment above).
+    let mut cursor: usize = 0;
+    // The reconnect counter feeding `backoff_delay`; reset on every successful
+    // attachment.
+    let mut attempt: u32 = 0;
+
+    // The first connect is the one impatient step: a freshly-invoked `attach`
+    // against a daemon that is not running should say so now (exit 1), not
+    // retry for ever against a socket nothing serves. Every later drop is a
+    // reconnect at worst — the daemon existed a moment ago.
     let mut conn = match open_connection(&socket).await {
         Ok(conn) => conn,
         Err(e) => {
@@ -732,42 +776,189 @@ async fn cmd_attach(rest: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    if let Err(e) = conn
-        .send(&Message::Attach {
-            v: VERSION,
-            id: id.clone(),
-            from_line: 0,
-        })
-        .await
-    {
-        eprintln!("attach: {e}");
-        return ExitCode::FAILURE;
-    }
+    let mut pending_attach = true;
     loop {
+        if pending_attach {
+            pending_attach = false;
+            if let Err(e) = conn
+                .send(&Message::Attach {
+                    v: VERSION,
+                    id: id.clone(),
+                    from_line: cursor,
+                })
+                .await
+            {
+                // The daemon died between connect and Attach — a cut in the
+                // instant. That is a drop, not a failure: reconnect.
+                match reattach(&socket, &id, cursor, attempt, &e).await {
+                    Reattach::Back {
+                        conn: reopened,
+                        cursor: resumed,
+                        attempt: attempts,
+                    } => {
+                        conn = reopened;
+                        cursor = resumed;
+                        attempt = attempts;
+                    }
+                    Reattach::Ended(code) => return code,
+                }
+            }
+        }
         match conn.recv().await {
             Ok(Message::Delta { lines, .. }) | Ok(Message::Snapshot { lines, .. }) => {
-                for text in lines {
+                for text in &lines {
                     println!("{text}");
                 }
+                cursor += lines.len();
             }
             Ok(Message::Exited { code, .. }) => {
                 eprintln!("attach: pane exited (code {code:?})");
                 return ExitCode::SUCCESS;
             }
             Ok(Message::Error { message, .. }) => {
-                eprintln!("attach: {message}");
+                // The daemon answered — this is a fact, not a carrier problem.
+                if message.contains("not found") {
+                    eprintln!(
+                        "attach: pane is gone: {message} (it exited, was killed, or was never \
+                         there; reattaching cannot bring it back)"
+                    );
+                } else {
+                    eprintln!("attach: {message}");
+                }
                 return ExitCode::FAILURE;
             }
             Ok(other) => {
                 eprintln!("attach: unexpected {other:?}");
                 return ExitCode::FAILURE;
             }
+            Err(e) => match reattach(&socket, &id, cursor, attempt, &e).await {
+                Reattach::Back {
+                    conn: reopened,
+                    cursor: resumed,
+                    attempt: attempts,
+                } => {
+                    conn = reopened;
+                    cursor = resumed;
+                    attempt = attempts;
+                }
+                Reattach::Ended(code) => return code,
+            },
+        }
+    }
+}
+
+/// What a reconnect attempt ended with.
+enum Reattach {
+    /// Back on the daemon, subscribed from `cursor` (already printed the
+    /// catch-up burst it delivered).
+    Back {
+        conn: Connection,
+        cursor: usize,
+        attempt: u32,
+    },
+    /// The attach ended terminally; `code` is the exit status to return.
+    Ended(ExitCode),
+}
+
+/// Reconnect after the connection to the daemon broke, and re-subscribe from
+/// the absolute cursor so the transcript resumes exactly where it stopped.
+///
+/// Sleeps the shared [`backoff_delay`] between attempts — the same policy the
+/// TUI's poll loop and the relay session use, because a dropped client and a
+/// dropped relay are the same event: "the carrier went away". Ends only when
+/// the daemon answers (reattached), the pane exited (exit 0), the daemon says
+/// the pane is gone (exit 1), or the process is killed (Ctrl-C/SIGPIPE).
+async fn reattach(
+    socket: &PathBuf,
+    id: &str,
+    mut cursor: usize,
+    mut attempt: u32,
+    reason: &str,
+) -> Reattach {
+    eprintln!("attach: connection lost: {reason}");
+    loop {
+        let delay = backoff_delay(attempt, jitter_fraction());
+        attempt = attempt.saturating_add(1);
+        tokio::time::sleep(delay).await;
+        let mut conn = match open_connection(socket).await {
+            Ok(conn) => conn,
             Err(e) => {
-                eprintln!("attach: connection lost: {e}");
-                return ExitCode::FAILURE;
+                eprintln!(
+                    "attach: daemon not reachable (attempt {attempt}): {e} — \
+                     retrying in {:.1}s",
+                    delay.as_secs_f64()
+                );
+                continue;
+            }
+        };
+        if let Err(e) = conn
+            .send(&Message::Attach {
+                v: VERSION,
+                id: id.to_string(),
+                from_line: cursor,
+            })
+            .await
+        {
+            // The daemon died between connect and Attach: still a cut, retry.
+            eprintln!("attach: reattach interrupted: {e}");
+            continue;
+        }
+        match conn.recv().await {
+            Ok(Message::Delta { lines, .. }) | Ok(Message::Snapshot { lines, .. }) => {
+                for text in &lines {
+                    println!("{text}");
+                }
+                let resumed_from = cursor;
+                cursor += lines.len();
+                eprintln!(
+                    "attach: reconnected after the daemon was replaced — \
+                     resuming from line {resumed_from}"
+                );
+                return Reattach::Back {
+                    conn,
+                    cursor,
+                    attempt: 0,
+                };
+            }
+            Ok(Message::Exited { code, .. }) => {
+                eprintln!("attach: pane exited (code {code:?})");
+                return Reattach::Ended(ExitCode::SUCCESS);
+            }
+            Ok(Message::Error { message, .. }) => {
+                // The daemon answered — a fact, not a carrier problem. The one
+                // non-transient failure a (re)attach can meet is the pane being
+                // gone; anything else the daemon answers is equally terminal.
+                if message.contains("not found") {
+                    eprintln!(
+                        "attach: pane is gone: {message} (it exited, was killed, or was never \
+                         there; reattaching cannot bring it back)"
+                    );
+                } else {
+                    eprintln!("attach: {message}");
+                }
+                return Reattach::Ended(ExitCode::FAILURE);
+            }
+            Ok(other) => {
+                eprintln!("attach: unexpected {other:?}");
+                return Reattach::Ended(ExitCode::FAILURE);
+            }
+            Err(e) => {
+                eprintln!("attach: reattach failed: {e}");
+                continue;
             }
         }
     }
+}
+
+/// A jitter fraction in `[0, 1)`, from the clock — the same local copy the TUI
+/// keeps (`crates/arreo-tui/src/main.rs`): jitter is a spread problem, not a
+/// secrecy one, so distinct processes starting at distinct nanoseconds is the
+/// whole requirement and needs no dependency.
+fn jitter_fraction() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| f64::from(d.subsec_nanos()) / 1e9)
+        .unwrap_or(0.0)
 }
 
 /// `arreo service install|uninstall|status`: manage the OS service unit.

@@ -3719,3 +3719,247 @@ fn the_daemon_answers_clients_while_the_panes_are_in_flight() {
     drop(session);
     cleanup(&socket);
 }
+
+// ---------------------------------------------------------------------------
+// T-0038 stage 3 — input sent across the cut is exactly-once or retryably refused.
+//
+// The stage-2 pause test proved that *output a pane wrote* while paused
+// survives; this half proves the same atomic point for *input a client sent* —
+// the pane's echo is exactly the ring line the ADR's read→push window must not
+// lose. "Lost and unmentioned" (a send the daemon acked whose echo vanished) is
+// the failure these tests exist for.
+// ---------------------------------------------------------------------------
+
+/// Stage-3 criterion: **a `Send` that lands while the panes are paused is
+/// echoed exactly once after the abort resumes the pumps.**
+///
+/// The handoff is held at the transfer point — every pump paused, nothing in
+/// flight, the outgoing daemon waiting for the commit — and a `Send` is written
+/// through the *outgoing* daemon's client socket while nothing is reading the
+/// terminal. The write reaches the master; the pane's echo sits in the kernel
+/// buffer; the handoff is then abandoned, and the resumed pump must read that
+/// echo into the ring exactly once. Two placements are possible for the echo —
+/// transferred-in-the-ring (the write landed before the pause) or
+/// kernel-buffered (it landed during) — and in both it must appear exactly once:
+/// a duplicate means a pause that resumed twice, a gap means a byte lost in the
+/// read→push window.
+///
+/// What removal turns red: a pause that also blocks the *write* path (the Send
+/// is refused — the assert on `Ok` fails); a pause without resume-on-abort (the
+/// echo never arrives and the poll times out); a resume that double-reads the
+/// buffer (the echo appears twice — the second assert).
+#[test]
+fn input_sent_while_the_panes_are_paused_survives_exactly_once() {
+    let socket = temp_socket("stage3-input-paused");
+    cleanup(&socket);
+    let mut old = spawn_daemon(&socket, &[], std::process::Stdio::null());
+    wait_serving(&mut old, &socket, Duration::from_secs(10));
+
+    // A pane that reflects each input line as `got:<line>` and nothing else
+    // (`stty -echo` keeps the terminal's own echo out of the transcript, so a
+    // `got:` line is unambiguously the pane's reflection and not the tty's).
+    let program = "stty -echo; while IFS= read -r line; do echo \"got:$line\"; done";
+    let reply = spawn_pane(&socket, "p0", "sh", &["-c", program]);
+    assert!(matches!(reply, Message::Ok { .. }), "spawn: {reply:?}");
+
+    // Held at the transfer point: the pane's pump is paused, the cut has not
+    // committed, and the outgoing daemon is still serving clients.
+    let held = HeldTransfer::receive(&socket, 1);
+    assert_eq!(held.id(0), "p0");
+
+    // The input race the ADR's atomicity is about: a Send accepted by the
+    // outgoing daemon while nothing is reading the terminal.
+    let marker = "CUT-MARK-1\n".to_string();
+    let reply = try_round_trip(
+        &socket,
+        &Message::Send {
+            v: VERSION,
+            id: "p0".to_string(),
+            data: marker.clone(),
+        },
+    );
+    assert!(
+        matches!(reply, Ok(Message::Ok { .. })),
+        "the outgoing daemon still writes input while the panes are paused: {reply:?}"
+    );
+
+    // Abandon the handoff: EOF on the transfer connection is what a killed
+    // incoming daemon looks like, and the pumps must resume with the echo intact.
+    drop(held);
+
+    let after = read_pane_until(&socket, "p0", Duration::from_secs(15), |lines| {
+        lines.iter().any(|line| line == "got:CUT-MARK-1")
+    });
+    let echoes: Vec<&String> = after
+        .iter()
+        .filter(|line| line.starts_with("got:"))
+        .collect();
+    assert_eq!(
+        echoes,
+        vec![&"got:CUT-MARK-1".to_string()],
+        "the input sent during the paused window is reflected exactly once"
+    );
+    assert!(
+        old.try_wait().expect("try_wait").is_none(),
+        "the outgoing daemon still serves after the abort"
+    );
+    cleanup(&socket);
+}
+
+/// Stage-3 criterion: **a `Send` racing a real, completed cut is acked exactly
+/// once or refused as retryable — never acked and lost.**
+///
+/// The sender hammers `Send` round trips on fresh connections while the cut is
+/// in flight. Every send the daemon answered `Ok` is an *acknowledgement*: the
+/// bytes reached the pane's master, so the pane's echo MUST appear in the
+/// post-cut scrollback exactly once — "the daemon acked it" and "the output
+/// vanished" together is the silent-loss shape this test exists for. A send
+/// whose round trip broke mid-cut (the outgoing daemon exited between connect
+/// and reply) is the retryable half: retrying it after the cut must succeed,
+/// and its echo must then appear at least once (the refused attempt *may* have
+/// landed before the connection broke, so a retried text can legitimately
+/// appear twice — the exactly-once claim is for the sends whose first attempt
+/// was acked).
+///
+/// What removal turns red: a transfer that drops bytes written during the
+/// pause window (an Ok'd send's echo is missing — the per-text assert names the
+/// text); a resumed pump that double-reads (an acked write's echo appears
+/// twice).
+#[test]
+fn a_send_racing_the_cut_is_acked_once_or_refused_as_retryable() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    let socket = temp_socket("stage3-input-race");
+    cleanup(&socket);
+    let mut old = spawn_daemon(&socket, &[], std::process::Stdio::null());
+    wait_serving(&mut old, &socket, Duration::from_secs(10));
+
+    let program = "stty -echo; while IFS= read -r line; do echo \"got:$line\"; done";
+    let reply = spawn_pane(&socket, "p0", "sh", &["-c", program]);
+    assert!(matches!(reply, Message::Ok { .. }), "spawn: {reply:?}");
+
+    // Distinct texts per round trip, so each echo is attributable to its ack.
+    let stop = Arc::new(AtomicBool::new(false));
+    let results: Arc<Mutex<Vec<(String, bool)>>> = Arc::new(Mutex::new(Vec::new()));
+    let (race_socket, race_stop, race_results) =
+        (socket.clone(), Arc::clone(&stop), Arc::clone(&results));
+    let sender = std::thread::spawn(move || {
+        let mut n = 0u64;
+        while !race_stop.load(Ordering::Relaxed) {
+            n += 1;
+            let text = format!("RACE-{n}\n");
+            let ok = matches!(
+                try_round_trip(
+                    &race_socket,
+                    &Message::Send {
+                        v: VERSION,
+                        id: "p0".to_string(),
+                        data: text.clone(),
+                    }
+                ),
+                Ok(Message::Ok { .. })
+            );
+            if let Ok(mut all) = race_results.lock() {
+                all.push((text, ok));
+            }
+        }
+    });
+
+    let mut incoming = spawn_handoff(
+        &socket,
+        &["--handoff-timeout-secs", "20"],
+        std::process::Stdio::null(),
+    );
+    assert!(
+        until(Duration::from_secs(30), || matches!(
+            old.try_wait(),
+            Ok(Some(_))
+        )),
+        "the cut completes"
+    );
+    assert!(
+        !exited_within(&mut incoming, Duration::from_millis(200)),
+        "the incoming daemon is serving"
+    );
+    // A settle so the thread also covers the post-commit daemon, then stop it.
+    std::thread::sleep(Duration::from_millis(800));
+    stop.store(true, Ordering::Relaxed);
+    let _ = sender.join();
+
+    // The retryable half: every send refused during the cut is retried against
+    // the serving daemon and must be accepted this time.
+    let mut accepted: Vec<String> = Vec::new();
+    let mut refused: Vec<String> = Vec::new();
+    {
+        let mut all = results.lock().expect("results lock");
+        for (text, ok) in all.drain(..) {
+            if ok {
+                accepted.push(text);
+            } else {
+                refused.push(text);
+            }
+        }
+    }
+    for text in &refused {
+        let reply = try_round_trip(
+            &socket,
+            &Message::Send {
+                v: VERSION,
+                id: "p0".to_string(),
+                data: text.clone(),
+            },
+        );
+        assert!(
+            matches!(reply, Ok(Message::Ok { .. })),
+            "a send refused by the cut retries successfully: {reply:?}"
+        );
+        accepted.push(text.clone());
+    }
+    assert!(
+        !accepted.is_empty(),
+        "the sender ran and every text was eventually accepted"
+    );
+
+    // Every ack must have produced its echo — acked, never lost. An acked send
+    // was written to the pane's master exactly once, so its echo must appear
+    // exactly once. A *refused* send is retryable: the retry is a fresh write,
+    // and the refused attempt may or may not have landed before the connection
+    // broke — so a retried text appears at least once (never zero: a retry that
+    // was acked must not be lost either), and the exactly-once claim is made
+    // for the sends whose first attempt was acked.
+    let mut acked_first: Vec<String> = Vec::new();
+    {
+        let all = results.lock().expect("results lock");
+        for (text, ok) in all.iter() {
+            if *ok {
+                acked_first.push(format!("got:{}", text.trim_end_matches('\n')));
+            }
+        }
+    }
+    let expected: Vec<String> = accepted
+        .iter()
+        .map(|text| format!("got:{}", text.trim_end_matches('\n')))
+        .collect();
+    let all_lines = read_pane_until(&socket, "p0", Duration::from_secs(15), |lines| {
+        expected
+            .iter()
+            .all(|want| lines.iter().filter(|l| *l == want).count() >= 1)
+    });
+    for want in &acked_first {
+        let count = all_lines.iter().filter(|l| *l == want).count();
+        assert_eq!(
+            count, 1,
+            "the acked send {want:?} is reflected exactly once (acked, never lost)"
+        );
+    }
+    for want in &expected {
+        let count = all_lines.iter().filter(|l| *l == want).count();
+        assert!(
+            count >= 1,
+            "every accepted write — original or retried — is reflected at least once \
+             (accepted, never lost): {want:?}"
+        );
+    }
+    cleanup(&socket);
+}

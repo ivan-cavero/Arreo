@@ -117,9 +117,11 @@ For a real agent, the wait that matters is `arreo wait <id> --state question
 --timeout 5m`: it returns the moment the harness asks something, with the pattern or
 event that decided it, instead of making you poll. `arreo attach <id>` streams a pane's
 output to stdout instead of taking over the terminal; Ctrl-C detaches and the pane keeps
-running. Every verb that talks to a daemon takes `--socket PATH` (after the verb) to
-reach a daemon other than the default one; the purely local verbs (`record`, `replay`,
-`metrics --pid`) do not.
+running. If the daemon is handed over underneath a live attach (`update --server`), the
+client reconnects on its own and the stream resumes at exactly the line where it stopped —
+the transcript is continuous, never a replay. Every verb that talks to a daemon takes
+`--socket PATH` (after the verb) to reach a daemon other than the default one; the purely
+local verbs (`record`, `replay`, `metrics --pid`) do not.
 
 In the TUI: `j`/`k` move, `Enter` attaches, `w` toggles the pane wall, `t` opens
 the theme picker, `/` searches, `?` lists every key on screen, `q` quits. The

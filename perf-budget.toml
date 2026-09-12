@@ -24,6 +24,13 @@ server_rss_10panes_mb = { phase0 = true, target = 100, unit = "MB" }
 per_pane_hot_kb = { phase0 = true, target = 3072, unit = "KB" }
 # State detection latency ≤ 200 ms after output (engine is O(bytes), sync).
 detection_latency_ms = { phase0 = true, target = 200, unit = "ms" }
+# Client reattach across a daemon handoff (T-0038): a live TUI and a live CLI
+# attached through a real handoff must be back on the same pane, same pane id,
+# in under this. Enforced by the `reattach` slice (`cargo xtask e2e --slice
+# reattach`), which reads this row from this file rather than holding a copy —
+# the handoff needs live daemons, which `bench` (a load measurement) does not
+# provide; same reasoning as `reattach_after_absence_s`.
+server_handoff_reattach_s = { phase0 = true, target = 2, unit = "s" }
 # 30-pane sampler sweep ≤ 1% CPU at 1 s cadence → ≤ 10 ms wall.
 sampler_sweep_30panes_ms = { phase0 = true, target = 300, unit = "ms" }
 # VT feed cost: 1-byte feed p99 < 50 ms (guards O(grid-scan) regressions).
@@ -46,7 +53,6 @@ tui_attach_30panes_ms = { phase0 = false, target = 300, unit = "ms" }
 # a relay; the slice is the authority.
 cross_machine_attach_s = { phase0 = false, target = 3, unit = "s" }
 config_sync_s = { phase0 = false, target = 10, unit = "s" }
-server_handoff_reattach_s = { phase0 = false, target = 2, unit = "s" }
 # T-0055 gives this row its mechanism: a machine that was away for weeks
 # re-attaches (dial, authenticate, drain its durable inbox) and is usable again.
 # Asserted by `crates/arreo-relay/tests/inbox.rs`, which reads this row's number
