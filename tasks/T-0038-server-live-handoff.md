@@ -275,9 +275,24 @@ PTY masters over SCM_RIGHTS, re-opens SQLite and serves — a failed step kills 
 - [ ] **Stage 4 — abort leaves the old daemon whole.** Kill -9 the new daemon at three points
       (before fd transfer, mid-transfer, after ack before commit): every pane alive, old daemon
       serving, clients unaware, a retry succeeding — `flock` keeps exactly one serving daemon.
-- [ ] SQLite: old daemon checkpoints WAL and closes, new one re-opens the same file; an audit
-      write during the cut loses nothing and raises no `database is locked`; a corrupt `-wal` heals
-      per T-0018's rule. Windows routes to T-0039 rather than half-implementing this.
+- [ ] SQLite: an audit write during the cut loses nothing and raises no `database is locked`; a
+      corrupt `-wal` heals. Windows routes to T-0039 rather than half-implementing this.
+
+      **Re-scope, recorded rather than silently narrowed:** the clause once read "old daemon
+      checkpoints the WAL and closes, new one re-opens the same file". Stage 1 corrected the ADR on
+      exactly that — there is no long-lived handle to close and no checkpoint to take: the store is
+      opened per operation, and two processes on the file is an existing, supported situation (WAL
+      + 5 s busy timeout) because the CLI already does it while the daemon runs. What remained
+      checkable was the last sentence, and *it is unproven**: no corrupt-`-wal` test exists
+      anywhere, and no "T-0018 rule" for healing is written down — T-0018's file says "corrupt DBs
+      heal aside" with no mechanism and no test. Measured: corrupting a live daemon's `-wal` does
+      not crash it and it keeps serving, but persistence then **silently degrades** (every store
+      open fails, every `if let Ok(store)` swallows it) — a daemon that looks healthy while its
+      audit trail and scrollback quietly stop persisting. That is not healing; it is the
+      degraded-silently failure mode this project keeps refusing. The fix this criterion requires:
+      a corrupt WAL (or DB) is **quarantined** — renamed aside with a loud log and audit line — so
+      the store opens cleanly and persistence resumes, without deleting or guessing at the corrupt
+      file's contents (SQLite cannot recover them anyway; quarantine loses nothing recoverable).
 
 ## Notes
 

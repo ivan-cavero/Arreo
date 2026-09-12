@@ -1,36 +1,35 @@
 ## State snapshot          ← REWRITTEN (not appended) at every checkpoint
-Task: **T-0038 stage 3 — DONE** (`25b8e0a`): clients reattach across the handoff. Stages 1-3 of 5
-done; **stage 4 (abort leaves the old daemon whole) is next, then the SQLite criterion.**
-Where you are: 626 workspace tests / 0 failed; clippy clean on both toolchains; fmt clean; **12
-slices green** (incl. the new `reattach`); bench 6/6; vet 336, deny 4/4, audit 0, check-targets
-PASS/SKIP. The user's T-0036/T-0063 edits remain dirty in the tree, theirs. T-0076 done, T-0079
-filed p1 (the wall poller).
-Next step: **T-0038 stage 4** — kill -9 the new daemon at three points (before fd transfer,
-mid-transfer, after ack before commit): every pane alive, old daemon serving, clients unaware, a
-retry succeeding. Much of this is already proven piecemeal by stage 1-2's abort tests; stage 4's
-job is the **three point-by-point chaos run** against the real binaries and the "clients unaware"
-half through the reattach slice's harness. Note before starting: the ADR's SQLite §4 claim was
-corrected in stage 1 (no checkpoint exists or is needed — WAL + busy timeout, store opened per
-operation); the SQLite criterion likely reduces to a test that an audit write during the cut loses
-nothing, which stage 2's abort tests already cover in spirit.
-Open workers: (none)
+Task: **T-0038 stage 4 (abort leaves the old daemon whole + the SQLite criterion) IN FLIGHT** with
+worker `Stage4Abort`. Stages 1-3 done and pushed; T-0076 done; T-0079 filed p1.
+Where you are: 626 tests / 61 targets, 12 slices green, bench 6/6, all gates green at `a7b239b`.
+The user's T-0036/T-0063 edits remain dirty, theirs.
+Next step: collect `Stage4Abort`, verify its three-point chaos slice against the real binaries and
+the SQLite tests independently, then the battery on the merged tree and commit stage 4.
+Open workers: **Stage4Abort** (the chaos slice + the audit-during-cut test + the corrupt-wal
+quarantine in `arreo-core/src/store.rs`)
 Known broken: T-0063 (CI ubuntu leg — the user is actively working it; do not touch) · Parked:
 T-0048 + T-0036 needs-human (T-0036 now `todo` per the user)
+Stage 4's design, held by the planner:
+- **The three kill points are already proven piecemeal** (abort/resume/paused-window tests); stage
+  4's job is the coherent chaos run — kill -9 a real incoming daemon at three observably distinct
+  moments (before the transfer / at first pause / after the transfer before the commit), asserting
+  the full bundle each time: panes alive + producing, old daemon serving, an attached client
+  unaware, a retry succeeding, exactly one daemon (flock).
+- **The SQLite criterion was re-scoped** (recorded in the task file): the "checkpoints WAL and
+  closes" clause is obsolete (stage 1 corrected the ADR — no checkpoint exists or is needed), and
+  the "corrupt -wal heals per T-0018's rule" clause is **unproven**: no such rule is written and
+  no test exists. Measured: corrupting a live daemon's -wal does not crash it, but persistence
+  silently degrades (every store open fails, every `if let Ok(store)` swallows it) — a daemon that
+  looks healthy while its audit trail and scrollback quietly stop persisting. The fix: a corrupt
+  store is **quarantined on open** (renamed aside, loud log + audit), never deleted, so the next
+  open creates a fresh store and persistence resumes.
 Findings:
-- **A measurement is what finds a TUI bug that no code reading would.** The reconnect loop was
-  correct-looking; the first side-by-side run showed 2.04 s, and the cause (re-subscribed reads
-  sitting until the next tick) was only visible as a number. The fix — a fresh connection polls
-  immediately — is the margin that makes the 2 s budget robust. Honest note: reverting it did not
-  turn the slice red on this box (base latency is low enough that even the unfixed path fits), so
-  the pin is the budget under real load plus the 2.04 s pre-fix measurement, not a mutation.
-- **A client that reconnects from `from_line: 0` would replay the ring** — the absolute cursor
-  plus the daemon's clamp is what makes resume exact (0.341 s, zero duplicates, 98 contiguous
-  lines in the smoke).
-- **"Assert it in bench" was the wrong mechanism for the row, and the codebase's own precedent
-  said so** — the slice is the authority (the second stage criterion that referenced a mechanism
-  that does not fit; both were clarified in the task file rather than silently reinterpreted).
-- **A racing-input test must know about canonical mode**: input to a tty needs its trailing
-  newline or it never reaches the child — a day-saver written into the test's comments.
+- **"Heals per T-0018's rule" was a claim with no rule behind it** — T-0018's file says "corrupt
+  DBs heal aside" with no mechanism and no test. The first probe showed the daemon survives a
+  corrupted -wal but degrades silently, which is exactly the failure mode this project refuses.
+  The criterion now defines the rule (quarantine) instead of referencing one.
+- **The three-point kill test is a timing problem** — the same lesson as stage 2: make each point
+  deterministically observable (immediately / ring-frozen / grace period) rather than racing it.
 ## Event log               ← append-only; newest last; never rewrite
 - 2026-09-10 [turn 1] ledger created; repo at e489fac (docs only); T-0001 + T-0022 (AGENTS.md gardened) done
 - 2026-09-10 [turn 2] T-0002 PTY manager done+pushed (342606c; 9 tests); PROMPT.md v2 synced + ADR 0001 (ef6c595)
@@ -166,3 +165,5 @@ Findings:
 - 2026-09-12 [turn 64] T-0038 stage 3 delegated (`Stage3Clients`): clients reattach across the handoff. Reconnaissance established the design before the worker started: the daemon clamps `from_line` (so an absolute-cursor resume self-heals and cannot panic), the TUI already reconnects with shared backoff and per-pane cursors (unmeasured against the 2 s row), and the **CLI's `attach` is one-shot — the real gap**. The criterion's "assert it in `xtask bench`" collides with the codebase's own precedent (a handoff needs live daemons and a live client; the slice is the authority, reading `server_handoff_reattach_s` from the file) — clarification written into the task file, the second time a stage criterion referenced a mechanism that does not fit. Also noted: reconnecting from `from_line: 0` would duplicate the ring; the absolute cursor is the exact resume.
 
 - 2026-09-13 [turn 65] T-0038 stage 3 done + pushed (`25b8e0a`): clients reattach across the handoff. The CLI's `attach` was a one-shot that died at the cut; it now reconnects with the absolute line count as its cursor (the daemon's `from_line` clamp makes the resume exact — never a replay of the ring), the shared backoff policy, and script contract exit codes (0 pane exited / 1 attach failed / 2 usage / 130 Ctrl-C / 141 SIGPIPE). The TUI's reconnect had a real bug the measurement found: re-subscribed `Read`s sat until the next 1 s tick, worst case 2.04 s over the budget; a fresh connection now polls immediately (0.55-0.65 s after, 13+ runs under 1.55 s). New `xtask/src/reattach_slice.rs` (11 checks, registered) drives a real daemon + pane + CLI attach + TUI on a pty through a real `--handoff-from` cut, measures reattach against `server_handoff_reattach_s` read from perf-budget.toml, flips the row to enforced, asserts the pane id unchanged, and corroborates exactly-once input (33 accepted sends, every echo once). The slice, not bench, is the row's authority — the criterion's "assert it in xtask bench" was clarified into the task file, matching the `reattach_after_absence_s` precedent. Two input-during-cut tests in tests/handoff.rs: a paused-pane send survives exactly once; a racing send is acked once or refused-and-retried (with the canonical-mode newline lesson written into the test). Honest verification note: reverting the TUI fix did not turn the slice red on this box (base latency fits even the unfixed path in 2 s) — the fix is the margin, its pre-fix evidence is the 2.04 s measurement. 626 tests, 12 slices, bench 6/6, all gates green; the user's T-0036/T-0063 left dirty.
+
+- 2026-09-13 [turn 66] T-0038 stage 4 delegated (`Stage4Abort`). Reconnaissance: the three abort points are behaviorally proven piecemeal by stages 1-2's tests, so stage 4's deliverable is the coherent chaos run (kill -9 a real incoming daemon at three observably distinct moments, assert the whole bundle each time) plus the SQLite criterion. The SQLite criterion needed a re-scope, recorded in the task file: the "checkpoints WAL and closes" clause is obsolete (stage 1 corrected the ADR), and "corrupt -wal heals per T-0018's rule" turned out to be a claim with no rule behind it — probed empirically: a corrupted -wal does not crash the daemon but persistence silently degrades (every store open fails, every `if let Ok(store)` swallows it). The criterion now defines the rule: quarantine a corrupt store on open, loudly, never delete it. Also probed: `wal_checkpoint(FULL)` removes the -wal entirely, so a corrupt -wal is the crash-mid-transaction shape.
