@@ -1,19 +1,21 @@
-T-0067 — a self-admitted certificate that nothing can verify
-==========================================================
+T-0067 — pinning has two answers
+=================================
 
-Reproduction (from empty dirs, one box):
-  1. devices list --json -> root R
-  2. relay account add --root-key R -> accepted
-  3. pair (print code) then pair --join (its own code) -> 'paired ... certificate: <path>'
-  4. devices list --socket -> 'no devices paired yet', with TWO certs in identity/devices/
-  5. daemon -> 'relay registration failed: ... certificate signature does not verify
-     under the root key', retrying forever
+Reproduced on a clean box (all stray relays killed first):
 
-Cross-check (the obvious explanation is ruled out):
-  relay.db account.root_key   = b7982e04edd07dc116f300e2c6cf248bb824a7570f841e7cd5b219f70374681a
-  devices list --json .root   = b7982e04edd07dc116f300e2c6cf248bb824a7570f841e7cd5b219f70374681a
-  -> identical. The cert is not signed by the registered root.
+  $ arreo devices list --socket $D/a/fresh.sock
+  no devices paired yet (pair one, or issue from a public key)
 
-Established: issuance path (authority.rs:268 signs with self.root; main.rs:2679 calls it),
-not key resolution. What is NOT established: which of the two differs at issue time, or whether
-the signed payload differs from what DeviceCert::verify recomputes. See the task file.
+  $ arreo machines trust dev_09a94313... --yes --socket $D/a/fresh.sock
+  machines trust: dev_09a94313... is not pinned on this machine, so a grant would
+  do nothing (it could not authenticate here). Pin it first: ...
+
+Both false: the certificate is on disk, verifies under this machine's root, and the
+authority's index (what the handshake consults) includes it -- a daemon at that same
+socket authenticates the device normally.
+
+Cause: authorization reads store + disk ('reload' adds disk certs to the index and says
+so), while 'devices list' and 'machines trust' read DeviceAuthority::devices() = store only.
+
+Harness note: the earlier 'certificate does not verify' report was a leaked-relay bug in
+the exit-criterion script (fixed ports, no kill), not the product. See the task file.
