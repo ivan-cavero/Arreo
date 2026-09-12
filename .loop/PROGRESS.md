@@ -1,26 +1,30 @@
 ## State snapshot          ← REWRITTEN (not appended) at every checkpoint
-Task: **T-0064 · the remote refusal hang — DONE.** The mesh slice's finding is fixed: the read
-after Hello is bounded (5 s, chosen so the Noise handshake's bound plus this one stays inside
-§5's 10 s row), on both transports, proved load-bearing by mutation.
-Where you are: 473 workspace tests green; clippy clean on both the pinned and the CI toolchain;
-fmt clean; `--slice mesh` 16 passed / 2 skipped / 0 failed in ~29 s. T-0047 (the mesh slice) is
-done and pushed. The skip count in the mesh slice is now *informative*: each skip names the task
-that closes it.
-Next step: **T-0065** (p2 — the daemon's refusal frame is written but never reaches a remote
-peer; the hypothesis and the settling test are in the file). It is the natural continuation:
-T-0064's fix turned a hang into a sentence, and T-0065 is why the sentence is missing. Then
-T-0063 needs repo admin (CI logs); T-0048 waits on a human.
+Task: **T-0065 · the lost refusal frame — DONE.** `RelayStream`'s drop aborted the one task that
+hands bytes to the session, so the frame written immediately before closing (every refusal path)
+never arrived. It now closes the write half and lets the task drain; the `JoinHandle` is gone and
+the type is simpler.
+Where you are: **both defects the mesh slice found are fixed and pushed** — T-0064 (the hang) and
+T-0065 (the lost frame). T-0047's mesh slice now PASSES "an untrusted device is refused with the
+actionable message": the operator gets `arreo machines trust … --yes`, the sentence T-0046 shipped
+for that moment. The slice's split assertion collapsed back into one, and it runs in 11.9 s
+instead of 29 s.
+474 workspace tests green; clippy clean on both toolchains; fmt clean; 10 slices green
+(relay 20, mesh 16/1 skip, chaos 8, theme 27, tui 20, api, compat, lifecycle 2, persistence 3,
+enforcement); vet 336, deny 4/4, audit 0, check-targets PASS/SKIP.
+Next step: **T-0063** (p1 — CI has never passed; needs repo admin for the ubuntu log) is the
+highest-priority open task but is blocked on a human. Otherwise T-0048's launch decision is the
+other human gate. With both parked, the next actionable work is drafting Phase 3's queue from
+ROADMAP (per §3: a phase boundary is a gate, not a wall).
 Open workers: (none)
-Known broken: CI red on the ubuntu test leg (T-0063) · Parked: T-0048 needs-human (launch)
+Known broken: CI red on the ubuntu test leg (T-0063) · Parked: T-0048 needs-human (launch decision)
 Findings:
-- **A hang is worse than a wrong message**: a wrong message can be read. Bounding the read is
-  what turned this from a mystery into a named failure — and then into T-0065.
-- **A bound must fit the budget it runs inside**: the post-Hello bound runs after the Noise
-  handshake, so 5 s + 5 s keeps §5's 10 s row; 10 s would have spent it all on the last step.
-- **Tests grade the harness when they can only fail by hanging** — so the regression test asserts
-  the *shape* of the failure, and mutation (not the test) is what proves the hang.
-- **Fixing one bug well exposes the next one**: T-0065 existed before this turn and was invisible
-  because the hang hid it.
+- **A destructor that aborts work is a destructor that loses data.** `Drop` called
+  `forward.abort()`, killing the task holding the last frame. Closing instead of aborting lets the
+  task finish, and the existing 300 ms grace pause — which had been useless — is what gives it room.
+- **A local-only test suite cannot see a transport-shaped bug**: T-0046's refusals were all tested
+  on a socket with no forwarding task, so the sentence never had to travel.
+- **Two bugs can hide each other**: the hang (T-0064) masked the loss (T-0065). Fixing the bound
+  first is what turned silence into a sentence.
 ## Event log               ← append-only; newest last; never rewrite
 - 2026-09-10 [turn 1] ledger created; repo at e489fac (docs only); T-0001 + T-0022 (AGENTS.md gardened) done
 - 2026-09-10 [turn 2] T-0002 PTY manager done+pushed (342606c; 9 tests); PROMPT.md v2 synced + ADR 0001 (ef6c595)
@@ -108,3 +112,5 @@ Findings:
 - 2026-09-12 [turn 55] T-0047 done: the mesh e2e slice. `xtask/src/mesh_slice.rs` (registered, CI step, hint updated) spawns two real daemons + a relay + a daemon-less client on loopback: directory, attach-by-name in 203-233 ms against the 3 s budget, local/remote payload parity, the pin→cut-grant→refuse→grant→attach trust sequence, and node isolation (beta's death leaves alpha's pane untouched). `xtask/src/chaos/mesh_reconnect.rs` kills beta ten times and asserts alpha is intact and uncontaminated. 15 passed, 2 skipped, 0 failed, 21.8 s. Three fixture findings (daemon and CLI share a device id so remote verbs need a daemon-less client; a device needs pinning on the peer, and refusals spend the relay handshake budget; `devices issue` grants on issue) and one product defect filed as **T-0064** (a remote trust refusal at Hello hangs the client — the daemon refuses correctly, the client prints nothing, because the post-Hello read has no bound). Also filed earlier this turn: T-0062 (Windows ungated unix import, fixed) and T-0063 (CI investigation). 472 workspace tests, clippy clean on both toolchains, fmt clean, evidence `.loop/evidence/T-0047/`.
 
 - 2026-09-12 [turn 56] T-0064 done: the post-Hello read in `Client::connect_to` is bounded by `HANDSHAKE_REPLY_TIMEOUT` (5 s, chosen so the Noise handshake bound plus this one stays inside §5's 10 s row), covering both transports. Proved load-bearing by mutation (without the timeout the new regression test hangs past 60 s; with it, 5.00 s). The fix immediately exposed **T-0065**: the daemon's refusal frame is written, flushed and never arrives over the relay — the client now reports a bounded, named failure instead of hanging, which is how the missing sentence became visible. The mesh slice splits the two facts (bounded failure PASS, missing sentence SKIP naming T-0065). 473 workspace tests, clippy clean on both toolchains, fmt clean, evidence `.loop/evidence/T-0064/`.
+
+- 2026-09-12 [turn 57] T-0065 done: `RelayStream::drop` no longer aborts its forwarding task — it closes the write half and lets the task drain, so a frame written immediately before closing (every refusal path) reaches the peer. The `JoinHandle` is gone and the type is simpler (`sink: Option<DuplexStream>`). Root cause: `forward.abort()` killed the one task that hands bytes to the session, so anything buffered in the duplex died with it; locally there is no such task, which is why T-0046's all-local refusal tests never saw it. Proved by `a_frame_written_immediately_before_closing_reaches_the_peer` (write, flush, shutdown, drop, over a real relay) — fails with the abort restored, passes without it. End to end, T-0047's mesh slice now PASSES the refusal assertion (the operator gets `arreo machines trust … --yes`), collapsing the two split checks back into one and dropping the slice from 29 s to 11.9 s. Audited every write-then-close caller: only `serve_session`'s wrapper, reached by both relay consumers through the same drop. 474 workspace tests, clippy clean on both toolchains, 10 slices green, vet/deny/audit/check-targets clean, evidence `.loop/evidence/T-0065/`.
