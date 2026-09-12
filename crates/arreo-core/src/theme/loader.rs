@@ -344,9 +344,11 @@ mod tests {
             .theme_with_depth("mine", Variant::Dark, Depth::Truecolor)
             .expect("loads");
         assert_eq!(theme.color("primary"), Color::Rgb(0xff, 0x00, 0x00));
+        // The rest is the base look — read from the base theme rather than
+        // re-typed here, so a palette change is one edit in one place.
         assert_eq!(
             theme.color("done"),
-            Color::Rgb(0x9e, 0xce, 0x6a),
+            Theme::arreo(Depth::Truecolor).color("done"),
             "base inherited"
         );
         std::fs::remove_dir_all(&dir).ok();

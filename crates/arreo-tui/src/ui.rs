@@ -1,18 +1,39 @@
 //! TUI rendering + event loop (T-0015): sidebar + focused pane, mouse-first.
 //!
-//! Layout: left sidebar (state groups with dots + RAM bars) | right region.
-//! The right region is either the focused pane (scrollback text) or the pane
-//! wall (every pane tiled, focused one highlighted).
+//! Layout: left sidebar (state groups with dots + labels + RAM bars) | right
+//! region. The right region is either the focused pane (scrollback text) or the
+//! pane wall (every pane tiled, focused one highlighted).
 //! Keys: j/k or arrows (move), Enter (attach/focus), / (search), q (quit),
-//! w (wall ↔ focus), t (theme picker), [ / ] (sidebar narrower/wider),
-//! Tab (cycle panes). The `/theme` command in the search prompt opens the
-//! same picker.
+//! w (wall ↔ focus), t (theme picker), ? (key list), [ / ] (sidebar
+//! narrower/wider), Tab (cycle panes), PgUp/PgDn/Home/End (scrollback).
+//! The `/theme` command in the search prompt opens the same picker.
 //! Mouse: click a sidebar row or a wall tile to focus it, drag the sidebar
 //! border to resize the split.
 //! Rendering is delta-driven: only changed lines re-render (the model's
 //! dirty cache); steady state redraws chrome only.
+//!
+//! **Two facts, two signals (T-0076).** The *focus* is where the keyboard is
+//! (a sidebar row, or the pane region after `Enter`); the *selection* is which
+//! pane is attached and streaming. They are drawn differently on purpose — the
+//! cursor row carries `▶` and inverse video, the attached row carries `▸` in
+//! `primary-strong` (BRAND §2's selection color), the focused region's border
+//! is `primary` (BRAND §2: cyan is "active states") — because a UI where the
+//! two look alike is a UI where the user cannot tell what a keypress will do.
+//!
+//! **State is never carried by color alone.** Every state renders a distinct
+//! dot glyph *and* its name, and the state's label falls back to the neutral
+//! when its hue cannot carry WCAG AA as text (see `Theme::state_label_color`).
+//! A `NO_COLOR` frame is fully readable; the captures under
+//! `.loop/evidence/T-0076/` are the proof, and the depth tests are the gate.
+//!
+//! **Motion is optional.** `question` pulses through the terminal's own slow
+//! blink (free: no frames, and it survives a static screenshot as a style).
+//! `tui.reduce_motion` — and `NO_COLOR`, which implies it — turns that off and
+//! leaves the dot shape and the label, which is what makes the state readable
+//! in the first place.
 
 use crate::model::{Focus, Model};
+use crate::settings::Settings;
 use crate::theme::ThemeState;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
@@ -34,6 +55,73 @@ pub const SIDEBAR_MIN: u16 = 18;
 /// Upper bound keeps the sidebar from swallowing the pane region.
 pub const SIDEBAR_MAX: u16 = 60;
 pub const SIDEBAR_DEFAULT: u16 = 28;
+/// Columns the pane region is guaranteed, whatever the sidebar wants (T-0076):
+/// a terminal too narrow for both gets a proportionally smaller sidebar rather
+/// than a clipped pane.
+pub const PANE_MIN: u16 = 24;
+/// The narrowest sidebar that still renders a legible row (a glyph, an id, a
+/// RAM reading). Below this the sidebar is gone and there is nothing to show.
+pub const SIDEBAR_FLOOR: u16 = 12;
+
+/// The key list (`?`), as (keys, what they do). One place: the on-screen list
+/// and the status line's legend are the same bindings the handler implements,
+/// and a binding added without a line here is a binding nobody can find.
+const KEY_LIST: &[(&str, &str)] = &[
+    ("j/k ↑/↓", "move the cursor"),
+    ("Enter", "attach the pane (or open the wall tile)"),
+    ("Tab", "next pane"),
+    ("w", "wall ↔ focus"),
+    ("t", "theme picker"),
+    ("/", "search the transcript"),
+    ("[ ]", "sidebar narrower / wider"),
+    ("PgUp/PgDn", "scroll the transcript"),
+    ("Home/End", "oldest line / live output"),
+    ("?", "this list"),
+    ("q / Esc", "quit"),
+];
+
+/// The keyboard cursor's glyph (a sidebar row), and the attached pane's.
+const FOCUS_CURSOR: &str = "▶";
+const SELECTION_MARKER: &str = "▸";
+/// Columns a pane id gets before it is cut. Long ids are still matched by
+/// their prefix; the full id is in the pane's title when attached.
+const ID_WIDTH: usize = 9;
+/// Indent of a pane's question line: the same column the pane ids start at
+/// (the two-glyph gutter plus a space), so the question reads as a line *of*
+/// that pane rather than as a new one (T-0076).
+const ASK_INDENT: &str = "   ";
+
+/// How many columns the sidebar actually gets: what the user asked for,
+/// clamped to what this terminal can pay for (T-0076).
+///
+/// A terminal too narrow for [`SIDEBAR_MIN`] plus [`PANE_MIN`] shrinks the
+/// sidebar first and never below [`SIDEBAR_FLOOR`] — the alternative is a
+/// sidebar that eats the pane region (the "glitch" this clamps out), and at
+/// 80×24 there is room for both with columns to spare.
+#[must_use]
+pub fn sidebar_extent(width: u16, desired: u16) -> u16 {
+    let cap = width
+        .saturating_sub(PANE_MIN)
+        .max(SIDEBAR_FLOOR.min(width.saturating_sub(1)));
+    desired.clamp(SIDEBAR_MIN, SIDEBAR_MAX).min(cap)
+}
+
+/// The status bar's key legend, in as much detail as the terminal can pay for.
+///
+/// A status line that clips mid-word teaches nothing, so the legend steps down
+/// with the width instead of being truncated (T-0076).
+#[must_use]
+pub fn key_hints(columns: u16) -> &'static str {
+    if columns >= 96 {
+        "j/k move · Enter attach · Tab cycle · w wall · t theme · / search · ? keys · q quit"
+    } else if columns >= 64 {
+        "j/k · Enter · Tab · w wall · t theme · / find · ? keys · q quit"
+    } else if columns >= 40 {
+        "j/k · Enter · w · t · / · ? · q"
+    } else {
+        "? keys · q quit"
+    }
+}
 
 pub struct App {
     pub model: Model,
@@ -42,10 +130,14 @@ pub struct App {
     /// machine's panes, so a per-row column would be the same fact N times.
     pub session: String,
     pub theme: ThemeState,
+    /// `[tui]` settings for this run (T-0076): today, whether motion is off.
+    pub settings: Settings,
     pub search: String,
     pub searching: bool,
     pub status: String,
     pub view: ViewMode,
+    /// The key list is up (`?`). It consumes input until dismissed.
+    pub help: bool,
     /// Sidebar width in columns, drag- or key-resizable.
     pub sidebar_width: u16,
     /// True while the user holds the mouse on the sidebar border.
@@ -115,10 +207,12 @@ impl App {
             model: Model::new(),
             session: "this machine · socket".to_string(),
             theme: ThemeState::new(),
+            settings: Settings::default(),
             search: String::new(),
             searching: false,
             status: "connecting…".to_string(),
             view: ViewMode::Focus,
+            help: false,
             sidebar_width: SIDEBAR_DEFAULT,
             dragging: false,
             screen_rows: 30,
@@ -138,10 +232,16 @@ impl App {
             height: area.height.saturating_sub(1),
             ..area
         };
-        let sidebar = self.sidebar_width.min(area.width.saturating_sub(10));
+        // The sidebar degrades by shrinking, never by eating the pane region
+        // (T-0076): `sidebar_extent` clamps what the user asked for to what
+        // this terminal can pay for.
+        let sidebar = sidebar_extent(area.width, self.sidebar_width);
         let chunks = Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([Constraint::Length(sidebar), Constraint::Min(10)])
+            .constraints([
+                Constraint::Length(sidebar),
+                Constraint::Min(area.width.saturating_sub(sidebar)),
+            ])
             .split(body);
         self.render_sidebar(frame, chunks[0]);
         match self.view {
@@ -151,7 +251,44 @@ impl App {
         if let Some(picker) = self.picker.clone() {
             self.render_picker(frame, area, &picker);
         }
+        if self.help {
+            self.render_help(frame, area);
+        }
         self.render_status(frame, area);
+    }
+
+    /// The key list (`?`): every binding, on screen, so the TUI is complete
+    /// without the docs (T-0076). Rendered over a cleared box so the frame
+    /// behind it cannot be mistaken for the list.
+    fn render_help(&self, frame: &mut Frame, area: Rect) {
+        let lines: Vec<Line> = KEY_LIST
+            .iter()
+            .map(|(keys, what)| {
+                Line::from(vec![
+                    Span::styled(format!(" {keys:<11}"), self.theme.primary_style()),
+                    Span::styled(*what, self.theme.text_style()),
+                ])
+            })
+            .collect();
+        let width = 46.min(area.width.saturating_sub(4));
+        let height = (lines.len() as u16 + 2).min(area.height.saturating_sub(2));
+        let overlay = Rect {
+            x: area.x + (area.width.saturating_sub(width)) / 2,
+            y: area.y + (area.height.saturating_sub(height)) / 2,
+            width,
+            height,
+        };
+        frame.render_widget(ratatui::widgets::Clear, overlay);
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(self.theme.color("borderActive")))
+            .title("keys")
+            .title_style(self.theme.text_style())
+            .style(Style::default().bg(self.theme.color("backgroundPanel")));
+        let paragraph = Paragraph::new(lines)
+            .block(block)
+            .style(self.theme.text_style());
+        frame.render_widget(paragraph, overlay);
     }
 
     /// Theme picker overlay: names, the current marker, and any load error.
@@ -209,7 +346,13 @@ impl App {
         frame.render_widget(list, overlay);
     }
 
-    /// Pane wall: every pane tiled in a near-square grid, focused highlighted.
+    /// Pane wall: every pane tiled in a near-square grid, the cursor tile
+    /// highlighted.
+    ///
+    /// The wall's keyboard cursor *is* the attached pane (there is one
+    /// highlighted tile, and j/k/Tab move it), so the marker is the same
+    /// `primary` border the focus view uses for "the keyboard is here" — with
+    /// the `▶` glyph in the title as the shape that survives NO_COLOR.
     fn render_wall(&self, frame: &mut Frame, area: Rect) {
         let panes = self.model.panes();
         if panes.is_empty() {
@@ -219,7 +362,8 @@ impl App {
                     Block::default()
                         .borders(Borders::ALL)
                         .border_style(self.theme.border_style())
-                        .title("wall"),
+                        .title("wall")
+                        .title_style(self.theme.text_style()),
                 );
             frame.render_widget(empty, area);
             return;
@@ -238,15 +382,29 @@ impl App {
                 let Some(pane) = panes.get(r * cols + c) else {
                     continue;
                 };
-                let focused = self.model.focused_id() == Some(pane.id.as_str());
+                let cursor = self.model.focused_id() == Some(pane.id.as_str());
+                // Title = dot shape + id + the state's own name: the tile says
+                // what it is with no color at all, and the cursor glyph is a
+                // shape rather than a hue.
+                let title = format!(
+                    "{} {} [{}]{}",
+                    state_dot(pane.state),
+                    pane.id,
+                    pane.state,
+                    if cursor {
+                        format!(" {FOCUS_CURSOR}")
+                    } else {
+                        String::new()
+                    }
+                );
                 let block = Block::default()
                     .borders(Borders::ALL)
-                    .title(format!("{} [{}]", pane.id, pane.state))
-                    .title_style(Style::default().fg(self.theme.state_color(pane.state)));
-                let block = if focused {
+                    .title(title)
+                    .title_style(self.theme.state_label_style(pane.state));
+                let block = if cursor {
                     block.border_style(
                         Style::default()
-                            .fg(self.theme.color("borderActive"))
+                            .fg(self.theme.color("primary"))
                             .add_modifier(Modifier::BOLD),
                     )
                 } else {
@@ -265,40 +423,64 @@ impl App {
 
     fn render_sidebar(&self, frame: &mut Frame, area: Rect) {
         let mut items = Vec::new();
+        let cursor = self.model.cursor_id();
         for (state, ids) in self.model.sidebar_groups() {
-            let dot = state_dot(state);
-            let color = self.theme.state_color(state);
-            // A waiting agent pulses: the terminal's own slow blink, so the
-            // attention cue costs no frames and survives a static screenshot.
-            let mut style = Style::default().fg(color).add_modifier(Modifier::BOLD);
-            if state == "question" {
-                style = style.add_modifier(Modifier::SLOW_BLINK);
-            }
-            items.push(ListItem::new(Line::from(vec![Span::styled(
-                format!("{dot} {state}"),
-                style,
-            )])));
+            // The group header is the state's *label*: a distinct dot shape and
+            // the state's own name, so the row says what it is with no color at
+            // all (T-0076, criterion 2). The hue is a second channel, not the
+            // only one — and the label steps to the neutral when the hue cannot
+            // carry AA as text (`state_label_color`).
+            // A waiting agent pulses — the terminal's own slow blink, so the
+            // attention cue costs no frames and survives a static screenshot as
+            // a style. `tui.reduce_motion` (and NO_COLOR, which implies it)
+            // turns it off; the dot shape and the label stay, which is what
+            // makes the state readable at all (T-0076).
+            let label = if state == "question" && !self.settings.reduce_motion {
+                self.theme
+                    .state_label_style(state)
+                    .add_modifier(Modifier::SLOW_BLINK)
+            } else {
+                self.theme.state_label_style(state)
+            };
+            items.push(ListItem::new(Line::from(vec![
+                Span::styled(
+                    format!("  {} ", state_dot(state)),
+                    Style::default().fg(self.theme.state_color(state)),
+                ),
+                Span::styled(state, label),
+            ])));
             for id in ids {
                 let pane = self.model.panes().iter().find(|p| p.id == id);
-                let (ram, marker) = match pane {
-                    Some(p) => (
-                        p.ram_kb,
-                        if self.model.focused_id() == Some(&id) {
-                            "▸"
-                        } else {
-                            " "
-                        },
-                    ),
-                    None => (0, " "),
+                let ram = pane.map_or(0, |p| p.ram_kb);
+                // Two independent facts, two glyphs (T-0076): `▶` is where the
+                // keyboard is, `▸` is which pane is attached and streaming. A
+                // frame that collapsed them could not show focus at all, and a
+                // keypress would act somewhere the user cannot see.
+                let here = if cursor == Some(id.as_str()) {
+                    FOCUS_CURSOR
+                } else {
+                    " "
+                };
+                let attached = if self.model.focused_id() == Some(id.as_str()) {
+                    SELECTION_MARKER
+                } else {
+                    " "
+                };
+                let row_style = if cursor == Some(id.as_str()) {
+                    // Inverse video: the focus survives a NO_COLOR terminal and
+                    // a 16-color one, where a hue difference might not.
+                    self.theme.text_style().add_modifier(Modifier::REVERSED)
+                } else {
+                    self.theme.text_style()
                 };
                 let bar = ram_bar(ram);
                 let human = human_ram(ram);
                 items.push(ListItem::new(Line::from(vec![
                     Span::styled(
-                        format!("{marker} {id:<9}{human:>6}"),
-                        self.theme.text_style(),
+                        format!("{here}{attached} {id:<ID_WIDTH$}{human:>6}"),
+                        row_style,
                     ),
-                    Span::styled(bar, Style::default().fg(color)),
+                    Span::styled(bar, Style::default().fg(self.theme.state_color(state))),
                 ])));
                 // **What it is asking (T-0061).** Indented under the pane, so the
                 // operator reads "which agent, waiting for what" as one thing —
@@ -306,7 +488,7 @@ impl App {
                 // over and look at the terminal.
                 if let Some(asking) = pane.and_then(|p| p.asking.as_deref()) {
                     items.push(ListItem::new(Line::from(Span::styled(
-                        format!("    {}", truncate(asking, ask_width(area.width))),
+                        format!("{ASK_INDENT}{}", truncate(asking, ask_width(area.width))),
                         self.theme.muted_style(),
                     ))));
                 }
@@ -349,17 +531,37 @@ impl App {
                         pane.lines[..end].to_vec()
                     };
                     let graph = sparkline(&pane.ram_history);
-                    let title = if self.scroll > 0 {
-                        format!("{} [{}] ↑{} {}", pane.id, pane.state, self.scroll, graph)
+                    // The title carries the state's dot shape and its name, so
+                    // the reading view says what it is without color too.
+                    let marker = if self.model.focus_is_pane() {
+                        format!("{FOCUS_CURSOR} ")
                     } else {
-                        format!("{} [{}] {}", pane.id, pane.state, graph)
+                        String::new()
+                    };
+                    let title = if self.scroll > 0 {
+                        format!(
+                            "{marker}{} {} [{}] ↑{} {}",
+                            state_dot(pane.state),
+                            pane.id,
+                            pane.state,
+                            self.scroll,
+                            graph
+                        )
+                    } else {
+                        format!(
+                            "{marker}{} {} [{}] {}",
+                            state_dot(pane.state),
+                            pane.id,
+                            pane.state,
+                            graph
+                        )
                     };
                     (title, visible)
                 }
                 None => ("(no pane)".to_string(), Vec::new()),
             },
             None => (
-                "(no focus — Enter on a sidebar row)".to_string(),
+                "(no pane attached — Enter on a sidebar row)".to_string(),
                 Vec::new(),
             ),
         };
@@ -367,10 +569,21 @@ impl App {
             .iter()
             .map(|l| Line::from(l.as_str()))
             .collect::<Vec<_>>();
+        // **Focus, not selection (T-0076).** This border is `primary` (BRAND
+        // §2: cyan is active states) exactly when the keyboard is in the pane
+        // region; while the cursor is in the sidebar the border is the plain
+        // hairline, so the two facts never look alike.
+        let border = if self.model.focus_is_pane() {
+            Style::default()
+                .fg(self.theme.color("primary"))
+                .add_modifier(Modifier::BOLD)
+        } else {
+            self.theme.border_style()
+        };
         let paragraph = Paragraph::new(text).style(self.theme.text_style()).block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_style(self.theme.border_style())
+                .border_style(border)
                 .title(title)
                 .title_style(self.theme.text_style()),
         );
@@ -396,8 +609,17 @@ impl App {
                 hits.len()
             )
         } else {
-            self.status.clone()
+            // Connection/daemon status *and* the key legend: the keys are the
+            // part that must not be clipped away, so they come last and the
+            // whole line is cut to the terminal (T-0076).
+            let hints = key_hints(area.width);
+            if self.status.is_empty() {
+                hints.to_string()
+            } else {
+                format!("{} · {hints}", self.status)
+            }
         };
+        let text = truncate(&text, usize::from(area.width));
         let status = Paragraph::new(text).style(self.theme.text_style()).block(
             Block::default().style(Style::default().bg(self.theme.color("backgroundPanel"))),
         );
@@ -453,8 +675,33 @@ impl App {
             }
             return true;
         }
+        if self.help {
+            // The key list is modal like the picker: any dismissal key closes
+            // it, and nothing behind it can be triggered by accident.
+            match code {
+                K::Esc | K::Char('q') | K::Char('?') => self.help = false,
+                _ => {}
+            }
+            return true;
+        }
         match code {
-            K::Char('q') | K::Esc => false,
+            K::Char('q') => false,
+            K::Esc => {
+                // Progressive dismissal, which is what the status line already
+                // promises: an applied search is what Esc clears first, and
+                // only an empty screen means "quit". A hint that lies about
+                // what a key does is worse than no hint (T-0076).
+                if self.search.is_empty() {
+                    false
+                } else {
+                    self.search.clear();
+                    true
+                }
+            }
+            K::Char('?') => {
+                self.help = true;
+                true
+            }
             K::Char('t') => {
                 self.open_picker();
                 true
@@ -491,22 +738,33 @@ impl App {
                 true
             }
             K::Char('j') | K::Down => {
-                self.model.focus_next();
-                self.scroll = 0;
+                self.move_cursor(1);
                 true
             }
             K::Char('k') | K::Up => {
-                self.model.focus_prev();
-                self.scroll = 0;
+                self.move_cursor(-1);
                 true
             }
             K::Enter => {
-                if let Focus::Sidebar(i) = self.model.focus() {
-                    let ids: Vec<String> =
-                        self.model.panes().iter().map(|p| p.id.clone()).collect();
-                    if let Some(id) = ids.get(i) {
-                        self.model.focus_pane(id);
-                        self.scroll = 0;
+                match self.view {
+                    // In the wall, Enter opens the highlighted tile full-height:
+                    // the wall is the overview and the reading view is one key
+                    // away, which is what the tile was for.
+                    ViewMode::Wall => {
+                        if self.model.focused_id().is_some() {
+                            self.view = ViewMode::Focus;
+                            self.model.focus_pane_view();
+                        }
+                    }
+                    ViewMode::Focus => {
+                        if let Focus::Sidebar(i) = self.model.focus() {
+                            let ids: Vec<String> =
+                                self.model.panes().iter().map(|p| p.id.clone()).collect();
+                            if let Some(id) = ids.get(i) {
+                                self.model.focus_pane(id);
+                                self.scroll = 0;
+                            }
+                        }
                     }
                 }
                 true
@@ -517,12 +775,43 @@ impl App {
                 true
             }
             K::Tab => {
-                self.model.focus_next();
-                self.scroll = 0;
+                self.move_cursor(1);
                 true
             }
             _ => true,
         }
+    }
+
+    /// Move the keyboard cursor: through the sidebar in the focus view, through
+    /// the wall's tiles in the wall view (where the highlighted tile is also
+    /// the attached one, so the cursor is never invisible).
+    fn move_cursor(&mut self, delta: i32) {
+        if self.view == ViewMode::Wall {
+            let ids: Vec<String> = self.model.panes().iter().map(|p| p.id.clone()).collect();
+            if ids.is_empty() {
+                return;
+            }
+            let next = match self
+                .model
+                .focused_id()
+                .and_then(|id| ids.iter().position(|candidate| candidate == id))
+            {
+                Some(i) if delta >= 0 => (i + 1) % ids.len(),
+                Some(i) => (i + ids.len() - 1) % ids.len(),
+                None if delta >= 0 => 0,
+                None => ids.len() - 1,
+            };
+            let id = ids[next].clone();
+            self.model.focus_pane(&id);
+            self.scroll = 0;
+            return;
+        }
+        if delta >= 0 {
+            self.model.focus_next();
+        } else {
+            self.model.focus_prev();
+        }
+        self.scroll = 0;
     }
 
     /// Open the theme picker over every theme the catalog found.
@@ -672,7 +961,7 @@ fn state_dot(state: &str) -> &'static str {
 /// is cut with an ellipsis rather than wrapped — a wrapped question would push
 /// every pane below it off the screen, and the full text is in the pane view.
 fn ask_width(sidebar_width: u16) -> usize {
-    usize::from(sidebar_width).saturating_sub(2 + 4 + 1)
+    usize::from(sidebar_width).saturating_sub(2 + ASK_INDENT.len() + 1)
 }
 
 /// Cut a line to `width` columns, marking that it was cut.

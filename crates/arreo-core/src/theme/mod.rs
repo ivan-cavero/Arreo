@@ -10,6 +10,7 @@
 //! merges theme files (built-in → user → project → cwd), and [`Theme`] is
 //! what the UI consumes.
 
+pub mod brand;
 pub mod color;
 pub mod loader;
 pub mod schema;
@@ -53,9 +54,16 @@ impl Theme {
     /// from, and the look that ships in the binary.
     #[must_use]
     pub fn arreo(depth: Depth) -> Self {
+        Self::arreo_variant(Variant::Dark, depth)
+    }
+
+    /// The same, in an explicit variant (the brand palette carries both from
+    /// BRAND §2's derivation rule).
+    #[must_use]
+    pub fn arreo_variant(variant: Variant, depth: Depth) -> Self {
         let catalog = Catalog::builtin();
         catalog
-            .theme_with_depth(BASE_THEME, Variant::Dark, depth)
+            .theme_with_depth(BASE_THEME, variant, depth)
             .expect("the arreo built-in always loads")
     }
 
@@ -101,7 +109,29 @@ impl Theme {
             "done" => self.color("done"),
             "idle" => self.color("idle"),
             "question" => self.color("question"),
+            // BRAND §2 lists `error` as a state color, so the board's language
+            // includes it: an error message is a state, and painting it muted
+            // would be the same gray as `unknown`.
+            "error" => self.color("error"),
             _ => self.color("textMuted"),
+        }
+    }
+
+    /// The color a state's **label** is painted in (T-0076): the state's own
+    /// hue when that hue carries WCAG AA as text on this theme's background,
+    /// `textMuted` when it does not.
+    ///
+    /// A state dot may be any hue the brand likes — it is a graphic, judged at
+    /// 3:1 (§1.4.11). A state *label* is text, judged at 4.5:1, and one state
+    /// hue (BRAND §2's muted `idle`, 3.5:1 on the dark page) cannot carry it.
+    /// Rather than repaint the brand's color, the label steps to the neutral
+    /// that can: the state stays readable and the dot keeps its meaning.
+    #[must_use]
+    pub fn state_label_color(&self, state: &str) -> Color {
+        let own = self.state_color(state);
+        match own.contrast_ratio(self.color("background")) {
+            Some(ratio) if ratio < brand::AA_TEXT => self.color("textMuted"),
+            _ => own,
         }
     }
 
@@ -206,13 +236,23 @@ mod tests {
     #[test]
     fn arreo_theme_defines_the_state_language() {
         let theme = Theme::arreo(Depth::Truecolor);
-        assert_eq!(theme.color("primary"), Color::Rgb(0x7d, 0xcf, 0xff));
+        assert_eq!(theme.color("primary"), Color::Rgb(0x6f, 0xd3, 0xe8));
         assert_eq!(theme.state_color("question"), theme.color("question"));
-        assert_eq!(theme.state_color("working"), Color::Rgb(0x7d, 0xcf, 0xff));
-        assert_eq!(theme.state_color("done"), Color::Rgb(0x9e, 0xce, 0x6a));
-        assert_eq!(theme.state_color("blocked"), Color::Rgb(0xe0, 0xaf, 0x68));
+        assert_eq!(theme.state_color("working"), Color::Rgb(0x6f, 0xd3, 0xe8));
+        assert_eq!(theme.state_color("question"), Color::Rgb(0xe8, 0xb4, 0x5a));
+        assert_eq!(theme.state_color("done"), Color::Rgb(0x8f, 0xd1, 0x9e));
+        assert_eq!(theme.state_color("blocked"), Color::Rgb(0xff, 0x9e, 0x64));
         // An unknown state is muted, not a panic.
         assert_eq!(theme.state_color("nonsense"), theme.color("textMuted"));
+        // Every state BRAND §2 names is a distinct hue — the state colors are
+        // the product's language, so two of them sharing a value would make
+        // the board unreadable at a glance.
+        let states = ["working", "question", "blocked", "done", "error", "idle"];
+        for (i, a) in states.iter().enumerate() {
+            for b in &states[i + 1..] {
+                assert_ne!(theme.state_color(a), theme.state_color(b), "{a} == {b}");
+            }
+        }
     }
 
     #[test]
@@ -220,7 +260,7 @@ mod tests {
         let theme = Theme::arreo(Depth::Ansi256);
         assert!(matches!(theme.color("primary"), Color::Ansi(_)));
         let truecolor = theme.with_depth(Depth::Truecolor);
-        assert_eq!(truecolor.color("primary"), Color::Rgb(0x7d, 0xcf, 0xff));
+        assert_eq!(truecolor.color("primary"), Color::Rgb(0x6f, 0xd3, 0xe8));
         let no_color = theme.with_depth(Depth::NoColor);
         assert_eq!(no_color.color("primary"), Color::None);
     }
@@ -230,7 +270,7 @@ mod tests {
         let theme = Theme::arreo(Depth::Truecolor);
         let html = reference_html(&theme);
         assert!(html.contains("data-theme=\"arreo\""));
-        assert!(html.contains("data-token=\"primary\" data-color=\"#7dcfff\""));
+        assert!(html.contains("data-token=\"primary\" data-color=\"#6fd3e8\""));
         for token in theme.colors().keys() {
             assert!(
                 html.contains(&format!("data-token=\"{token}\"")),
@@ -240,7 +280,7 @@ mod tests {
         // The 256-color quantization shows up in the HTML too (shared table).
         let quantized = reference_html(&Theme::arreo(Depth::Ansi256));
         assert!(
-            !quantized.contains("#7dcfff"),
+            !quantized.contains("#6fd3e8"),
             "truecolor leaked into 256 HTML"
         );
         assert!(quantized.contains("ansi "), "no quantized labels in HTML");

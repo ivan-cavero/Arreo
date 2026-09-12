@@ -13,6 +13,10 @@ use std::collections::BTreeMap;
 pub const COLOR_TOKENS: &[&str] = &[
     // Core semantics.
     "primary",
+    // BRAND §2 `primary-strong`: the hero/selection step of the primary hue.
+    // Arreo's own token (opencode has no name for it), so the brand document
+    // maps onto the schema without either side inventing a second palette.
+    "primaryStrong",
     "secondary",
     "accent",
     "error",

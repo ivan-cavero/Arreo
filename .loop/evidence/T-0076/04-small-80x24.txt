@@ -1,0 +1,24 @@
+┌this machine · socket─────┐┌▶ ● gamma [working] ▏█▏ peak    3M ───────────────┐
+│  ◉ question              ││GAMMA-MARKER                                      │
+│   beta        3M █░░░░░░░││                                                  │
+│   Proceed? [y/n]         ││                                                  │
+│  ● working               ││                                                  │
+│   alpha       3M █░░░░░░░││                                                  │
+│ ▸ gamma       3M █░░░░░░░││                                                  │
+│                          ││                                                  │
+│                          ││                                                  │
+│                          ││                                                  │
+│                          ││                                                  │
+│                          ││                                                  │
+│                          ││                                                  │
+│                          ││                                                  │
+│                          ││                                                  │
+│                          ││                                                  │
+│                          ││                                                  │
+│                          ││                                                  │
+│                          ││                                                  │
+│                          ││                                                  │
+│                          ││                                                  │
+│                          ││                                                  │
+└──────────────────────────┘└──────────────────────────────────────────────────┘
+3 panes · j/k · Enter · Tab · w wall · t theme · / find · ? keys · q quit

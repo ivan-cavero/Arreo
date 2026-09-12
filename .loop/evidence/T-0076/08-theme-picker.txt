@@ -1,0 +1,30 @@
+┌this machine · socket─────┐┌◉ beta [question] ▶─────────────────────────┐┌● alpha [working]───────────────────────────┐
+│  ◉ question              ││Proceed? [y/n]                              ││ALPHA-MARKER                                │
+│ ▸ beta        3M █░░░░░░░││                                            ││                                            │
+│   Proceed? [y/n]         ││                                            ││                                            │
+│  ● working               ││                                            ││                                            │
+│   alpha       3M █░░░░░░░││                                            ││                                            │
+│   gamma       3M █░░░░░░░││                                            ││                                            │
+│                          ││                                            ││                                            │
+│                          ││                                            ││                                            │
+│                          ││                                            ││                                            │
+│                          ││         ┌theme: arreo (256)────────────────────────┐                                     │
+│                          ││         │▸ arreo  built-in                         │                                     │
+│                          ││         │  tokyonight  built-in                    │                                     │
+│                          ││         │  catppuccin  built-in                    │                                     │
+│                          │└─────────│  gruvbox  built-in                       │─────────────────────────────────────┘
+│                          │┌● gamma [│  system  built-in                        │
+│                          ││GAMMA-MAR│                                          │
+│                          ││         │                                          │
+│                          ││         └──────────────────────────────────────────┘
+│                          ││                                            │
+│                          ││                                            │
+│                          ││                                            │
+│                          ││                                            │
+│                          ││                                            │
+│                          ││                                            │
+│                          ││                                            │
+│                          ││                                            │
+│                          ││                                            │
+└──────────────────────────┘└────────────────────────────────────────────┘
+3 panes · j/k move · Enter attach · Tab cycle · w wall · t theme · / search · ? keys · q quit

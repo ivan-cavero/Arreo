@@ -53,7 +53,9 @@ connection to the daemon.
   scripting and agent surface.
 - **`arreo-tui`** is the ratatui client: a sidebar of panes with their state and
   RAM, and a pane wall. It is a separate binary on purpose — the daemon does not
-  have a UI, so the UI can be closed and reopened freely.
+  have a UI, so the UI can be closed and reopened freely. It is themed from the
+  brand palette in [`design/BRAND.md`](../design/BRAND.md), and every state is a
+  dot *shape* and its own name, so the board is readable with no color at all.
 - **`arreo-relay`** is the network component. It is the only piece that needs to be
   reachable from the internet, and it is the only AGPL-licensed crate. It routes
   bytes it cannot decrypt; it also holds the machine directory and the pairing
@@ -97,7 +99,7 @@ spawned build
 
 # 3. Look at it, or attach the TUI.
 ./target/debug/arreo read build
-./target/debug/arreo-tui      # j/k move · Enter attach · w wall · t theme · q quit
+./target/debug/arreo-tui      # j/k move · Enter attach · w wall · t theme · ? keys · q quit
 
 # 4. Type into it — `send` writes bytes, so include the carriage return to press
 #    Enter — then block until it needs a human.
@@ -120,8 +122,20 @@ reach a daemon other than the default one; the purely local verbs (`record`, `re
 `metrics --pid`) do not.
 
 In the TUI: `j`/`k` move, `Enter` attaches, `w` toggles the pane wall, `t` opens
-the theme picker, `/` searches, `q` quits. Ctrl-C on `arreo attach` detaches and
-leaves the pane running — the pane belongs to the daemon, not to your terminal.
+the theme picker, `/` searches, `?` lists every key on screen, `q` quits. The
+keyboard cursor (`▶`, inverse video) is not the attached pane (`▸`): one is where
+a keypress goes, the other is what is streaming, and the frame shows both. `Esc`
+dismisses whatever is open — the picker, the key list, an applied search — and
+only quits when there is nothing left to dismiss. Ctrl-C on `arreo attach`
+detaches and leaves the pane running — the pane belongs to the daemon, not to
+your terminal.
+
+Two things are worth knowing before a long session. The pulse on a `question`
+group is the terminal's own slow blink, so it costs no frames; if you want it
+still, put `[tui] reduce_motion = true` in the config file the daemon already
+reads (`--config PATH` or `$ARREO_CONFIG`), and `NO_COLOR` implies the same.
+And at 80×24 the frame is laid out for it — the sidebar gives up columns before
+the pane region does — so a small terminal degrades instead of glitching.
 
 If you want the daemon managed for you instead of started by hand, `arreo service
 install` writes the unit for this OS and, on Linux with a systemd user session,
@@ -165,7 +179,8 @@ table — but this table is what the code does.
 | Long-lived identity | `$ARREO_IDENTITY_DIR`, else `$XDG_DATA_HOME/arreo`, else `$HOME/.local/share/arreo` | `identity_dir()` in `arreo_core::identity::keys`. |
 | Keys and certificates | `<identity>/identity/root.key` (the server's root), `identity/devices/<id>.cert` (pinned devices) | `identity_root()`, same file. Mode 0600/0700. |
 | The machine-directory cache | `<identity>/identity/machines.cache` | `arreo machines`; a mirror that a successful relay read replaces whole, never a source. |
-| Themes | `$ARREO_THEME_DIR`, then `$XDG_CONFIG_HOME/arreo/themes`, then `<repo>/.arreo/themes`, then `./.arreo/themes` | `default_dirs()` in `arreo_core::theme::loader`. Five themes are embedded in the binary (`arreo`, `tokyonight`, `catppuccin`, `gruvbox`, `system`), so a static build still has a theme with no data dir. |
+| Themes | `$ARREO_THEME_DIR`, then `$XDG_CONFIG_HOME/arreo/themes`, then `<repo>/.arreo/themes`, then `./.arreo/themes` | `default_dirs()` in `arreo_core::theme::loader`. Five themes are embedded in the binary (`arreo`, `tokyonight`, `catppuccin`, `gruvbox`, `system`), so a static build still has a theme with no data dir. The `arreo` built-in *is* [`design/BRAND.md`](../design/BRAND.md) §2, token for token, and a test compares the two files rather than a copy of the table. |
+| TUI settings | the `[tui]` section of the file named by `--config` or `$ARREO_CONFIG` | `TuiSettings::load` in `arreo_core::relay::config` — one parser for the one config file, so the TUI and the daemon cannot disagree about what it means. Today: `reduce_motion`. |
 | Relay configuration | the file given by `--config PATH` or `$ARREO_CONFIG` | Shared by the daemon and the CLI (`arreo_core::relay::config`). A `[relay]` section with `enabled = true` starts the outbound session; **disabled is the default**, and no relay is needed for a local-only machine. |
 | The daemon's service unit | `~/.config/systemd/user/arreo.service`, or `~/Library/LaunchAgents/dev.arreo.daemon.plist` | `unit_path()` in `arreo_core::lifecycle`, written by `arreo service install`. Windows has no unit file: the verb prints the `sc.exe` script instead. |
 | Relay state | `<state-dir>/relay.db`, plus the pairing mailbox socket/tcp listener | `arreo-relay serve --state-dir DIR`. See [relay-deploy.md](relay-deploy.md). |

@@ -8,8 +8,16 @@
 //!
 //! `--interactive-evidence` writes the per-step screens to
 //! `.loop/evidence/T-0015/` (the frames a reviewer reads).
+//!
+//! T-0076 adds the accessibility layer of the same slice: the frame at every
+//! depth a terminal can be (truecolor, 256, 16, NO_COLOR), the two focus
+//! signals, the key list, the motion switch, and 80×24 degradation — with the
+//! captures under `.loop/evidence/T-0076/`. The budget checks (idle deltas, no
+//! clear-screen) stay where T-0015 put them, because the mechanism is the same
+//! one.
 
 use crate::harness::{bins, cli, wait_bound, TestServer, TuiSession};
+use arreo_core::theme::Depth;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
@@ -22,8 +30,15 @@ pub fn run(rest: &[String]) -> ExitCode {
         .join(".loop")
         .join("evidence")
         .join("T-0015");
+    let evidence_dir_76 = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("workspace root")
+        .join(".loop")
+        .join("evidence")
+        .join("T-0076");
     if evidence {
         let _ = std::fs::create_dir_all(&evidence_dir);
+        let _ = std::fs::create_dir_all(&evidence_dir_76);
     }
 
     let socket = std::env::temp_dir().join(format!("arreo-e2e-tui-{}.sock", std::process::id()));
@@ -94,6 +109,7 @@ pub fn run(rest: &[String]) -> ExitCode {
     let screen = session.screen();
     if evidence {
         let _ = std::fs::write(evidence_dir.join("01-overview.txt"), &screen);
+        let _ = std::fs::write(evidence_dir_76.join("01-overview.txt"), &screen);
     }
     check(
         "sidebar lists all panes",
@@ -120,7 +136,7 @@ pub fn run(rest: &[String]) -> ExitCode {
     );
     check(
         "the hung agent's question is shown beside it, in the sidebar",
-        match screen.find("    Proceed? [y/n]") {
+        match screen.find("   Proceed? [y/n]") {
             Some(at) => {
                 let line_start = screen[..at].rfind('\n').map_or(0, |n| n + 1);
                 at - line_start < 30
@@ -129,10 +145,18 @@ pub fn run(rest: &[String]) -> ExitCode {
         },
         "beta's question is not on an indented sidebar line",
     );
+    // **State is never color-only (T-0076).** Every group header is a dot
+    // *shape* plus the state's own word, so the sidebar is readable with no
+    // color at all — and the two are adjacent, not merely both on screen.
     check(
         "state dots rendered",
         screen.contains('◉') && screen.contains('●'),
         "state dots missing",
+    );
+    check(
+        "every state row is a dot shape and its own name",
+        screen.contains("◉ question") && screen.contains("● working"),
+        "a state row carries only a hue",
     );
     check(
         "status bar advertises keys",
@@ -153,9 +177,20 @@ pub fn run(rest: &[String]) -> ExitCode {
         "no KiB/MiB reading for each pane",
     );
 
-    // Focus a pane (j then Enter) — the focused pane streams its output.
+    // **Two signals (T-0076).** `j` moves the keyboard cursor (▶, inverse
+    // video) without attaching anything; Enter attaches the pane the cursor is
+    // on (▸ in the sidebar, the cyan border on the pane region).
     session.send("j");
     std::thread::sleep(Duration::from_millis(600));
+    let cursor_only = session.screen();
+    if evidence {
+        let _ = std::fs::write(evidence_dir_76.join("02-cursor.txt"), &cursor_only);
+    }
+    check(
+        "the keyboard cursor is visible before anything is attached",
+        sidebar_region(&cursor_only).contains('▶') && !sidebar_region(&cursor_only).contains('▸'),
+        "the cursor row is not marked, or a selection exists before Enter",
+    );
     session.send("\r");
     std::thread::sleep(Duration::from_secs(2));
     let focused = session.screen();
@@ -174,6 +209,21 @@ pub fn run(rest: &[String]) -> ExitCode {
         focused.contains("Proceed?") || focused.contains("MARKER"),
         "no pane output in transcript",
     );
+    // The attached pane keeps its own marker while the cursor is elsewhere:
+    // the selection did not move when the keyboard did.
+    check(
+        "the attached pane is marked in the sidebar",
+        sidebar_region(&focused).contains('▸'),
+        "no selection marker after Enter",
+    );
+    check(
+        "the cursor left the sidebar for the pane region",
+        !sidebar_region(&focused).contains('▶'),
+        "the sidebar still shows a cursor while the pane region has focus",
+    );
+    if evidence {
+        let _ = std::fs::write(evidence_dir_76.join("03-attached.txt"), &focused);
+    }
 
     // Search prompt owns the status line.
     session.send("/");
@@ -241,6 +291,55 @@ pub fn run(rest: &[String]) -> ExitCode {
         "frame kept rows from the old size",
     );
 
+    // The status line promises "Esc clears"; Esc must mean that before it
+    // means quit, or the hint is a lie (T-0076).
+    session.send("\u{1b}");
+    std::thread::sleep(Duration::from_millis(800));
+    check(
+        "Esc clears an applied search instead of quitting",
+        !session.exited() && !session.screen().contains("matching lines"),
+        "Esc quit the app, or the filter stayed applied",
+    );
+
+    // **80×24 is the documented minimum and must be usable (T-0076).**
+    session.resize(24, 80);
+    std::thread::sleep(Duration::from_secs(2));
+    let small = session.screen();
+    if evidence {
+        let _ = std::fs::write(evidence_dir_76.join("04-small-80x24.txt"), &small);
+    }
+    check(
+        "80x24 stays usable: panes, states and the key legend",
+        small.contains("alpha")
+            && small.contains("question")
+            && small.contains("q quit")
+            && !small.contains('…'),
+        "the 80-column frame lost something",
+    );
+    check(
+        "80x24 keeps the pane region (the sidebar clamps, it does not win)",
+        sidebar_column(&small).is_some_and(|edge| 80 - edge >= 40),
+        "the sidebar ate the pane region at 80 columns",
+    );
+
+    // Below that: clamped, not glitched. The frame still lays out to the new
+    // size instead of overflowing it.
+    session.resize(12, 40);
+    std::thread::sleep(Duration::from_secs(2));
+    let narrow = session.screen();
+    if evidence {
+        let _ = std::fs::write(evidence_dir_76.join("05-narrow-40x12.txt"), &narrow);
+    }
+    check(
+        "40x12 clamps instead of glitching",
+        narrow.lines().count() == 12
+            && narrow.lines().all(|line| line.chars().count() <= 40)
+            && narrow.contains("alpha"),
+        "the narrow frame is not 40x12",
+    );
+    session.resize(30, 120);
+    std::thread::sleep(Duration::from_secs(2));
+
     // Wall: every pane tiled at once, each tile streaming its own output.
     session.send("w");
     std::thread::sleep(Duration::from_secs(4));
@@ -262,6 +361,63 @@ pub fn run(rest: &[String]) -> ExitCode {
         wall.contains("ALPHA-MARKER") && wall.contains("GAMMA-MARKER") && wall.contains("Proceed?"),
         "a wall tile is missing its pane's output",
     );
+
+    // **The wall's cursor is visible (T-0076).** `j` moves the highlighted
+    // tile, so the keyboard never acts somewhere the user cannot see.
+    session.send("j");
+    std::thread::sleep(Duration::from_secs(2));
+    let wall_cursor = session.screen();
+    if evidence {
+        let _ = std::fs::write(evidence_dir_76.join("06-wall-focus.txt"), &wall_cursor);
+    }
+    check(
+        "the wall marks exactly one tile as the cursor",
+        wall_cursor.matches('▶').count() == 1
+            && ["alpha", "beta", "gamma"]
+                .iter()
+                .any(|id| wall_cursor.contains(&format!("{id} ["))),
+        "no single visible cursor tile in the wall",
+    );
+
+    // **The key list (T-0076).** Every binding on screen, so the TUI is
+    // complete without the docs.
+    session.send("?");
+    std::thread::sleep(Duration::from_secs(1));
+    let help = session.screen();
+    if evidence {
+        let _ = std::fs::write(evidence_dir_76.join("07-keys.txt"), &help);
+    }
+    check(
+        "? lists the keys on screen",
+        help.contains("move the cursor") && help.contains("quit") && help.contains("wall ↔ focus"),
+        "the key list did not open",
+    );
+    session.send("\u{1b}");
+    std::thread::sleep(Duration::from_millis(600));
+    check(
+        "Esc closes the key list without quitting",
+        !session.exited(),
+        "the TUI exited instead of dismissing the key list",
+    );
+
+    // **The theme picker (T-0076 evidence): the same overlay, captured.**
+    session.send("t");
+    std::thread::sleep(Duration::from_secs(1));
+    let picker = session.screen();
+    if evidence {
+        let _ = std::fs::write(evidence_dir_76.join("08-theme-picker.txt"), &picker);
+    }
+    let listed = ["arreo", "tokyonight", "catppuccin", "gruvbox", "system"]
+        .iter()
+        .filter(|name| picker.contains(**name))
+        .count();
+    check(
+        "t opens the theme picker over every built-in",
+        picker.contains("theme:") && listed == 5,
+        &format!("{listed}/5 built-ins listed"),
+    );
+    session.send("\u{1b}");
+    std::thread::sleep(Duration::from_millis(600));
 
     // Border drag: grab the sidebar edge and widen it; the split must follow.
     let before = session.screen();
@@ -313,6 +469,103 @@ pub fn run(rest: &[String]) -> ExitCode {
         session.exited(),
         "TUI still running after q",
     );
+
+    // ---- T-0076: every depth a terminal can be, and the motion switch -------
+    //
+    // One session per terminal shape against the same daemon (beta is still
+    // asking, so a state hue and a state *word* are both on screen). The
+    // captures are the evidence a reviewer reads; the checks are what makes
+    // "readable without color" an assertion rather than an opinion.
+    for shape in DEPTH_SHAPES {
+        let name = shape.name;
+        let Some(mut shaped) = TuiSession::start_with(&tui_bin, &socket, &[], shape.env) else {
+            println!("[FAIL] tui: could not start the TUI for depth {name}");
+            return ExitCode::FAILURE;
+        };
+        std::thread::sleep(Duration::from_secs(3));
+        let frame = shaped.screen();
+        if evidence {
+            let _ = std::fs::write(evidence_dir_76.join(format!("depth-{name}.txt")), &frame);
+            // The raw stream too: a blink is a style, so the *bytes* are what
+            // show the pulse (and its absence under NO_COLOR).
+            let _ = std::fs::write(
+                evidence_dir_76.join(format!("depth-{name}.raw")),
+                shaped.transcript(),
+            );
+            if shape.depth == Depth::Truecolor {
+                // The pulse is a *style*, so the capture a reviewer can check
+                // is the byte stream: SGR 5 on the question group, and no
+                // clear-screen anywhere (the budget's other half).
+                let _ = std::fs::write(
+                    evidence_dir_76.join("09-question-pulse.raw"),
+                    shaped.transcript(),
+                );
+            }
+        }
+        check(
+            &format!("depth {name} is readable without relying on color"),
+            ["alpha", "beta", "question", "working", "◉", "●", "q quit"]
+                .iter()
+                .all(|needle| frame.contains(needle)),
+            &format!("the {name} frame lost a shape or a label"),
+        );
+        // The pulse is the terminal's own slow blink (SGR 5), and it is on
+        // exactly where motion is allowed: not on a NO_COLOR terminal.
+        let blinking = crate::theme_slice::sgr_sets_modifier(&shaped.transcript(), 5);
+        if shape.depth == Depth::NoColor {
+            check(
+                "NO_COLOR implies still: no blink on the question group",
+                !blinking,
+                "a NO_COLOR frame asked the terminal to blink",
+            );
+        } else {
+            check(
+                &format!("depth {name} still pulses the question group"),
+                blinking,
+                "the attention cue is missing where motion is allowed",
+            );
+        }
+        shaped.send("q");
+        std::thread::sleep(Duration::from_secs(1));
+    }
+
+    // **`tui.reduce_motion` (T-0076).** The same terminal shape as the pulsing
+    // case above, with one line of config: the state stays on screen (dot and
+    // word) and the motion is gone.
+    let config = std::env::temp_dir().join(format!("arreo-e2e-tui-{}.toml", std::process::id()));
+    std::fs::write(&config, "[tui]\nreduce_motion = true\n").expect("write the config");
+    let config_arg = config.to_str().expect("utf-8 temp path");
+    let Some(mut still) = TuiSession::start_with(
+        &tui_bin,
+        &socket,
+        &["--config", config_arg],
+        &[("COLORTERM", "truecolor"), ("TERM", "xterm-256color")],
+    ) else {
+        println!("[FAIL] tui: could not start the TUI for the reduce_motion case");
+        return ExitCode::FAILURE;
+    };
+    std::thread::sleep(Duration::from_secs(3));
+    let frame = still.screen();
+    if evidence {
+        let _ = std::fs::write(evidence_dir_76.join("depth-reduce-motion.txt"), &frame);
+        let _ = std::fs::write(
+            evidence_dir_76.join("depth-reduce-motion.raw"),
+            still.transcript(),
+        );
+    }
+    check(
+        "tui.reduce_motion stills the pulse",
+        !crate::theme_slice::sgr_sets_modifier(&still.transcript(), 5),
+        "reduce_motion did not stop the blink",
+    );
+    check(
+        "...and the state is still on screen, as a shape and a word",
+        frame.contains("◉ question"),
+        "stilling the motion removed the cue instead of the motion",
+    );
+    still.send("q");
+    std::thread::sleep(Duration::from_secs(1));
+    let _ = std::fs::remove_file(&config);
 
     // Metrics graph case (T-0040): the focused pane's title carries the RAM
     // sparkline from the durable series — real pty, real key events, the same
@@ -392,4 +645,68 @@ pub fn run(rest: &[String]) -> ExitCode {
         println!("tui: {passes} passed, {failures} failed");
         ExitCode::FAILURE
     }
+}
+
+/// One terminal shape the T-0076 depth matrix drives the TUI under: the
+/// environment that decides detection, and the depth it must therefore render
+/// at. `Depth` comes from `arreo-core`, so the expectation is the engine's own
+/// answer rather than a second opinion about what `TERM=xterm` means.
+struct DepthShape {
+    name: &'static str,
+    env: &'static [(&'static str, &'static str)],
+    depth: Depth,
+}
+
+const DEPTH_SHAPES: &[DepthShape] = &[
+    // iTerm2/Alacritty/kitty shape.
+    DepthShape {
+        name: "truecolor",
+        env: &[("COLORTERM", "truecolor"), ("TERM", "xterm-256color")],
+        depth: Depth::Truecolor,
+    },
+    // Windows Terminal / older xterm: 256 colors, no COLORTERM hint.
+    DepthShape {
+        name: "256",
+        env: &[("COLORTERM", ""), ("TERM", "xterm-256color")],
+        depth: Depth::Ansi256,
+    },
+    // Legacy Terminal.app / conhost shape: bare xterm, 16 colors.
+    DepthShape {
+        name: "16",
+        env: &[("COLORTERM", ""), ("TERM", "xterm")],
+        depth: Depth::Ansi16,
+    },
+    // NO_COLOR: no color at all, and no motion either.
+    DepthShape {
+        name: "no-color",
+        env: &[("NO_COLOR", "1"), ("TERM", "xterm-256color")],
+        depth: Depth::NoColor,
+    },
+];
+
+/// The sidebar's own columns of a reconstructed frame, as text.
+///
+/// The sidebar and the pane region repeat the same words (a pane id is in both),
+/// so a check that could not tell them apart would pass on a frame with no
+/// sidebar at all — the same reasoning the T-0061 checks use.
+fn sidebar_region(screen: &str) -> String {
+    match sidebar_column(screen) {
+        Some(edge) => screen
+            .lines()
+            .map(|line| line.chars().take(edge as usize).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        None => String::new(),
+    }
+}
+
+/// The column just past the sidebar's right border, read off the frame itself
+/// (the `┐` of its title row) rather than from a constant that could drift.
+fn sidebar_column(screen: &str) -> Option<u16> {
+    screen
+        .lines()
+        .next()?
+        .chars()
+        .position(|c| c == '┐')
+        .map(|col| col as u16 + 1)
 }

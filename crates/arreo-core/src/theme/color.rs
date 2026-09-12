@@ -64,6 +64,46 @@ impl Color {
         Ok(Self::Rgb(r, g, b))
     }
 
+    /// WCAG 2.x relative luminance (0 = black, 1 = white).
+    ///
+    /// Only a 24-bit color has a luminance we can know. An ANSI index names a
+    /// slot in *someone else's* palette — what it paints depends on the user's
+    /// terminal, so claiming a number for it would be a measurement of our own
+    /// guess. `None` for both, deliberately.
+    #[must_use]
+    pub fn relative_luminance(self) -> Option<f64> {
+        let Self::Rgb(r, g, b) = self else {
+            return None;
+        };
+        Some(0.2126 * linearize(r) + 0.7152 * linearize(g) + 0.0722 * linearize(b))
+    }
+
+    /// WCAG 2.x contrast ratio between two colors, 1.0 (identical) to 21.0
+    /// (black on white). `None` when either side has no knowable luminance.
+    ///
+    /// This is the number the acceptance criteria and the state-label rule are
+    /// judged by, so it lives in the color model rather than in a test: the
+    /// code that decides what is readable and the test that checks it use the
+    /// same arithmetic.
+    #[must_use]
+    pub fn contrast_ratio(self, other: Self) -> Option<f64> {
+        let (a, b) = (self.relative_luminance()?, other.relative_luminance()?);
+        let (lighter, darker) = if a >= b { (a, b) } else { (b, a) };
+        Some((lighter + 0.05) / (darker + 0.05))
+    }
+
+    /// The same color mixed toward black by `factor` (0.0 leaves it alone,
+    /// 1.0 is black) — BRAND §2's "states shift one step darker" for the light
+    /// variant, in one place so the step is one number and not a habit.
+    #[must_use]
+    pub fn darkened(self, factor: f64) -> Self {
+        let Self::Rgb(r, g, b) = self else {
+            return self;
+        };
+        let step = |v: u8| ((f64::from(v) * (1.0 - factor)).round()).clamp(0.0, 255.0) as u8;
+        Self::Rgb(step(r), step(g), step(b))
+    }
+
     /// The ANSI index this color becomes when only `depth` is available.
     /// `None` in, `None` out: an unset token stays unset at every depth.
     #[must_use]
@@ -175,6 +215,17 @@ pub enum ColorError {
     Malformed(String),
     #[error("color index out of range: {0}")]
     OutOfRange(String),
+}
+
+/// One sRGB channel, linearized for luminance maths (WCAG 2.x §relative
+/// luminance: the piecewise transfer function, not a plain `v / 255`).
+fn linearize(channel: u8) -> f64 {
+    let v = f64::from(channel) / 255.0;
+    if v <= 0.040_45 {
+        v / 12.92
+    } else {
+        ((v + 0.055) / 1.055).powf(2.4)
+    }
 }
 
 /// The 16 ANSI colors as RGB, i.e. what a 16-color terminal paints. Legacy

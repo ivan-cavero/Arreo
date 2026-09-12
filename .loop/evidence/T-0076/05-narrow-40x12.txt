@@ -1,0 +1,12 @@
+┌this machine …┐┌▶ ● gamma [working] ▏█┐
+│  ◉ question  ││GAMMA-MARKER          │
+│   beta       ││                      │
+│   Proceed? … ││                      │
+│  ● working   ││                      │
+│   alpha      ││                      │
+│ ▸ gamma      ││                      │
+│              ││                      │
+│              ││                      │
+│              ││                      │
+└──────────────┘└──────────────────────┘
+3 panes · j/k · Enter · w · t · / · ? ·…

@@ -8,7 +8,7 @@
 //! themes (or depths) is a data swap, not a re-render rewrite.
 
 use arreo_core::theme::{Catalog, Color, Depth, LoadError, Theme, Variant};
-use ratatui::style::{Color as UiColor, Style};
+use ratatui::style::{Color as UiColor, Modifier, Style};
 
 /// A resolved theme plus the catalog it came from (the picker's data).
 pub struct ThemeState {
@@ -131,6 +131,24 @@ impl ThemeState {
     #[must_use]
     pub fn state_color(&self, state: &str) -> UiColor {
         to_ui_color(self.theme.state_color(state))
+    }
+
+    /// The style a state's **label** is painted in: its own hue when that hue
+    /// can carry WCAG AA as text, the neutral when it cannot (the engine
+    /// decides — see `Theme::state_label_color`). Bold, because the state word
+    /// is the loudest text on the row.
+    #[must_use]
+    pub fn state_label_style(&self, state: &str) -> Style {
+        Style::default()
+            .fg(to_ui_color(self.theme.state_label_color(state)))
+            .add_modifier(Modifier::BOLD)
+    }
+
+    /// BRAND §2's `primary`: actions and active states — the color that marks
+    /// "the keyboard is here" (never a state hue, which would collide).
+    #[must_use]
+    pub fn primary_style(&self) -> Style {
+        Style::default().fg(self.color("primary"))
     }
 
     /// Bold text style in the theme's foreground (headings, group names).

@@ -18,6 +18,7 @@ use arreo_core::proto::{AgentState, Message, VERSION};
 use arreo_core::theme::{Depth, Variant};
 use arreo_tui::client::{default_socket, Client, PaneSummary, Target};
 use arreo_tui::model::PaneView;
+use arreo_tui::settings;
 use arreo_tui::theme::ThemeState;
 use arreo_tui::ui::{App, ViewMode};
 use crossterm::event::{self, Event, KeyEventKind};
@@ -167,6 +168,7 @@ async fn main() -> anyhow::Result<()> {
         theme,
         variant: variant.as_deref().and_then(parse_variant),
         depth: depth.as_deref().and_then(parse_depth),
+        config,
     };
 
     enable_raw_mode()?;
@@ -207,12 +209,16 @@ enum Poll {
     },
 }
 
-/// Theme options from the command line (they override detection).
+/// Options from the command line that shape how this process renders (they
+/// override detection).
 #[derive(Debug, Default, Clone)]
 struct ThemeRequest {
     theme: Option<String>,
     variant: Option<Variant>,
     depth: Option<Depth>,
+    /// `--config PATH` (T-0076): the same file the daemon reads, for its `[tui]`
+    /// section. `$ARREO_CONFIG` is the fallback, resolved by `settings`.
+    config: Option<PathBuf>,
 }
 
 fn parse_variant(raw: &str) -> Option<Variant> {
@@ -249,10 +255,12 @@ async fn run(
     // Which machine, and over what (T-0061): shown in the sidebar once, not
     // repeated on every row — one sidebar is one machine's panes today.
     app.session = session;
-    app.theme = ThemeState::with_depth(
-        request.depth.unwrap_or_else(Depth::detect),
-        request.variant.unwrap_or_default(),
-    );
+    let depth = request.depth.unwrap_or_else(Depth::detect);
+    app.theme = ThemeState::with_depth(depth, request.variant.unwrap_or_default());
+    // `[tui]` settings (T-0076): from the same config file the daemon reads,
+    // plus what the terminal itself decides (NO_COLOR implies still).
+    let (settings, settings_problem) = settings::resolve(request.config.as_deref(), depth);
+    app.settings = settings;
     if let Some(name) = request.theme.as_deref() {
         if let Err(e) = app.theme.select(name) {
             // A bad --theme is worth saying out loud, not silently ignoring.
@@ -261,6 +269,14 @@ async fn run(
     } else if let Some(problem) = app.theme.startup_error() {
         // Same rule for a broken user theme shadowing the default.
         app.status = problem.to_string();
+    }
+    // A config the user pointed at that we could not use is the same kind of
+    // fact, and it outranks nothing else — it is appended, not overwritten.
+    if let Some(problem) = settings_problem {
+        app.status = match app.status.is_empty() {
+            true => problem,
+            false => format!("{} · {problem}", app.status),
+        };
     }
     // Daemon traffic lives in its own task: a slow socket must never delay
     // input. The UI loop only drains events and applies finished snapshots.
@@ -321,10 +337,9 @@ async fn run(
                         .collect();
                     // Preserve scrollback lines across polls (merge by id).
                     merge_views(&mut app, views);
-                    app.status = format!(
-                        "{} panes · j/k move · Enter attach · w wall · t theme · / search · q quit",
-                        summaries.len()
-                    );
+                    // The key legend is the status renderer's job (it knows the
+                    // width, and a legend that clips mid-word teaches nothing).
+                    app.status = format!("{} panes", summaries.len());
                 }
                 Poll::Panes(Err(e)) => {
                     app.status = format!("daemon unreachable: {e}");

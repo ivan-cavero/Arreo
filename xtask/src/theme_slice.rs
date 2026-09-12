@@ -73,8 +73,15 @@ pub fn run(rest: &[String]) -> ExitCode {
         .join(".loop")
         .join("evidence")
         .join("T-0016");
+    let evidence_dir_76 = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("workspace root")
+        .join(".loop")
+        .join("evidence")
+        .join("T-0076");
     if evidence {
         let _ = std::fs::create_dir_all(&evidence_dir);
+        let _ = std::fs::create_dir_all(&evidence_dir_76);
     }
 
     let mut failures = 0usize;
@@ -201,11 +208,33 @@ pub fn run(rest: &[String]) -> ExitCode {
 
     // alpha is in `question`, so the sidebar paints the question token; that
     // is the byte-exact sequence each shape must (or must not) produce.
-    let question_color = catalog
-        .theme_with_depth("arreo", Variant::Dark, Depth::Truecolor)
-        .expect("arreo loads")
-        .color("question");
+    //
+    // The expected color comes from `design/BRAND.md` (T-0076), not from the
+    // engine: the document is the source of truth for the palette, so this
+    // slice asserts that the bytes a real terminal receives are the brand's —
+    // and a drift between the document and the palette fails here as well as
+    // in the unit test that reads both files.
+    let doc = arreo_core::theme::brand::read_doc().expect("BRAND.md is readable");
+    let brand = arreo_core::theme::brand::palette(&doc);
+    let brand_color = |token: &str| -> Color {
+        let hex = brand
+            .get(token)
+            .unwrap_or_else(|| panic!("BRAND §2 has no {token}"));
+        Color::parse(hex).unwrap_or_else(|e| panic!("BRAND §2 {token}: {e}"))
+    };
+    let question_color = brand_color("question");
+    check(
+        "the arreo built-in's question token is BRAND §2's",
+        catalog
+            .theme_with_depth("arreo", Variant::Dark, Depth::Truecolor)
+            .expect("arreo loads")
+            .color("question")
+            == question_color,
+        "the engine disagrees with the document",
+    );
 
+    // The truecolor transcript, kept for the brand-bytes check below.
+    let mut raw_truecolor: Vec<u8> = Vec::new();
     for shape in SHAPES {
         let Some(session) = TuiSession::start_with(&tui_bin, &socket, shape.args, shape.env) else {
             println!("[FAIL] theme: could not start the TUI for {}", shape.name);
@@ -231,6 +260,7 @@ pub fn run(rest: &[String]) -> ExitCode {
         // What the terminal actually received.
         let truecolor_present = contains_subslice(&raw, b"\x1b[38;2;");
         if shape.expect_truecolor {
+            raw_truecolor = raw.clone();
             check(
                 &format!("{} emits truecolor as designed", shape.name),
                 truecolor_present,
@@ -296,6 +326,118 @@ pub fn run(rest: &[String]) -> ExitCode {
             &format!("HTML lacks working={label}"),
         );
     }
+
+    // ---- Layer 4: BRAND §2 is the source of truth (T-0076) -------------------
+    //
+    // The unit tests in `arreo_core::theme::brand` already compare the engine
+    // with the document. What only this slice can do is prove the document's
+    // colors are what *reaches a terminal*: the expected SGR below is computed
+    // from `design/BRAND.md`, so a drift between the document and the palette
+    // fails here too, on the bytes rather than on the token table.
+    check(
+        "the brand palette reaches the reference HTML",
+        {
+            let html = reference_html(&Theme::arreo(Depth::Truecolor));
+            html.contains(&format!(
+                "data-token=\"question\" data-color=\"{}\"",
+                brand_color("question")
+            )) && html.contains(&format!(
+                "data-token=\"primary\" data-color=\"{}\"",
+                brand_color("primary")
+            ))
+        },
+        "the HTML reference disagrees with BRAND §2",
+    );
+    check(
+        "the truecolor terminal is asked for the brand's exact bytes",
+        carries_color(&raw_truecolor, brand_color("question")),
+        "BRAND §2's question hue never reached the pty",
+    );
+
+    // The contrast numbers, computed and printed: the criterion asks for the
+    // maths in a test, and the evidence wants the numbers. `Color` owns the
+    // arithmetic, so the slice and the unit tests cannot disagree about it.
+    //
+    // Two floors, because there are two kinds of thing on a state row: the
+    // *label* is text (AA 4.5:1) and the *dot* is a graphic (AA 3:1). The
+    // engine decides which hue the label may wear (`state_label_color`).
+    let dark = Theme::arreo(Depth::Truecolor);
+    let light = Theme::arreo_variant(Variant::Light, Depth::Truecolor);
+    let mut worst_text = f64::MAX;
+    let mut worst_dot = f64::MAX;
+    let mut table = String::from(
+        "BRAND §2 contrast (WCAG 2.x) — text floor 4.5:1, graphic floor 3.0:1\n\
+         variant role   token          surface          ratio\n",
+    );
+    for (variant, theme) in [("dark", &dark), ("light", &light)] {
+        for surface in ["background", "backgroundPanel"] {
+            let bg = theme.color(surface);
+            for token in arreo_core::theme::brand::TEXT_TOKENS {
+                let ratio = theme
+                    .color(token)
+                    .contrast_ratio(bg)
+                    .unwrap_or_else(|| panic!("{token} has no luminance"));
+                worst_text = worst_text.min(ratio);
+                table.push_str(&format!(
+                    "{variant:7} text  {token:14} {surface:16} {ratio:5.2}\n"
+                ));
+            }
+            for state in arreo_core::theme::brand::STATE_TOKENS {
+                let label = theme
+                    .state_label_color(state)
+                    .contrast_ratio(bg)
+                    .expect("labels are 24-bit");
+                let dot = theme
+                    .state_color(state)
+                    .contrast_ratio(bg)
+                    .expect("dots are 24-bit");
+                worst_text = worst_text.min(label);
+                worst_dot = worst_dot.min(dot);
+                table.push_str(&format!(
+                    "{variant:7} label {state:14} {surface:16} {label:5.2}\n"
+                ));
+                table.push_str(&format!(
+                    "{variant:7} dot   {state:14} {surface:16} {dot:5.2}\n"
+                ));
+            }
+        }
+    }
+    print!("{table}");
+    if evidence {
+        // The contrast table is T-0076's evidence (the criterion that asks for
+        // the numbers), so it lands with that task's captures.
+        let _ = std::fs::write(evidence_dir_76.join("contrast.txt"), &table);
+        // The light variant as a page a reviewer can open: the same token
+        // table the TUI reads, so "the light rule" is visible and not just
+        // asserted.
+        let _ = std::fs::write(
+            evidence_dir_76.join("reference-light.html"),
+            reference_html(&light),
+        );
+    }
+    check(
+        &format!("every text and state label clears WCAG AA (worst {worst_text:.2}:1)"),
+        worst_text >= arreo_core::theme::brand::AA_TEXT,
+        &format!("worst text pair is {worst_text:.2}:1"),
+    );
+    check(
+        &format!("every state dot clears WCAG's graphic floor (worst {worst_dot:.2}:1)"),
+        worst_dot >= arreo_core::theme::brand::AA_NON_TEXT,
+        &format!("worst dot pair is {worst_dot:.2}:1"),
+    );
+    check(
+        "the light variant is the brand's derivation, not a second palette",
+        {
+            let surfaces =
+                arreo_core::theme::brand::light_surfaces(&doc).expect("§2 states the light rule");
+            light.color("background") == Color::parse(&surfaces.background).unwrap()
+                && light.color("backgroundPanel") == Color::parse(&surfaces.paper).unwrap()
+                && arreo_core::theme::brand::STATE_TOKENS.iter().all(|state| {
+                    light.color(state).relative_luminance() < dark.color(state).relative_luminance()
+                })
+        },
+        "the light variant does not follow BRAND §2's rule",
+    );
 
     // ---- The picker: `/theme` over a real terminal --------------------------
     let Some(mut session) = TuiSession::start_with(
@@ -408,7 +550,11 @@ fn palette_indices(raw: &[u8]) -> impl Iterator<Item = u16> + '_ {
 
 /// The numeric parameters of every SGR sequence, in order, across the whole
 /// stream. This is what a terminal actually parses.
-fn sgr_params(raw: &[u8]) -> Vec<u16> {
+///
+/// Shared with the TUI slice (T-0076), which asks the same question of the same
+/// bytes — one scanner, so a change to what counts as an SGR cannot make one
+/// slice disagree with the other.
+pub(crate) fn sgr_params(raw: &[u8]) -> Vec<u16> {
     let text = String::from_utf8_lossy(raw);
     let mut out = Vec::new();
     let mut rest = text.as_ref();
@@ -428,6 +574,40 @@ fn sgr_params(raw: &[u8]) -> Vec<u16> {
         out.extend(params.split(';').filter_map(|p| p.parse::<u16>().ok()));
     }
     out
+}
+
+/// True when the stream turns on SGR *modifier* `code` (e.g. 5 = slow blink)
+/// as an attribute rather than as part of an extended color.
+///
+/// `sgr_params` alone cannot answer this: an indexed color is `38;5;N`, so a
+/// bare "contains 5" would call every 256-color frame a blinking one. A
+/// modifier sequence is one that carries `code` and no `38`/`48` (the extended
+/// color introducers).
+pub(crate) fn sgr_sets_modifier(raw: &[u8], code: u16) -> bool {
+    let text = String::from_utf8_lossy(raw);
+    let mut rest = text.as_ref();
+    while let Some(at) = rest.find('\u{1b}') {
+        rest = &rest[at + 1..];
+        let Some(body) = rest.strip_prefix('[') else {
+            continue;
+        };
+        let Some(end) = body.find(|c: char| c.is_ascii_alphabetic()) else {
+            continue;
+        };
+        let (params, final_byte) = body.split_at(end);
+        rest = &body[end + 1..];
+        if !final_byte.starts_with('m') {
+            continue;
+        }
+        let codes: Vec<u16> = params
+            .split(';')
+            .filter_map(|p| p.parse::<u16>().ok())
+            .collect();
+        if codes.contains(&code) && !codes.contains(&38) && !codes.contains(&48) {
+            return true;
+        }
+    }
+    false
 }
 
 /// Does the stream carry this exact color as a foreground payload?

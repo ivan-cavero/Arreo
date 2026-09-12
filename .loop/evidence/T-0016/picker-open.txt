@@ -1,7 +1,7 @@
-┌agents────────────────────┐┌(no focus — Enter on a sidebar row)───────────────────────────────────────────────────────┐
-│◉ question                ││                                                                                          │
-│  alpha       3M █░░░░░░░░││                                                                                          │
-│                          ││                                                                                          │
+┌this machine · socket─────┐┌(no pane attached — Enter on a sidebar row)───────────────────────────────────────────────┐
+│  ◉ question              ││                                                                                          │
+│▶  alpha       3M █░░░░░░░││                                                                                          │
+│   Proceed? [y/n]         ││                                                                                          │
 │                          ││                                                                                          │
 │                          ││                                                                                          │
 │                          ││                                                                                          │
@@ -27,4 +27,4 @@
 │                          ││                                                                                          │
 │                          ││                                                                                          │
 └──────────────────────────┘└──────────────────────────────────────────────────────────────────────────────────────────┘
-1 panes · j/k move · Enter attach · w wall · t theme · / search · q quit
+1 panes · j/k move · Enter attach · Tab cycle · w wall · t theme · / search · ? keys · q quit

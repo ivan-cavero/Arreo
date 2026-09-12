@@ -88,11 +88,44 @@ impl Model {
         self.focus
     }
 
+    /// The pane the keyboard cursor is on, when the cursor is in the sidebar
+    /// (T-0076). `None` while the cursor is in the pane region.
+    ///
+    /// This is what the sidebar paints as *focus*, and it is deliberately not
+    /// the same fact as [`Self::focused_id`] (which pane is attached and
+    /// streaming): one is where the keyboard is, the other is what is selected.
+    /// Collapsing the two is how a UI ends up with no visible focus at all.
+    #[must_use]
+    pub fn cursor_id(&self) -> Option<&str> {
+        match self.focus {
+            Focus::Sidebar(i) => self.panes.get(i).map(|pane| pane.id.as_str()),
+            Focus::Pane => None,
+        }
+    }
+
+    /// True while the keyboard cursor is in the pane region (the attached pane
+    /// is what a keypress acts on).
+    #[must_use]
+    pub fn focus_is_pane(&self) -> bool {
+        self.focus == Focus::Pane
+    }
+
     /// Focus a pane by id (attaching the main view); falls back to sidebar.
     pub fn focus_pane(&mut self, id: &str) {
         if self.panes.iter().any(|p| p.id == id) {
             self.focus = Focus::Pane;
             self.focused_id = Some(id.to_string());
+        }
+    }
+
+    /// Put the keyboard cursor back in the pane region without changing which
+    /// pane is attached — the wall's `Enter` (open the highlighted tile
+    /// full-height) and the focus view's own return trip. A no-op when nothing
+    /// is attached, because "focus the pane region" with no pane would leave
+    /// every keypress with nowhere to go.
+    pub fn focus_pane_view(&mut self) {
+        if self.focused_id.is_some() {
+            self.focus = Focus::Pane;
         }
     }
 

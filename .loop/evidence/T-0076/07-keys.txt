@@ -1,0 +1,30 @@
+┌this machine · socket─────┐┌◉ beta [question] ▶─────────────────────────┐┌● alpha [working]───────────────────────────┐
+│  ◉ question              ││Proceed? [y/n]                              ││ALPHA-MARKER                                │
+│ ▸ beta        3M █░░░░░░░││                                            ││                                            │
+│   Proceed? [y/n]         ││                                            ││                                            │
+│  ● working               ││                                            ││                                            │
+│   alpha       3M █░░░░░░░││                                            ││                                            │
+│   gamma       3M █░░░░░░░││                                            ││                                            │
+│                          ││                                            ││                                            │
+│                          ││        ┌keys────────────────────────────────────────┐                                    │
+│                          ││        │ j/k ↑/↓    move the cursor                 │                                    │
+│                          ││        │ Enter      attach the pane (or open the wal│                                    │
+│                          ││        │ Tab        next pane                       │                                    │
+│                          ││        │ w          wall ↔ focus                    │                                    │
+│                          ││        │ t          theme picker                    │                                    │
+│                          │└────────│ /          search the transcript           │────────────────────────────────────┘
+│                          │┌● gamma │ [ ]        sidebar narrower / wider        │
+│                          ││GAMMA-MA│ PgUp/PgDn  scroll the transcript           │
+│                          ││        │ Home/End   oldest line / live output       │
+│                          ││        │ ?          this list                       │
+│                          ││        │ q / Esc    quit                            │
+│                          ││        └────────────────────────────────────────────┘
+│                          ││                                            │
+│                          ││                                            │
+│                          ││                                            │
+│                          ││                                            │
+│                          ││                                            │
+│                          ││                                            │
+│                          ││                                            │
+└──────────────────────────┘└────────────────────────────────────────────┘
+3 panes · j/k move · Enter attach · Tab cycle · w wall · t theme · / search · ? keys · q quit

@@ -1,10 +1,10 @@
-┌this machine · socket─────┐┌▶ ● gamma [working] ▏█▏ peak    3M ───────────────────────────────────────────────────────┐
-│  ◉ question              ││GAMMA-MARKER                                                                              │
+┌this machine · socket─────┐┌(no pane attached — Enter on a sidebar row)───────────────────────────────────────────────┐
+│  ◉ question              ││                                                                                          │
 │   beta        3M █░░░░░░░││                                                                                          │
 │   Proceed? [y/n]         ││                                                                                          │
 │  ● working               ││                                                                                          │
-│   alpha       3M █░░░░░░░││                                                                                          │
-│ ▸ gamma       3M █░░░░░░░││                                                                                          │
+│▶  alpha       3M █░░░░░░░││                                                                                          │
+│   gamma       3M █░░░░░░░││                                                                                          │
 │                          ││                                                                                          │
 │                          ││                                                                                          │
 │                          ││                                                                                          │
@@ -27,4 +27,4 @@
 │                          ││                                                                                          │
 │                          ││                                                                                          │
 └──────────────────────────┘└──────────────────────────────────────────────────────────────────────────────────────────┘
-/MARK  1 matching lines · Esc clears
+3 panes · j/k move · Enter attach · Tab cycle · w wall · t theme · / search · ? keys · q quit

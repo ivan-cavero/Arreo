@@ -112,6 +112,40 @@ fn many_views(n: usize) -> Vec<PaneView> {
 }
 
 #[test]
+fn esc_clears_an_applied_search_before_it_means_quit() {
+    // The status line promises "Esc clears" while a filter is applied, so Esc
+    // must do that — quitting instead would make the hint a lie (T-0076).
+    let mut app = App::new();
+    app.model.set_panes(views());
+    app.model.focus_pane("gamma");
+    app.on_key(KeyCode::Char('/'));
+    for c in "GAMMA".chars() {
+        app.on_key(KeyCode::Char(c));
+    }
+    app.on_key(KeyCode::Enter);
+    assert!(!app.searching && app.search == "GAMMA");
+    assert!(app.on_key(KeyCode::Esc), "Esc clears, it does not quit");
+    assert!(app.search.is_empty(), "the filter is gone");
+    // Nothing left to clear: now Esc is the quit key.
+    assert!(!app.on_key(KeyCode::Esc));
+}
+
+#[test]
+fn the_help_list_is_modal() {
+    let mut app = App::new();
+    app.model.set_panes(views());
+    app.on_key(KeyCode::Char('?'));
+    assert!(app.help);
+    // Every other binding is inert while the list is up.
+    app.on_key(KeyCode::Char('w'));
+    assert_eq!(app.view, ViewMode::Focus, "w must not fire behind the list");
+    app.on_key(KeyCode::Char('t'));
+    assert!(app.picker.is_none());
+    app.on_key(KeyCode::Char('?'));
+    assert!(!app.help, "? closes it again");
+}
+
+#[test]
 fn wall_grid_tiles_panes_near_square() {
     assert_eq!(wall_grid(1), (1, 1));
     assert_eq!(wall_grid(2), (1, 2));

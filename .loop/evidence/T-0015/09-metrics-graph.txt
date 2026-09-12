@@ -1,11 +1,11 @@
-┌this machine · socket─────┐┌alpha [working] ▏██▏ peak    3M ──────────────────────────────────────────────────────────┐
-│◉ question                ││ALPHA-MARKER                                                                              │
-│  beta        3M █░░░░░░░░││                                                                                          │
-│    Proceed? [y/n]        ││                                                                                          │
-│● working                 ││                                                                                          │
-│▸ alpha       3M █░░░░░░░░││                                                                                          │
-│  gamma       3M █░░░░░░░░││                                                                                          │
-│  graph       3M █░░░░░░░░││                                                                                          │
+┌this machine · socket─────┐┌▶ ● alpha [working] ▏██▏ peak    3M ──────────────────────────────────────────────────────┐
+│  ◉ question              ││ALPHA-MARKER                                                                              │
+│   beta        3M █░░░░░░░││                                                                                          │
+│   Proceed? [y/n]         ││                                                                                          │
+│  ● working               ││                                                                                          │
+│ ▸ alpha       3M █░░░░░░░││                                                                                          │
+│   gamma       3M █░░░░░░░││                                                                                          │
+│   graph       3M █░░░░░░░││                                                                                          │
 │                          ││                                                                                          │
 │                          ││                                                                                          │
 │                          ││                                                                                          │
@@ -27,4 +27,4 @@
 │                          ││                                                                                          │
 │                          ││                                                                                          │
 └──────────────────────────┘└──────────────────────────────────────────────────────────────────────────────────────────┘
-4 panes · j/k move · Enter attach · w wall · t theme · / search · q quit
+4 panes · j/k move · Enter attach · Tab cycle · w wall · t theme · / search · ? keys · q quit
