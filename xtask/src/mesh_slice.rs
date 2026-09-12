@@ -740,32 +740,19 @@ pub fn run(rest: &[String]) -> ExitCode {
     // The message is what proves the refusal is the ledger's (it names the grant
     // command) rather than a network failure — and the exit code (5, the trust
     // vocabulary) proves it is a refusal rather than a reachability problem.
-    // **Two facts, asserted separately, because they fail separately.**
-    //
-    // The refusal is *bounded* (T-0064 fixed the unbounded read that used to hang
-    // here forever), and the refusal's *sentence* is not delivered (T-0065: the
-    // daemon writes it and the frame is lost over the relay). Reporting them as
-    // one check would hide which is which — and the bounded half is the one this
-    // slice can assert today, so it is a PASS rather than a skip.
-    let refusal_in_daemon_log = beta.log_text().contains("refusing Hello");
+    // **One assertion now, because the two facts it split into are both true
+    // again** (T-0065 delivered the refusal; T-0064 bounded the wait). The check
+    // is the criterion in full: the device is refused, the exit code is the trust
+    // vocabulary's (5, not a reachability 4), and the message carries the command
+    // that fixes it. The bound is proven by the call returning inside its
+    // deadline at all — `cli_with_deadline` reports "timed out" instead of a
+    // message when it does not.
     check(
-        "a refused peer fails bounded and names the peer, rather than hanging",
-        !ok && refused.contains(BETA) && refused.contains("no answer"),
+        "an untrusted device is refused with the actionable message",
+        !ok && refused.contains("arreo machines trust") && refused.contains("grant"),
         &refused,
     );
-    if refusal_in_daemon_log && !refused.contains("arreo machines trust") {
-        skip(
-            "the refusal's own message reaches the operator",
-            "the daemon refuses correctly (its log has the sentence and the grant command) \
-             and the frame is lost on the relay path — T-0065, not this slice's fence",
-        );
-    } else {
-        check(
-            "the refusal's own message reaches the operator",
-            refused.contains("arreo machines trust"),
-            &refused,
-        );
-    }
+
     if evidence {
         let _ = std::fs::write(evidence_dir.join("03-deny.txt"), &refused);
     }

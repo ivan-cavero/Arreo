@@ -1,0 +1,20 @@
+T-0065 — a frame written before closing must reach the peer
+===========================================================
+
+## The defect, reproduced
+
+With the old abort: the peer never receives the frame (it never even learns a peer arrived).
+
+## The fix
+
+test a_frame_written_immediately_before_closing_reaches_the_peer ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 6 filtered out; finished in 0.14s
+
+## Load-bearing, proved by mutation
+
+Restoring 'forward.abort()' in Drop fails the same test (10.4s, no bytes).
+
+## End to end: the refusal sentence now arrives (T-0047's mesh slice)
+
+[PASS] mesh: an untrusted device is refused with the actionable message
+mesh: 16 passed, 1 skipped, 0 failed

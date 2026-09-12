@@ -50,7 +50,6 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, DuplexStream, ReadBuf};
 use tokio::sync::{mpsc, oneshot};
-use tokio::task::JoinHandle;
 
 /// Largest plaintext chunk carried in one envelope.
 ///
@@ -991,13 +990,16 @@ async fn read_pump(
 /// somewhere to put bytes that cannot block the caller and cannot lose a waker;
 /// that is exactly what a duplex is for.
 pub struct RelayStream {
-    sink: DuplexStream,
+    /// `Option` so [`Drop`] can close the write half deterministically and let the
+    /// forwarding task drain what is already in the duplex (T-0065) — a field
+    /// cannot be moved out of `&mut self`, and "close it, then let the task
+    /// finish" is exactly the order that matters.
+    sink: Option<DuplexStream>,
     inbound: mpsc::Receiver<Vec<u8>>,
     /// The chunk being handed to the caller, and how much of it is left.
     current: Option<Vec<u8>>,
     peer: DeviceId,
     failure: Arc<Mutex<Option<String>>>,
-    forward: JoinHandle<()>,
 }
 
 impl std::fmt::Debug for RelayStream {
@@ -1017,7 +1019,10 @@ impl RelayStream {
     ) -> Self {
         let (sink, mut drain) = tokio::io::duplex(STREAM_BUFFER);
         let out_peer = peer.clone();
-        let forward = tokio::spawn(async move {
+        // Detached on purpose (T-0065): the task ends when the duplex closes and
+        // is drained, or when the session goes away and its `send` fails. Keeping
+        // the handle would invite an `abort`, which is the defect this fixed.
+        tokio::spawn(async move {
             let mut buf = vec![0u8; MAX_CHUNK];
             loop {
                 match drain.read(&mut buf).await {
@@ -1039,12 +1044,11 @@ impl RelayStream {
             }
         });
         Self {
-            sink,
+            sink: Some(sink),
             inbound,
             current: None,
             peer,
             failure,
-            forward,
         }
     }
 
@@ -1065,8 +1069,24 @@ impl RelayStream {
 }
 
 impl Drop for RelayStream {
+    /// Close the write half and let the forwarding task finish (T-0065).
+    ///
+    /// **Not `abort`.** Aborting killed the one task that hands bytes to the
+    /// session, so anything still sitting in the duplex died with it — and on
+    /// every "refuse and hang up" path, the last thing written *is* the reason the
+    /// peer was refused. Over a local socket there is no such task and the bytes
+    /// arrive, which is why the local tests never caught it.
+    ///
+    /// Closing the sink is enough to end the task: `poll_read` on a duplex drains
+    /// what is buffered before it reports end-of-stream, so the task sends the
+    /// remaining frame and *then* returns. The task also returns on its own if the
+    /// session goes away first (its `outbound.send` fails), so nothing leaks by
+    /// not aborting — and the daemon's existing `FINAL_FRAME_GRACE` pause is what
+    /// gives the drain its window, which is what that pause was always for.
     fn drop(&mut self) {
-        self.forward.abort();
+        // Closing first makes the order explicit rather than incidental: the
+        // task must see end-of-stream *after* it has read the buffer.
+        drop(self.sink.take());
     }
 }
 
@@ -1116,14 +1136,26 @@ impl AsyncWrite for RelayStream {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<std::io::Result<usize>> {
-        Pin::new(&mut self.sink).poll_write(cx, buf)
+        let Some(sink) = self.sink.as_mut() else {
+            return Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "the stream is closed",
+            )));
+        };
+        Pin::new(sink).poll_write(cx, buf)
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.sink).poll_flush(cx)
+        let Some(sink) = self.sink.as_mut() else {
+            return Poll::Ready(Ok(()));
+        };
+        Pin::new(sink).poll_flush(cx)
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.sink).poll_shutdown(cx)
+        let Some(sink) = self.sink.as_mut() else {
+            return Poll::Ready(Ok(()));
+        };
+        Pin::new(sink).poll_shutdown(cx)
     }
 }

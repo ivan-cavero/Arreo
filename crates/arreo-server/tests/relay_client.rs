@@ -538,3 +538,83 @@ async fn a_departing_device_ends_the_streams_its_peers_hold() {
         "the fresh stream carries data again"
     );
 }
+
+/// **T-0065: a frame written immediately before closing must reach the peer.**
+///
+/// This is the shape every "refuse and hang up" path has: the daemon writes its
+/// answer (a refusal, an error, a final status), shuts the stream down, and
+/// returns. Over a local socket the bytes are in a duplex the same process owns
+/// and always arrive — which is why T-0046's tests, all local, never caught this.
+/// Over the relay the write direction is a `DuplexStream` plus **one forwarding
+/// task**, and that task is what actually hands the bytes to the session.
+///
+/// The assertion is the whole point: the peer must read the frame. A stream that
+/// is dropped before its forwarding task has drained loses whatever was written
+/// last — and "whatever was written last" is, on every refusal path, the reason.
+#[tokio::test]
+async fn a_frame_written_immediately_before_closing_reaches_the_peer() {
+    let relay = Relay::start("final-frame");
+    let root = RootKey::generate().expect("entropy");
+    relay.register_account("acct-1", &root.public());
+
+    let (alice_key, alice_cert) = device(&root, "alice", 1);
+    let (bob_key, bob_cert) = device(&root, "bob", 2);
+    let alice_id = alice_cert.device().clone();
+    let bob_id = bob_cert.device().clone();
+
+    let alice_session = RelaySession::dial(relay.addr, "acct-1", &alice_key, &alice_cert)
+        .await
+        .expect("alice registers");
+    let mut bob_session = RelaySession::dial(relay.addr, "acct-1", &bob_key, &bob_cert)
+        .await
+        .expect("bob registers");
+
+    // Alice's side: write the frame, shut the stream down, and drop it — the
+    // exact sequence a daemon performs when it refuses a peer.
+    const FINAL: &[u8] = b"the reason you were refused";
+    let alice_stream = alice_session.stream_to(&bob_id);
+    let writer = tokio::spawn(async move {
+        let mut stream = alice_stream;
+        stream.write_all(FINAL).await.expect("write");
+        stream.flush().await.expect("flush");
+        // `shutdown` then drop: what `serve_session`'s wrapper does after the
+        // grace sleep.
+        AsyncWriteExt::shutdown(&mut stream).await.ok();
+        drop(stream);
+    });
+
+    // Bob's side: open the matching stream and read what arrives.
+    let peer = tokio::time::timeout(Duration::from_secs(10), bob_session.next_peer())
+        .await
+        .expect("bob is told about the peer")
+        .expect("a peer arrived");
+    assert_eq!(peer, alice_id, "the announced peer is alice");
+
+    let mut bob_stream = bob_session.stream_to(&peer);
+    let mut got = Vec::new();
+    let read = tokio::time::timeout(Duration::from_secs(10), async {
+        let mut buf = [0u8; 256];
+        loop {
+            match bob_stream.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    got.extend_from_slice(&buf[..n]);
+                    if got.len() >= FINAL.len() {
+                        break;
+                    }
+                }
+            }
+        }
+    })
+    .await;
+    assert!(
+        read.is_ok(),
+        "the final frame must arrive within the timeout, got {} byte(s)",
+        got.len()
+    );
+    assert_eq!(
+        got, FINAL,
+        "the frame written immediately before closing must reach the peer"
+    );
+    writer.await.expect("the writer task finishes");
+}

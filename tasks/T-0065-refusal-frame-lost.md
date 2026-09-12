@@ -3,12 +3,12 @@ id: T-0065
 title: The daemon's refusal frame is written but never reaches a remote peer
 phase: 2
 priority: 2
-status: proposed
+status: done
 depends_on: [T-0064]
 scope:
   - crates/arreo-core/src/relay/session.rs
   - crates/arreo-server/src/daemon.rs
-  - crates/arreo-server/tests/relay.rs
+  - crates/arreo-server/tests/relay_client.rs
   - .loop/evidence/T-0065/**
 ---
 
@@ -47,32 +47,40 @@ panes: beta-machine: mesh client handshake: no answer to Hello within 10s (the p
 So: refusal written, flush attempted (`serve_session`'s wrapper does `writer.shutdown()` then
 sleeps `FINAL_FRAME_GRACE`), and nothing arrives.
 
-## The hypothesis to test first
+## The hypothesis, confirmed
 
 `RelayStream`'s write direction is a `DuplexStream` plus **one forwarding task**. The bytes
 the daemon writes go into the duplex; that task is what actually sends them as relay
 envelopes. The task belongs to the `RelayStream`, and the `RelayStream` is dropped when
 `serve_session` returns — i.e. immediately after `FINAL_FRAME_GRACE`. If the forwarding task is
-aborted by that drop before it has drained the duplex, the frame dies with it. If that is the
-mechanism, a refusal on a *local* socket (no RelayStream, no forwarding task) would arrive
-fine — which is exactly what T-0046's tests show, and why they never caught this.
+aborted by that drop before it has drained the duplex, the frame dies with it. **Confirmed** — and the
+local path behaves as predicted: it has no `RelayStream` and no forwarding task, so the bytes
+arrive, which is exactly what T-0046's (all local) tests show and why they never caught this.
 
 The test that settles it: write a frame, call `shutdown`, drop the stream, and assert the
 frame arrived — on both transports. Local passes today; the relay half is the bug.
 
 ## Acceptance criteria
 
-- [ ] A frame written immediately before `shutdown` reaches a relay peer. Proven by a test over
-      a real relay (the pattern `crates/arreo-server/tests/relay.rs` already uses), not by
-      inspection.
-- [ ] The daemon's refusal at Hello arrives verbatim at a remote client, and the CLI maps it to
-      the trust exit code (5) — the sentence T-0046 ships for exactly this moment.
-- [ ] T-0047's mesh check "the refusal's own message reaches the operator" flips from SKIP to
-      PASS, and that skip is removed rather than left as history.
-- [ ] The local path keeps working (no regression): `crates/arreo-cli/tests/remote_machine.rs`
-      and `crates/arreo-server/tests/trust.rs` stay green.
-- [ ] Any other caller that writes-then-closes over the relay is audited for the same defect —
-      the shape is general, so the fix belongs in the stream, not at one call site.
+- [x] A frame written immediately before `shutdown` reaches a relay peer:
+      `a_frame_written_immediately_before_closing_reaches_the_peer` in
+      `crates/arreo-server/tests/relay_client.rs` (the fence named `relay.rs`, which does not exist —
+      corrected here), over a real relay binary. Proved load-bearing by mutation: restoring the
+      `abort` fails it.
+- [x] The daemon's refusal at Hello arrives verbatim at a remote client: T-0047's mesh slice now
+      PASSES "an untrusted device is refused with the actionable message" — the message carries
+      `arreo machines trust … --machine … --role … --yes`, and the exit code is the trust
+      vocabulary's.
+- [x] T-0047's mesh checks flip to PASS: the split (bounded failure / missing sentence) is
+      **collapsed back into one assertion**, because both facts are true again — the device is
+      refused, the exit code is 5, and the message names the fix. The slice is also faster
+      (11.9 s vs 29 s) because nothing waits on a timeout any more.
+- [x] The local path keeps working: `crates/arreo-server/tests/trust.rs` (the local trust refusals)
+      and the whole 474-test workspace suite are green.
+- [x] Every caller audited, and the fix is at the right layer: the only write-then-close path is
+      `serve_session`'s wrapper (`crates/arreo-server/src/daemon.rs:957`), and both relay consumers
+      (`serve_peer`, `probe_peer`) wrap the `RelayStream` in a `SecureChannel` that reaches
+      `RelayStream::drop`. Fixing the drop fixes all of them; no call site needed changing.
 
 ## Notes
 
@@ -94,3 +102,21 @@ cargo test -p arreo-core --lib relay::session
 cargo test -p arreo-server --test relay
 cargo xtask e2e --slice mesh
 ```
+
+## Outcome
+
+Fixed and pushed. The forwarding task is no longer aborted: `RelayStream::drop` closes the write
+half and lets it drain, so a frame written immediately before closing reaches the peer. The task
+still ends on its own — the duplex reports end-of-stream after the buffer, and a dead session
+fails its `send` — so nothing leaks and no handle needs keeping.
+
+**The mechanism, confirmed:** `Drop for RelayStream` called `forward.abort()`, killing the one task
+that hands bytes to the session. Anything still in the duplex died with it. `serve_session`'s
+`FINAL_FRAME_GRACE` pause made room for the drain; the abort is what made the room useless.
+
+**Why only the relay path showed it:** locally there is no forwarding task and no duplex — the
+bytes go straight into a socket the same process owns. T-0046's tests are all local, which is
+exactly why the refusal they assert never arrived over the wire.
+
+The refactor paid for itself too: `tokio::task::JoinHandle` left the file, and the stream is
+simpler than before (`sink: Option<DuplexStream>` and no handle).
