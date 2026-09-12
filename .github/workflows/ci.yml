@@ -13,9 +13,13 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-      # No toolchain input: respects rust-toolchain.toml (T-0001).
+      # Pinned to the repo's toolchain (T-0063): CI installs `@stable`, the repo
+      # pins 1.98.0, and clippy's lint set moves underneath the version — "clippy
+      # is clean" meant two different things, which is how the macOS leg broke on
+      # lints the pinned clippy never fired. One lint set everywhere now.
       - uses: dtolnay/rust-toolchain@stable
         with:
+          toolchain: "1.98.0"
           components: rustfmt, clippy
       - name: fmt
         run: cargo fmt --all -- --check
@@ -67,3 +71,41 @@ jobs:
         run: cargo run -p xtask -- e2e --slice compat
       - name: xtask stubs
         run: cargo xtask e2e
+
+  # T-0048: the public-readiness gate, as its own job and on one OS.
+  #
+  # Deliberately overlapping with the matrix above: the matrix proves the product
+  # *behaves* on three operating systems, this proves the *repository* is ready to
+  # be public — licenses, the whole git history's secrets, the docs' links, the
+  # claims. Those are different claims, and a readiness gate that only ran when
+  # the matrix was green would be a gate nobody could point at.
+  #
+  # One OS on purpose: every item here is OS-independent (lint, scan, links), and
+  # running a full-history secret scan three times buys nothing.
+  public-readiness:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # **The whole history.** The secret scan's criterion is that the *log* is
+          # clean, not the working tree, and `actions/checkout` is shallow by
+          # default — a depth-1 clone would make gitleaks scan one commit and
+          # report PASS for a scan it never ran (T-0048).
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.98.0"
+          components: rustfmt, clippy
+      - name: pinned scanners (gitleaks 8.28.0 + reuse 5.0.2)
+        run: |
+          set -euo pipefail
+          curl -sSL -o /tmp/gitleaks.tar.gz \
+            https://github.com/gitleaks/gitleaks/releases/download/v8.28.0/gitleaks_8.28.0_linux_x64.tar.gz
+          echo "a65b5253807a68ac0cafa4414031fd740aeb55f54fb7e55f386acb52e6a840eb  /tmp/gitleaks.tar.gz" \
+            | sha256sum -c -
+          tar -xzf /tmp/gitleaks.tar.gz -C /tmp gitleaks
+          echo "ARREO_GITLEAKS=/tmp/gitleaks" >> "$GITHUB_ENV"
+          python3 -m pip install --quiet "reuse==5.0.2"
+          echo "ARREO_REUSE=$(command -v reuse)" >> "$GITHUB_ENV"
+      - name: release-check (T-0048 — fail closed on any check that cannot run)
+        run: cargo run -p xtask -- release-check --public
