@@ -70,6 +70,10 @@ pub fn run(rest: &[String]) -> ExitCode {
         return ExitCode::from(USAGE);
     }
 
+    if args.server {
+        return server(&args);
+    }
+
     let current = match update::current_binary() {
         Ok(path) => path,
         Err(e) => {
@@ -133,15 +137,468 @@ pub fn run(rest: &[String]) -> ExitCode {
     }
 }
 
+/// `arreo update --server --from <path>` — the daemon half of the update (T-0038).
+///
+/// ## The order, and why it is this order
+///
+/// ```text
+/// 1. stage the candidate beside the installed server binary
+/// 2. prove the staged binary runs            (--version)
+/// 3. spawn the *staged* binary in handoff mode
+/// 4. wait until a different process serves the socket
+/// 5. only now install over the server path   (hard link + one atomic rename)
+/// ```
+///
+/// The tempting order is to install first and then ask the daemon to take over,
+/// and it is worse in exactly the way this codebase keeps choosing against: if
+/// the handoff fails, the install has already happened, so the machine is left
+/// with a new binary on disk, the old one running from memory, and `.prev`
+/// holding something the operator did not ask for. **Handing off from the staged
+/// path makes a failed handoff change nothing at all** — no swap, no `.prev`
+/// churn, and the daemon still serving the binary it was already running. The
+/// swap is the cheap, atomic, always-possible step, so it goes last.
+///
+/// ## Why the child gets no stdio
+///
+/// The new daemon outlives this command. If it inherited our stdout/stderr and
+/// the operator piped `arreo update --server | tee`, then our exit would close
+/// that pipe and the daemon's next log line would be written to a broken
+/// descriptor — a daemon that can be killed by its launcher exiting is precisely
+/// what a handoff exists to prevent. So the child is given null stdio, and this
+/// command reports what happened itself. The cost is real and worth naming: a
+/// daemon started this way logs nowhere, which is why a supervised install
+/// (`arreo service install`) remains the way to run one for real.
+///
+/// ## Why argv[0] is the installed path, not the staged one
+///
+/// The running process's image is `<binary>.staged` until the swap. `arreo server
+/// stop` and this command both find a daemon by scanning `/proc` for a process
+/// whose argv runs `arreo-server` and names the socket — so the child is spawned
+/// with argv[0] set to the installed path it is about to occupy, and every such
+/// scan keeps working across the cut.
+fn server(args: &Args) -> ExitCode {
+    let current = match server_binary() {
+        Ok(path) => path,
+        Err(message) => {
+            eprintln!("update: {message}");
+            return ExitCode::from(FAILED);
+        }
+    };
+    if !current.is_file() {
+        // `is_file` is false for a missing binary and for one this user cannot
+        // read, and the two need different advice.
+        eprintln!(
+            "update: no `arreo-server` beside this binary (looked for {}). \
+             --server replaces the daemon; install one first.",
+            current.display()
+        );
+        return ExitCode::from(FAILED);
+    }
+    // One updater at a time, keyed on the server binary (the client lock is a
+    // different file, so a client update and a server update can proceed
+    // together — they touch different paths).
+    let _lock = match update::UpdateLock::acquire(&current) {
+        Ok(lock) => lock,
+        Err(UpdateError::Locked(path)) => {
+            eprintln!("update: another update is already in progress (holding {path})");
+            return ExitCode::from(IN_PROGRESS);
+        }
+        Err(e) => {
+            eprintln!("update: {e}");
+            return ExitCode::from(FAILED);
+        }
+    };
+
+    if args.rollback {
+        return match update::rollback(&current) {
+            Ok(()) => {
+                println!("rolled back {}", current.display());
+                println!(
+                    "the running daemon is unchanged; it takes effect when the daemon \
+                     next starts"
+                );
+                OK.into()
+            }
+            Err(e) => {
+                eprintln!("update: {e}");
+                ExitCode::from(exit_code(&e))
+            }
+        };
+    }
+
+    let Some(source) = args.from.as_deref() else {
+        eprintln!("update: nothing to install. Pass --from <path> with a server binary you have.");
+        usage();
+        return ExitCode::from(USAGE);
+    };
+    // Re-running the same install is a no-op, and saying so is better than
+    // manufacturing a `.prev` for an install that changes nothing (the same rule
+    // the client path follows).
+    if update::identical(std::path::Path::new(source), &current).unwrap_or(false) {
+        let version = update::verify_runs(&current).unwrap_or_else(|_| "unknown".to_string());
+        println!(
+            "already running {version} ({} is byte-identical); nothing to do",
+            source
+        );
+        return OK.into();
+    }
+    let socket = args
+        .socket
+        .clone()
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(crate::default_socket);
+
+    // 1-2. Stage beside the installed binary and prove it runs. `stage` refuses a
+    // candidate that is not executable; `verify_runs` refuses one that is
+    // executable but not a working `arreo-server` — which for a *server* matters
+    // more than for a client, because the daemon about to adopt every PTY on this
+    // machine is the thing being trusted.
+    let staged = match update::stage(std::path::Path::new(source), &current) {
+        Ok(staged) => staged,
+        Err(e) => {
+            eprintln!("update: {e}");
+            return ExitCode::from(exit_code(&e));
+        }
+    };
+    let version = match update::verify_runs(&staged) {
+        Ok(version) => version,
+        Err(e) => {
+            let _ = std::fs::remove_file(&staged);
+            eprintln!("update: the candidate does not run: {e}");
+            return ExitCode::from(FAILED);
+        }
+    };
+    // "It runs" is not enough for this path: `arreo --version` also succeeds, and
+    // installing a *client* over the *server* path would leave the machine with a
+    // daemon that cannot be started. The version string is the one piece of
+    // self-description a binary offers, so it is what gets checked — the check is
+    // cheap and the failure it prevents is a bricked daemon.
+    if !version.contains(SERVER_BINARY_NAME) {
+        let _ = std::fs::remove_file(&staged);
+        eprintln!(
+            "update: {source} is not an arreo server (it reports {version:?}); \
+             --server replaces the daemon, not the client"
+        );
+        return ExitCode::from(FAILED);
+    }
+
+    // 3-4. Hand the daemon over, if one is running.
+    //
+    // On Windows there is no descriptor passing, so no handoff exists: the binary
+    // is installed and takes effect at the next daemon start — §3.13's deferred
+    // update, which is what that platform is specified to get (T-0039). The
+    // distinction is reported, not glossed: an operator must never think a cut
+    // happened when the daemon is still running the old code.
+    #[cfg(not(unix))]
+    let handoff = {
+        if crate::find_daemon_pid(&socket).is_some() {
+            Handoff::Deferred
+        } else {
+            Handoff::NoDaemon
+        }
+    };
+    #[cfg(unix)]
+    let handoff = match crate::find_daemon_pid(&socket) {
+        None => Handoff::NoDaemon,
+        Some(pid) => match wait_for_takeover(&staged, &current, &socket, pid, args) {
+            Ok(new_pid) => Handoff::TookOver {
+                from: pid,
+                to: new_pid,
+            },
+            Err(message) => {
+                // The handoff failed, so nothing is installed and nothing
+                // changed: the staged copy is dropped and the daemon that was
+                // serving keeps serving the binary it was already running.
+                let _ = std::fs::remove_file(&staged);
+                eprintln!("update: {message}");
+                eprintln!(
+                    "update: nothing was installed; the daemon serving {} is still running \
+                     (pid {pid})",
+                    socket.display()
+                );
+                return ExitCode::from(FAILED);
+            }
+        },
+    };
+
+    // 5. Install. At this point a daemon may already be running the staged
+    // binary, so a failure here must say that plainly rather than implying the
+    // update did not happen.
+    let previous = match update::swap(&staged, &current) {
+        Ok(()) => update::prev_path(&current).display().to_string(),
+        Err(e) => {
+            eprintln!(
+                "update: the handoff succeeded but installing over {} failed: {e}",
+                current.display()
+            );
+            eprintln!(
+                "update: the new daemon is running from {}; `arreo update --server --rollback` \
+                 will not see it until the next start",
+                staged.display()
+            );
+            return ExitCode::from(exit_code(&e));
+        }
+    };
+
+    if args.json {
+        let handoff = match &handoff {
+            Handoff::NoDaemon => serde_json::json!({"daemon": null}),
+            Handoff::TookOver { from, to } => {
+                serde_json::json!({"daemon": {"from_pid": from, "to_pid": to}})
+            }
+            #[cfg(not(unix))]
+            Handoff::Deferred => serde_json::json!({"daemon": {"deferred": true}}),
+        };
+        println!(
+            "{}",
+            serde_json::json!({
+                "changed": true,
+                "installed": current.display().to_string(),
+                "version": version,
+                "previous": previous,
+                "handoff": handoff,
+            })
+        );
+    } else {
+        println!("installed {}", current.display());
+        println!("version: {version}");
+        println!("previous kept at {previous}");
+        match handoff {
+            Handoff::NoDaemon => println!(
+                "no daemon was serving {}; it will run the new binary when it next starts",
+                socket.display()
+            ),
+            Handoff::TookOver { from, to } => {
+                println!(
+                    "handed over: the daemon serving {} is now pid {to} (was {from})",
+                    socket.display()
+                );
+                println!("no agent was restarted: the PTYs and their processes were untouched");
+            }
+            #[cfg(not(unix))]
+            Handoff::Deferred => println!(
+                "update pending: a daemon is serving {} and this platform cannot hand it over \
+                 without a restart; the new binary takes effect when it next starts",
+                socket.display()
+            ),
+        }
+    }
+    OK.into()
+}
+
+/// What the daemon half of the update did.
+enum Handoff {
+    /// Nothing was serving the socket, so there was nothing to hand over.
+    NoDaemon,
+    /// The daemon was handed over to the new binary without a restart.
+    TookOver { from: u32, to: u32 },
+    /// Windows: installed, and it takes effect at the next daemon start.
+    #[cfg(not(unix))]
+    Deferred,
+}
+
+/// Spawn the staged server binary in handoff mode and wait until it is the
+/// process serving `socket`.
+///
+/// ## What counts as "it took over"
+///
+/// **The outgoing daemon is no longer running, and the socket still answers.**
+/// Both halves are load-bearing, and the obvious weaker condition — "some
+/// daemon is answering on the socket" — is wrong: the *incoming* daemon appears
+/// in `/proc` the moment it starts (before it has taken anything over) and the
+/// *outgoing* one keeps answering until it exits, so a poll on "someone answers"
+/// can fire before the cut has happened and report a success that has not
+/// occurred.
+///
+/// The ordering in ADR 0021 is what makes the two-part condition exact: the
+/// outgoing daemon exits only *after* the incoming one has committed, so
+/// "old is gone" cannot be true before the cut is real. It holds for the crash
+/// case too — if the outgoing daemon dies mid-handoff the incoming one aborts
+/// and serves nothing, so the second half fails and this reports a failure
+/// rather than a success.
+///
+/// **A zombie counts as not running.** The outgoing daemon may not have been
+/// reaped by whoever started it (a shell, or a test that has not waited), so
+/// `/proc/<pid>` can linger after it exits. Reading the `stat` state handles
+/// that and the reaped case alike.
+fn wait_for_takeover(
+    staged: &std::path::Path,
+    current: &std::path::Path,
+    socket: &std::path::Path,
+    previous_pid: u32,
+    args: &Args,
+) -> Result<u32, String> {
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    let timeout = Duration::from_secs(args.timeout_secs.unwrap_or(DEFAULT_HANDOFF_TIMEOUT_SECS));
+    let mut command = Command::new(staged);
+    // argv[0] is the path this process is about to occupy, so `/proc` scans for
+    // `arreo-server` keep finding the daemon across the cut (see the fn docs).
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.arg0(current);
+    }
+    // See the fn docs: a TTY is safe to inherit and worth inheriting; anything
+    // else is a stream that can close under the daemon and kill it via a panicking
+    // `eprintln!`.
+    let stderr = if std::io::IsTerminal::is_terminal(&std::io::stderr()) {
+        Stdio::inherit()
+    } else {
+        Stdio::null()
+    };
+    let mut child = command
+        .arg("--handoff-from")
+        .arg(socket)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(stderr)
+        .spawn()
+        .map_err(|e| format!("cannot start the new daemon ({}): {e}", staged.display()))?;
+
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                return Err(format!(
+                    "the new daemon exited ({status}) before taking over — it was refused, or \
+                     the handoff failed (run `arreo-server --handoff-from {}` by hand for the \
+                     reason)",
+                    socket.display()
+                ));
+            }
+            Ok(None) => {}
+            Err(e) => return Err(format!("cannot check on the new daemon: {e}")),
+        }
+        if let Some(pid) = takeover(
+            crate::find_daemon_pid(socket),
+            previous_pid,
+            daemon_running(previous_pid),
+        ) {
+            return Ok(pid);
+        }
+        std::thread::sleep(POLL_INTERVAL);
+    }
+    // **This kills the direct child, not its descendants.** `Child::kill` signals
+    // one pid, and a candidate that spawned children before hanging would leave
+    // them behind (observed while testing a deliberately hanging fake server: the
+    // `sh` wrapper died and its `sleep` did not). Reaping the whole tree needs a
+    // process group plus a group-kill syscall, which this crate has no dependency
+    // for; the practical exposure today is nil because an `arreo-server` waiting
+    // on a handoff has adopted nothing and spawned nothing. It stops being nil
+    // when the handoff carries panes, so it is filed rather than noted and
+    // forgotten — see T-0072.
+    let _ = child.kill();
+    let _ = child.wait();
+    Err(format!(
+        "the handoff did not complete within {}s (the outgoing daemon, pid {previous_pid}, was \
+         still running at the last check)",
+        timeout.as_secs()
+    ))
+}
+
+/// **The readiness rule**, as a pure function of the two facts the poll can
+/// observe: which pid is answering the socket, and whether the outgoing daemon
+/// is still running.
+///
+/// Pure on purpose. The property being expressed — "do not report a takeover
+/// before it has happened" — is a race, and a race cannot be tested by racing: a
+/// test that polls a real handoff passes with the rule weakened, because by the
+/// time it can look, the cut has completed anyway. (That is not a hypothesis: it
+/// was tried, and the weakened rule passed the integration test.) So the rule
+/// lives here, where every combination including the dangerous one is a row in a
+/// table, and `wait_for_takeover` only supplies the facts.
+///
+/// The dangerous combination is the first row: a *different* daemon is answering
+/// while the old one still runs. That is exactly the state during a handoff — the
+/// incoming process appears in `/proc` long before it has taken anything over —
+/// and treating it as success would print a cut that had not happened.
+fn takeover(found: Option<u32>, previous: u32, previous_running: bool) -> Option<u32> {
+    let found = found?;
+    if found == previous || previous_running {
+        return None;
+    }
+    Some(found)
+}
+
+/// Is `pid` still running?
+///
+/// Linux answers from `/proc`, and **a zombie counts as not running** — which is
+/// the case that matters, because the outgoing daemon is rarely ours to reap and
+/// `/proc/<pid>` otherwise outlives it.
+///
+/// Elsewhere there is no `/proc`: this reports `false`, so readiness falls back
+/// to "a daemon is answering" and can in principle fire a moment early. That is
+/// recorded rather than hidden — the alternative is parsing `sysctl`/`kqueue` in
+/// a CLI, and the property being weakened (proving the *old* process is gone) is
+/// not one the operator can act on anyway. Linux is the handoff's target;
+/// Windows takes the deferred path (see `deferred_server_install`).
+#[cfg(target_os = "linux")]
+fn daemon_running(pid: u32) -> bool {
+    let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+        return false; // gone, or a pid we cannot read: not running for our purposes
+    };
+    // `pid (comm) state ...` — `comm` may contain spaces and parentheses, so the
+    // state is whatever follows the *last* `)`.
+    match stat.rsplit_once(") ") {
+        Some((_, rest)) => !rest.starts_with('Z'),
+        None => false,
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn daemon_running(_pid: u32) -> bool {
+    false
+}
+
+/// How long `--server` waits for a handoff before giving up. Generous because
+/// the alternative to waiting is a failed update, and the handoff itself is
+/// bounded by its own timeout on the daemon side.
+const DEFAULT_HANDOFF_TIMEOUT_SECS: u64 = 30;
+
+/// How often the takeover poll re-checks. Short enough to feel immediate, long
+/// enough that a `/proc` scan per tick is not the cost of the operation.
+const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// The `arreo-server` beside the running `arreo`.
+///
+/// A dist install and a `target/debug` build both put the two binaries in one
+/// directory, and the daemon that serves this machine is the one shipped with
+/// the client — so "beside me" is the only rule that cannot pick up an unrelated
+/// binary from `$PATH`.
+fn server_binary() -> Result<std::path::PathBuf, String> {
+    let client =
+        update::current_binary().map_err(|e| format!("cannot find the running binary: {e}"))?;
+    let dir = client
+        .parent()
+        .ok_or_else(|| format!("{} has no parent directory", client.display()))?;
+    Ok(dir.join(SERVER_BINARY_NAME))
+}
+
+/// The daemon binary's name. One constant: `arreo server stop` finds the process
+/// by the same string, and two spellings would mean one of them stops working.
+#[cfg(unix)]
+const SERVER_BINARY_NAME: &str = "arreo-server";
+#[cfg(windows)]
+const SERVER_BINARY_NAME: &str = "arreo-server.exe";
+
 fn usage() {
     eprintln!(
         "usage: arreo update --from <path> [--json] [--no-reexec] [--reattach-pane ID] [--socket PATH]"
     );
     eprintln!("       arreo update --rollback [--json]");
     eprintln!("       arreo update --check");
+    eprintln!(
+        "       arreo update --server --from <path> [--json] [--socket PATH] [--timeout-secs N]"
+    );
     eprintln!("  --from      a binary to install in place of this one (already on disk)");
     eprintln!("  --rollback  put the previous binary back");
     eprintln!("  --check     report the available version from the release channel (needs T-0037)");
+    eprintln!(
+        "  --server    with --from: replace the `arreo-server` beside this binary and hand the \
+         running daemon over to it, without killing an agent"
+    );
     eprintln!(
         "  exit codes: 0 ok · 1 failed · 2 usage · 3 update in progress · 4 path not writable"
     );
@@ -156,6 +613,15 @@ struct Args {
     no_reexec: bool,
     reattach_pane: Option<String>,
     socket: Option<String>,
+    /// Replace the **server** binary and hand the daemon over to it (T-0038),
+    /// instead of swapping this client binary (T-0070). Two different
+    /// operations with the same verb because they are one story to an operator
+    /// ("update arreo"), and different flags because they act on different
+    /// processes.
+    server: bool,
+    /// How long to wait for the handoff to complete. Only meaningful with
+    /// `--server`.
+    timeout_secs: Option<u64>,
 }
 
 fn parse(rest: &[String]) -> Result<Args, String> {
@@ -181,6 +647,17 @@ fn parse(rest: &[String]) -> Result<Args, String> {
                 args.socket = Some(value()?);
                 i += 2;
             }
+            "--server" => {
+                args.server = true;
+                i += 1;
+            }
+            "--timeout-secs" => {
+                let raw = value()?;
+                args.timeout_secs = Some(raw.parse().map_err(|_| {
+                    format!("--timeout-secs needs a number of seconds, got {raw:?}")
+                })?);
+                i += 2;
+            }
             "--rollback" => {
                 args.rollback = true;
                 i += 1;
@@ -203,6 +680,16 @@ fn parse(rest: &[String]) -> Result<Args, String> {
     if args.rollback && (args.from.is_some() || args.check) {
         return Err(
             "--rollback installs the previous binary; it takes no --from or --check".into(),
+        );
+    }
+    if args.server && (args.reattach_pane.is_some() || args.no_reexec) {
+        // Both flags describe what *this* client process does after a swap. The
+        // server path swaps a different binary and hands a daemon over, so
+        // neither has a meaning — and accepting them silently would let an
+        // operator believe their pane was resumed when nothing looked at it.
+        return Err(
+            "--reattach-pane and --no-reexec describe this client; --server swaps the daemon"
+                .into(),
         );
     }
     Ok(args)
@@ -501,6 +988,48 @@ mod tests {
 
     fn args(list: &[&str]) -> Vec<String> {
         list.iter().map(|a| a.to_string()).collect()
+    }
+
+    /// Every combination of the readiness rule, as a table. The facts are
+    /// parameters precisely so this test is deterministic: a version that read
+    /// `/proc` itself would depend on whether the pid the test happened to choose
+    /// exists on the machine, which is not a property of the rule.
+    ///
+    /// The first row is the race that matters. During a handoff the incoming
+    /// daemon is already answering while the outgoing one still runs — so
+    /// "a different pid answers" alone would report a cut that has not happened.
+    /// That is the row a naive implementation gets wrong, and the reason the rule
+    /// is a function instead of a condition buried in the poll loop.
+    #[test]
+    fn readiness_requires_the_outgoing_daemon_to_be_gone() {
+        // A different daemon answers while the old one still runs: NOT a takeover.
+        assert_eq!(takeover(Some(200), 100, true), None);
+        // The old daemon is gone and a different one answers: the cut happened.
+        assert_eq!(takeover(Some(200), 100, false), Some(200));
+        // The pid answering is still the outgoing daemon: no cut has occurred.
+        assert_eq!(takeover(Some(100), 100, false), None);
+        // Nothing answers yet, whatever the outgoing daemon is doing.
+        assert_eq!(takeover(None, 100, false), None);
+        assert_eq!(takeover(None, 100, true), None);
+        // And a re-answer from the same pid while the old daemon runs is not a cut.
+        assert_eq!(takeover(Some(100), 100, true), None);
+    }
+
+    /// The same rule against the real world: a pid that has certainly exited is
+    /// not running, and with it gone a different pid is accepted.
+    #[test]
+    fn a_reaped_pid_is_not_running() {
+        let mut child = std::process::Command::new("/bin/true")
+            .spawn()
+            .expect("spawn a process to outlive");
+        let pid = child.id();
+        child.wait().expect("reap it");
+        assert!(!daemon_running(pid), "a reaped pid is not running");
+        assert_eq!(
+            takeover(Some(pid + 1), pid, daemon_running(pid)),
+            Some(pid + 1),
+            "a different pid, with the old one gone, is a takeover"
+        );
     }
 
     #[test]

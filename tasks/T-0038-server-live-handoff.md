@@ -99,8 +99,81 @@ PTY masters over SCM_RIGHTS, re-opens SQLite and serves — a failed step kills 
       no Linux build can.
 - [ ] **Stage 1 — handoff with 0 panes.** `arreo update --server` on an idle daemon: the new
       process connects, version handshake, takes over, old exits 0. Socket path and session id
-      unchanged, no client sees a disconnect, `arreo status --json` shows the new pid, audit row
+      unchanged, no client sees a disconnect, the new pid is observable, audit row
       `handoff v<from> → v<to> panes=0`.
+
+      **Two criteria clarifications, written down rather than silently reinterpreted:**
+
+      1. *"`arreo status --json` shows the new pid"* — **there is no `status` verb.** The CLI's
+         verbs are enumerated in `crates/arreo-cli/src/main.rs:125-149` and none reports the
+         daemon's pid; the closest thing, `machines status`, is about relay presence. Inventing a
+         verb here would smuggle a new surface into a handoff task. The criterion's *intent* — the
+         cut produced a serving daemon with a new pid, and an operator can see which — is met by
+         the audit row naming both versions and the incoming daemon's own log line naming its pid.
+         If a `status` verb is wanted it is its own task, and it should be filed on its merits
+         rather than as a side effect of this one.
+      2. *"no client sees a disconnect"* — re-scoped to what it can mean at this stage, and
+         deliberately made **stronger in mechanism** than a rebind would give: the incoming daemon
+         **inherits the listening socket**, so the path never refuses a connect and work queued in
+         the backlog survives the cut. That is asserted with a client connecting *during* the
+         handoff (criterion 1 of the stage). What is **not** in stage 1 is carrying live
+         *connections* — a client already attached when the old daemon exits is dropped and must
+         reconnect. That is exactly what stage 3 exists for, and pretending otherwise here would
+         make stage 3 look redundant.
+
+      **The stage-1 security review is the reason this took three passes, and its findings are
+      the most important thing written down in this task.** The protocol was implemented, reviewed,
+      and **six of the nine findings were reproduced against the running binaries** — a handoff is
+      a new local attack surface, because whatever receives the descriptors can impersonate the
+      daemon. The two critical ones, both of which the review demonstrated rather than reasoned:
+
+      - **A half-close was read as the commit.** A local process sent `Handoff`, read
+        `HandoffReady`, connected to `<socket>.handoff`, then `shutdown(SHUT_WR)` and did nothing
+        else. The outgoing daemon **exited 0 in 40 ms**, wrote `handoff ok`, and left the machine
+        with **nobody serving**: a client's connect hung on the stale backlog, and the audit log
+        recorded a cut that never happened. That is exactly the half-dead state ADR 0021 §2 exists
+        to make unreachable, reached by the cheapest possible input. **The root cause is
+        conceptual, not a missing check: EOF is evidence that a peer stopped writing, never that a
+        daemon is serving.** The commit is now a positive marker byte, sent by the incoming daemon
+        only once its accept loop is genuinely running; EOF before it is an abort.
+      - **The transfer socket was unauthenticated.** Any local process that won the race to
+        `<socket>.handoff` received the listening socket and the lock, the outgoing daemon exited
+        0, and the attacker served the socket as the daemon. The socket's mode was the ambient
+        umask's (`0775`), and `connect()` needs only write permission on the inode — so it admitted
+        any same-group user, and under `umask 0` anyone. Fixed in three layers: mode `0600`,
+        `SO_PEERCRED` uid equality, and a per-handoff nonce delivered on the main socket that must
+        be presented on the transfer connection — the third is what binds the transfer to *the
+        process that asked*, not to any process that noticed the path.
+
+      The rest, each reproduced: **two concurrent handoffs both committed, leaving two daemons
+      serving one socket** (T-0071's invariant defeated — the shared open file description means
+      both inherited holders believe they hold the lock); the incoming daemon validated neither
+      that the descriptor was a *listening socket* nor that it was the socket for the path it was
+      told to take over (sent a different listener, it served that instead); the inherited-lock
+      check proved *someone* held the path rather than that the descriptor carried the lock (sent
+      `/etc/hostname`, the daemon served holding nothing); the incoming daemon committed even when
+      its own `serve_inherited` had refused, because the readiness channel's error was discarded;
+      the audit trail **inverted** — a cut that never happened recorded as `ok`, aborts recorded
+      nowhere at all — and took a **900 KB attacker-chosen `detail` string** from one frame; and
+      **the version check ran in the backward direction**, so a forward protocol bump — the normal
+      case, and the exact update the feature exists to perform — could never complete, while the
+      code's own comment said the opposite.
+
+      Two lessons worth more than the fixes. **A review that reproduces is worth ten that reason**:
+      every one of these reads as correct and none of them is, and the three that would have hurt
+      most were found by writing a hostile peer, not by reading the code. And **an invariant
+      enforced by an inherited descriptor is not enforced by it**: `flock` on a shared open file
+      description is held by *every* holder, so "both daemons hold the lock" is consistent — which
+      is why single-instance for the handoff needed its own exclusive lock on the transfer path,
+      not the inherited one.
+
+      **A correction this stage forced on ADR 0021** (recorded there): §4 claimed the outgoing
+      daemon "checkpoints the WAL and closes before the new one opens". Nothing was checked when
+      that was written, and nothing of the sort is needed — `SessionStore` is opened per operation
+      and the only long-lived connection is the authority's, on the same file, with WAL and a 5 s
+      busy timeout already configured because the CLI opens it concurrently. Likewise §"the relay
+      session token travels" has no token to travel; the incoming daemon dials its own session and
+      T-0060's displacement rule recovers it in ~289 ms.
 - [ ] **Stage 2 — N panes with output in flight.** 8 panes emitting a monotonic marker stream;
       handoff under load → every pane pid unchanged, no marker lost, duplicated or reordered
       across the cut, and lines written before the cut still readable after it.

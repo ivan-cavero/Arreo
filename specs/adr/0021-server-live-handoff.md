@@ -66,6 +66,20 @@ easy to get wrong in stage 1:
   version handshake — but **macOS has no `AF_UNIX` `SOCK_SEQPACKET`**, so requiring it
   would make the macOS handoff impossible. A stream pair plus this discipline it is.)
 
+  **And on stage 1 it became a dedicated connection, not a pair on the client socket.** The
+  client socket cannot be made safe for descriptors by reading carefully: the kernel hands a
+  descriptor to whichever `recvmsg` reads the byte it rides on, so an ordinary buffered
+  asynchronous reader that happens to read that byte makes the kernel **discard the
+  descriptor** — silently. A lost listener descriptor means the outgoing daemon exits, the
+  new one has no socket, and the machine is left with no daemon at all: precisely the
+  half-dead state §2 exists to prevent, arrived at by a means the FD-transfer tests would
+  never see (they pass on a `socketpair` where nothing else is written). So the descriptors
+  travel on their own connection to `<socket>.handoff`, which is bound **only while a handoff
+  is negotiated** and unlinked when it ends, and on which nothing but marker bytes and
+  descriptors is ever written. The topology makes the hazard unreachable rather than
+  disciplined — the same move as the hard link in ADR 0020, which removed a window rather
+  than testing inside it.
+
 - **The claimed child pid is verified against the terminal before it is used.** The pid
   arrives over the same channel as the descriptor, so on its own it is a number an
   attacker chooses — and a pid is not inert: `pidfd_open` on a same-user process needs no
@@ -135,15 +149,33 @@ child pids — and the new daemon re-opens what is already on disk. The alternat
 scrollback through the socket) would make the cut's cost proportional to history length, which
 is exactly the wrong shape for the one operation that must be fast.
 
-SQLite: the old daemon checkpoints the WAL and closes before the new one opens, so there is no
-window with two writers. An audit write during the cut loses nothing, and a corrupt `-wal`
-heals by T-0018's existing rule.
+SQLite needs **nothing** here, which is a correction to this ADR's first draft (§4 originally
+said "the old daemon checkpoints the WAL and closes before the new one opens"). That was
+written before reading the store: there is no long-lived handle to close. `SessionStore` is
+opened per operation and dropped (`daemon.rs:140,221,495,591,1723`) — one connection per audit
+row — and the only long-lived connection in the process is the device authority's, on the *same
+file*. WAL and a 5-second busy timeout are already configured (`store.rs:315,321`) for exactly
+this reason: the daemon holds a connection while the CLI opens its own. So two processes on the
+DB is an existing, supported situation rather than a hazard to engineer around, and the
+handoff's overlap window is a second process doing what the CLI already does. The lesson is
+narrow but worth keeping: **the ADR described a mechanism nobody had checked for; the store
+turned out not to need one, and the risk of believing the ADR was implementing a checkpoint
+that the design does not require.**
 
 **5. A protocol break becomes a deferred update, never a half-handoff.**
 
 The handshake refuses a new daemon whose protocol version is outside the N−1 window
 (ADR 0017). The machine keeps serving the old binary and the UI says "update pending". An
 update that cannot complete is a *scheduled* update, not a failed one.
+
+**The check is the incoming daemon's, and the direction matters.** It is
+`negotiate(new_protocol, [old_protocol])` — the incoming daemon is the one that must speak the
+outgoing daemon's protocol, so it is the `server` argument of the negotiation. Written the
+other way round (`negotiate(old, [new])`) the window is `{old, old-1}`, which **refuses every
+forward version bump** — that is, it would refuse exactly the update it exists to perform, and
+only ever accept a no-op or a downgrade. An update that bumps the version is the normal case,
+so getting this backwards would make the feature useless in a way that looks like a version
+policy rather than a bug.
 
 ## Why not the alternatives
 
@@ -172,9 +204,15 @@ update that cannot complete is a *scheduled* update, not a failed one.
 - **Windows is a different story** (T-0039): ConPTY pseudoconsole handles can be inherited, but
   the fallback — swap the binary and take effect at the next restart — is what ships if that
   proves unreliable on some OS build. "Never forced while agents run" holds either way.
-- **The relay session token travels in the same payload** (§3.13 step 3), so a machine that
-  hands off does not re-handshake with the relay — the field is reserved now and filled when
-  the relay crates land.
+- **The relay session is restarted, not carried** — also a correction. §3.13 step 3 says the
+  relay session tokens transfer, but nothing to transfer exists: `RelayContext` has no resume
+  field, and the relay task's `JoinHandle` is discarded at spawn (`main.rs:150`), so the live
+  connection is owned by a `RelaySession` whose `Drop` aborts its pumps. The new daemon
+  therefore dials its own session, and the relay sees a re-register rather than a
+  continuation. That is safe, not merely expedient: T-0060 already made a second session for
+  one device *end the session it replaced* and recover in ~289 ms, which is the same event a
+  handoff now produces. Carrying the session is an optimisation with no requirement behind it,
+  so it is not planned.
 - **Stage 0 is the primitive everything else rests on**: `Pane::adopt` plus the fd-passing
   helpers, tested by passing a real master over a socketpair and reading back through the
   adopted pane. Stages 1–4 build the protocol, the manifest and the abort paths on top of it.

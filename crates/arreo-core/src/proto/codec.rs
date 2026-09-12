@@ -136,10 +136,10 @@ pub fn classify_op(bytes: &[u8]) -> Option<Direction> {
     Some(match op.as_str() {
         // Client → server: the verbs a client asks the daemon to perform.
         "hello" | "resume" | "spawn" | "attach" | "send" | "resize" | "kill" | "read" | "wait"
-        | "split" | "metrics_req" | "panes" => Direction::Request,
+        | "split" | "metrics_req" | "panes" | "handoff" => Direction::Request,
         // Server → client: answers and news.
         "welcome" | "snapshot" | "delta" | "error" | "state_event" | "metrics"
-        | "metrics_series" | "ok" | "exited" => Direction::Event,
+        | "metrics_series" | "ok" | "exited" | "handoff_ready" => Direction::Event,
         // Unknown: the shape of a future version. A client that sent something
         // the server does not know asked for work — that is a request until a
         // newer server says otherwise, so it is refused rather than ignored. A

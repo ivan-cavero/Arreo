@@ -912,7 +912,7 @@ async fn cmd_server(rest: &[String]) -> ExitCode {
     // SIGTERM the daemon: resolve its PID via `panes` liveness, else fall
     // back to pkill by socket path. Simplest robust path: find arreo-server
     // processes whose command line names our socket.
-    let pid = find_daemon_pid(&socket).await;
+    let pid = find_daemon_pid(&socket);
     match pid {
         Some(pid) => {
             unsafe {
@@ -942,10 +942,15 @@ async fn cmd_server(rest: &[String]) -> ExitCode {
     }
 }
 
-/// Find the daemon PID by probing: connect + ask `panes` — any answer proves
-/// liveness; the PID itself comes from a `server pid` lookup via /proc scan
-/// for `arreo-server --socket <path>`.
-async fn find_daemon_pid(socket: &PathBuf) -> Option<u32> {
+/// Find the daemon PID serving `socket`, by scanning `/proc` for a process
+/// whose argv runs `arreo-server` **and** names this socket, then confirming
+/// something is actually answering.
+///
+/// Synchronous and `Path`-generic because two callers need it with different
+/// runtimes: `arreo server stop` (async) and `arreo update --server` (sync,
+/// before it spawns the replacement). The probe is a blocking `connect` either
+/// way — there is nothing to await in a /proc scan.
+fn find_daemon_pid(socket: &std::path::Path) -> Option<u32> {
     let want = socket.to_string_lossy().to_string();
     let entries = std::fs::read_dir("/proc").ok()?;
     for entry in entries.filter_map(|e| e.ok()) {
@@ -966,7 +971,7 @@ async fn find_daemon_pid(socket: &PathBuf) -> Option<u32> {
             .collect();
         if parts.iter().any(|p| p.ends_with("arreo-server")) && parts.iter().any(|p| *p == want) {
             // Confirm it answers (not a zombie holding the path).
-            if tokio::net::UnixStream::connect(socket).await.is_ok() {
+            if std::os::unix::net::UnixStream::connect(socket).is_ok() {
                 return Some(pid);
             }
         }

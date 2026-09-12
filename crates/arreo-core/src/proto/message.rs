@@ -210,6 +210,34 @@ pub enum Message {
         downshifted: bool,
         rows: Vec<MetricsPoint>,
     },
+    /// Client → server: ask the serving daemon to hand the socket over to a
+    /// replacement (T-0038 stage 1). `protocol` is the incoming daemon's own
+    /// `VERSION` — the outgoing daemon checks it against *its* window before
+    /// doing anything — and `build` is the incoming daemon's build version
+    /// (its `CARGO_PKG_VERSION`), for the audit row and the operator's log.
+    /// `#[serde(default)]` so a v0 peer decodes the *shape* rather than
+    /// failing the whole frame; the daemon still answers with a typed refusal
+    /// when the version is outside its window.
+    Handoff {
+        v: u32,
+        #[serde(default)]
+        protocol: u32,
+        #[serde(default)]
+        build: String,
+    },
+    /// Server → client: the outgoing daemon accepted the handoff and bound
+    /// `<socket>.handoff` for the descriptor transfer. `protocol` is the
+    /// agreed version (what the outgoing daemon will speak on the new
+    /// daemon's session), `server_protocol` is the outgoing daemon's own
+    /// `VERSION` (so the incoming daemon — and the audit row — can name both
+    /// sides of the cut), and `panes` is the live pane count (stage 2 will
+    /// transfer the panes themselves; stage 1 moves no pane process).
+    HandoffReady {
+        v: u32,
+        protocol: u32,
+        server_protocol: u32,
+        panes: u64,
+    },
 }
 
 /// One history point on the wire: average and peak, so the graph draws the line

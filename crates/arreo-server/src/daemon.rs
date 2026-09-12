@@ -338,6 +338,16 @@ pub struct Daemon {
     /// `serve` future on SIGTERM and keeps draining — the lock has to outlive the
     /// future so a second daemon cannot start inside that window.
     instance: std::sync::Mutex<Option<arreo_core::lock::ExclusiveLock>>,
+    /// Set when a handoff commits: the accept loop ends after its current
+    /// `accept`, while live connection tasks (which hold only `Arc` clones +
+    /// their owned stream) continue undisturbed. Ending the loop stops
+    /// accepting without disturbing live connections — which is why the cut
+    /// is a flag, not a shutdown.
+    ///
+    /// Shared (`Arc`) so an accepted session can signal the loop: `tokio::spawn`
+    /// requires `'static`, so the session cannot borrow `self` — it holds a
+    /// clone of this flag instead.
+    stop_accepting: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Daemon {
@@ -350,7 +360,37 @@ impl Daemon {
             db,
             sessions: Arc::new(LiveSessions::default()),
             instance: std::sync::Mutex::new(None),
+            stop_accepting: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
+    }
+
+    /// The socket this daemon serves. The handoff path needs it (the session
+    /// loop binds `<socket>.handoff`), and it is the one stable fact about a
+    /// daemon — everything else is replaceable across the cut.
+    #[must_use]
+    pub fn socket(&self) -> &Path {
+        &self.socket
+    }
+
+    /// The store path (`<socket>.db`). The handoff audit rows are written
+    /// against it by the session loop.
+    #[must_use]
+    pub fn db(&self) -> &Path {
+        &self.db
+    }
+
+    /// Live pane count, for the `HandoffReady` reply and the audit row.
+    pub async fn pane_count(&self) -> u64 {
+        self.registry.read().await.len() as u64
+    }
+
+    /// Stop accepting new connections after the current `accept` (T-0038 stage
+    /// 1: the outgoing daemon's last act before `exit(0)`). Live connection
+    /// tasks hold only `Arc` clones + their owned stream, so ending the loop
+    /// disturbs nothing in flight — the cut is a flag, not a shutdown.
+    pub fn stop_accepting(&self) {
+        self.stop_accepting
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     #[must_use]
@@ -423,7 +463,22 @@ impl Daemon {
     /// The lock is taken **before** the probe, which makes probe→remove→bind a
     /// critical section: only the lock holder may decide the socket is dead.
     pub async fn serve(&self) -> Result<(), DaemonError> {
+        // Probe → lock → re-probe → bind. The lock makes probe→remove→bind a
+        // critical section (T-0071); the two probes close the handoff window:
+        // the first refuses the obvious "someone is serving" case without
+        // taking the lock, and the second — under the lock — catches a cut
+        // that landed between the first probe and the acquire (the outgoing
+        // daemon exits on commit and its lock releases with its last
+        // descriptor, so the acquire can succeed while the incoming daemon is
+        // already serving). A live socket at either probe means someone else
+        // serves it: refuse rather than unlinking their path.
         let lock_path = super::persist::lock_path_for(&self.socket);
+        if Self::is_live(&self.socket).await {
+            return Err(DaemonError::Io(std::io::Error::new(
+                std::io::ErrorKind::AddrInUse,
+                format!("socket {} already served", self.socket.display()),
+            )));
+        }
         let lock = arreo_core::lock::ExclusiveLock::acquire(&lock_path).map_err(|e| {
             DaemonError::Io(std::io::Error::new(
                 std::io::ErrorKind::AddrInUse,
@@ -434,6 +489,8 @@ impl Daemon {
         // local that dies with this future.
         *self.instance.lock().unwrap_or_else(|e| e.into_inner()) = Some(lock);
 
+        // Re-probe under the lock (see above): a cut that landed between the
+        // first probe and the acquire reads as live here, and refuses.
         if Self::is_live(&self.socket).await {
             return Err(DaemonError::Io(std::io::Error::new(
                 std::io::ErrorKind::AddrInUse,
@@ -442,6 +499,90 @@ impl Daemon {
         }
         let _ = std::fs::remove_file(&self.socket);
         let listener = UnixListener::bind(&self.socket)?;
+        self.serve_on(listener, None).await
+    }
+
+    /// Serve on an **inherited** listener + lock (T-0038 stage 1: the incoming
+    /// daemon). No bind, no `try_lock` — the descriptors arrived over
+    /// `SCM_RIGHTS` from the outgoing daemon, and the lock lives in the shared
+    /// open file description, so acquiring would be both redundant and wrong.
+    ///
+    /// Verifies the inheritance before serving: opens the lock path afresh and
+    /// asserts the lock is held, which proves the descriptor really carried
+    /// the lock (a forged or dropped descriptor would read as free). A lock
+    /// that reads as free is a loud refusal, never a serve — two daemons on
+    /// one socket is the state the lock exists to prevent.
+    pub async fn serve_inherited(
+        &self,
+        listener: UnixListener,
+        lock: arreo_core::lock::ExclusiveLock,
+        ready: Option<tokio::sync::oneshot::Sender<()>>,
+    ) -> Result<(), DaemonError> {
+        let lock_path = super::persist::lock_path_for(&self.socket);
+        if lock.path() != lock_path {
+            return Err(DaemonError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "inherited lock is for {} but this daemon serves {}",
+                    lock.path().display(),
+                    self.socket.display()
+                ),
+            )));
+        }
+        if !arreo_core::lock::ExclusiveLock::is_held(&lock_path) {
+            return Err(DaemonError::Io(std::io::Error::new(
+                std::io::ErrorKind::AddrInUse,
+                format!(
+                    "inherited lock for {} reads as free — refusing to serve",
+                    self.socket.display()
+                ),
+            )));
+        }
+        // Held for the daemon's life, like the acquired lock. The inherited
+        // variant's `Drop` closes the descriptor and never unlocks (shared
+        // open file description — see `ExclusiveLock::inherited`), so holding
+        // it here keeps the socket ours until the process ends.
+        //
+        // The socket file must already exist: the outgoing daemon never unlinks
+        // it across the cut, so a missing path means this process was given a
+        // listener for a socket nobody serves — serving it would fork the world
+        // into two daemons (a fresh `serve` would bind the same path). Refuse
+        // rather than guess.
+        if !self.socket.exists() {
+            return Err(DaemonError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!(
+                    "socket {} is missing — refusing an inherited listener with no path",
+                    self.socket.display()
+                ),
+            )));
+        }
+        *self.instance.lock().unwrap_or_else(|e| e.into_inner()) = Some(lock);
+        self.serve_on(listener, ready).await
+    }
+
+    /// The accept loop both starts share: restore, warn, spawn the sweeps,
+    /// then accept until the listener errors or [`Daemon::stop_accepting`]
+    /// fires. The socket file is **never** unlinked here — neither the fresh
+    /// bind (which removed a stale file before binding) nor the handoff cut
+    /// (where the incoming daemon holds a dup of the same listener) may leave
+    /// the path missing.
+    ///
+    /// `ready` fires once the loop owns the listener and is about to accept
+    /// (T-0038 stage 1: the incoming daemon commits only after this, so a
+    /// connect is never queued on a socket nobody drains). `None` on a fresh
+    /// start, where nobody waits for it.
+    ///
+    /// The `accept` carries a 200 ms timeout and the stop flag is re-checked
+    /// on every wake: the commit path also self-connects to wake the loop, but
+    /// that wakeup can land in the *incoming* daemon's backlog (two listeners
+    /// share the path after the dup) — so the flag alone, without a bounded
+    /// `accept`, would leave the old loop parked forever and the cut hanging.
+    async fn serve_on(
+        &self,
+        listener: UnixListener,
+        ready: Option<tokio::sync::oneshot::Sender<()>>,
+    ) -> Result<(), DaemonError> {
         // Boot restore BEFORE serving: crash survivors reappear with history.
         self.restore_boot().await;
         // Tell the operator if the audit log has grown past what they should
@@ -602,13 +743,90 @@ impl Daemon {
                 }
             });
         }
+        // The loop below owns the listener from here: signal readiness now, so
+        // the incoming daemon commits only once this task is about to accept.
+        // (The sweeps above are spawned, not awaited — nothing between them
+        // and the loop blocks.)
+        if let Some(ready) = ready {
+            let _ = ready.send(());
+        }
         loop {
-            let (stream, _) = listener.accept().await?;
+            // The stop flag is re-checked on every wake: the commit path also
+            // self-connects to wake the loop, but that wakeup can land in the
+            // *incoming* daemon's backlog (two listeners share the path after
+            // the dup) — so the flag alone, without a bounded `accept`, would
+            // leave the old loop parked forever and the cut hanging.
+            if self
+                .stop_accepting
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                // The handoff cut: stop accepting, keep serving. Dropping the
+                // listener here closes *this* process's fd; the incoming daemon
+                // holds a dup, and the socket file stays — a connect is never
+                // refused across the cut. Live connection tasks hold only `Arc`
+                // clones + their owned stream and run on undisturbed.
+                // `Ok(())` (not an error): the caller exits 0, it did not fail.
+                return Ok(());
+            }
+            let stream = match tokio::time::timeout(
+                std::time::Duration::from_millis(200),
+                listener.accept(),
+            )
+            .await
+            {
+                Ok(Ok((stream, _))) => stream,
+                // Timeout: re-check the flag. Error: the listener is gone.
+                Ok(Err(e)) => return Err(DaemonError::Io(e)),
+                Err(_) => continue,
+            };
+            if self
+                .stop_accepting
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                // The wakeup (or a real client that raced the commit): the
+                // incoming daemon is serving on its dup, so dropping this
+                // connection is correct — it can reconnect to the new daemon.
+                // The socket file stays either way.
+                return Ok(());
+            }
             let registry = Arc::clone(&self.registry);
             let sessions = Arc::clone(&self.sessions);
             let db = self.db.clone();
+            let socket = self.socket.clone();
+            let stop_accepting = Arc::clone(&self.stop_accepting);
+            // Owned dups for the session: `send_fd` dups them into the peer, so
+            // the loop keeps its own. A dup of a listener is itself a listener;
+            // a dup of the lock shares the same open file description and
+            // therefore the same lock. `None` when the lock is somehow absent
+            // (serve always holds it — see `serve`/`serve_inherited`) means the
+            // session answers handoffs as unavailable rather than failing.
+            use std::os::unix::io::AsFd;
+            let fds = self
+                .instance
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_ref()
+                .and_then(|lock| {
+                    lock.fd()
+                        .try_clone_to_owned()
+                        .ok()
+                        .map(|lock_dup| (lock_dup, lock.path().to_path_buf()))
+                })
+                .and_then(|(lock_dup, _)| {
+                    listener
+                        .as_fd()
+                        .try_clone_to_owned()
+                        .ok()
+                        .map(|listener_dup| (listener_dup, lock_dup))
+                });
             tokio::spawn(async move {
-                if let Err(e) = handle(stream, registry, sessions, db).await {
+                let handoff = fds.map(|(listener_fd, lock_fd)| HandoffCtx {
+                    socket,
+                    listener_fd,
+                    lock_fd,
+                    stop_accepting,
+                });
+                if let Err(e) = handle(stream, registry, sessions, db, handoff).await {
                     eprintln!("daemon: connection error: {e}");
                 }
             });
@@ -753,13 +971,14 @@ async fn handle(
     registry: Registry,
     sessions: Sessions,
     db: PathBuf,
+    handoff: Option<HandoffCtx>,
 ) -> Result<(), DaemonError> {
     let (reader, writer) = stream.into_split();
-    // `None`: the local socket is same-machine and trusted, so no per-verb
+    // `None` auth: the local socket is same-machine and trusted, so no per-verb
     // authorization gate applies — and no device to register under, so no
     // cutoff handle either. A remote peer always arrives with one (see
     // [`SessionAuth`]).
-    serve_session(reader, writer, registry, sessions, db, None).await
+    serve_session_with_handoff(reader, writer, registry, sessions, db, None, handoff).await
 }
 
 /// How long a finished session stays alive after closing its write half, so the
@@ -959,9 +1178,15 @@ async fn cutoff_tick(auth: &Option<SessionAuth>) {
 ///
 /// Generic over the byte stream so the local socket and the remote transport
 /// run *this* loop: one protocol implementation, two ways to reach it.
+///
+/// `handoff` is `Some` only for the local Unix socket: the handoff request is
+/// negotiated there (it can be refused with a typed error and audited), and
+/// only there — a remote peer must never be able to replace the daemon. The
+/// remote transport and the relay pass `None`, and a `Handoff` frame arriving
+/// on those paths is answered as an unexpected verb, never acted on.
 pub(crate) async fn serve_session<R, W>(
-    mut reader: R,
-    mut writer: W,
+    reader: R,
+    writer: W,
     registry: Registry,
     sessions: Sessions,
     db: PathBuf,
@@ -971,7 +1196,42 @@ where
     R: AsyncReadExt + Unpin,
     W: AsyncWriteExt + Unpin,
 {
-    let result = serve_session_inner(&mut reader, &mut writer, registry, sessions, db, auth).await;
+    // `serve_session` is the no-handoff path (remote transport, relay): the
+    // local socket uses `serve_session_with_handoff` below.
+    serve_session_with_handoff(reader, writer, registry, sessions, db, auth, None).await
+}
+
+/// The local-socket entry point: like [`serve_session`], but the session may
+/// carry a handoff request. `handoff` bundles what the session loop needs that
+/// the verb loop does not otherwise see: the socket path (for `<socket>.handoff`),
+/// the listener fd (borrowed — `SCM_RIGHTS` dups it into the peer), the lock fd
+/// (borrowed the same way), and the daemon itself (to stop the accept loop when
+/// the cut commits).
+pub(crate) async fn serve_session_with_handoff<R, W>(
+    reader: R,
+    writer: W,
+    registry: Registry,
+    sessions: Sessions,
+    db: PathBuf,
+    auth: Option<SessionAuth>,
+    handoff: Option<HandoffCtx>,
+) -> Result<(), DaemonError>
+where
+    R: AsyncReadExt + Unpin,
+    W: AsyncWriteExt + Unpin,
+{
+    let mut reader = reader;
+    let mut writer = writer;
+    let result = serve_session_inner(
+        &mut reader,
+        &mut writer,
+        registry,
+        sessions,
+        db,
+        auth,
+        handoff,
+    )
+    .await;
 
     // **The last frame must reach the peer, on *every* way out (T-0052, T-0046).**
     // Closing the write half signals the transport's pump to drain what the
@@ -991,6 +1251,26 @@ where
     result
 }
 
+/// What the local-socket session loop needs to serve a handoff request: the
+/// socket path (for `<socket>.handoff`), owned dups of the listener + lock fds
+/// (borrowed would be ideal — `SCM_RIGHTS` dups them into the peer — but the
+/// session is a spawned `'static` task that cannot borrow the accept loop),
+/// and a way to stop the accept loop when the cut commits.
+pub(crate) struct HandoffCtx {
+    pub socket: PathBuf,
+    /// Owned dups of the accept loop's listener + the daemon's lock, taken per
+    /// accepted connection. `send_fd` dups them into the peer, so the loop keeps
+    /// its own; a dup of a listener is itself a listener, and a dup of the lock
+    /// shares the same open file description and therefore the same lock. Owned
+    /// (not borrowed) because the session is a spawned `'static` task that
+    /// cannot borrow the accept loop.
+    pub listener_fd: std::os::unix::io::OwnedFd,
+    pub lock_fd: std::os::unix::io::OwnedFd,
+    /// The daemon's stop flag, by clone: the session sets it when the cut
+    /// commits, and the accept loop observes it after its current `accept`.
+    pub stop_accepting: Arc<std::sync::atomic::AtomicBool>,
+}
+
 /// The session itself. Every exit here is covered by [`serve_session`]'s flush.
 async fn serve_session_inner<R, W>(
     // `mut` on the writer so the body can reborrow: `write_message` takes
@@ -1001,6 +1281,7 @@ async fn serve_session_inner<R, W>(
     sessions: Sessions,
     db: PathBuf,
     auth: Option<SessionAuth>,
+    handoff: Option<HandoffCtx>,
 ) -> Result<(), DaemonError>
 where
     R: AsyncReadExt + Unpin,
@@ -1231,6 +1512,58 @@ where
                 watch_state(&mut writer, &registry, &message).await?;
                 continue;
             }
+            Message::Handoff { v, protocol, build } => {
+                let (v, protocol, build) = (*v, *protocol, build.clone());
+                // The handoff request is negotiated on this client socket (so
+                // it can be refused with a typed error and audited), but the
+                // descriptors travel on the dedicated `<socket>.handoff`
+                // connection — never here (see `handoff.rs` for why).
+                if let Err(reply) = check_version(v) {
+                    write_message(writer, &reply).await?;
+                    continue;
+                }
+                match serve_handoff_request(
+                    &mut writer,
+                    &registry,
+                    &db,
+                    handoff.as_ref(),
+                    protocol,
+                    &build,
+                )
+                .await
+                {
+                    // The cut committed: the descriptors moved, the incoming
+                    // daemon committed, the audit row is written. Stop
+                    // accepting and end this session — the accept loop observes
+                    // the flag after its current `accept`, drops the listener,
+                    // and the caller exits 0. The socket file stays.
+                    HandoffSessionOutcome::Committed => {
+                        return Ok(());
+                    }
+                    // Refused or aborted: the reply is already on the wire, the
+                    // `.handoff` file is already gone, and this daemon keeps
+                    // serving — on this very connection, which stays open so
+                    // the peer can report what happened.
+                    HandoffSessionOutcome::Answered => continue,
+                    // The session's connection broke mid-handoff (the reply or
+                    // a descriptor step failed on this socket). The `.handoff`
+                    // file is already gone; keep serving, end this session.
+                    HandoffSessionOutcome::Gone => {
+                        break "handoff session lost".to_string();
+                    }
+                }
+            }
+            Message::HandoffReady { .. } => {
+                write_message(
+                    writer,
+                    &Message::Error {
+                        v: VERSION,
+                        message: "unexpected handoff_ready here".to_string(),
+                    },
+                )
+                .await?;
+                continue;
+            }
             _ => {}
         }
         let reply = dispatch(&message, &registry, &db).await;
@@ -1341,6 +1674,10 @@ fn verb_of(message: &Message) -> Verb {
         Message::Spawn { .. } => Verb::Spawn,
         Message::Split { .. } => Verb::Split,
         Message::Kill { .. } => Verb::Kill,
+        // The handoff request drives the machine (it replaces the daemon), so
+        // it needs the control capability; the readiness notice is news.
+        Message::Handoff { .. } => Verb::Admin,
+        Message::HandoffReady { .. } => Verb::Admin,
         Message::Welcome { .. }
         | Message::Error { .. }
         | Message::Ok { .. }
@@ -1378,6 +1715,8 @@ fn op_name(message: &Message) -> &'static str {
         Message::Exited { .. } => "exited",
         Message::Read { .. } => "read",
         Message::Wait { .. } => "wait",
+        Message::Handoff { .. } => "handoff",
+        Message::HandoffReady { .. } => "handoff_ready",
         Message::Split { .. } => "split",
         Message::MetricsReq { .. } => "metrics-req",
     }
@@ -1765,12 +2104,221 @@ async fn dispatch(message: &Message, registry: &Registry, db: &std::path::Path) 
         | Message::StateEvent { .. }
         | Message::Metrics { .. }
         | Message::MetricsSeries { .. }
+        | Message::Handoff { .. }
+        | Message::HandoffReady { .. }
         | Message::Ok { .. }
         | Message::Exited { .. } => Some(Message::Error {
             v: VERSION,
             message: format!("unexpected {} here", op_name(message)),
         }),
     }
+}
+
+/// What serving one handoff request concluded. Returned to the session loop so
+/// the single place that owns the accept loop can act on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HandoffSessionOutcome {
+    /// The cut committed: descriptors sent, commit observed, audit row written.
+    /// The session ends; the accept loop stops; the caller exits 0.
+    Committed,
+    /// Refused or aborted: the reply is on the wire, the `.handoff` file is
+    /// gone, and this daemon keeps serving on this very connection.
+    Answered,
+    /// This session's connection broke mid-handoff. The `.handoff` file is
+    /// gone; the daemon keeps serving; this session ends.
+    Gone,
+}
+
+/// Serve one handoff request on the client socket (T-0038 stage 1, outgoing
+/// side). The full ordering lives here; the session loop acts on the outcome.
+///
+/// 1. Validate the incoming daemon's protocol against *this* daemon's window
+///    (`negotiate(VERSION, [incoming])` — the incoming daemon is the one that
+///    must speak our protocol). A refusal writes the `handoff.refuse` audit
+///    row, answers a typed `Error` naming both versions, and leaves this
+///    daemon serving — a refused handoff is a deferred update, never a failure.
+/// 2. Bind `<socket>.handoff`; reply `HandoffReady { v, protocol, panes }`.
+/// 3. Accept one connection there with a deadline; unlink the path as soon as
+///    it is accepted.
+/// 4. Send the listener descriptor, then the lock descriptor (the order is part
+///    of the contract; stage 2 adds panes after the lock).
+/// 5. Wait for the incoming daemon's commit (EOF — see `handoff.rs`).
+/// 6. Write the audit row (`handoff <from> -> <to> panes=<n>`).
+/// 7. Set the stop flag (the accept loop ends after its current `accept`,
+///    dropping *this* process's listener fd; the incoming daemon holds a dup,
+///    and the socket file stays).
+///
+/// Every abort path unlinks the `.handoff` path before returning: an aborted
+/// handoff leaves the outgoing daemon serving, holding the lock, with no
+/// `.handoff` file behind — and a retry succeeds.
+async fn serve_handoff_request(
+    writer: &mut (impl AsyncWriteExt + Unpin),
+    registry: &Registry,
+    db: &std::path::Path,
+    handoff: Option<&HandoffCtx>,
+    incoming_protocol: u32,
+    incoming_build: &str,
+) -> HandoffSessionOutcome {
+    // A handoff request without the transfer context is not a handoff: it
+    // arrived on a path that cannot move descriptors (remote transport, relay).
+    // Answered, never acted on — a remote peer must never replace the daemon.
+    let Some(ctx) = handoff else {
+        write_message(
+            writer,
+            &Message::Error {
+                v: VERSION,
+                message: "handoff is not available on this connection".to_string(),
+            },
+        )
+        .await
+        .ok();
+        return HandoffSessionOutcome::Answered;
+    };
+    // 1. The version check is the *incoming* daemon's window: it must speak our
+    // protocol (`old == new` or `old == new - 1`). `negotiate(old, [new])` would
+    // refuse any version bump at all — backwards.
+    let agreed =
+        match crate::handoff::check_incoming_protocol(incoming_protocol, db, incoming_build) {
+            Ok(agreed) => agreed,
+            Err(detail) => {
+                write_message(
+                    writer,
+                    &Message::Error {
+                        v: VERSION,
+                        message: detail,
+                    },
+                )
+                .await
+                .ok();
+                return HandoffSessionOutcome::Answered;
+            }
+        };
+    // 2. Bind the dedicated transfer socket. Bound only for this handoff;
+    // every exit below unlinks it.
+    let handoff_path = crate::handoff::handoff_path_for(&ctx.socket);
+    let _ = std::fs::remove_file(&handoff_path);
+    let handoff_listener = match std::os::unix::net::UnixListener::bind(&handoff_path) {
+        Ok(listener) => listener,
+        Err(e) => {
+            let _ = std::fs::remove_file(&handoff_path);
+            write_message(
+                writer,
+                &Message::Error {
+                    v: VERSION,
+                    message: format!("handoff unavailable (cannot bind transfer socket): {e}"),
+                },
+            )
+            .await
+            .ok();
+            return HandoffSessionOutcome::Answered;
+        }
+    };
+    let panes = registry.read().await.len() as u64;
+    if write_message(
+        writer,
+        &Message::HandoffReady {
+            v: agreed,
+            protocol: agreed,
+            server_protocol: VERSION,
+            panes,
+        },
+    )
+    .await
+    .is_err()
+    {
+        let _ = std::fs::remove_file(&handoff_path);
+        return HandoffSessionOutcome::Gone;
+    }
+    // 3. Accept one connection there with a deadline; unlink the path as soon
+    // as it is accepted (it exists only for this transfer).
+    let _ = handoff_listener.set_nonblocking(true);
+    let deadline = std::time::Instant::now() + crate::handoff::DEFAULT_HANDOFF_TIMEOUT;
+    let conn = loop {
+        match handoff_listener.accept() {
+            Ok((conn, _)) => break Some(conn),
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::Interrupted =>
+            {
+                if std::time::Instant::now() >= deadline {
+                    break None;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            Err(_) => break None,
+        }
+    };
+    let _ = std::fs::remove_file(&handoff_path);
+    let Some(conn) = conn else {
+        write_message(
+            writer,
+            &Message::Error {
+                v: VERSION,
+                message: "handoff aborted: the new daemon never connected for the descriptors"
+                    .to_string(),
+            },
+        )
+        .await
+        .ok();
+        return HandoffSessionOutcome::Answered;
+    };
+    // The transfer socket stays blocking: `send_fd`/`recv_fd` do one message
+    // each, and blocking keeps the commit wait exact (EOF, not WouldBlock).
+    let _ = conn.set_nonblocking(false);
+    // 4. The listener first, then the lock — the order is the contract.
+    use std::os::unix::io::AsFd;
+    if crate::handoff::send_one(&conn, ctx.listener_fd.as_fd()).is_err()
+        || crate::handoff::send_one(&conn, ctx.lock_fd.as_fd()).is_err()
+    {
+        write_message(
+            writer,
+            &Message::Error {
+                v: VERSION,
+                message: "handoff aborted: the descriptor transfer failed".to_string(),
+            },
+        )
+        .await
+        .ok();
+        return HandoffSessionOutcome::Answered;
+    }
+    // 5. Wait for the incoming daemon's commit (EOF on the handoff connection:
+    // it closes its side once it is genuinely accepting on the inherited
+    // listener). A dead incoming daemon reads as PeerClosed/TimedOut here —
+    // an abort, and this daemon keeps serving.
+    if let Err(detail) =
+        crate::handoff::wait_for_commit(&conn, crate::handoff::DEFAULT_HANDOFF_TIMEOUT)
+    {
+        write_message(
+            writer,
+            &Message::Error {
+                v: VERSION,
+                message: format!("handoff aborted: {detail}"),
+            },
+        )
+        .await
+        .ok();
+        return HandoffSessionOutcome::Answered;
+    }
+    // 6. The audit row, written by the outgoing daemon before it exits — with
+    // the two protocol versions, the pane count, and the incoming daemon's pid
+    // is not yet known here, so the row carries this process's pid as the agent
+    // and the versions + panes in `detail` (the incoming daemon's own
+    // `handoff complete` line carries its pid for the operator).
+    crate::handoff::record_handoff(db, VERSION, incoming_protocol, panes, std::process::id());
+    // 7. Stop accepting. The accept loop ends after its current `accept` and
+    // drops *this* process's listener fd; the incoming daemon holds a dup, and
+    // the socket file stays. This session returns `Committed` so the session
+    // loop ends it — the caller (`main`) exits 0 after `serve` returns.
+    //
+    // The loop may be parked in `accept` with nobody connecting, so the flag
+    // alone would leave it parked: wake it with a connect to our own socket.
+    // The wakeup connection is accepted (or refused — either way the loop
+    // observes the flag next iteration) and handled as an ordinary session,
+    // which ends at its handshake timeout with no side effects.
+    ctx.stop_accepting
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let _ = std::os::unix::net::UnixStream::connect(&ctx.socket);
+    HandoffSessionOutcome::Committed
 }
 
 /// Watch a pane until it reaches `state` or the timeout elapses. Answers

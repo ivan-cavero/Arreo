@@ -99,6 +99,68 @@ impl ExclusiveLock {
     pub fn path(&self) -> &Path {
         &self.path
     }
+
+    /// Borrow the lock's descriptor (for `SCM_RIGHTS` sends, which dup it into
+    /// the peer — the borrow stays here, held for the daemon's life).
+    #[must_use]
+    pub fn fd(&self) -> std::os::unix::io::BorrowedFd<'_> {
+        use std::os::unix::io::AsFd;
+        self.file.as_fd()
+    }
+
+    /// Adopt a lock another process already holds, from a descriptor that
+    /// arrived over `SCM_RIGHTS` (T-0038 stage 1: the daemon handoff).
+    ///
+    /// The descriptor is a `dup` of the outgoing daemon's lock file, so it
+    /// shares the same **open file description** — and the lock lives in that
+    /// description, which is why this works at all: no `try_lock` is needed
+    /// (or wanted) here, because the lock is already ours by inheritance.
+    ///
+    /// The `Drop` deliberately **closes the descriptor and nothing else**: with
+    /// a shared open file description, `flock(LOCK_UN)` releases the lock for
+    /// *every* holder, so an inherited-lock `Drop` that called `unlock()` would
+    /// hand the socket to a third daemon the moment this value was dropped.
+    /// Closing releases nothing — the kernel's own rule (the lock ends when the
+    /// last holder's descriptor closes) is what keeps the socket ours until the
+    /// process ends, the same rule the acquired lock relies on.
+    #[must_use]
+    pub fn inherited(fd: std::os::unix::io::OwnedFd, path: PathBuf) -> Self {
+        use std::os::unix::io::{FromRawFd, IntoRawFd};
+        // Soundness: `fd` is owned, so this process holds the only reference to
+        // this descriptor number; `into_raw_fd` transfers that ownership to the
+        // `File` without duplicating or closing anything, and the `File` takes
+        // over closing it exactly once. The descriptor is a regular-file
+        // descriptor (it was opened on the lock path by the outgoing daemon),
+        // so wrapping it as a `File` performs no I/O and cannot misinterpret
+        // the handle.
+        let raw = std::os::unix::io::OwnedFd::into_raw_fd(fd);
+        // SAFETY: `raw` came from an owned descriptor this line just consumed,
+        // so it is valid, open, and uniquely owned — the three conditions
+        // `from_raw_fd` requires.
+        let file = unsafe { File::from_raw_fd(raw) };
+        Self { file, path }
+    }
+
+    /// Is `path`'s lock currently held by someone (this process or another)?
+    ///
+    /// Opens the path afresh and tries the lock: `true` means a `try_lock`
+    /// would block, i.e. a holder exists. The probe descriptor is closed on
+    /// return and never locked, so calling this changes nothing — it is the
+    /// read-only half of `acquire`, for the incoming daemon's inheritance
+    /// check (proving the descriptor it received really carried the lock).
+    #[must_use]
+    pub fn is_held(path: &Path) -> bool {
+        let Ok(file) = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(path)
+        else {
+            return false;
+        };
+        matches!(file.try_lock(), Err(fs::TryLockError::WouldBlock))
+    }
 }
 
 impl Drop for ExclusiveLock {

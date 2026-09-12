@@ -136,6 +136,16 @@ pub mod actions {
     /// A device was refused because of this machine's grant (T-0059): no grant,
     /// too low a role, or a revoked grant.
     pub const TRUST_REFUSE: &str = "trust.refuse";
+    /// The serving daemon handed its socket to a replacement process (T-0038
+    /// stage 1). Written by the *outgoing* daemon before it exits, with both
+    /// protocol versions and the pane count in `detail`; the incoming daemon
+    /// never writes one, so exactly one row exists per cut.
+    pub const HANDOFF: &str = "handoff";
+    /// A handoff request was refused (T-0038 stage 1): the incoming daemon's
+    /// protocol version was outside the outgoing daemon's N−1 window. The
+    /// outgoing daemon keeps serving — a refused handoff is a deferred
+    /// update, never a failure — and the row names both versions.
+    pub const HANDOFF_REFUSE: &str = "handoff.refuse";
 }
 
 /// One audit row (prompt already redacted on write).

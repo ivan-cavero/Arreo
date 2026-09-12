@@ -27,6 +27,8 @@ use std::path::PathBuf;
 async fn main() {
     let mut socket: Option<PathBuf> = None;
     let mut config: Option<PathBuf> = None;
+    let mut handoff_from: Option<PathBuf> = None;
+    let mut handoff_timeout = arreo_server::handoff::DEFAULT_HANDOFF_TIMEOUT;
     let mut args = std::env::args().skip(1).peekable();
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -36,10 +38,46 @@ async fn main() {
             "--config" => {
                 config = args.next().map(PathBuf::from);
             }
+            "--handoff-from" => {
+                handoff_from = args.next().map(PathBuf::from);
+            }
+            "--handoff-timeout-secs" => {
+                let secs = args.next().unwrap_or_default();
+                match secs.parse::<u64>() {
+                    Ok(secs) => {
+                        handoff_timeout = std::time::Duration::from_secs(secs.max(1));
+                    }
+                    Err(_) => {
+                        eprintln!(
+                            "arreo-server: --handoff-timeout-secs wants a number, got {secs:?}"
+                        );
+                        std::process::exit(2);
+                    }
+                }
+            }
+            "--version" => {
+                // `update --server`'s `verify_runs` shells out to `<binary>
+                // --version`, and the handoff's build reporting names it too —
+                // so this must print a version and exit 0, never fall through
+                // to serving. The string names the binary (`verify_runs`
+                // refuses a candidate that is not a server by checking for it).
+                println!("arreo-server {}", env!("CARGO_PKG_VERSION"));
+                return;
+            }
             "--help" | "-h" => {
-                println!("usage: arreo-server [--socket PATH] [--config PATH]");
+                println!("usage: arreo-server [--socket PATH] [--config PATH] [--handoff-from SOCKET] [--handoff-timeout-secs N] [--version]");
                 println!("  --config  a TOML file whose [relay] section enables the relay session");
                 println!("            (or set ARREO_CONFIG); without one the relay stays off");
+                println!("  --handoff-from SOCKET");
+                println!(
+                    "            take over the daemon serving SOCKET without the socket going dead"
+                );
+                println!(
+                    "            (T-0038 stage 1: the new process inherits the listener + lock)"
+                );
+                println!("  --handoff-timeout-secs N");
+                println!("            bound each handoff wait (default 10)");
+                println!("  --version print the server version and exit");
                 return;
             }
             other => {
@@ -47,6 +85,13 @@ async fn main() {
                 std::process::exit(2);
             }
         }
+    }
+    if handoff_from.is_some() && socket.is_some() {
+        eprintln!("arreo-server: --socket and --handoff-from are exclusive (the handoff takes the socket it is given)");
+        std::process::exit(2);
+    }
+    if let Some(from) = handoff_from {
+        run_handoff(from, handoff_timeout).await;
     }
     let socket = socket.unwrap_or_else(default_socket);
     // Bootstrap the device authority before serving: a device-gated session
@@ -222,9 +267,18 @@ async fn main() {
     eprintln!("arreo-server: serving on {}", socket.display());
     tokio::select! {
         result = daemon.serve() => {
-            if let Err(e) = result {
-                eprintln!("arreo-server: {e}");
-                std::process::exit(1);
+            match result {
+                Ok(()) => {
+                    // The handoff cut: the accept loop ended after commit, the
+                    // incoming daemon is serving on the inherited listener, and
+                    // the socket file stays. No drain, no unlink — this is a
+                    // handover, not a shutdown. No destructor may run.
+                    std::process::exit(0);
+                }
+                Err(e) => {
+                    eprintln!("arreo-server: {e}");
+                    std::process::exit(1);
+                }
             }
         }
         signal = shutdown_signal() => {
@@ -299,6 +353,224 @@ fn default_socket() -> PathBuf {
     }
     let uid = libc_uid();
     std::env::temp_dir().join(format!("arreo-{uid}.sock"))
+}
+
+/// The incoming side of a live handoff (T-0038 stage 1): take over the daemon
+/// serving `socket` without the socket ever going dead. Never returns — on
+/// success the process keeps serving (it never exits), on failure it prints
+/// the reason on stderr and exits 1 (usage errors already exited 2 in `main`).
+///
+/// 1. Connect to the client socket, Hello/Welcome, send the handoff request,
+///    read `HandoffReady` (a typed `Error` here is a refusal — the outgoing
+///    daemon keeps serving, and this process exits 1 saying so).
+/// 2. Connect to `<socket>.handoff`, receive the listener, then the lock.
+/// 3. Build the daemon around the inherited listener and lock: no bind, no
+///    `try_lock`. The descriptor becomes a non-blocking tokio listener first.
+/// 4. Verify the inheritance (the lock path reads as held — this replaces the
+///    acquire and proves the descriptor really carried the lock), then serve.
+/// 5. Once genuinely accepting on the inherited listener, commit (close the
+///    handoff connection → EOF) and print `handoff complete` with the new pid.
+/// 6. Keep serving. The process never exits on success — a child that exits
+///    *is* the failure signal, and the launcher polls for a new pid on the
+///    socket rather than parsing this line.
+async fn run_handoff(socket: PathBuf, timeout: std::time::Duration) -> ! {
+    let detail = run_handoff_inner(&socket, timeout).await;
+    eprintln!("arreo-server: handoff failed: {detail}");
+    eprintln!(
+        "arreo-server: the old daemon is still serving {}",
+        socket.display()
+    );
+    std::process::exit(1);
+}
+
+async fn run_handoff_inner(socket: &std::path::Path, timeout: std::time::Duration) -> String {
+    use arreo_core::proto::{codec, Message, VERSION};
+    use std::io::Write;
+
+    let fail = |detail: String| -> String { detail };
+    // 1. The client socket: Hello→Welcome, then the request.
+    let mut stream = match std::os::unix::net::UnixStream::connect(socket) {
+        Ok(stream) => stream,
+        Err(e) => {
+            return fail(format!(
+                "cannot reach the daemon at {}: {e}",
+                socket.display()
+            ))
+        }
+    };
+    if let Err(e) = stream.set_read_timeout(Some(timeout)) {
+        return fail(format!("cannot set a read timeout: {e}"));
+    }
+    if let Err(e) = stream.set_write_timeout(Some(timeout)) {
+        return fail(format!("cannot set a write timeout: {e}"));
+    }
+    let hello = Message::Hello {
+        v: VERSION,
+        client: "arreo-server-handoff".to_string(),
+        wants: vec![VERSION],
+    };
+    let frame = match codec::encode_frame(&hello) {
+        Ok(frame) => frame,
+        Err(e) => return fail(format!("cannot encode Hello: {e}")),
+    };
+    if let Err(e) = stream.write_all(&frame) {
+        return fail(format!("cannot send Hello: {e}"));
+    }
+    let welcome = match read_one(&mut stream) {
+        Ok(welcome) => welcome,
+        Err(e) => return fail(format!("no Welcome: {e}")),
+    };
+    let _agreed = match welcome {
+        Message::Welcome { v, .. } => v,
+        Message::Error { message, .. } => return fail(format!("handshake refused: {message}")),
+        other => return fail(format!("handshake failed: unexpected {other:?}")),
+    };
+    let request = Message::Handoff {
+        v: VERSION,
+        protocol: VERSION,
+        build: env!("CARGO_PKG_VERSION").to_string(),
+    };
+    let frame = match codec::encode_frame(&request) {
+        Ok(frame) => frame,
+        Err(e) => return fail(format!("cannot encode Handoff: {e}")),
+    };
+    if let Err(e) = stream.write_all(&frame) {
+        return fail(format!("cannot send Handoff: {e}"));
+    }
+    let ready = match read_one(&mut stream) {
+        Ok(ready) => ready,
+        Err(e) => return fail(format!("no HandoffReady: {e}")),
+    };
+    let (agreed, old_protocol, panes) = match ready {
+        Message::HandoffReady {
+            protocol,
+            server_protocol,
+            panes,
+            ..
+        } => (protocol, server_protocol, panes),
+        Message::Error { message, .. } => {
+            // A refusal: the outgoing daemon audited it and keeps serving — a
+            // deferred update, never a failure of the running machine.
+            return fail(format!(
+                "the outgoing daemon refused the handoff: {message}"
+            ));
+        }
+        other => return fail(format!("handoff failed: unexpected {other:?}")),
+    };
+    // 2. The dedicated connection: listener first, then the lock — the order
+    // is the contract (stage 2 adds panes after the lock).
+    let handoff_path = arreo_server::handoff::handoff_path_for(socket);
+    let deadline = std::time::Instant::now() + timeout;
+    let transfer = loop {
+        match std::os::unix::net::UnixStream::connect(&handoff_path) {
+            Ok(stream) => break stream,
+            Err(_) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            Err(e) => {
+                return fail(format!(
+                    "cannot reach the transfer socket {}: {e}",
+                    handoff_path.display()
+                ));
+            }
+        }
+    };
+    let _ = transfer.set_read_timeout(Some(timeout));
+    let listener_fd = match arreo_server::handoff::recv_one(&transfer, timeout) {
+        Ok(fd) => fd,
+        Err(e) => return fail(format!("the listener descriptor did not arrive: {e}")),
+    };
+    let lock_fd = match arreo_server::handoff::recv_one(&transfer, timeout) {
+        Ok(fd) => fd,
+        Err(e) => return fail(format!("the lock descriptor did not arrive: {e}")),
+    };
+    // 3. Build the daemon around the inherited listener and lock: no bind, no
+    // `try_lock`. The descriptor becomes a non-blocking tokio listener first.
+    let std_listener = arreo_server::handoff::std_listener_from_fd(listener_fd);
+    if let Err(e) = std_listener.set_nonblocking(true) {
+        return fail(format!(
+            "cannot make the inherited listener non-blocking: {e}"
+        ));
+    }
+    let tokio_listener = match tokio::net::UnixListener::from_std(std_listener) {
+        Ok(listener) => listener,
+        Err(e) => return fail(format!("cannot adopt the inherited listener: {e}")),
+    };
+    let lock_path = arreo_server::persist::lock_path_for(socket);
+    let lock = arreo_core::lock::ExclusiveLock::inherited(lock_fd, lock_path.clone());
+    //
+    // 4. Verify the inheritance before serving: the lock path must read as
+    // held. This replaces the acquire and proves the descriptor really carried
+    // the lock — serving on a free lock would fork the world into two daemons.
+    if !arreo_core::lock::ExclusiveLock::is_held(&lock_path) {
+        return fail(format!(
+            "the inherited lock for {} reads as free — refusing to serve",
+            socket.display()
+        ));
+    }
+    // 5. Start accepting on the inherited listener, in the background: the
+    // commit must only happen once this process is genuinely accepting — not
+    // merely after the descriptors arrived — because the launcher treats the
+    // cut as done when a new pid answers on the socket. `serve_inherited`
+    // re-checks the lock itself; the check above is the early, loud refusal
+    // before any task is spawned.
+    let daemon = arreo_server::Daemon::new(socket);
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<()>();
+    let server_task = tokio::spawn(async move {
+        // Readiness means "the accept loop owns the listener and is about to
+        // accept" (the signal fires inside `serve_on`, after the lock check,
+        // before the first `accept`). The kernel queues connects on the
+        // inherited backlog from the moment the dup exists — so by the time
+        // the outgoing daemon exits on our commit, this loop is the thing
+        // draining them. Committing before accepting would drop connects into
+        // a socket nobody drains: the half-dead state this mechanism exists
+        // to prevent.
+        let _ = daemon
+            .serve_inherited(tokio_listener, lock, Some(ready_tx))
+            .await;
+    });
+    // Wait until the accept loop is running before committing: the outgoing
+    // daemon exits on our commit, so this ordering is the cut itself.
+    let _ = ready_rx.await;
+    // 6. Commit: close our side of the transfer connection (EOF for the
+    // outgoing daemon's `wait_for_commit`), then announce the cut with the
+    // new pid — the only place an operator can see it, given no `status`
+    // verb exists. Printed only now, after the accept loop is running on
+    // the inherited listener — never merely when the descriptors arrived.
+    drop(transfer);
+    eprintln!(
+        "arreo-server: handoff complete (protocol {old_protocol} -> {agreed}, panes {panes}, pid {})",
+        std::process::id()
+    );
+    // Keep serving: success means this process never exits. A server task that
+    // ends (its listener errored fatally) is a failure — report it and exit 1
+    // rather than idling as a pid that answers nothing.
+    match server_task.await {
+        Ok(()) => fail("the inherited listener failed".to_string()),
+        Err(e) => fail(format!("the serving task failed: {e}")),
+    }
+}
+
+/// Read exactly one framed message on a blocking stream with a read timeout.
+fn read_one(
+    stream: &mut std::os::unix::net::UnixStream,
+) -> Result<arreo_core::proto::Message, String> {
+    use arreo_core::proto::codec;
+    use std::io::Read;
+    let mut acc = Vec::new();
+    let mut chunk = [0u8; 8192];
+    loop {
+        match codec::decode_frame(&acc) {
+            Ok((message, _)) => return Ok(message),
+            Err(codec::CodecError::Truncated { .. }) => {}
+            Err(e) => return Err(format!("cannot decode the reply: {e}")),
+        }
+        let n: usize = stream.read(&mut chunk).map_err(|e| format!("read: {e}"))?;
+        if n == 0 {
+            return Err("the daemon closed the connection".to_string());
+        }
+        acc.extend_from_slice(&chunk[..n]);
+    }
 }
 
 #[cfg(unix)]

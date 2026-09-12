@@ -6,6 +6,7 @@
 pub mod audit;
 pub mod daemon;
 pub mod devices;
+pub mod handoff;
 pub mod lifecycle;
 pub mod persist;
 pub mod protocol;
