@@ -1,39 +1,29 @@
 ## State snapshot          ← REWRITTEN (not appended) at every checkpoint
-Task: **T-0038 stage 1 — DONE.** `arreo-server --handoff-from <socket>` + `arreo update --server
---from <path>`: the daemon is handed over without the socket ever going dead, and the swap happens
-only after the cut succeeds. Stage 2 (N panes with output in flight) is next.
-Where you are: 569 workspace tests / 0 failed (60 targets); clippy clean on **both** toolchains; fmt
-clean; 11 slices green; bench 6/6; vet 336, deny 4/4, audit 0, **check-targets PASS/SKIP**.
-**Two independent security reviews** shaped this, and the second (by an agent that wrote none of
-it) found the first round's fix incomplete: 9 findings reproduced, then 4 more. Everything fixed
-with tests that fail without the fix, and the three headline attacks re-run by me against the
-fixed binaries (half-close → daemon survives; forged nonce → 0 descriptors; two handoffs → exactly
-one survivor).
-Next step: **T-0038 stage 2** — hand the panes over too: 8 panes emitting a monotonic marker
-stream, handoff under load, every pane pid unchanged, no marker lost/duplicated/reordered across
-the cut, lines written before the cut still readable after it. Read ADR 0021 §2c first (the commit
-is a marker byte, not EOF) and note T-0077 before starting: a timed-out handoff leaks the
-candidate's descendants, which is *nil* exposure today and real once the candidate adopts panes.
-Open workers: (none)
+Task: **T-0038 stage 2 (panes across the handoff) IN FLIGHT** with worker `HandoffStage2`, and
+**T-0076 (modern/accessible TUI) IN FLIGHT** with worker `TuiModern` — two disjoint slices, run in
+parallel: the handoff owns `arreo-server/**` + `arreo-core/src/pty.rs` + `proto/message.rs`, the TUI
+owns `arreo-tui/**` + `arreo-core/src/theme/**` + the tui/theme xtask slices. No shared file.
+Where you are: stage 1 is committed and pushed (`1cb7d3b`, plus `60a6319` test hygiene). Tree was
+clean at 569 tests / 60 targets, clippy clean on both toolchains, 11 slices green, bench 6/6.
+**Stage 2's design is mine and is in ADR 0021 §2d** — read it before reviewing the worker:
+- the transfer point must be **atomic w.r.t. read→push** (the pump checks a pause flag before each
+  read and acknowledges quiescence; the buffer lock cannot be the point because `read` blocks);
+- **every abort must resume the pumps** or a child that filled the pipe buffer stays blocked
+  forever — a worse outcome than the update not happening;
+- the incoming daemon **does not read before committing** (bytes consumed then would be lost and
+  the resuming daemon could not recover them);
+- **state travels, derived state is re-derived**: scrollback + journal + identity cross; the engine's
+  state and its feed cursor do not (it is a pure function of the journal — a second copy would be a
+  second source of truth);
+- the enforcement guard travels as a **cgroup path**, re-opened, never dropped silently.
+Next step: collect both workers, verify their claims independently (mutation-test the two hazards
+above: the pause atomicity and the abort-unpause), run a **fresh** security review of the pane
+transfer (descriptor passing + agent output), then the battery on the merged tree and commit.
+Open workers: **HandoffStage2** (arreo-server + arreo-core/pty + proto) · **TuiModern** (arreo-tui +
+theme + xtask slices)
 Known broken: T-0063 (CI ubuntu leg, needs repo admin) · Parked: T-0048 + T-0036 needs-human
-Findings:
-- **A security review must be run by someone who did not write the code, and a fix must be reviewed
-  again.** Round one found the two CRITICALs; round two found that round one's version fix was
-  still defeated one layer up (the *client* Hello announced only its own version, so a newer daemon
-  never got a session), that the commit byte authorises rather than proves, and that the main
-  socket's default mode makes the trust model "same group", not "same user". Neither round was
-  redundant.
-- **`/tmp` is a tmpfs and `target/` is not — a hard link across them is `EXDEV`, and the fallback
-  copy is what fills the disk.** Two test files were fixed; the scratch now lives beside the
-  binaries on the build tree's filesystem. The failure surfaced as `StorageFull` inside a helper,
-  which reads as anything but a disk problem, and only under parallelism.
-- **The cross-OS gate earned its keep again**: a worker's fix used `std::os::unix` in a
-  cross-platform module and its own (Linux-only) clippy could not see it. `check-targets` caught it
-  before the commit — the second time this session that gate has caught an ungated unix import.
-- **`git add -A` in a shared tree is the bug** (see the process note below).
-- **An invariant enforced by an inherited descriptor is not enforced by it**: `flock` lives in the
-  open file description, so every holder of an inherited lock "holds" it — which is why one-handoff-
-  at-a-time needed its own lock, and why the received lock descriptor is validated against the path.
+Note for the TUI worker's scope: `design/BRAND.md` is the **user's** document — read-only. T-0076
+criterion 1 makes it machine-checked (a test reads it), which is the right shape and worth keeping.
 ## Event log               ← append-only; newest last; never rewrite
 - 2026-09-10 [turn 1] ledger created; repo at e489fac (docs only); T-0001 + T-0022 (AGENTS.md gardened) done
 - 2026-09-10 [turn 2] T-0002 PTY manager done+pushed (342606c; 9 tests); PROMPT.md v2 synced + ADR 0001 (ef6c595)
@@ -137,3 +127,5 @@ Findings:
 - 2026-09-12 [turn 62] T-0038 stage 1 implemented and **security-reviewed before commit** — the review found 9 issues, 6 reproduced, 2 CRITICAL. Built: `arreo-server --handoff-from <socket>` (inherits the listener + single-instance lock over SCM_RIGHTS on a dedicated `.handoff` connection, two-phase commit, old daemon serves until the new one commits), `--version`, `arreo update --server --from <path>` (stage → hand off → install only on success; readiness observed externally as "old pid gone AND new pid answering", because a poll on "someone answers" fires before the cut), 7 daemon integration tests + 11 CLI tests + 2 CLI unit tests. **The critical findings**: (1) a half-close was read as the commit, so any local process could make the daemon exit 0 with nobody serving — the half-dead state ADR 0021 exists to prevent, reached by the cheapest input; root cause conceptual, not a missing check: EOF is not evidence of serving; (2) `.handoff` was unauthenticated, so whoever won the race got the listener and the lock and could impersonate the daemon (mode was the umask's 0775; `connect()` needs only write on the inode). Also: two concurrent handoffs both committed, leaving two daemons on one socket (T-0071 defeated — a *shared* open file description means every holder of an inherited flock "holds" it); the received fd was never validated as a listening socket bound to the expected path; the lock check proved someone held the path rather than that the descriptor carried the lock; the incoming daemon committed even after its own `serve_inherited` refused; the audit inverted (fake cut = ok, aborts silent) and took a 900 KB attacker string; and the version check ran backwards so a forward bump could never hand over. Fixes in flight. Also planted: T-0077 (a timed-out handoff leaks the candidate's descendants), T-0078 (p2: the store is world-readable — proven by reading a pane's output out of a 0644 `-db-wal`; the identity dir was already 0700/0600, so the decided case is right and the inherited case is not). ADR 0021 corrected on three of its own claims. 547 tests, 11 slices, bench 6/6 green at the point of review.
 
 - 2026-09-12 [turn 62, cont.] T-0038 stage 1 landed: the server live handoff. `arreo-server --handoff-from <socket>` (+ `--handoff-timeout-secs`, `--version`) and `arreo update --server --from <path>` (stage → hand off from the staged binary → install only on success, so a failed handoff changes nothing). Mechanism: a `.handoff` socket bound only for the duration of a handoff, a nonce issued on the main socket and required on the transfer connection, listener-then-lock over SCM_RIGHTS, a positive commit marker (never EOF), a per-handoff exclusive lock, descriptor validation (listening socket + expected path; lock inode + shared-description try_lock), bounded waits, and an audit trail that records aborts rather than inverting. Two security review rounds: the first found 2 CRITICAL + 4 HIGH/other (a half-close made the daemon exit 0 with nobody serving; the transfer socket was unauthenticated; two handoffs left two daemons on one socket; the fd was never validated; the lock check proved the wrong thing; the incoming daemon committed after refusing; the audit inverted and took a 900 KB string; the version check ran backwards), the second found 4 more (the client Hello still announced one version so a forward bump never got a session; the commit byte authorises rather than proves; the main socket's default mode makes the trust model same-group; a held handoff reports as a failure not a deferred update). All fixed with tests, all three headline attacks re-run by me against the fixed binaries. Also fixed in passing: a Windows-target break (ungated `std::os::unix` in `lock.rs`, caught by check-targets — the gate's second catch this session) and the cross-filesystem hard-link fallback that was filling /tmp during parallel test runs. 569 tests, 11 slices, bench 6/6, vet/deny/audit/targets green.
+
+- 2026-09-12 [turn 63] T-0038 stage 2 delegated (`HandoffStage2`) and T-0076 delegated (`TuiModern`) in parallel — two disjoint slices (arreo-server+pty vs arreo-tui+theme), so the fleet is not serialized on one crate. Planner's work this turn: the stage-2 design, recorded in **ADR 0021 §2d** before the worker started — the pause must be atomic with respect to the pump's read→push (the buffer lock cannot be it, because `read` blocks on an idle pane); **every abort must resume the pumps**, because a paused pane whose child fills the 64 KiB pipe buffer blocks that child forever (worse than not updating); the incoming daemon must not read before it commits, or an abort loses bytes the resuming daemon cannot recover; state travels (scrollback lines + partial + raw journal + pane identity) while **derived** state is re-derived (the engine's state and its feed cursor — a pure function of the journal, so transferring them would create a second source of truth for one fact); and the enforcement guard travels as a **cgroup path**, re-opened on the other side, because a pane that arrived without its guard would silently lose its memory ceiling. Reconnaissance findings that shaped it: `persist::restore` (the crash path) **re-spawns** a new child, so it cannot be reused for this; `PaneEntry::pump` feeds the engine from the raw journal, so without the journal a pane that was `question` becomes `unknown` at the cut — the product's headline feature regressing visibly.

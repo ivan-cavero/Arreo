@@ -211,6 +211,60 @@ daemon for the duration of a handoff. **An invariant enforced by an inherited de
 enforced by it** — the same confusion that made the received lock descriptor need validation
 against the path rather than a probe of the path.
 
+**2d. The panes travel by descriptor and by memory, and the pause is the atomic point.**
+
+Stage 1 moved the socket and the lock; stage 2 moves the agents. Two different things have to
+cross, and they need different mechanisms:
+
+- **The master descriptor** — the kernel's handle on the terminal (stage 0's `Pane::adopt`).
+- **Everything the old daemon had already read into memory** — the scrollback a client sees and
+  the journal the state engine is derived from. A read consumes: bytes the outgoing daemon has
+  read are *gone* from the pipe, so if only the descriptor crossed, the incoming daemon would
+  start with an empty scrollback and every client would watch the history vanish at the cut.
+
+**The transfer point must be atomic with respect to `read` → `push`.** The pump reads from the
+master and pushes into the ring, and the bytes between those two steps are in flight — not yet in
+the ring, no longer in the kernel. A snapshot taken then loses them silently, which is the worst
+shape of bug this project has: output that disappears with nothing to point at. The buffer lock
+cannot be the quiescence point, because `read` blocks indefinitely on an idle pane and the
+snapshot would wait forever behind it. So each pump checks a pause flag **before** it reads, and
+acknowledges when it has finished the read+push it was in; once every pump has acknowledged,
+nothing is in flight and the snapshot is exact.
+
+**And every abort must resume the pumps — this is the requirement the design nearly missed.**
+A paused pane whose child keeps writing fills the kernel pipe buffer (commonly 64 KiB) and then
+**the child blocks**. If a handoff aborts while the pumps are paused and nobody resumes them,
+that agent is stuck until the daemon restarts — a worse outcome than the update simply not
+happening, arrived at by the feature meant to protect it. So the outgoing daemon resumes before
+it returns to serving, on every abort path, and a test proves it by pushing well over a pipe
+buffer through a paused pane and then aborting.
+
+**The incoming daemon does not read until it has committed.** If it started its pumps early and
+then aborted, the bytes it had consumed would be gone and the outgoing daemon — resuming with a
+hole in its scrollback — could not get them back. So it adopts, seeds, starts the accept loop,
+commits, and only *then* begins reading. Bytes written in the meantime wait in the pipe buffer,
+which is exactly what makes the ordering safe.
+
+**What travels is state; what is derived is re-derived.** The scrollback (lines plus an
+unterminated partial), the raw journal, and the pane's identity travel. The state engine's state
+and its feed cursor do **not**: the engine is a pure function of the journal, so the incoming
+daemon feeds it the transferred journal once and gets the same answer, including a pane that was
+mid-question at the cut. Transferring the engine's state instead would create a second source of
+truth for the same fact — the defect class this codebase keeps finding — and would leave the two
+free to disagree. The metrics sampler is derived the same way (it samples `/proc`, which is the
+one place process facts live).
+
+**Enforcement travels as a path, not a descriptor.** A cgroup is a *named* kernel object
+(`/sys/fs/cgroup/...`), so the guard is re-opened from its path on the other side rather than
+passed. A pane that arrived without its guard would silently lose its memory ceiling, so the
+incoming daemon either re-opens it or says so — serving an agent unprotected while reporting a
+clean handoff is the failure that would matter most and show least.
+
+**Rejected: reusing the crash path.** T-0018's restore re-spawns the recorded command, which is
+right for a reboot (a descriptor cannot survive one) and wrong here: it produces a *new* child,
+and the whole point of §3.13 is that the agent keeps running. Two mechanisms for two different
+problems, and the reboot path is not a shortcut for this one.
+
 **3. One serving daemon, enforced by `flock`.**
 
 The daemon holds an exclusive lock on its socket path for its whole life. A second daemon
