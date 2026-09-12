@@ -1,35 +1,31 @@
 ## State snapshot          ← REWRITTEN (not appended) at every checkpoint
-Task: **T-0067 · pinning has two answers — DONE**, and the task it came out of (T-0066) is
-resolved on the product side: **Phase 2's exit criterion passes** — two machines in one account in
-**1–3 s** against the 300 s budget, both listed `online`.
-Where you are: the self-admission bootstrap is tested for the first time
-(`a_self_admitted_machine_gets_a_certificate_the_root_signs` — real relay, real account, then a
-daemon that must register), `DeviceAuthority::devices()` is the union of the store and the disk so
-"is this device pinned here?" has one answer, and the earlier "certificate does not verify" report
-was corrected: it was my harness (a leaked relay on a fixed port holding a previous run's account),
-not the product.
-476 workspace tests green; clippy clean on both toolchains; fmt clean; 10 slices green
-(relay 20, mesh 16/1 skip, chaos 8, theme 27, tui 20, api, compat, lifecycle 2, persistence 3,
-enforcement); vet 336, deny 4/4, audit 0, check-targets PASS/SKIP; bench 6/6.
-Next step: **T-0066's documentation half** — the one real gap left in the criterion: `devices list`
-prints the account root **truncated**, `identity/root.key` holds the *secret*, and only
-`devices list --json` carries the value a stranger needs; no doc says so. Then T-0063 (p1, needs repo
-admin for the ubuntu CI log) and T-0048 (needs-human).
+Task: **T-0066 · the first machine — DONE.** Phase 2's exit criterion is met and the path to it is
+findable: `devices list` prints the full root, the docs start from "the first machine" (before
+"adding a second"), and the relay's unknown-account refusal names the command that fixes it.
+Where you are: **T-0069 also fixed** (a refused registration no longer burns the relay's
+per-address handshake budget and bury its own reason under transport errors). Phase 2's remaining
+queue is the auto-update family, which was blocked on T-0036's human-gated signing key — so
+**T-0037 was split**: the swap half is now **T-0070** (buildable now, driven by an explicit
+`--from <path>`), the channel half stays in T-0037 behind T-0036.
+477 workspace tests green; clippy clean on both toolchains; fmt clean; 10 slices green; the
+exit-criterion script passes at 1–3 s; vet/deny/audit/check-targets clean.
+Next step: **T-0070** — stage → atomic swap → crash-safety → lock → `--rollback` → re-exec →
+reattach, plus the "never touch a PTY-bearing process" invariant and the update slice with 8
+panes. It is the largest unblocked unit left in Phase 2.
 Open workers: (none)
-Known broken: T-0063 (CI ubuntu leg, needs admin) · Parked: T-0048 + T-0036 needs-human
+Known broken: T-0063 (CI ubuntu leg, needs repo admin) · Parked: T-0048 + T-0036 needs-human
 Findings:
-- **A leaked process on a fixed address is indistinguishable from a product defect.** The
-  exit-criterion script never killed its relay, so runs 2+ talked to run 1's relay — which held an
-  account registered with the *secret* seed. The relay then rejected a good certificate, and the
-  message read exactly like a crypto bug. When a security failure looks impossible, check whether
-  the peer is the one you think it is.
-- **One fact, two sources — again.** Authorization read the store *plus* disk certificates; the
-  listing read the store alone, so a device could authenticate and be denied existence.
-- **Verify the task before you trust the task file**: T-0067 was filed as a p1 product bug on
-  evidence that turned out to be the harness's. Re-scoping it honestly (keeping the misdiagnosis in
-  the record) was worth more than deleting it.
-- **Registering a key: the human output truncates it, the secret file is not it.** Three ways to get
-  the account root wrong, and two of them are accepted silently.
+- **"Without docs help" is the sharper half of a criterion.** The mechanism took 1–3 s; what was
+  missing was anything telling a stranger how the *first* machine enters its own account. Both
+  sides of the unknown-account refusal now name the command, and `devices list` no longer
+  truncates the value that gets pasted into it.
+- **A refused registration is not a transport failure** (T-0069): retrying a deterministic
+  refusal on the reconnect ramp exhausts a per-address budget and replaces the reason with
+  "connection refused". Typed distinction (`ClientError::Refused`), ceiling retry, and the log
+  says why it is waiting.
+- **A split can be forced by a human gate without shrinking the phase**: T-0036 blocks the
+  *signing* half of auto-update, not the swap — and the swap is the half that can destroy an
+  agent, so it is the half worth proving first.
 ## Event log               ← append-only; newest last; never rewrite
 - 2026-09-10 [turn 1] ledger created; repo at e489fac (docs only); T-0001 + T-0022 (AGENTS.md gardened) done
 - 2026-09-10 [turn 2] T-0002 PTY manager done+pushed (342606c; 9 tests); PROMPT.md v2 synced + ADR 0001 (ef6c595)
@@ -123,3 +119,5 @@ Findings:
 - 2026-09-12 [turn 57] T-0065 done (RelayStream no longer aborts its forwarding task on drop; a frame written before close reaches the peer; proved load-bearing by mutation and end to end by T-0047's refusal assertion, which now PASSES), plus three gardening/exercise outcomes: T-0034 marked done with inbox/presence criteria dropped as redundant and `--weakened` retired after an experiment showed the opacity check cannot fail alone (the relay logs ciphertext, which is stronger than the check tests); T-0027 retired as superseded (its hostile cases are noise.rs and pairing.rs tests, all in CI); Phase 2's exit criterion exercised and found to FAIL for product reasons — T-0066 (the account root *public* key is undiscoverable: `devices list` truncates it and the obvious file holds the secret seed) and T-0067 (p1: a self-admitted certificate verifies against nothing, with the relay's stored root byte-identical to the machine's, so the fault is in issuance). The daemon's "pair this machine first" message now names the real two-step self-admission. 474 workspace tests, clippy clean on both toolchains, fmt clean, 10 slices green.
 
 - 2026-09-12 [turn 58] T-0067 done, and with it the Phase 2 exit criterion is met. Diagnosis first: the "self-admitted certificate does not verify" report was **my harness**, not the product — the exit-criterion script used fixed ports and never killed its relay, so later runs talked to a stale relay holding an account registered with the *secret* seed; rewritten with pid-scoped ports, `trap` cleanup, polled readiness and the account root from `devices list --json`, the criterion passes in **1-3 s** (budget 300 s) with both machines `online`. Two real deliverables came out of it: (1) the first-machine bootstrap is now tested (`a_self_admitted_machine_gets_a_certificate_the_root_signs` — real relay + real account + a daemon that must register; nothing covered it before, since every pairing test used a mailbox-only relay that verifies no certificates), and (2) `DeviceAuthority::devices()` now returns the union of the store and the index, because authorization read store+disk while the listing read store-only — so a certificate on disk without a store row (the explicit-`--socket` deployment shape) was a device the daemon authenticated and `machines trust` denied with a false message. Proved load-bearing by mutation. 476 workspace tests, clippy clean on both toolchains, fmt clean, 10 slices green, exit criterion scripted and green, bench 6/6.
+
+- 2026-09-12 [turn 59] T-0066 done and with it Phase 2's exit criterion in full: `arreo devices list` prints the full root (a truncated identifier that looks complete is the trap — it is pasted into `account add --root-key`), `docs/machines.md` gained § The first machine before § Joining (every command executed verbatim), `docs/tour.md`/README start from the first machine, and the relay's unknown-account refusal names the fix on both sides (machine and relay log). The "without docs help" pass found the last gap: nothing said how an account comes to exist. Then T-0069, found by that same dogfooding: a refused registration retried on the transport ramp (250ms) exhausted the relay's 3-per-10s-per-**address** handshake budget, so the operator's log replaced the real reason ("unknown account…") with a transport error; now typed (`ClientError::Refused`), retried at the ceiling, with a log line saying why, and the test pins that the *first* retry waits the ceiling while a transport failure keeps the quick one. Gardening: T-0037 split — the swap half (stage/rename/crash-safety/lock/rollback/re-exec/reattach + the never-touch-a-PTY invariant + the update slice) is now T-0070, buildable now behind `--from <path>`, because T-0036's signing key is human-gated and the swap is the half that can destroy an agent. 477 workspace tests, clippy clean on both toolchains, fmt clean, 10 slices green, exit criterion 1-3s.

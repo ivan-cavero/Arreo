@@ -18,6 +18,21 @@ scope:
   - .loop/evidence/T-0037/**
 ---
 
+## Re-scope (2026-09-12): the swap moved to T-0070
+
+Five of this task's eight criteria are about the **swap** (the invariant, the atomic rename,
+crash-safety, concurrency, `--rollback`) and need nothing from the signing key. Three are about
+the **channel** (read the index, verify, `--check`) and cannot start while T-0036 is human-gated
+on key custody.
+
+So the swap became **T-0070**, which can proceed now with an explicit local artifact source
+(`arreo update --from <path>` — a real feature, and where a channel source will feed in). This
+task keeps the channel half: the anonymous `arreo update` that requires a signature, `--check`,
+and the release index. Until both land, `arreo update` with no `--from` refuses.
+
+This is a correction of the split, not a reduction: nothing is dropped, and the criteria below
+are annotated with which task owns them.
+
 ## Goal
 
 The client half of §3.13: download → verify → atomic swap → restart → reattach through the
@@ -26,30 +41,17 @@ a PTY — T-0037 makes `arreo` and `arreo-tui` self-updating (server half T-0038
 
 ## Acceptance criteria
 
-- [ ] Invariant stated in code and in `docs/release.md`, enforced by construction: **the
-      client update path never signals, reaps, restarts or stops a PTY-bearing process, and
-      never stops the daemon** — it may only touch the CLI/TUI binary path and the resume store.
-- [ ] `arreo update` end-to-end: read the channel index → verify (T-0036, fail closed) → stage
-      beside the running binary on the same filesystem → atomic `rename(2)` swap keeping the
-      previous binary as `.prev` → re-exec → reattach. No instant where the binary path is
-      missing or non-executable.
-- [ ] Invariant proof in `cargo xtask e2e --slice update` (this task wires the slice): 8 panes
-      with a live marker stream; record daemon pid, all 8 pane pids and a scrollback marker → run
-      `arreo update` → assert daemon pid and every pane pid unchanged, zero `exit` state events,
-      markers still readable, reattach via the stored resume token in < 2 s, session id unchanged.
-- [ ] Crash-safe swap: a crash injected between the two renames still leaves an executable
-      binary at the path (old or new); the slice asserts `--version` runs either way and that
-      the `.prev` recovery path restores the old one.
-- [ ] A failed download or a failed verification leaves the running binary and the resume store
-      byte-identical (hash before == hash after, asserted in the slice).
-- [ ] Concurrency: two `arreo update` processes → one swaps, the other exits non-zero with
-      "update already in progress" (a lock file, not a race); a stale lock from a killed updater
-      is reclaimed by pid liveness, not by a timeout guess.
-- [ ] `arreo update --rollback` restores `.prev`, re-execs and reattaches on the same
-      resume token.
-- [ ] `arreo update --check` reports current/available versions and changes nothing; on a
-      read-only or package-manager-owned install path the updater makes zero partial writes
-      and prints the package manager's own command instead.
+- [~] **→ T-0070** (the invariant, and the machinery that must satisfy it).
+- [~] Split: the **stage → swap → re-exec → reattach** half is **T-0070**; the **read the
+      channel index → verify (T-0036, fail closed)** half stays here.
+- [~] **→ T-0070** (the slice, wired and proven there).
+- [~] **→ T-0070.**
+- [~] Split: the *staging* half (a failed write leaves the binary byte-identical) is **T-0070**;
+      the *verification* half (a failed signature) stays here.
+- [~] **→ T-0070.**
+- [~] **→ T-0070.**
+- [~] Split: `--check` (needs the channel) stays here; the package-manager/read-only path is
+      **T-0070**.
 
 ## Notes
 
@@ -64,8 +66,8 @@ a PTY — T-0037 makes `arreo` and `arreo-tui` self-updating (server half T-0038
 - Honest gap: Homebrew and `cargo install` own their binary path, so the updater prints the
   correct package-manager command rather than fighting it; and no unattended background install
   ships here (that needs Phase-5 channel policy) — `--check` is all this task ships.
-- The `update` slice is wired here (T-0042 runs it on the CI matrix and chains it into the
-  release story).
+- The `update` slice is wired in **T-0070** now (T-0042 runs it on the CI matrix and chains it
+  into the release story).
 
 ## Verification
 
