@@ -1,30 +1,30 @@
 ## State snapshot          ← REWRITTEN (not appended) at every checkpoint
 Task: **T-0065 · the lost refusal frame — DONE.** `RelayStream`'s drop aborted the one task that
 hands bytes to the session, so the frame written immediately before closing (every refusal path)
-never arrived. It now closes the write half and lets the task drain; the `JoinHandle` is gone and
-the type is simpler.
-Where you are: **both defects the mesh slice found are fixed and pushed** — T-0064 (the hang) and
-T-0065 (the lost frame). T-0047's mesh slice now PASSES "an untrusted device is refused with the
-actionable message": the operator gets `arreo machines trust … --yes`, the sentence T-0046 shipped
-for that moment. The slice's split assertion collapsed back into one, and it runs in 11.9 s
-instead of 29 s.
-474 workspace tests green; clippy clean on both toolchains; fmt clean; 10 slices green
-(relay 20, mesh 16/1 skip, chaos 8, theme 27, tui 20, api, compat, lifecycle 2, persistence 3,
-enforcement); vet 336, deny 4/4, audit 0, check-targets PASS/SKIP.
-Next step: **T-0063** (p1 — CI has never passed; needs repo admin for the ubuntu log) is the
-highest-priority open task but is blocked on a human. Otherwise T-0048's launch decision is the
-other human gate. With both parked, the next actionable work is drafting Phase 3's queue from
-ROADMAP (per §3: a phase boundary is a gate, not a wall).
+never arrived. It now closes the write half and lets the task drain; the `Handle` is gone.
+Where you are: the two defects the mesh slice found (T-0064 hang, T-0065 lost frame) are **both
+fixed and pushed**, and T-0047's refusal assertion passes end to end — the operator gets
+`arreo machines trust … --yes`. The slice runs 11.9 s instead of 29 s. Then the Phase 2 exit
+criterion was exercised (§6) and it **fails for product reasons**, filed as T-0066 + T-0067:
+the root public key is undiscoverable (T-0066) and a self-admitted certificate verifies against
+nothing (T-0067, p1) — with the relay's handshake budget masking both on loopback.
+474 workspace tests green; clippy clean on both toolchains; fmt clean; 10 slices green.
+Next step: **T-0067** (diagnose and fix the unverifiable self-admitted certificate — the reproduction
+and what is/ isn't established are in the file). It blocks Phase 2's exit criterion. Then T-0066's
+documentation half, then the timed re-run of the exit criterion.
 Open workers: (none)
-Known broken: CI red on the ubuntu test leg (T-0063) · Parked: T-0048 needs-human (launch decision)
+Known broken: T-0067 (self-admitted cert unverifiable) · T-0063 (CI ubuntu leg, needs admin) ·
+Parked: T-0048 needs-human (launch decision), T-0036 needs-human (signing key custody)
 Findings:
-- **A destructor that aborts work is a destructor that loses data.** `Drop` called
-  `forward.abort()`, killing the task holding the last frame. Closing instead of aborting lets the
-  task finish, and the existing 300 ms grace pause — which had been useless — is what gives it room.
+- **A destructor that aborts work loses data** (T-0065): `Drop` called `forward.abort()`, killing
+  the task holding the last frame. Closing instead of aborting lets it finish.
 - **A local-only test suite cannot see a transport-shaped bug**: T-0046's refusals were all tested
   on a socket with no forwarding task, so the sentence never had to travel.
-- **Two bugs can hide each other**: the hang (T-0064) masked the loss (T-0065). Fixing the bound
-  first is what turned silence into a sentence.
+- **Two bugs can hide each other**: the hang (T-0064) masked the loss (T-0065).
+- **A check that cannot fail is not evidence** (T-0034): mutating the relay to log every payload it
+  routes left the opacity check passing — because what it logs is ciphertext. That is a *stronger*
+  property than the check tests, and the check now says so.
+- **Exercising the exit criterion found more than the docs**: two tasks, one of them p1.
 ## Event log               ← append-only; newest last; never rewrite
 - 2026-09-10 [turn 1] ledger created; repo at e489fac (docs only); T-0001 + T-0022 (AGENTS.md gardened) done
 - 2026-09-10 [turn 2] T-0002 PTY manager done+pushed (342606c; 9 tests); PROMPT.md v2 synced + ADR 0001 (ef6c595)
@@ -114,3 +114,5 @@ Findings:
 - 2026-09-12 [turn 56] T-0064 done: the post-Hello read in `Client::connect_to` is bounded by `HANDSHAKE_REPLY_TIMEOUT` (5 s, chosen so the Noise handshake bound plus this one stays inside §5's 10 s row), covering both transports. Proved load-bearing by mutation (without the timeout the new regression test hangs past 60 s; with it, 5.00 s). The fix immediately exposed **T-0065**: the daemon's refusal frame is written, flushed and never arrives over the relay — the client now reports a bounded, named failure instead of hanging, which is how the missing sentence became visible. The mesh slice splits the two facts (bounded failure PASS, missing sentence SKIP naming T-0065). 473 workspace tests, clippy clean on both toolchains, fmt clean, evidence `.loop/evidence/T-0064/`.
 
 - 2026-09-12 [turn 57] T-0065 done: `RelayStream::drop` no longer aborts its forwarding task — it closes the write half and lets the task drain, so a frame written immediately before closing (every refusal path) reaches the peer. The `JoinHandle` is gone and the type is simpler (`sink: Option<DuplexStream>`). Root cause: `forward.abort()` killed the one task that hands bytes to the session, so anything buffered in the duplex died with it; locally there is no such task, which is why T-0046's all-local refusal tests never saw it. Proved by `a_frame_written_immediately_before_closing_reaches_the_peer` (write, flush, shutdown, drop, over a real relay) — fails with the abort restored, passes without it. End to end, T-0047's mesh slice now PASSES the refusal assertion (the operator gets `arreo machines trust … --yes`), collapsing the two split checks back into one and dropping the slice from 29 s to 11.9 s. Audited every write-then-close caller: only `serve_session`'s wrapper, reached by both relay consumers through the same drop. 474 workspace tests, clippy clean on both toolchains, 10 slices green, vet/deny/audit/check-targets clean, evidence `.loop/evidence/T-0065/`.
+
+- 2026-09-12 [turn 57] T-0065 done (RelayStream no longer aborts its forwarding task on drop; a frame written before close reaches the peer; proved load-bearing by mutation and end to end by T-0047's refusal assertion, which now PASSES), plus three gardening/exercise outcomes: T-0034 marked done with inbox/presence criteria dropped as redundant and `--weakened` retired after an experiment showed the opacity check cannot fail alone (the relay logs ciphertext, which is stronger than the check tests); T-0027 retired as superseded (its hostile cases are noise.rs and pairing.rs tests, all in CI); Phase 2's exit criterion exercised and found to FAIL for product reasons — T-0066 (the account root *public* key is undiscoverable: `devices list` truncates it and the obvious file holds the secret seed) and T-0067 (p1: a self-admitted certificate verifies against nothing, with the relay's stored root byte-identical to the machine's, so the fault is in issuance). The daemon's "pair this machine first" message now names the real two-step self-admission. 474 workspace tests, clippy clean on both toolchains, fmt clean, 10 slices green.
