@@ -1,32 +1,49 @@
 ## State snapshot          ← REWRITTEN (not appended) at every checkpoint
-Task: **T-0070 · the client update swap — DONE.** §3.13's client half exists, with the invariant
-proven: a real update across a live daemon and eight panes, no pid moved, every pane's counter
-continued. `arreo update --from <path>` / `--rollback` / `--check`.
-Where you are: 497 workspace tests green; clippy clean on both toolchains; fmt clean; **11 slices
-green** (relay 20, mesh 16/1 skip, update 17, chaos 8, theme 27, tui 20, api, compat, lifecycle 2,
-persistence 3, enforcement); vet 336, deny 4/4, audit 0, check-targets PASS/SKIP; bench 6/6.
-The swap is a hard link + one atomic `rename(2)` (no window where the path is missing), the
-one-updater lock is an OS `File::try_lock` (a stale lock cannot arise), and the hand-over carries
-the path resolved before the swap — because `exec` discards unflushed stdout and `/proc/self/exe`
-becomes `… (deleted)` after it. ADR 0020 records all three, with the rejected alternatives.
-Next step: **T-0038** (server live handoff — PTY masters over SCM_RIGHTS; the hardest thing in
-Phase 2). It was blocked on T-0036 by inheritance; re-scoped this turn exactly as T-0037 was,
-because every one of its five stages is mechanism and none needs a signature. Start with stage 0
-(`Pane::adopt`), which is also the piece the others cannot be built without.
+Task: **T-0038 stage 0 — DONE** (the adopt primitive) and **T-0071 — DONE** (one daemon per
+socket). T-0038 is `in-progress`: stages 1–4 (the handoff protocol, manifest, client reconnect,
+abort-safety) remain, and stage 1 is next.
+Where you are: three commits pushed (`65cc4ed` T-0071, `6014082` T-0038 stage 0). 527 workspace
+tests / 0 failed; clippy clean on both toolchains; fmt clean; **11 slices green**; vet 336, deny
+4/4, audit 0, check-targets PASS/SKIP; bench 6/6.
+**T-0038 stage 0**: `Pane::adopt(master_fd, child_pid, AdoptSize, SpawnSpec)` + `send_fd`/`recv_fd`
+in `arreo-core::pty::adopt` (24 tests in `crates/arreo-core/tests/adopt.rs`). `MasterPty` is a
+public trait, so the adopted master implements it — no portable-pty fork. `spawn` and `adopt` end
+in one private `assemble`, so every Pane method behaves identically on either.
+Next step: **T-0038 stage 1** — `arreo update --server` on an idle daemon: new process connects,
+version handshake, takes over, old exits 0; socket path and session id unchanged; audit row
+`handoff v<from> → v<to> panes=0`. Read ADR 0021 §2/§2b first: the fd channel must be a dedicated
+socketpair (ancillary data is a barrier on a stream socket), and the outgoing daemon must not drop
+its panes before exiting (portable-pty's writer sends EOT on drop — `std::process::exit` runs no
+destructors, which is why today it is safe by accident rather than by design).
 Open workers: (none)
 Known broken: T-0063 (CI ubuntu leg, needs repo admin) · Parked: T-0048 + T-0036 needs-human
+Cross-OS gate for a later stage: `TIOCGSID` on a session-less master is measured on Linux and
+[INFERENCE] from XNU on Darwin.
 Findings:
-- **"No pane restarted" cannot be proven by pid** — `PaneInfo` carries `id`, `alive`, `alert` and
-  nothing else, so the proof must be behavioural (a counter that would reset), and the evidence
-  should be shown to *bite* by mutating the pane script to emulate a restart.
-- **A test that only cleans up on success is a test that fills the disk on failure**: 3 × 128 MB
-  per test filled a 12 GB tmpfs in one failing run. `Drop` guard + hard link.
-- **`exec` has two consequences that are easy to miss**: it discards unflushed stdout, so anything
-  printed after it is never printed; and it leaves the process's own path stale, so re-deriving it
-  fails. Report before handing over, and carry the path.
-- **A dependency can be inherited rather than needed**: T-0038 listed T-0036 because the new daemon
-  is *presumably* a verified release, but none of its stages touches a signature. Reading the
-  criteria before trusting the dependency is what unblocked the hardest task in the phase.
+- **A fix can be worse than the defect it closes, when it converts "unknown" into a verdict.**
+  The pid cross-check (F1) was right; its first version read a `tcgetsid` error as "the session
+  leader exited", so a LIVE pane was reported dead, its kill switch no-opped, and its attach stream
+  tore down. `ENOTTY` means only that the *terminal* has no session — measured with a child that
+  calls `setsid()` and never takes the controlling terminal, alive and writing throughout. The
+  branch now drops the pid and concludes nothing. **Generalised: an API whose job is to report
+  state must distinguish "I know it is X" from "I could not find out" — collapsing those is how a
+  live thing gets declared dead.**
+- **A dependency can be inherited rather than needed** (T-0038 listed T-0036 for a signature no
+  stage uses), and **a defect can be load-bearing for the invariant a later task rests on** (T-0071:
+  the handoff's "exactly one daemon" was assumed, and two could serve one socket 1 round in 12).
+  Both were found by reading the criteria and the code rather than trusting the frontmatter.
+- **A test for a race is usually a bad test.** The T-0071 regression test asserts the *rule*
+  deterministically (the test holds the lock, the socket is absent — the state both racers saw)
+  rather than racing, which would have passed ~11 times in 12 before the fix.
+- **Descriptions of the platform must be checked against the platform.** `AF_UNIX`
+  `SOCK_SEQPACKET` does not exist on macOS, so requiring it would have made that handoff
+  impossible; and `TIOCNOTTY` delivers SIGHUP, so it was a muddier repro than it looked.
+- Dependency note (per AGENTS.md): **`rustix` 0.38 promoted to a direct dep of `arreo-core`**
+  (features alloc/event/net/process/pty/termios) for the fd transfer, winsize/tty probes, `fcntl`
+  and `pidfd_open`. It was already in the graph at exactly 0.38.44 (portable-pty, alacritty,
+  polling), so no new supply-chain entry: vet stayed at 336, deny 4/4, and the `polling = "=3.7.0"`
+  pin that keeps rustix at 0.38 is untouched. It gives a safe API with zero `unsafe` in the new
+  code, which hand-rolled `libc::sendmsg` would not.
 ## Event log               ← append-only; newest last; never rewrite
 - 2026-09-10 [turn 1] ledger created; repo at e489fac (docs only); T-0001 + T-0022 (AGENTS.md gardened) done
 - 2026-09-10 [turn 2] T-0002 PTY manager done+pushed (342606c; 9 tests); PROMPT.md v2 synced + ADR 0001 (ef6c595)
@@ -124,3 +141,5 @@ Findings:
 - 2026-09-12 [turn 59] T-0066 done and with it Phase 2's exit criterion in full: `arreo devices list` prints the full root (a truncated identifier that looks complete is the trap — it is pasted into `account add --root-key`), `docs/machines.md` gained § The first machine before § Joining (every command executed verbatim), `docs/tour.md`/README start from the first machine, and the relay's unknown-account refusal names the fix on both sides (machine and relay log). The "without docs help" pass found the last gap: nothing said how an account comes to exist. Then T-0069, found by that same dogfooding: a refused registration retried on the transport ramp (250ms) exhausted the relay's 3-per-10s-per-**address** handshake budget, so the operator's log replaced the real reason ("unknown account…") with a transport error; now typed (`ClientError::Refused`), retried at the ceiling, with a log line saying why, and the test pins that the *first* retry waits the ceiling while a transport failure keeps the quick one. Gardening: T-0037 split — the swap half (stage/rename/crash-safety/lock/rollback/re-exec/reattach + the never-touch-a-PTY invariant + the update slice) is now T-0070, buildable now behind `--from <path>`, because T-0036's signing key is human-gated and the swap is the half that can destroy an agent. 477 workspace tests, clippy clean on both toolchains, fmt clean, 10 slices green, exit criterion 1-3s.
 
 - 2026-09-12 [turn 60] T-0070 done: the client update swap. `arreo_core::update` (stage → hard-link `.prev` → one atomic `rename(2)`; OS `File::try_lock` for one-updater-at-a-time; `--rollback`; `package_manager_advice`) + `arreo_core::update::resume` (the resume token, XDG *state* not data, one mechanism for a phone after a network hop and a client after a swap) + the `arreo update` verb (`--from <path>`, `--rollback`, `--check`, `--json`, `--no-reexec`, `--reattach-pane`) + `xtask/src/update_slice.rs` (17 checks, in CI) + 11 core unit tests + 8 CLI integration tests + ADR 0020 + docs/release.md's invariant section. The invariant — never signal/reap/restart/stop a PTY-bearing process — is proven by the slice across a live daemon and eight panes (daemon un-reaped, counters continued), and the evidence was shown to bite by mutating the pane script to emulate a restart. Two defects found by running it: the re-exec dropped the `update` verb (usage text instead of a handover), and the report printed *after* `exec` so `| cat` lost it. Also `--check` refuses because there is no channel (T-0036's key is human-gated) and this build must not install what it cannot verify. Gardening: **T-0038 re-scoped** — T-0036 dropped from its dependencies, because all five of its stages are mechanism (SCM_RIGHTS, adoption, abort-safety) and none needs a signature; the artifact source is explicit, exactly as T-0070 did for the client. 497 workspace tests, clippy clean on both toolchains, fmt clean, 11 slices green, bench 6/6.
+
+- 2026-09-12 [turn 61] T-0071 done (one daemon per socket) + T-0038 stage 0 done (the adopt primitive). T-0071 was found while designing the handoff, whose "exactly one daemon serves this machine" was assumed rather than enforced: `serve` probed the socket, removed it and bound, so two daemons starting together both unlinked and the second removed the first's listener — measured at **1 round in 12** of eight simultaneous starts with two live daemons. Fixed with an exclusive lock on `<socket>.lock` taken *before* the probe, shared with the updater's lock (refactored into `arreo_core::lock`; `identity::authority::sidecar` is now the one sidecar-path rule), held on the `Daemon` because `main` cancels the `serve` future on SIGTERM and keeps draining. The regression test asserts the *rule* deterministically rather than racing (a racing test would have passed ~11 times in 12 pre-fix), and was mutation-checked. T-0038 stage 0: `Pane::adopt` + `send_fd`/`recv_fd` (24 tests), `MasterPty` implemented rather than the crate forked, `spawn`/`adopt` sharing one `assemble`. A **mandatory security review** of the fd path found seven issues and then falsified the first fix's assumption — the pid cross-check was right, but reading a `tcgetsid` error as "the session leader exited" reported LIVE panes as dead (measured independently: child in state S, ENOTTY on the master, still writing); that branch now drops the pid and concludes nothing. Two further findings: a refused adoption was not side-effect free (the geometry repair ran before the pid check, so a refusal had already resized the sender's live terminal), and a bare pid was signalled without re-checking it against the terminal. New ADR 0021 (the handoff design: two-phase commit with the old daemon serving until the new one commits, the fd channel dedicated because ancillary data is a barrier on a stream socket, no `SOCK_SEQPACKET` because macOS lacks it). `rustix` 0.38 promoted to a direct dep of arreo-core — already in the graph at exactly 0.38.44, so no new supply-chain entry. 527 workspace tests, clippy clean on both toolchains, fmt clean, 11 slices green, bench 6/6, vet 336, deny 4/4, audit 0, check-targets PASS/SKIP. Three commits pushed: 65cc4ed, 6014082.
