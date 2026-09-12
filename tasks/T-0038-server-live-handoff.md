@@ -4,7 +4,7 @@ title: Server live handoff on Unix — PTY masters over SCM_RIGHTS, zero-cut upd
 phase: 2
 priority: 2
 status: proposed
-depends_on: [T-0002, T-0012, T-0013, T-0018, T-0036]
+depends_on: [T-0002, T-0012, T-0013, T-0018]
 scope:
   - crates/arreo-server/src/handoff/**
   - crates/arreo-server/src/daemon.rs
@@ -18,6 +18,25 @@ scope:
   - perf-budget.toml
   - .loop/evidence/T-0038/**
 ---
+
+## Re-scope (2026-09-12): the signing key is not on the critical path
+
+`T-0036` was in this task's dependencies because the new daemon is *presumably* a verified
+release. Reading the five stages, none of them needs that: stage 0 is adopting a PTY master
+over `SCM_RIGHTS`, stages 1–2 are the handoff and the in-flight-output proof, stage 3 is
+client reconnect plus the latency row, stage 4 is abort-safety, and the last criterion is
+SQLite. **Every one of them is mechanism.** Verification is T-0037's half, and it is blocked
+on key custody a human holds.
+
+So the dependency is dropped here, on the same reasoning that split T-0037 (see
+`tasks/T-0070-update-swap.md`), and the artifact source is explicit: the new binary is staged
+at a path the operator names — `arreo update --from <path> --server`, or the equivalent —
+exactly as the client swap does. When T-0036 lands, the verified path feeds the same seam.
+
+What does **not** change: a handoff still refuses a binary whose protocol version is outside
+the N−1 window (that check is in the criteria below and needs no signature). Verification
+before *installing* stays T-0037's job; this task's job is that the install cannot lose an
+agent.
 
 ## Goal
 

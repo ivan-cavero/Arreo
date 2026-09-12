@@ -1,31 +1,32 @@
 ## State snapshot          ← REWRITTEN (not appended) at every checkpoint
-Task: **T-0066 · the first machine — DONE.** Phase 2's exit criterion is met and the path to it is
-findable: `devices list` prints the full root, the docs start from "the first machine" (before
-"adding a second"), and the relay's unknown-account refusal names the command that fixes it.
-Where you are: **T-0069 also fixed** (a refused registration no longer burns the relay's
-per-address handshake budget and bury its own reason under transport errors). Phase 2's remaining
-queue is the auto-update family, which was blocked on T-0036's human-gated signing key — so
-**T-0037 was split**: the swap half is now **T-0070** (buildable now, driven by an explicit
-`--from <path>`), the channel half stays in T-0037 behind T-0036.
-477 workspace tests green; clippy clean on both toolchains; fmt clean; 10 slices green; the
-exit-criterion script passes at 1–3 s; vet/deny/audit/check-targets clean.
-Next step: **T-0070** — stage → atomic swap → crash-safety → lock → `--rollback` → re-exec →
-reattach, plus the "never touch a PTY-bearing process" invariant and the update slice with 8
-panes. It is the largest unblocked unit left in Phase 2.
+Task: **T-0070 · the client update swap — DONE.** §3.13's client half exists, with the invariant
+proven: a real update across a live daemon and eight panes, no pid moved, every pane's counter
+continued. `arreo update --from <path>` / `--rollback` / `--check`.
+Where you are: 497 workspace tests green; clippy clean on both toolchains; fmt clean; **11 slices
+green** (relay 20, mesh 16/1 skip, update 17, chaos 8, theme 27, tui 20, api, compat, lifecycle 2,
+persistence 3, enforcement); vet 336, deny 4/4, audit 0, check-targets PASS/SKIP; bench 6/6.
+The swap is a hard link + one atomic `rename(2)` (no window where the path is missing), the
+one-updater lock is an OS `File::try_lock` (a stale lock cannot arise), and the hand-over carries
+the path resolved before the swap — because `exec` discards unflushed stdout and `/proc/self/exe`
+becomes `… (deleted)` after it. ADR 0020 records all three, with the rejected alternatives.
+Next step: **T-0038** (server live handoff — PTY masters over SCM_RIGHTS; the hardest thing in
+Phase 2). It was blocked on T-0036 by inheritance; re-scoped this turn exactly as T-0037 was,
+because every one of its five stages is mechanism and none needs a signature. Start with stage 0
+(`Pane::adopt`), which is also the piece the others cannot be built without.
 Open workers: (none)
 Known broken: T-0063 (CI ubuntu leg, needs repo admin) · Parked: T-0048 + T-0036 needs-human
 Findings:
-- **"Without docs help" is the sharper half of a criterion.** The mechanism took 1–3 s; what was
-  missing was anything telling a stranger how the *first* machine enters its own account. Both
-  sides of the unknown-account refusal now name the command, and `devices list` no longer
-  truncates the value that gets pasted into it.
-- **A refused registration is not a transport failure** (T-0069): retrying a deterministic
-  refusal on the reconnect ramp exhausts a per-address budget and replaces the reason with
-  "connection refused". Typed distinction (`ClientError::Refused`), ceiling retry, and the log
-  says why it is waiting.
-- **A split can be forced by a human gate without shrinking the phase**: T-0036 blocks the
-  *signing* half of auto-update, not the swap — and the swap is the half that can destroy an
-  agent, so it is the half worth proving first.
+- **"No pane restarted" cannot be proven by pid** — `PaneInfo` carries `id`, `alive`, `alert` and
+  nothing else, so the proof must be behavioural (a counter that would reset), and the evidence
+  should be shown to *bite* by mutating the pane script to emulate a restart.
+- **A test that only cleans up on success is a test that fills the disk on failure**: 3 × 128 MB
+  per test filled a 12 GB tmpfs in one failing run. `Drop` guard + hard link.
+- **`exec` has two consequences that are easy to miss**: it discards unflushed stdout, so anything
+  printed after it is never printed; and it leaves the process's own path stale, so re-deriving it
+  fails. Report before handing over, and carry the path.
+- **A dependency can be inherited rather than needed**: T-0038 listed T-0036 because the new daemon
+  is *presumably* a verified release, but none of its stages touches a signature. Reading the
+  criteria before trusting the dependency is what unblocked the hardest task in the phase.
 ## Event log               ← append-only; newest last; never rewrite
 - 2026-09-10 [turn 1] ledger created; repo at e489fac (docs only); T-0001 + T-0022 (AGENTS.md gardened) done
 - 2026-09-10 [turn 2] T-0002 PTY manager done+pushed (342606c; 9 tests); PROMPT.md v2 synced + ADR 0001 (ef6c595)
@@ -121,3 +122,5 @@ Findings:
 - 2026-09-12 [turn 58] T-0067 done, and with it the Phase 2 exit criterion is met. Diagnosis first: the "self-admitted certificate does not verify" report was **my harness**, not the product — the exit-criterion script used fixed ports and never killed its relay, so later runs talked to a stale relay holding an account registered with the *secret* seed; rewritten with pid-scoped ports, `trap` cleanup, polled readiness and the account root from `devices list --json`, the criterion passes in **1-3 s** (budget 300 s) with both machines `online`. Two real deliverables came out of it: (1) the first-machine bootstrap is now tested (`a_self_admitted_machine_gets_a_certificate_the_root_signs` — real relay + real account + a daemon that must register; nothing covered it before, since every pairing test used a mailbox-only relay that verifies no certificates), and (2) `DeviceAuthority::devices()` now returns the union of the store and the index, because authorization read store+disk while the listing read store-only — so a certificate on disk without a store row (the explicit-`--socket` deployment shape) was a device the daemon authenticated and `machines trust` denied with a false message. Proved load-bearing by mutation. 476 workspace tests, clippy clean on both toolchains, fmt clean, 10 slices green, exit criterion scripted and green, bench 6/6.
 
 - 2026-09-12 [turn 59] T-0066 done and with it Phase 2's exit criterion in full: `arreo devices list` prints the full root (a truncated identifier that looks complete is the trap — it is pasted into `account add --root-key`), `docs/machines.md` gained § The first machine before § Joining (every command executed verbatim), `docs/tour.md`/README start from the first machine, and the relay's unknown-account refusal names the fix on both sides (machine and relay log). The "without docs help" pass found the last gap: nothing said how an account comes to exist. Then T-0069, found by that same dogfooding: a refused registration retried on the transport ramp (250ms) exhausted the relay's 3-per-10s-per-**address** handshake budget, so the operator's log replaced the real reason ("unknown account…") with a transport error; now typed (`ClientError::Refused`), retried at the ceiling, with a log line saying why, and the test pins that the *first* retry waits the ceiling while a transport failure keeps the quick one. Gardening: T-0037 split — the swap half (stage/rename/crash-safety/lock/rollback/re-exec/reattach + the never-touch-a-PTY invariant + the update slice) is now T-0070, buildable now behind `--from <path>`, because T-0036's signing key is human-gated and the swap is the half that can destroy an agent. 477 workspace tests, clippy clean on both toolchains, fmt clean, 10 slices green, exit criterion 1-3s.
+
+- 2026-09-12 [turn 60] T-0070 done: the client update swap. `arreo_core::update` (stage → hard-link `.prev` → one atomic `rename(2)`; OS `File::try_lock` for one-updater-at-a-time; `--rollback`; `package_manager_advice`) + `arreo_core::update::resume` (the resume token, XDG *state* not data, one mechanism for a phone after a network hop and a client after a swap) + the `arreo update` verb (`--from <path>`, `--rollback`, `--check`, `--json`, `--no-reexec`, `--reattach-pane`) + `xtask/src/update_slice.rs` (17 checks, in CI) + 11 core unit tests + 8 CLI integration tests + ADR 0020 + docs/release.md's invariant section. The invariant — never signal/reap/restart/stop a PTY-bearing process — is proven by the slice across a live daemon and eight panes (daemon un-reaped, counters continued), and the evidence was shown to bite by mutating the pane script to emulate a restart. Two defects found by running it: the re-exec dropped the `update` verb (usage text instead of a handover), and the report printed *after* `exec` so `| cat` lost it. Also `--check` refuses because there is no channel (T-0036's key is human-gated) and this build must not install what it cannot verify. Gardening: **T-0038 re-scoped** — T-0036 dropped from its dependencies, because all five of its stages are mechanism (SCM_RIGHTS, adoption, abort-safety) and none needs a signature; the artifact source is explicit, exactly as T-0070 did for the client. 497 workspace tests, clippy clean on both toolchains, fmt clean, 11 slices green, bench 6/6.
