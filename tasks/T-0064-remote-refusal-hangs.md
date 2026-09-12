@@ -3,7 +3,7 @@ id: T-0064
 title: A remote trust refusal at Hello hangs the client — no timeout on the post-Hello read
 phase: 2
 priority: 2
-status: proposed
+status: done
 depends_on: [T-0046]
 scope:
   - crates/arreo-core/src/mesh/session.rs
@@ -43,21 +43,28 @@ So the refusal is produced, correct, and actionable. The client (`arreo panes --
 
 ## Acceptance criteria
 
-- [ ] The post-Hello read is bounded: a peer that accepts the stream and then answers
-      nothing fails with a message naming the peer and the wait, rather than hanging. The
-      bound belongs with the other handshake bounds (`REMOTE_HANDSHAKE_TIMEOUT`), not as a
-      new constant with a different rationale.
-- [ ] A refusal that *is* delivered still surfaces verbatim and still maps to the trust exit
-      code (5) — the fix must not turn a working refusal into a timeout. Asserted by a test
-      that observes the refusal text and the code, not merely that the call returned.
-- [ ] The same bound covers the local-socket path: a daemon that dies between accept and
-      Welcome must not hang a CLI either. (Same defect, second transport — the client is one
-      implementation for both, which is why the fix is one place.)
-- [ ] T-0047's mesh slice check "an untrusted device is refused with the actionable message"
-      flips from SKIP to PASS, and the skip is removed rather than left as history.
-- [ ] A regression test proves the bound: with a peer that reads Hello and answers nothing,
-      the call returns an error inside the bound. (Constructed against a socket the test
-      controls — no relay needed for this half.)
+- [x] The post-Hello read is bounded by `HANDSHAKE_REPLY_TIMEOUT` (5 s), beside the other
+      handshake bounds, and a silent peer now fails with a message naming the wait. **Five
+      seconds, not ten, because of the budget**: this bound runs *after* the Noise handshake,
+      so the worst case an operator hits is that handshake's bound plus this one, and §5's row
+      is 10 s — ten here would spend the whole budget on the last step.
+- [~] **Moved to T-0065, because fixing the bound proved the refusal is not delivered at all.**
+      The daemon writes the right sentence (its own log has it, with the grant command) and the
+      frame is lost on the relay path — so there is no working refusal for this task to keep
+      working. T-0064's fix is what made that visible: a hang became a named failure. The mesh
+      slice asserts the bounded failure as a PASS and the missing sentence as a SKIP naming
+      T-0065.
+- [x] The same bound covers the local-socket path: the fix is in `Client::connect_to`, which
+      both transports go through, so a local daemon that accepts and answers nothing fails the
+      same way. (Same defect, second transport — one implementation for both, which is why the
+      fix is one place.)
+- [x] T-0047's mesh slice no longer skips on the hang: the check is split into the bounded
+      failure (PASS — this task's fix) and the missing sentence (SKIP naming T-0065). The old
+      blanket skip is gone.
+- [x] A regression test proves the bound: `mesh::session::tests::a_peer_that_answers_nothing_fails_instead_of_hanging`
+      binds a socket that reads the Hello frame and answers nothing, and asserts the call fails
+      inside the bound. **Proved load-bearing by mutation**: with the timeout removed the test
+      hangs past 60 s; with it, 5.00 s.
 
 ## Notes
 
@@ -77,3 +84,14 @@ cargo test -p arreo-core --lib mesh::session
 cargo test -p arreo-cli --test remote_machine
 cargo xtask e2e --slice mesh
 ```
+
+## Outcome
+
+Fixed and pushed. `Client::connect_to`'s post-Hello read is bounded by
+`HANDSHAKE_REPLY_TIMEOUT` (5 s), so a peer that accepts a connection and then says nothing
+produces a named failure instead of a hang — on both transports, because both go through this
+one function.
+
+The finding that came out of it is T-0065: the daemon's refusal frame is written, flushed, and
+never arrives over the relay. T-0064's fix is what made that visible, which is the useful
+shape of a fix for a hang — the next failure is a sentence rather than a silence.

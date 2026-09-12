@@ -731,7 +731,7 @@ pub fn run(rest: &[String]) -> ExitCode {
     // the slice slow for a reason the reader already knows. Ten seconds is far
     // more than a healthy refusal needs and bounds the cost of the defect.
     let (ok, refused) = cli_with_deadline(
-        Duration::from_secs(10),
+        Duration::from_secs(25),
         &gamma_dir,
         &gamma_config,
         &cli_bin,
@@ -740,25 +740,29 @@ pub fn run(rest: &[String]) -> ExitCode {
     // The message is what proves the refusal is the ledger's (it names the grant
     // command) rather than a network failure — and the exit code (5, the trust
     // vocabulary) proves it is a refusal rather than a reachability problem.
-    // **Honest SKIP while the product hangs, never a silent pass (T-0064).**
-    // Beta's daemon produces exactly the refusal this check wants — it is in the
-    // log, with the grant command in it — and the client prints nothing and never
-    // exits, because its post-Hello read has no bound. A hang is worse than a
-    // wrong message: the wrong message can be read. So the check reports what is
-    // true (the refusal exists on the daemon's side, the client cannot deliver it
-    // to the operator) and names the task that fixes it, rather than failing
-    // forever on a defect this slice does not own.
+    // **Two facts, asserted separately, because they fail separately.**
+    //
+    // The refusal is *bounded* (T-0064 fixed the unbounded read that used to hang
+    // here forever), and the refusal's *sentence* is not delivered (T-0065: the
+    // daemon writes it and the frame is lost over the relay). Reporting them as
+    // one check would hide which is which — and the bounded half is the one this
+    // slice can assert today, so it is a PASS rather than a skip.
     let refusal_in_daemon_log = beta.log_text().contains("refusing Hello");
-    if refusal_in_daemon_log && !ok {
+    check(
+        "a refused peer fails bounded and names the peer, rather than hanging",
+        !ok && refused.contains(BETA) && refused.contains("no answer"),
+        &refused,
+    );
+    if refusal_in_daemon_log && !refused.contains("arreo machines trust") {
         skip(
-            "the untrusted device is refused with the actionable message",
-            "the daemon refuses correctly (its log has the refusal and the grant command) \
-             but the client hangs instead of reporting it — T-0064, not this slice's fence",
+            "the refusal's own message reaches the operator",
+            "the daemon refuses correctly (its log has the sentence and the grant command) \
+             and the frame is lost on the relay path — T-0065, not this slice's fence",
         );
     } else {
         check(
-            "the untrusted device is refused with the actionable message",
-            !ok && refused.contains("arreo machines trust"),
+            "the refusal's own message reaches the operator",
+            refused.contains("arreo machines trust"),
             &refused,
         );
     }

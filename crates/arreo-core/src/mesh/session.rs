@@ -252,10 +252,24 @@ impl Client {
             wants: vec![VERSION],
         })
         .await?;
-        match conn.recv().await? {
-            Message::Welcome { .. } => Ok(conn),
-            Message::Error { message, .. } => Err(ClientError::Handshake(message)),
-            other => Err(ClientError::Handshake(format!("unexpected {other:?}"))),
+        // **The answer to Hello is bounded, on both transports** (T-0064). A peer
+        // can accept the stream and then say nothing — a machine that refuses the
+        // device, a daemon that dies between accept and Welcome, a relay that drops
+        // the frame carrying the refusal. Without a bound the CLI hangs forever and
+        // prints *nothing*, which is strictly worse than a wrong message: a wrong
+        // message can be read, and a hang says only that something is wrong
+        // somewhere. The bound is the handshake's own, because this is the last
+        // step of the handshake and a peer that has not answered within it is
+        // absent, not slow — the same reasoning `Link::remote` already applies.
+        match tokio::time::timeout(HANDSHAKE_REPLY_TIMEOUT, conn.recv()).await {
+            Ok(Ok(Message::Welcome { .. })) => Ok(conn),
+            Ok(Ok(Message::Error { message, .. })) => Err(ClientError::Handshake(message)),
+            Ok(Ok(other)) => Err(ClientError::Handshake(format!("unexpected {other:?}"))),
+            Ok(Err(e)) => Err(e),
+            Err(_) => Err(ClientError::Handshake(format!(
+                "no answer to Hello within {HANDSHAKE_REPLY_TIMEOUT:?} (the peer accepted the \
+                 connection and then said nothing — it may be refusing this device)"
+            ))),
         }
     }
 
@@ -427,6 +441,21 @@ impl Link {
     }
 }
 
+/// How long the daemon has to answer Hello before the connect gives up.
+///
+/// **Five seconds, and the arithmetic is the budget** (T-0045, §5): this bound
+/// runs *after* the Noise handshake, so the worst case an operator can hit is
+/// that handshake's own bound plus this one — and the row they were promised is
+/// 10 s. Five plus five leaves the row intact with room for the relay round
+/// trips; ten would spend the whole budget on the last step alone.
+///
+/// Longer than [`REMOTE_HANDSHAKE_TIMEOUT`] because it covers the *answer* rather
+/// than one Noise flight: on the remote path that travels peer → relay → us, and
+/// the peer may have queued work ahead of it. Still bounded, because the failure
+/// it prevents — an operator staring at a command that will never return — costs
+/// more than a slow answer does.
+const HANDSHAKE_REPLY_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// How many fresh streams one connect may use (see [`Link::remote`]).
 const REMOTE_HANDSHAKE_ATTEMPTS: usize = 3;
 
@@ -445,3 +474,60 @@ const REMOTE_HANDSHAKE_ATTEMPTS: usize = 3;
 /// because a reconnect races the far end's previous stream, T-0054); the length of
 /// each one is what the budget buys.
 const REMOTE_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(3);
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use tokio::io::AsyncWriteExt;
+
+    /// **T-0064: a peer that accepts and then says nothing must not hang the
+    /// connect.** This is the half of the defect that a test can construct
+    /// without a relay: a socket that reads the Hello frame and never answers.
+    ///
+    /// The assertion is the *bound*, not the wording: before the fix this call
+    /// never returned (the real defect hung an operator's CLI forever and printed
+    /// nothing), and the test would have had to be killed. A test that can only
+    /// fail by hanging is a test that grades the harness, so it asserts the
+    /// shape of the failure instead — a `Handshake` error naming the wait.
+    #[tokio::test]
+    async fn a_peer_that_answers_nothing_fails_instead_of_hanging() {
+        let dir = std::env::temp_dir().join(format!(
+            "arreo-session-silent-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch");
+        let socket = dir.join("silent.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).expect("bind");
+
+        // A daemon that accepts, reads everything, and answers nothing.
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept");
+            let mut sink = Vec::new();
+            let _ = stream.read_to_end(&mut sink).await;
+            // Explicitly: no reply. The client must give up on its own.
+            let _ = stream.shutdown().await;
+        });
+
+        let started = std::time::Instant::now();
+        let result = Client::connect(&socket).await;
+        let elapsed = started.elapsed();
+
+        match result {
+            Err(ClientError::Handshake(message)) => assert!(
+                message.contains("no answer"),
+                "the failure must name the wait it gave up on: {message}"
+            ),
+            Err(other) => panic!("a silent peer must fail at the handshake, got {other}"),
+            Ok(_) => panic!("a silent peer must not produce a session"),
+        }
+        // Bounded, and the bound is the constant — not a guess about scheduling.
+        assert!(
+            elapsed < HANDSHAKE_REPLY_TIMEOUT + std::time::Duration::from_secs(2),
+            "the failure must arrive inside the bound, took {elapsed:?}"
+        );
+        server.abort();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

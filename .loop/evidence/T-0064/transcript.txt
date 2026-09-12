@@ -1,0 +1,22 @@
+T-0064 — a silent peer must not hang the connect
+==============================================
+
+## The fix: a bounded post-Hello read
+
+test mesh::session::tests::a_peer_that_answers_nothing_fails_instead_of_hanging ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 147 filtered out; finished in 5.06s
+
+## Load-bearing, proved by mutation
+
+With the timeout removed, the same test hangs past 60s (killed by the harness):
+  test mesh::session::tests::a_peer_that_answers_nothing_fails_instead_of_hanging
+  has been running for over 60 seconds
+
+With it: 5.00s, inside HANDSHAKE_REPLY_TIMEOUT.
+
+## What it revealed (T-0065)
+
+The daemon writes the refusal and the frame is lost over the relay. From the mesh slice:
+  daemon: refusing Hello for dev_67a... : ... Re-grant it with: arreo machines trust ...
+  client: panes: beta-machine: ... no answer to Hello within 10s (the peer accepted the
+          connection and then said nothing — it may be refusing this device)
