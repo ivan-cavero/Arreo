@@ -1580,13 +1580,6 @@ mod audit {
     /// store's own rendering of an empty window (what `audit_export` returns for
     /// a filter that matches nothing), so a log that does not exist yet and a
     /// window with no rows produce the same bytes.
-    fn empty_export(format: ExportFormat) -> String {
-        match format {
-            ExportFormat::Jsonl => String::new(),
-            ExportFormat::Json => "[]\n".to_string(),
-        }
-    }
-
     /// Write the export where `--out` asked: stdout for `-` (and for no flag at
     /// all), a file otherwise — and a file write names the path it wrote, because
     /// a silent success on a typo'd path is an export the operator does not have.
@@ -1692,7 +1685,13 @@ mod audit {
             // A log that does not exist holds no rows in the window: emit the
             // empty export rather than nothing, so `--format json | jq` works on
             // a machine that has never logged anything.
-            Ok(None) => return emit(out.as_deref(), &empty_export(format), format),
+            Ok(None) => {
+                // The one renderer, asked for no rows: a missing log and an empty
+                // window must produce the same bytes, and the only way that stays
+                // true is if there is one place that decides what those bytes are.
+                let empty = arreo_core::store::render_export(&[], format).unwrap_or_default();
+                return emit(out.as_deref(), &empty, format);
+            }
             Err(code) => return code,
         };
         // The filters are passed through as given: the export is a *view* of the

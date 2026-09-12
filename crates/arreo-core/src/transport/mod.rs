@@ -22,7 +22,7 @@ pub mod quic;
 
 pub use noise::{FlightGuard, Role, SecureChannel, TransportError, HANDSHAKE_TIMEOUT};
 pub use quic::{
-    accept_connection, accept_session, client_endpoint, open_session, server_endpoint,
+    accept_connection, accept_session, client_endpoint, open_session, server_endpoint, Accepted,
     HandshakeLimiter, QuicError, RemoteSession, ALPN, SERVER_NAME, TEST_LISTEN_ENV,
 };
 /// The QUIC types, re-exported so a consumer of this transport (the daemon)

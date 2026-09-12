@@ -31,7 +31,9 @@ use arreo_core::relay::{
     RelayError, RelayHeader, RelayKind, RemoveRequest, RenameRequest, StaleRequest,
     MAX_HANDSHAKE_BYTES, RELAY_SENDER, RELAY_VERSION,
 };
-use arreo_core::transport::{accept_connection, Connection, Endpoint, HandshakeLimiter, QuicError};
+use arreo_core::transport::{
+    accept_connection, Accepted, Connection, Endpoint, HandshakeLimiter, QuicError,
+};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
@@ -151,6 +153,24 @@ impl Router {
                 next_token: 1,
             }),
             limiter: HandshakeLimiter::default(),
+        }
+    }
+
+    /// Append an audit row, and never let the trail take the relay down with it.
+    ///
+    /// A failure to record is logged and dropped rather than propagated. The
+    /// alternative — refusing a session because the write failed — turns a full
+    /// disk into an outage, and the trail is a record *of* the service, not a
+    /// precondition for it. The cost is a real one and worth naming: on a full
+    /// disk the relay keeps serving and the trail has a gap, which the log line
+    /// marks. The other direction (a relay nobody can connect to, with a perfect
+    /// trail) is worse for the person running it.
+    pub fn record(&self, event: crate::audit::RelayAuditEvent) {
+        if let Err(e) = self.store.record(&event) {
+            eprintln!(
+                "arreo-relay: cannot write the audit trail ({}): {e}",
+                event.action
+            );
         }
     }
 
@@ -581,6 +601,11 @@ enum Decision {
 /// ignore.
 pub const SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60 * 60);
 
+/// When the audit trail is worth telling the operator about: 100 MB of text. The
+/// guard only warns — nothing prunes automatically, because a relay that deleted
+/// its own trail would defeat the point of keeping one (T-0053).
+pub const AUDIT_WARN_BYTES: u64 = 100 * 1024 * 1024;
+
 /// Serve sessions until the endpoint closes.
 pub async fn serve(endpoint: Endpoint, router: Arc<Router>) -> Result<(), RouterError> {
     // The periodic sweep, so expiry does not depend on traffic arriving.
@@ -600,6 +625,9 @@ pub async fn serve(endpoint: Endpoint, router: Arc<Router>) -> Result<(), Router
                     }
                     Err(e) => eprintln!("arreo-relay: inbox sweep failed: {e}"),
                 }
+                if let Ok(Some(warning)) = router.store().audit_size_warning(AUDIT_WARN_BYTES) {
+                    eprintln!("arreo-relay: {warning}");
+                }
             }
         });
     }
@@ -607,10 +635,27 @@ pub async fn serve(endpoint: Endpoint, router: Arc<Router>) -> Result<(), Router
         // Only the accept is serialized; the peer-paced handshake runs in its
         // own task, so one quiet peer cannot stop the next device connecting
         // (the same split the daemon's transport uses, for the same reason).
-        let Some(connection) = accept_connection(&endpoint, &router.limiter).await? else {
-            // `accept_connection` logs the refused address itself (it is the only
-            // place that knows it); nothing to add here.
-            continue;
+        let connection = match accept_connection(&endpoint, &router.limiter).await? {
+            Accepted::Open(connection) => connection,
+            Accepted::OverBudget(ip) => {
+                // The transport logs the refusal, but a log line is not a record:
+                // the operator asking "is someone hammering this relay?" needs the
+                // trail to answer, and this is the only place that knows *who* was
+                // turned away (T-0053).
+                //
+                // The budget is per *address*, so there is no port to record — and
+                // the truncation rule drops ports anyway, so the row says the same
+                // thing a full address would.
+                router.record(
+                    crate::audit::RelayAuditEvent::new(
+                        crate::audit::actions::REFUSE,
+                        arreo_core::store::AuditOutcome::Refused,
+                    )
+                    .peer(std::net::SocketAddr::new(ip, 0))
+                    .detail("over its handshake budget"),
+                );
+                continue;
+            }
         };
         let router = Arc::clone(&router);
         tokio::spawn(async move {
@@ -646,6 +691,17 @@ async fn handle_connection(connection: Connection, router: Arc<Router>) -> Resul
         eprintln!(
             "arreo-relay: refused {peer}: unknown account {}",
             hello.account_id
+        );
+        router.record(
+            crate::audit::RelayAuditEvent::new(
+                crate::audit::actions::REFUSE,
+                arreo_core::store::AuditOutcome::Refused,
+            )
+            .account(hello.account_id.clone())
+            .device(hello.device_id.clone())
+            .peer(peer)
+            .proto_version(hello.v)
+            .detail("unknown account"),
         );
         return refuse_hello(
             &mut send,
@@ -684,6 +740,20 @@ async fn handle_connection(connection: Connection, router: Arc<Router>) -> Resul
                 "arreo-relay: refused {peer} for account {}: {e}",
                 hello.account_id
             );
+            router.record(
+                crate::audit::RelayAuditEvent::new(
+                    crate::audit::actions::REFUSE,
+                    arreo_core::store::AuditOutcome::Refused,
+                )
+                .account(hello.account_id.clone())
+                .device(hello.device_id.clone())
+                .peer(peer)
+                .proto_version(hello.v)
+                // The reason verbatim: it is the verifier's own sentence, and it
+                // distinguishes a bad certificate from a bad proof of possession —
+                // which are the same word ("auth") to a reader of the status line.
+                .detail(e.to_string()),
+            );
             return refuse_auth(&mut send, &connection, e.to_string()).await;
         }
     };
@@ -716,6 +786,16 @@ async fn handle_connection(connection: Connection, router: Arc<Router>) -> Resul
     eprintln!(
         "arreo-relay: {peer} authenticated as {} in account {}",
         session.device_id, session.account_id
+    );
+    router.record(
+        crate::audit::RelayAuditEvent::new(
+            crate::audit::actions::SESSION_CONNECT,
+            arreo_core::store::AuditOutcome::Ok,
+        )
+        .account(session.account_id.clone())
+        .device(session.device_id.as_str().to_string())
+        .peer(peer)
+        .proto_version(hello.v),
     );
 
     // From here the connection is two independent directions: a writer task
@@ -786,6 +866,18 @@ async fn handle_connection(connection: Connection, router: Arc<Router>) -> Resul
         "arreo-relay: {} disconnected ({})",
         session.device_id,
         if result.is_ok() { "clean" } else { "error" }
+    );
+    // A disconnect is `ok` either way: the outcome is about the *record*, and the
+    // fact being recorded is that the session ended. Whether it ended cleanly is
+    // the detail, where a reader can see it without it changing the vocabulary.
+    router.record(
+        crate::audit::RelayAuditEvent::new(
+            crate::audit::actions::SESSION_DISCONNECT,
+            arreo_core::store::AuditOutcome::Ok,
+        )
+        .account(session.account_id.clone())
+        .device(session.device_id.as_str().to_string())
+        .detail(if result.is_ok() { "clean" } else { "error" }),
     );
     result
 }

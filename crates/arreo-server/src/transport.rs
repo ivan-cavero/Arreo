@@ -95,7 +95,11 @@ pub async fn serve(
         // Only the accept happens here; everything peer-paced moves into the
         // per-connection task below, so one quiet peer cannot stop the listener
         // from accepting the next device.
-        let Some(connection) = accept_connection(&endpoint, &limiter).await? else {
+        // The daemon keeps no record of a rate-limited peer, so it takes the
+        // connection and lets the refusal go: `accept_connection` logged the
+        // address, which is all this side needs (the relay, which does keep a
+        // record, reads the address from the same result — T-0053).
+        let Some(connection) = accept_connection(&endpoint, &limiter).await?.open() else {
             continue; // refused by the rate limiter; keep serving
         };
         let local = Arc::clone(&local);

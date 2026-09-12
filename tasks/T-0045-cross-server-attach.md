@@ -3,7 +3,7 @@ id: T-0045
 title: Cross-server attach — attach to a pane on machine B from a client paired with A
 phase: 2
 priority: 3
-status: in-progress
+status: done
 depends_on: [T-0014, T-0043, T-0044]
 scope:
   - crates/arreo-cli/src/remote.rs
@@ -183,3 +183,19 @@ that helper exists and is documented rather than being a mystery in the harness.
 cargo test -p arreo-cli --test remote_machine
 cargo xtask e2e --slice mesh
 ```
+
+## Outcome
+
+Done, with two criteria out of this file's scope by their own admission (both recorded
+above with reasons, both re-scoped rather than dropped):
+
+- criterion 4 (the TUI sidebar) → **T-0061**, which found T-0045's fence listed no
+  `arreo-tui` path, and is now done;
+- criterion 7 (the latency budget row) → **T-0047**, the slice that owns
+  `perf-budget.toml`'s mesh rows.
+
+Everything this task could hold is delivered and proven: `attach --machine NAME` and the
+same flag on `panes`/`read`/`send`/`wait`/`split`/`metrics`, one connection type either
+way, identical output locally and remotely (compared, not asserted), trust the target's
+call, and distinct fast failures. Evidence: `.loop/evidence/T-0045/` (transcript of the
+six conformance tests) plus the slice counts in `.loop/PROGRESS.md`.

@@ -19,12 +19,14 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 
 /// Current schema version. Bumped only alongside a migration below.
-pub const SCHEMA_VERSION: u32 = 4;
+pub const SCHEMA_VERSION: u32 = 5;
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
     #[error("relay store: {0}")]
     Sqlite(#[from] rusqlite::Error),
+    #[error("relay store: {0}")]
+    Json(#[from] serde_json::Error),
     #[error("relay store is poisoned")]
     Poisoned,
 }
@@ -171,6 +173,36 @@ impl RelayStore {
         if version < 4 && !has_column(conn, "machine", "daemon_key")? {
             conn.execute_batch("ALTER TABLE machine ADD COLUMN daemon_key TEXT;")?;
         }
+        // v5 (T-0053): the relay's own audit trail. Deliberately **not** a mirror
+        // of the machine's table (`arreo_core::store`'s `audit`): the machine knows
+        // which pane was touched and by which device, the relay knows only that
+        // bytes moved between two ids — and keeping the two apart is what stops
+        // this database from becoming somewhere content could accumulate.
+        //
+        // No declared primary key, so SQLite's implicit `rowid` is what breaks a
+        // tie in the ordering: two rows in the same millisecond (a reconnect that
+        // displaces a session writes both) still read back in the order they were
+        // written, even if the clock steps backwards between them.
+        if version < 5 {
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS relay_audit(
+                   ts_ms INTEGER NOT NULL,
+                   action TEXT NOT NULL,
+                   outcome TEXT NOT NULL,
+                   device_id TEXT,
+                   account_id TEXT,
+                   -- Truncated at write (IPv4 /24, IPv6 /48). The relay is the box
+                   -- most likely to be someone else's, and a full-address trail
+                   -- there is a location history of everyone who used it.
+                   peer TEXT,
+                   proto_version INTEGER,
+                   -- A bounded, relay-authored reason. Never a payload: the writers
+                   -- are format strings over identifiers, and `record` caps the
+                   -- length so a pathological identifier cannot smuggle a blob.
+                   detail TEXT);
+                 CREATE INDEX IF NOT EXISTS relay_audit_time ON relay_audit(ts_ms);",
+            )?;
+        }
         conn.execute(
             "INSERT INTO meta(key, value) VALUES ('schema_version', ?1)
              ON CONFLICT(key) DO UPDATE SET value=excluded.value",
@@ -309,6 +341,188 @@ impl RelayStore {
 
     pub(crate) fn lock(&self) -> Result<MutexGuard<'_, Connection>, StoreError> {
         self.conn.lock().map_err(|_| StoreError::Poisoned)
+    }
+
+    // ---- the audit trail (T-0053) ------------------------------------------
+
+    /// Append one audit row. **The** writer: there is deliberately no update or
+    /// delete API, so the log is append-only by construction rather than by
+    /// convention, and the only removal is the explicit [`Self::audit_prune`].
+    ///
+    /// Two things happen here rather than at the call sites, because a rule that
+    /// every writer must remember is a rule that will eventually be forgotten:
+    ///
+    /// - **the peer is truncated** (IPv4 /24, IPv6 /48) by
+    ///   [`arreo_core::store::truncate_peer`] — the same function the machine's
+    ///   trail uses, so the two logs redact identically;
+    /// - **the detail is bounded** to [`crate::audit::DETAIL_MAX`]. A reason is a
+    ///   sentence; a longer one is a bug, and capping it here means a pathological
+    ///   identifier cannot become a place content accumulates.
+    pub fn record(&self, event: &crate::audit::RelayAuditEvent) -> Result<(), StoreError> {
+        let peer = event.peer.as_ref().map(arreo_core::store::truncate_peer);
+        let detail = event.detail.as_ref().map(|text| {
+            if text.chars().count() <= crate::audit::DETAIL_MAX {
+                text.clone()
+            } else {
+                let head: String = text.chars().take(crate::audit::DETAIL_MAX).collect();
+                format!("{head}…")
+            }
+        });
+        let conn = self.lock()?;
+        conn.execute(
+            "INSERT INTO relay_audit
+               (ts_ms, action, outcome, device_id, account_id, peer, proto_version, detail)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            rusqlite::params![
+                crate::directory::now_ms(),
+                event.action,
+                event.outcome.as_str(),
+                event.device_id,
+                event.account_id,
+                peer,
+                event.proto_version.map(i64::from),
+                detail,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Read the trail, oldest first.
+    ///
+    /// Ordered by `(ts_ms, rowid)`: `ts_ms` is the clock, `rowid` is the order the
+    /// rows were actually written, so a clock that steps backwards between two
+    /// writes does not reorder history. The filter type is the machine's own
+    /// [`AuditQuery`], so "the same filter semantics" is a shared type rather than
+    /// two parsers that agree today.
+    pub fn audit_query(
+        &self,
+        query: &arreo_core::store::AuditQuery,
+    ) -> Result<Vec<crate::audit::StoredRelayAudit>, StoreError> {
+        // **The filter is `u64`; a stored timestamp is `i64`.** A cutoff past
+        // `i64::MAX` (which is what a caller passes when it means "no bound at
+        // all" and reaches for `u64::MAX`) would wrap to a negative number in a
+        // cast — and a negative `since` matches *every* row while a negative
+        // `until` matches none. Both are the opposite of what was asked for, so
+        // the impossible window is answered here rather than by a cast.
+        if query.since_ms.is_some_and(|ms| ms > i64::MAX as u64) {
+            return Ok(Vec::new());
+        }
+        let since = query.since_ms.map(|ms| ms.min(i64::MAX as u64) as i64);
+        // `until` past the i64 range means every row is before it, so the clamp is
+        // exactly equivalent rather than merely close.
+        let until = query.until_ms.map(|ms| ms.min(i64::MAX as u64) as i64);
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT ts_ms, action, outcome, device_id, account_id, peer, proto_version, detail
+               FROM relay_audit
+              WHERE (?1 IS NULL OR ts_ms >= ?1)
+                AND (?2 IS NULL OR ts_ms <= ?2)
+                AND (?3 IS NULL OR action = ?3)
+              ORDER BY ts_ms ASC, rowid ASC
+              LIMIT ?4",
+        )?;
+        let rows = stmt.query_map(
+            rusqlite::params![since, until, query.action.as_deref(), query.limit as i64],
+            |row| {
+                Ok(crate::audit::StoredRelayAudit {
+                    ts_ms: row.get::<_, i64>(0)? as u64,
+                    action: row.get(1)?,
+                    outcome: arreo_core::store::AuditOutcome::parse(&row.get::<_, String>(2)?),
+                    device_id: row.get(3)?,
+                    account_id: row.get(4)?,
+                    peer: row.get(5)?,
+                    proto_version: row.get::<_, Option<i64>>(6)?.map(|v| v as u32),
+                    detail: row.get(7)?,
+                })
+            },
+        )?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
+    }
+
+    /// Export the trail, byte-identically to the machine's own export for the
+    /// same rows and filters — one renderer, in `arreo_core`.
+    pub fn audit_export(
+        &self,
+        query: &arreo_core::store::AuditQuery,
+        format: arreo_core::store::ExportFormat,
+    ) -> Result<String, StoreError> {
+        let rows = self.audit_query(query)?;
+        crate::audit::render(&rows, format).map_err(StoreError::from)
+    }
+
+    /// How many rows the trail holds, and roughly how many bytes of text they
+    /// carry. The numbers the size guard reports, and what a prune prints.
+    pub fn audit_size(&self) -> Result<(u64, u64), StoreError> {
+        let conn = self.lock()?;
+        let (rows, bytes) = conn.query_row(
+            "SELECT COUNT(*),
+                    COALESCE(SUM(LENGTH(action) + LENGTH(COALESCE(device_id, ''))
+                               + LENGTH(COALESCE(account_id, '')) + LENGTH(COALESCE(peer, ''))
+                               + LENGTH(COALESCE(detail, ''))), 0)
+               FROM relay_audit",
+            [],
+            |row| Ok((row.get::<_, i64>(0)? as u64, row.get::<_, i64>(1)? as u64)),
+        )?;
+        Ok((rows, bytes))
+    }
+
+    /// The size guard: a warning when the trail has grown past `limit_bytes`, or
+    /// `None` while it is small.
+    ///
+    /// **Measured, not estimated from a row count.** A row's size depends on how
+    /// long the identifiers are, so "a million rows" says nothing about disk. The
+    /// text a row carries is the part that grows without bound, so that is what is
+    /// summed; the report says it is text rather than claiming to be the file size.
+    ///
+    /// Nothing prunes automatically — a relay that silently deleted its own trail
+    /// would defeat the point of having one. This only says when to run the
+    /// documented offline prune.
+    pub fn audit_size_warning(&self, limit_bytes: u64) -> Result<Option<String>, StoreError> {
+        let (rows, bytes) = self.audit_size()?;
+        if bytes <= limit_bytes {
+            return Ok(None);
+        }
+        Ok(Some(format!(
+            "the relay's audit trail holds {rows} row(s), about {} MiB of text (limit {} MiB): \
+             prune it offline with `arreo-relay audit prune --before <ms>`",
+            bytes / (1024 * 1024),
+            limit_bytes / (1024 * 1024)
+        )))
+    }
+
+    /// Delete trail rows older than `before_ms`, returning how many went.
+    ///
+    /// The prune records *itself* (an `audit.prune` row with the count) after the
+    /// delete, so the trail always says that a prune happened and how much it took
+    /// — a gap in a log with no explanation is worse than the log being long.
+    pub fn audit_prune(&self, before_ms: u64) -> Result<u64, StoreError> {
+        let removed = {
+            let conn = self.lock()?;
+            // The same `u64`-cutoff-versus-`i64`-column trap the query has: a
+            // cutoff above the i64 range means "everything", and casting it would
+            // wrap to a negative bound that deletes nothing.
+            let deleted = if before_ms > i64::MAX as u64 {
+                conn.execute("DELETE FROM relay_audit", [])?
+            } else {
+                conn.execute(
+                    "DELETE FROM relay_audit WHERE ts_ms < ?1",
+                    rusqlite::params![before_ms as i64],
+                )?
+            };
+            deleted as u64
+        };
+        self.record(
+            &crate::audit::RelayAuditEvent::new(
+                crate::audit::actions::PRUNE,
+                arreo_core::store::AuditOutcome::Ok,
+            )
+            .detail(format!(
+                "removed {removed} row(s) before {}",
+                arreo_core::store::rfc3339_ms(before_ms as i64)
+            )),
+        )?;
+        Ok(removed)
     }
 }
 

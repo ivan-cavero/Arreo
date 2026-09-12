@@ -927,22 +927,7 @@ impl SessionStore {
     ) -> Result<String, SessionError> {
         let events = self.audit_query(query)?;
         let values: Vec<serde_json::Value> = events.iter().map(audit_json).collect();
-        match format {
-            ExportFormat::Jsonl => {
-                let mut out = String::new();
-                for value in &values {
-                    out.push_str(&serde_json::to_string(value).map_err(SessionError::Json)?);
-                    out.push('\n');
-                }
-                Ok(out)
-            }
-            ExportFormat::Json => {
-                let array = serde_json::Value::Array(values);
-                let mut out = serde_json::to_string_pretty(&array).map_err(SessionError::Json)?;
-                out.push('\n');
-                Ok(out)
-            }
-        }
+        render_export(&values, format).map_err(SessionError::Json)
     }
 
     /// How many rows the log holds, and roughly how many bytes — the numbers the
@@ -1384,6 +1369,42 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
     let day = (doy - (153 * mp + 2) / 5 + 1) as u32;
     let month = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
     (if month <= 2 { year + 1 } else { year }, month, day)
+}
+
+/// Assemble an export from already-serialised rows: the one implementation of
+/// the byte shape every audit log shares (T-0053).
+///
+/// **Why this is a free function and not a method.** The relay keeps its own
+/// audit trail in its own database (a different process, schema and lifetime),
+/// and T-0053 requires the two to produce byte-identical output for the same
+/// rows. Two methods would be two chances to differ on the things nobody thinks
+/// to test — the trailing newline, the pretty-printing of `json`, and what an
+/// empty window looks like. One function makes "identical" a property of the
+/// code rather than a promise in a document.
+///
+/// The empty window is part of the contract, not an edge case: JSONL of nothing
+/// is zero bytes (a log pipeline must not see a line that is not an object), and
+/// JSON of nothing is `[]` (a parser must get an array).
+pub fn render_export(
+    rows: &[serde_json::Value],
+    format: ExportFormat,
+) -> Result<String, serde_json::Error> {
+    match format {
+        ExportFormat::Jsonl => {
+            let mut out = String::new();
+            for value in rows {
+                out.push_str(&serde_json::to_string(value)?);
+                out.push('\n');
+            }
+            Ok(out)
+        }
+        ExportFormat::Json => {
+            let array = serde_json::Value::Array(rows.to_vec());
+            let mut out = serde_json::to_string_pretty(&array)?;
+            out.push('\n');
+            Ok(out)
+        }
+    }
 }
 
 /// One row as the export and `--json` readers see it. Field names are the

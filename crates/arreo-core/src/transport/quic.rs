@@ -253,7 +253,7 @@ pub struct RemoteSession {
 pub async fn accept_connection(
     endpoint: &Endpoint,
     limiter: &HandshakeLimiter,
-) -> Result<Option<Connection>, QuicError> {
+) -> Result<Accepted, QuicError> {
     let incoming = match endpoint.accept().await {
         Some(incoming) => incoming,
         None => return Err(QuicError::Connect("endpoint closed".into())),
@@ -267,13 +267,42 @@ pub async fn accept_connection(
             "arreo: refused {peer}: over its handshake budget ({HANDSHAKE_MAX_ATTEMPTS} per {HANDSHAKE_WINDOW:?})"
         );
         incoming.refuse();
-        return Ok(None);
+        // The address travels back rather than being left in the log line: the
+        // relay keeps an audit trail, and "someone over their budget" with no
+        // address is a row an operator cannot act on (T-0053).
+        return Ok(Accepted::OverBudget(peer));
     }
     let connection = tokio::time::timeout(CONNECT_TIMEOUT, incoming)
         .await
         .map_err(|_| QuicError::Timeout(CONNECT_TIMEOUT))?
         .map_err(|e| QuicError::Connect(e.to_string()))?;
-    Ok(Some(connection))
+    Ok(Accepted::Open(connection))
+}
+
+/// What an accept produced: a session, or a peer turned away before one.
+///
+/// A named refusal rather than `Option`, because the two outcomes carry
+/// different facts and only one of them has an address — a caller that keeps a
+/// record (the relay's audit trail) needs the address of the peer it refused,
+/// and one that does not (the daemon) calls [`Accepted::open`] and sees the
+/// `Option` it used to.
+#[derive(Debug)]
+pub enum Accepted {
+    /// The peer passed the budget and completed the QUIC handshake.
+    Open(Connection),
+    /// The peer was over its handshake budget, refused before any QUIC work.
+    OverBudget(std::net::IpAddr),
+}
+
+impl Accepted {
+    /// The connection, or `None` when the peer was over its budget.
+    #[must_use]
+    pub fn open(self) -> Option<Connection> {
+        match self {
+            Self::Open(connection) => Some(connection),
+            Self::OverBudget(_) => None,
+        }
+    }
 }
 
 /// Run the Noise handshake on an accepted connection: take its bidi stream,
@@ -436,6 +465,7 @@ mod tests {
             let connection = accept_connection(&server, &limiter)
                 .await
                 .expect("accept")
+                .open()
                 .expect("not rate limited");
             accept_session(
                 &connection,
@@ -501,10 +531,16 @@ mod tests {
         )
         .await;
         let server_result = server_task.await.expect("join").expect("accept");
-        assert!(
-            server_result.is_none(),
-            "the rate limiter should have refused the peer"
-        );
+        // The refusal names the address it turned away (T-0053): a caller keeping
+        // a record needs to know who, and this is the only place that knows.
+        match server_result {
+            Accepted::OverBudget(ip) => assert_eq!(
+                ip,
+                "127.0.0.1".parse::<std::net::IpAddr>().expect("loopback"),
+                "the refusal must name the peer it refused"
+            ),
+            Accepted::Open(_) => panic!("the rate limiter should have refused the peer"),
+        }
         assert!(
             client_result.is_err(),
             "a refused peer must not get a session"
@@ -523,8 +559,8 @@ mod tests {
                 // The QUIC handshake itself fails on the ALPN mismatch, so
                 // there is no connection to run Noise on.
                 Err(e) => Err(e),
-                Ok(None) => Ok(None),
-                Ok(Some(connection)) => {
+                Ok(Accepted::OverBudget(_)) => Ok(None),
+                Ok(Accepted::Open(connection)) => {
                     let local = server_key().noise_static();
                     accept_session(
                         &connection,
@@ -572,6 +608,7 @@ mod tests {
             let connection = accept_connection(&server, &limiter)
                 .await
                 .expect("accept")
+                .open()
                 .expect("not rate limited");
             // Nobody is pinned.
             accept_session(

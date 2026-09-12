@@ -1,12 +1,13 @@
-# The machine's audit trail (schema v5)
+# The audit trails (machine schema v7, relay schema v5)
 
 > Operator's reference for the append-only log an Arreo daemon keeps beside its
 > socket: what it records, what it refuses to record, what it redacts before
 > anything reaches disk, and how to read it back. Everything here is a property
 > of the code that ships in `crates/arreo-core/src/store.rs`,
-> `crates/arreo-server/src/audit.rs`, `crates/arreo-server/src/daemon.rs` and
-> `crates/arreo-cli/src/main.rs` — nothing is aspirational, and the sections at
-> the end name the parts that are not there yet.
+> `crates/arreo-server/src/audit.rs`, `crates/arreo-server/src/daemon.rs`,
+> `crates/arreo-cli/src/main.rs`, and (for §11) `crates/arreo-relay/src/*.rs` —
+> nothing is aspirational, and the sections at the end name the parts that are not
+> there yet.
 
 One sentence: the daemon writes one row per action taken against it — who acted,
 from which network, what they touched, and whether it was carried out — and the
@@ -413,9 +414,17 @@ but its `peer` is NULL, because a relay peer has no direct address of its own
 and what the daemon sees is the relay.
 
 The **relay's own** record is a different database, in the relay's state
-directory (`relay.db`), and a different task (T-0053). It is not queryable with
-`arreo audit`, and this document does not describe it; `docs/relay-deploy.md`
-covers what the relay writes, which today is its own stderr.
+directory (`relay.db`): it records what the **relay** did — the sessions it
+admitted, the peers it refused, the messages it dropped — and nothing about
+content. It is read with `arreo-relay audit`, not `arreo audit`, and §11
+describes it in full.
+
+The split is deliberate and is worth stating plainly: the machine knows which
+pane was touched, by whom, and what the agent was asked; the relay knows only that
+bytes moved between two device ids. Keeping the two tables in two databases in two
+processes is what makes "the relay cannot accumulate content" a structural fact
+rather than a promise. What they share is the format — one export renderer, one
+set of filters, one truncation rule — so a script that reads one reads the other.
 
 ## 9. Troubleshooting
 
@@ -444,7 +453,7 @@ covers what the relay writes, which today is its own stderr.
   acted, not what that device was allowed to do; the role is a property of the
   device registry, not of the trail.
 - **The relay's own audit trail is a separate database and a separate task
-  (T-0053).** This document covers the machine's.
+  (T-0053).** §11 covers the relay's; this list is about the machine's.
 - **A session already open when a device is revoked keeps working until it
   ends** (T-0052). The revocation is durable and audited, but it takes effect on
   the next connection.
@@ -467,3 +476,106 @@ covers what the relay writes, which today is its own stderr.
   every action. For `device.issue` and `device.rotate` that means the actor is
   not recoverable from the row at all (§3); a revocation does name its actor, in
   `detail`.
+
+## 11. The relay's trail
+
+Written by `crates/arreo-relay` into `relay.db` beside the directory it already
+owns. Same shape as the machine's log, different facts: a relay row is about
+*movement*, never about what moved.
+
+### 11.1 The schema (relay schema v5)
+
+| Column | Holds |
+| --- | --- |
+| `ts_ms` | When, on the relay's clock (Unix milliseconds) |
+| `action` | `session.connect`, `session.disconnect`, `relay.refuse`, `inbox.drop`, `inbox.expire`, `audit.prune` |
+| `outcome` | `ok`, `refused`, or `expired` — the same vocabulary the machine's log uses |
+| `device_id` | The canonical device id (no `dev_` prefix), the spelling every relay table keys on |
+| `account_id` | Which account the device was in |
+| `peer` | The peer's network, truncated at write (§4.2) |
+| `proto_version` | The protocol version the peer announced |
+| `detail` | A bounded, relay-authored reason: at most 240 characters |
+
+There is no declared primary key, so SQLite's implicit `rowid` breaks ties in the
+ordering — the same rule as §2, and for the same reason: a reconnect that displaces
+a session writes two rows in one millisecond, and history must read back in the
+order it happened even if the clock steps backwards.
+
+The column set is the schema test's contract (`crates/arreo-relay/tests/audit.rs`).
+It has nowhere to put a pane id, an agent state, a prompt, or payload bytes, and
+the test fails if a column so much as suggests one.
+
+### 11.2 What each action means
+
+| Action | Outcome | Written when |
+| --- | --- | --- |
+| `session.connect` | `ok` | A device authenticated; carries the device, account, peer and protocol version |
+| `session.disconnect` | `ok` | A session ended; `detail` is `clean` or `error` |
+| `relay.refuse` | `refused` | A peer was turned away — unknown account, bad certificate, bad proof of possession, or over its handshake budget — with the reason in `detail` |
+| `inbox.drop` | `ok` | The inbox evicted messages because a device's queue was full; `detail` carries the count |
+| `inbox.expire` | `expired` | A sweep found messages past their time-to-live; `detail` carries the count |
+| `audit.prune` | `ok` | The operator pruned the trail; `detail` carries the removed count |
+
+A **drop** and a **refusal** are different facts, and the vocabulary keeps them
+apart: a refusal is the relay declining to do something, a drop is a message the
+relay accepted and then could not keep. An operator looking at a full inbox wants
+to see the drop count; one looking at an enumeration attempt wants the refusals.
+
+### 11.3 Redaction
+
+The peer is truncated **at write** by the same function the machine's log uses
+(`arreo_core::store::truncate_peer`): IPv4 to its `/24`, IPv6 to its `/48`. This
+matters more here than anywhere else in the product — the relay is the box most
+likely to be someone else's, and a full-address trail on it is a location history
+of everyone who used it. The row never holds a full address, so no export flag can
+recover one.
+
+`detail` is capped at 240 characters with a visible `…`. Every writer fills it
+from a format string over identifiers, so the cap is a backstop against a
+pathological identifier rather than a routine event.
+
+### 11.4 Reading it back
+
+```console
+arreo-relay audit export --state-dir /var/lib/arreo-relay [--format jsonl|json] \
+  [--since MS] [--until MS] [--action NAME] [--out PATH|-]
+arreo-relay audit prune --state-dir /var/lib/arreo-relay --before MS
+```
+
+`--since` and `--until` take bare Unix milliseconds, exactly as `arreo audit
+export` does — one filter vocabulary for both logs, so a script that works on one
+works on the other. The rows go through the **same renderer** as the machine's
+export (`arreo_core::store::render_export`), which is what makes the two logs agree
+on the things nobody thinks to test: the trailing newline, the alphabetical key
+order, and what an empty window looks like (JSONL: zero bytes; JSON: `[]`).
+
+An example row:
+
+```json
+{"account":"acct-1","action":"session.connect","detail":null,"device":"db238318ee9e7c54a0522b50245e82c3","outcome":"ok","peer":"127.0.0.0/24","proto_version":1,"ts_ms":1789177351987}
+```
+
+### 11.5 Retention
+
+Nothing prunes automatically, for the same reason as §7: a relay that silently
+deleted its own trail would defeat the point of keeping one. `audit prune` is
+offline and explicit, and it records **itself** — an `audit.prune` row carrying the
+count it removed — so the trail always says a prune happened and how much it took.
+A gap with no explanation is worse than a log that is long.
+
+The hourly sweep warns when the trail's text passes 100 MB (`AUDIT_WARN_BYTES`),
+naming the prune command. The size is *measured* (the text the rows carry), not
+inferred from a row count: a row's size depends on how long its identifiers are.
+
+### 11.6 What the relay's trail is not
+
+- **Not a mirror of the machine's.** A relay row has no pane, no agent and no
+  prompt, because the relay has none of those. A shared table would have needed
+  one side to hold the other's database, and their lifetimes differ.
+- **Not hash-chained.** There is no tamper evidence yet; an operator with write
+  access to `relay.db` can rewrite history, exactly as with the machine's log.
+- **Not role-aware.** A relay row attributes to a device id, never to a role: the
+  relay has no role model, and the target's own ledger (T-0046) is what decides
+  what a device may do.
+- **Not a substitute for the operator's log.** `arreo-relay` still prints what it
+  does to stderr; the trail is the durable, queryable half.

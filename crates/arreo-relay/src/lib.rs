@@ -8,6 +8,7 @@
 //! (T-0029..T-0031); they extend this crate, and they must not weaken the
 //! guarantees here (see the module docs for the exact rules).
 
+pub mod audit;
 pub mod directory;
 pub mod inbox;
 pub mod pairing;
@@ -15,6 +16,7 @@ pub mod presence;
 pub mod router;
 pub mod store;
 
+pub use audit::{actions, RelayAuditEvent, StoredRelayAudit};
 pub use directory::{clock_offset_ms, Directory, DirectoryFailure, JoinTicket, CLOCK_OFFSET_ENV};
 pub use inbox::{
     Drained, Enqueued, Inbox, InboxError, InboxLimits, InboxStats, DEFAULT_MAX_MB,

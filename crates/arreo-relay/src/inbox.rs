@@ -27,6 +27,7 @@
 //! exactly-once without the consumer's half would be a lie.
 
 use crate::store::{RelayStore, StoreError};
+use arreo_core::store::AuditOutcome;
 use rusqlite::{params, OptionalExtension, TransactionBehavior};
 
 /// Default retention: 30 days (§3.14). The managed tiers are pricing
@@ -260,6 +261,30 @@ impl Inbox {
             |row| row.get(0),
         )?;
         tx.commit()?;
+        // The lock is released *before* the trail is written: `record` takes the
+        // same mutex, and holding it here would deadlock rather than merely be
+        // slow. Recording inside the transaction was rejected for a second reason
+        // — a message's durability must not depend on the audit write succeeding —
+        // but this one would have been the bug.
+        drop(conn);
+
+        // The trail, after the commit (T-0053). Both facts are recorded by the
+        // side that knows them: this is where a drop is discovered, and
+        // `note_expiry` is where an expiry is.
+        self.note_expiry(expired);
+        if !evicted.is_empty() {
+            self.record(
+                crate::audit::RelayAuditEvent::new(
+                    crate::audit::actions::INBOX_DROP,
+                    AuditOutcome::Ok,
+                )
+                .device(device.to_string())
+                .detail(format!(
+                    "evicted {} oldest message(s): the queue is full",
+                    evicted.len()
+                )),
+            );
+        }
 
         Ok(Enqueued {
             seq,
@@ -326,6 +351,13 @@ impl Inbox {
             params![device, dropped_total, bytes as i64, queued as i64],
         )?;
         tx.commit()?;
+        // Released before the trail is written: `record` takes the same mutex
+        // (see `enqueue`).
+        drop(conn);
+        // A drain expires lazily, so the expiry is recorded from here too: the
+        // fact is "these messages are gone", and which call noticed is an
+        // implementation detail the operator has no use for.
+        self.note_expiry(expired);
 
         Ok(Drained {
             messages,
@@ -367,7 +399,46 @@ impl Inbox {
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let expired = Self::sweep_locked(&tx, now_ms)?;
         tx.commit()?;
+        drop(conn);
+        self.note_expiry(expired);
         Ok(expired)
+    }
+
+    /// Record that `expired` messages reached their time-to-live.
+    ///
+    /// **One row per sweep with the count, not one per message.** A sweep can
+    /// expire thousands; a trail that grows by thousands of near-identical rows an
+    /// hour is a trail nobody reads, and the fact the operator wants — how much
+    /// mail aged out, and when — is the count. `inbox_stats.expired_total` remains
+    /// the per-device counter; this is the record that it happened at all.
+    fn note_expiry(&self, expired: u64) {
+        if expired == 0 {
+            return;
+        }
+        self.record(
+            crate::audit::RelayAuditEvent::new(
+                crate::audit::actions::INBOX_EXPIRE,
+                AuditOutcome::Expired,
+            )
+            .detail(format!(
+                "expired {expired} message(s) past their time-to-live"
+            )),
+        );
+    }
+
+    /// Append an audit row, and never let the trail break the mailbox.
+    ///
+    /// Same policy as the router's: a failed write is logged and dropped. A
+    /// message that cannot be expired because the audit write failed would linger
+    /// past its TTL and then be *delivered* — which is worse than a gap in the
+    /// trail, and the log line marks the gap.
+    fn record(&self, event: crate::audit::RelayAuditEvent) {
+        if let Err(e) = self.store.record(&event) {
+            eprintln!(
+                "arreo-relay: cannot write the audit trail ({}): {e}",
+                event.action
+            );
+        }
     }
 
     /// The counters for one device.

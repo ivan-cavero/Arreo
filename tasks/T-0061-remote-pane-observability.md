@@ -3,7 +3,7 @@ id: T-0061
 title: Remote panes are not second-class in the sidebar — machine, link and the question payload
 phase: 2
 priority: 3
-status: in-progress
+status: done
 depends_on: [T-0032, T-0045]
 scope:
   - crates/arreo-tui/src/ui.rs
@@ -101,3 +101,12 @@ Two things the work taught, both recorded because they will recur:
 cargo test -p arreo-tui
 cargo xtask e2e --slice tui
 ```
+
+## Evidence
+
+`.loop/evidence/T-0061/` — the frames (sidebar with the session label and the question
+line; the whole question in the pane view; a local session for comparison) and the
+transcript of the three runs that prove it: `cargo xtask e2e --slice relay` (20/20, of
+which five are this task's), `--slice tui` (20/20), and `cargo test -p arreo-tui --test
+remote` (5/5). Load-bearing proved by mutation: suppressing the question line in
+`render_sidebar` fails two slice checks.

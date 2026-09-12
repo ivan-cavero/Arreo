@@ -1,30 +1,27 @@
 ## State snapshot          ← REWRITTEN (not appended) at every checkpoint
-Task: **T-0061 · remote panes are not second-class in the sidebar — DONE.** With it, ROADMAP §3.7's
-observability bar holds end to end: a remote pane shows the same fields as a local one, the sidebar
-says which machine and over what link, and a blocked agent's question is visible without the operator
-touching anything.
-Where you are: `arreo-tui` takes `--machine NAME` (same name the CLI takes, resolved through the same
-`arreo_core::mesh::resolve`), the sidebar title is the session label, and a `question` pane shows the
-line it is waiting on — cut to the sidebar's width, whole in the pane view. Remote-pane state, RAM and
-question all cross the relay through one code path; the resolver now lives in `arreo-core` because two
-clients resolve names and `arreo-tui` may not depend on `arreo-cli`. 456 tests, all green; theme slice 27/27, relay 20/20, tui 20/20, bench 6/6.
+Task: **T-0053 · the relay's own audit trail — DONE.** Both halves of §4's audit story now exist and
+agree: the machine's log (T-0033) and the relay's (`relay_audit`, schema v5), in two databases in two
+processes, sharing one export renderer, one filter vocabulary and one truncation rule.
+Where you are: the relay records what it *did* — `session.connect`/`disconnect`, `relay.refuse`
+(unknown account, bad certificate, bad proof, handshake budget), `inbox.drop`, `inbox.expire`,
+`audit.prune` — and never what it carried. Peers truncated at write (/24, /48). Ordered by
+`(ts_ms, rowid)`. Read with `arreo-relay audit export|prune`, byte-identical to the machine's export
+for the same rows. 468 tests, all green; relay slice 20/20, bench 6/6.
 Next step: **T-0047** (the mesh e2e slice — the referee for T-0043…T-0046, and where the
-`cross_machine_attach_ms` budget row lives), or T-0048 (OSS launch readiness) if a release-shaped
-deliverable is wanted first.
+`cross_machine_attach_ms` budget row lives) or **T-0048** (OSS launch readiness).
 Open workers: (none)
 Known broken: (none) · Parked: (none)
 Findings:
-- **`Target` cannot name a machine** — the name lives in the directory, the target carries a device
-  id, and an accessor returning it would be read as a name by every caller. The name travels with the
-  *resolution*; the address-addressed form labels itself with the device id it actually knows.
-- **Two live sessions for one device id displace each other at the relay (T-0060)** — a slice that
-  runs two TUIs of the same identity flakes, and that is the product being right.
-- **Byte offsets from two lines are not comparable** in a frame of box-drawing characters (3 bytes
-  each); a sidebar/pane-region check must count columns.
-- **`cargo xtask e2e --slice X` does not build `arreo-tui`** — a stale TUI binary makes slice checks
-  pass against the old behaviour. Build the workspace before believing a TUI result.
-- **A check that cannot fail is not a check**: asserting the question is "on an indented sidebar line"
-  is what distinguishes "the sidebar shows it" from "the terminal shows it".
+- **A `u64` epoch cast to `i64` wraps negative** — a `--since` of `u64::MAX` matched everything, a
+  `--before` of the same deleted nothing. Both the opposite of the request. Reach for that cast
+  anywhere a timestamp is compared.
+- **Recording from inside a store's own transaction deadlocks** when the writer takes the same mutex.
+  Release the lock before writing the trail, even though the trail is "part of" the operation.
+- **A vanished QUIC client is noticed at ~15 s** (idle timeout), not when its socket closes.
+- **A `&& b && c || d` condition reads as "all three, or d"** — this repo has now paid for that once
+  (the machine's redaction) and the same shape appeared in my own export test's key extraction.
+- **`cargo xtask e2e --slice X` does not rebuild every binary** — it cost a stale-TUI round in T-0061
+  and a stale-relay round here.
 ## Event log               ← append-only; newest last; never rewrite
 - 2026-09-10 [turn 1] ledger created; repo at e489fac (docs only); T-0001 + T-0022 (AGENTS.md gardened) done
 - 2026-09-10 [turn 2] T-0002 PTY manager done+pushed (342606c; 9 tests); PROMPT.md v2 synced + ADR 0001 (ef6c595)
@@ -104,3 +101,5 @@ Findings:
 - 2026-09-11 [turn 51] T-0045's conformance criterion landed: `--machine <name> [--config PATH]` on `panes`, `read`, `send`, `wait`, `split`, `metrics` and `metrics history`, all through one `Session` type (local socket or relay client) with the flags lifted out before each verb parses its own — so local and remote differ only in what had to be resolved. `request()` is gone with its last caller. The conformance test replays one scripted sequence against a local pane and the same pane by name from another machine and asserts equal output (normalised only for measurements and the pane id); it caught that `send` is silent on success, so the "produced output" check now excludes it. Criterion 4 **re-scoped to T-0061** with the reason: the criterion is TUI work and T-0045's fence lists no `arreo-tui` path — the third time a task's own fence excluded its own criterion. 455 tests, clippy/fmt clean, evidence `.loop/evidence/T-0045/`
 
 - 2026-09-12 [turn 52] T-0061 done: `arreo-tui --machine NAME [--config PATH]` (mutually exclusive with `--remote/--peer/--socket`), the name resolved through `arreo_core::mesh::resolve` — the resolver moved out of `arreo-cli` because two clients resolve names and the TUI may not depend on a binary crate; the error became a typed `ResolveError` (Usage/UnknownMachine/Unreachable) that the CLI maps to its exit codes and the TUI to one message. The sidebar title is the session label ("peer-machine · relay" / "this machine · socket" / "device ab12cd34 · relay"), and a `question` pane shows the line it is waiting on, indented, cut with `…` to the sidebar's width, whole in the pane view. `arreo_tui::client::asking_line` is the one read on either transport, fetched only for a pane already known to be asking. Proof: the relay slice drives the real TUI on a pty to a peer reached **by name** and checks the machine, the link, the question in the sidebar, the marked cut and the whole question in the pane (20/20); a relay test asserts the read is identical over the relay and over the peer's own socket; mutation (suppressing the question line) fails two slice checks. Findings: `Target` cannot honestly name a machine (the name is the directory's, the target has a device id) so `machine()` was deleted in favour of `link()` plus the resolver's `Resolved::name`; two TUIs of one device id displace each other at the relay (T-0060) so the slice serializes them; byte offsets from different lines are not comparable in a box-drawing frame; and `cargo xtask e2e --slice tui` does not rebuild `arreo-tui`, which cost a stale-binary round. 456 tests, clippy/fmt clean.
+
+- 2026-09-12 [turn 53] T-0053 done: the relay's audit trail. `relay_audit` (relay schema v5) with one append-only writer (`RelayStore::record`, no update/delete API), written at the router's connect/disconnect/refusal sites and the mailbox's own eviction/expiry, read by `arreo-relay audit export|prune`. Shared with the machine's log rather than mirrored: `render_export` was extracted from `arreo_core`'s `audit_export` so both logs emit identical bytes, `truncate_peer` does both redactions, and `AuditQuery` is the filter type for both. `accept_connection` gained a typed `Accepted` return (open, or the address over its budget) because the rate-limit refusal is an audit row and the address was otherwise only in a log line. Two real bugs found by the tests: a `u64`→`i64` cast that made `--since u64::MAX` match everything and `--before u64::MAX` delete nothing, and a deadlock from recording while holding the store mutex. Also measured: a vanished QUIC client is noticed at ~15 s (idle timeout). 468 tests, clippy/fmt clean, vet/deny/audit/check-targets clean, 8 slices green, bench 6/6. Evidence `.loop/evidence/T-0053/`.
