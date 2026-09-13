@@ -3,7 +3,7 @@ id: T-0036
 title: Signed releases — minisign-signed artifacts with fail-closed verification
 phase: 2
 priority: 1
-status: todo
+status: in-progress
 depends_on: [T-0020]
 scope:
   - crates/arreo-core/src/update/**
