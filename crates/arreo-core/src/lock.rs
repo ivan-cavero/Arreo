@@ -83,6 +83,13 @@ impl std::fmt::Display for LockError {
 
 impl std::error::Error for LockError {}
 
+/// The mode every lock file carries (T-0078): owner-only, like the identity
+/// key files (T-0025). The lock file's content is empty — the exclusion lives
+/// in the open file description — but its mode is part of the daemon's file
+/// surface: a 664 lock file is a file the policy says nobody else may touch.
+#[cfg(unix)]
+const LOCK_FILE_MODE: u32 = 0o600;
+
 /// An exclusive lock, held for as long as this value lives.
 ///
 /// The lock is taken with `try_lock`, never a blocking acquire: a caller that
@@ -111,13 +118,35 @@ impl std::fmt::Debug for ExclusiveLock {
 impl ExclusiveLock {
     /// Take the lock at `path`, creating the file if it does not exist.
     pub fn acquire(path: &Path) -> Result<Self, LockError> {
-        let file = fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
+        let mut options = fs::OpenOptions::new();
+        options.create(true).truncate(false).read(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            // The identity pattern (T-0025): the mode applies only at
+            // creation, so a new lock file is 0600 before anything is written
+            // into it — no window. A pre-existing file keeps its old mode,
+            // which the chmod below fixes.
+            options.mode(LOCK_FILE_MODE);
+        }
+        let file = options
             .open(path)
             .map_err(|e| LockError::Io(path.to_path_buf(), e))?;
+        // Re-apply owner-only to an existing lock file (one created before
+        // T-0078 has the ambient umask's mode — 664 at the measured default).
+        // Best-effort and loud: the mode is hygiene here — the exclusion lives
+        // in the open file description, not in the inode's bits — so an
+        // unsettable mode must not stop the daemon from starting.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Err(e) = fs::set_permissions(path, fs::Permissions::from_mode(LOCK_FILE_MODE)) {
+                eprintln!(
+                    "arreo-core: cannot set owner-only mode {LOCK_FILE_MODE:o} on lock file {}: {e}",
+                    path.display()
+                );
+            }
+        }
         match file.try_lock() {
             Ok(()) => Ok(Self {
                 file,
@@ -344,6 +373,43 @@ mod tests {
         let a = ExclusiveLock::acquire(&dir.join("a.lock")).expect("a");
         let b = ExclusiveLock::acquire(&dir.join("b.lock")).expect("b");
         assert_ne!(a.path(), b.path());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// T-0078: a *new* lock file is owner-only (0600) at creation — created
+    /// before anything is written into it, so the mode never borrows the
+    /// process umask.
+    #[test]
+    #[cfg(unix)]
+    fn a_new_lock_file_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch("mode-fresh");
+        let path = dir.join("fresh.lock");
+        drop(ExclusiveLock::acquire(&path).expect("acquire"));
+        let mode = fs::metadata(&path).expect("stat").permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "a new lock file must be owner-only, was {mode:o}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// T-0078: an *existing* lock file (created before the policy, or under a
+    /// loose umask) is tightened by the acquire that reuses it.
+    #[test]
+    #[cfg(unix)]
+    fn acquire_tightens_an_existing_loose_lock_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch("mode-loose");
+        let path = dir.join("loose.lock");
+        drop(ExclusiveLock::acquire(&path).expect("acquire"));
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o664)).expect("loosen");
+        drop(ExclusiveLock::acquire(&path).expect("re-acquire"));
+        let mode = fs::metadata(&path).expect("stat").permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "re-acquiring an existing lock must tighten it to owner-only, was {mode:o}"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 

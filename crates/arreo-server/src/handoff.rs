@@ -167,9 +167,9 @@
 //! The local socket is ungated by design (`auth: None` in `handle`), and a
 //! same-user process can already `kill` the daemon. **And the gate for
 //! `Handoff` is the main socket's mode, not the uid**: `Handoff` needs only
-//! `connect()`, which on a Unix socket requires write permission on the inode,
-//! and the main socket is bound with the ambient umask and never chmod'd — so at
-//! the default mode (0775 measured here; 0755 under `umask 022`) a peer in the
+//! `connect()`, which on a Unix socket requires write permission on the inode.
+//! The main socket is chmodded to 0600 at the top of `serve_on` (T-0078), so at
+//! the default mode a peer in the
 //! same **group** can request a handoff, read the nonce and drive the cut, not
 //! merely a same-user one. Narrowing the main socket's mode is T-0078's
 //! decision; this feature neither narrows nor widens it. What the nonce adds is
@@ -827,11 +827,10 @@ pub fn wait_for_commit(socket: &UnixStream, timeout: Duration) -> Result<(), Str
 /// the nonce from it; the uid makes the descriptor handover this-user-only
 /// regardless. It is **not** what decides who may *ask* for a handoff — `Handoff`
 /// is ungated and needs only `connect()`, which on a Unix socket requires write
-/// permission on the main socket's inode. That socket is bound with the ambient
-/// umask and never chmod'd (0775 measured here; 0755 under `umask 022`), so at
-/// the default mode a same-**group** peer can request a handoff, read the nonce
-/// and drive the cut. The main socket's mode is therefore the gate for the
-/// request, and narrowing it is T-0078's decision — not this check's.
+/// permission on the main socket's inode. That socket is chmodded to 0600 at the
+/// top of `serve_on` (T-0078), so at the default mode only the owning user can
+/// request a handoff at all — and this check is the second layer, for a socket
+/// whose mode an operator deliberately widened.
 ///
 /// `Ok(())` when the platform cannot answer (`peer_uid` returns `None`): the
 /// handoff stays possible there, with the nonce and the socket's own

@@ -427,6 +427,52 @@ fn store_files(path: &std::path::Path) -> [PathBuf; 3] {
     [path.to_path_buf(), wal, shm]
 }
 
+/// The mode every file a store consists of carries (T-0078): owner-only. The
+/// store holds pane scrollback — agent output, the operator's prompts and
+/// whatever a tool printed — plus the audit log and the device records, so
+/// nothing in it may be group- or world-reachable.
+#[cfg(unix)]
+const STORE_FILE_MODE: u32 = 0o600;
+
+/// Enforce owner-only modes on the store's files (`<db>`, `<db>-wal`,
+/// `<db>-shm`) after an open has made them present.
+///
+/// SQLite creates its own files and cannot be told a creation mode, so the
+/// honest shape is a chmod immediately after the open (T-0078). The window is
+/// bounded to a brand-new store's first empty pages — no pane content or audit
+/// row exists before the chmod of the open that creates them — and an existing
+/// store is chmodded by the very open that first touches it. The `-wal`/`-shm`
+/// sidecars are re-created by SQLite (and deleted when the last connection
+/// closes), so this chmods whatever exists at this open and the next open
+/// re-applies it — which the daemon's per-operation opens do constantly.
+///
+/// Best-effort with a loud warning, not an error: a chmod that fails is a
+/// *policy* failure on this filesystem, not a store failure — the store just
+/// opened fine, and refusing to use it would take the daemon down while leaving
+/// the file exactly as exposed. On every normal local filesystem the chmod
+/// succeeds; where it cannot, the operator is told on stderr rather than
+/// silently served a looser mode.
+#[cfg(unix)]
+fn restrict_store_files(path: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+    for file in store_files(path) {
+        match std::fs::set_permissions(&file, std::fs::Permissions::from_mode(STORE_FILE_MODE)) {
+            Ok(()) => {}
+            // The `-shm` (and rarely `-wal`) may not exist yet: SQLite creates
+            // them lazily. Nothing failed — the open that creates them
+            // re-applies this chmod.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => eprintln!(
+                "arreo-core: cannot set owner-only mode {STORE_FILE_MODE:o} on {}: {e}",
+                file.display()
+            ),
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn restrict_store_files(_path: &std::path::Path) {}
+
 /// Move a corrupt store's files aside — **renamed, never deleted**.
 ///
 /// Each of `<db>`, `<db>-wal` and `<db>-shm` becomes `<itself>.corrupt-<ms>`: the
@@ -1111,6 +1157,11 @@ impl SessionStore {
         let conn = Connection::open(path)?;
         Self::prepare(&conn)?;
         Self::migrate(&conn)?;
+        // T-0078: the store's files are the operator's private state (pane
+        // scrollback, the audit log, device records) — owner-only the moment
+        // this open made them present. See `restrict_store_files` for the
+        // window statement and why a chmod failure is loud, not fatal.
+        restrict_store_files(path);
         Ok(Self {
             conn: std::sync::Mutex::new(conn),
         })

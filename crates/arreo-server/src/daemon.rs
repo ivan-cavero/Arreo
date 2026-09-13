@@ -20,6 +20,7 @@ use arreo_core::proto::{AgentState, Message, PaneDetail, PaneInfo, VERSION};
 use arreo_core::pty::{ExitState, Pane};
 use arreo_core::state::{Adapter, Confidence, Engine, State};
 use std::collections::HashMap;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use thiserror::Error;
@@ -37,6 +38,24 @@ pub enum DaemonError {
     NotFound(String),
     #[error("pty: {0}")]
     Pty(String),
+}
+
+/// The mode the daemon's client socket carries (T-0078): owner-only.
+///
+/// The socket file's mode is the only gate in front of the daemon's verbs and
+/// the handoff request — `connect()` on a Unix socket needs only write
+/// permission on the inode — and with `XDG_RUNTIME_DIR` unset the default
+/// socket lands in `/tmp` (world-writable), so the file mode is the only
+/// control there. Unlike the store and lock chmods, a failure here is an
+/// error: a group-connectable socket is the vulnerability T-0078 exists to
+/// close, not a hygiene detail, and serving anyway would be the old daemon.
+pub const CLIENT_SOCKET_MODE: u32 = 0o600;
+
+/// Make the bound client socket owner-only, immediately after the bind — the
+/// same shape as [`crate::handoff::restrict_transfer_socket`] for
+/// `<socket>.handoff`.
+fn restrict_client_socket(path: &Path) -> std::io::Result<()> {
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(CLIENT_SOCKET_MODE))
 }
 
 /// Per-pane daemon state: the PTY plus its state engine + metrics sampler.
@@ -727,6 +746,14 @@ impl Daemon {
         adopted: Option<Vec<(String, Arc<PaneEntry>)>>,
         ready: Option<tokio::sync::oneshot::Sender<Result<(), String>>>,
     ) -> Result<(), DaemonError> {
+        // T-0078: the socket file's mode is the gate in front of the daemon
+        // (connect() needs only write on the inode), so it must be owner-only
+        // the moment serving starts — on the fresh bind and on the inherited
+        // listener, whose file the outgoing daemon chmodded too. Re-applying
+        // here also corrects a pre-change daemon's loose mode across a handoff.
+        // A failure refuses the start (or the handoff): serving a
+        // group-connectable socket is the vulnerability this policy closes.
+        restrict_client_socket(&self.socket)?;
         match adopted {
             // Boot restore BEFORE serving: crash survivors reappear with history.
             None => self.restore_boot().await,

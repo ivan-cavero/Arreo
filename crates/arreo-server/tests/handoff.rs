@@ -4467,3 +4467,39 @@ fn a_corrupt_wal_does_not_lock_a_second_writer_out() {
     let _ = daemon.0.wait();
     cleanup(&socket);
 }
+
+/// The transfer socket's mode is part of the file policy (T-0078), and it was the
+/// one file the daemon creates that no mode test covered: it exists only between
+/// a handoff request and the peer's connection, so it needs its own test. The
+/// window is the test's to control — after `HandoffReady` the daemon waits for
+/// the transfer connection with a deadline, so the path is present and stat-able
+/// here, and dropping the session afterwards aborts the handoff cleanly.
+///
+/// What removal turns it red: deleting `restrict_transfer_socket`'s chmod (the
+/// socket would be 0775 under this box's umask 0002), or deleting
+/// `TRANSFER_MODE`.
+#[test]
+fn the_transfer_socket_is_owner_only() {
+    use std::os::unix::fs::PermissionsExt;
+    let socket = temp_socket("stage4-handoff-mode");
+    cleanup(&socket);
+    let mut daemon = spawn_daemon(&socket, &[], std::process::Stdio::null());
+    wait_serving(&mut daemon, &socket, Duration::from_secs(10));
+
+    let (session, reply) = accepted_handoff(&socket, "mode-check");
+    assert!(matches!(reply, Message::HandoffReady { .. }), "handoff accepted: {reply:?}");
+
+    let handoff = arreo_core::identity::authority::sidecar(&socket, ".handoff");
+    let mode = std::fs::metadata(&handoff)
+        .expect("the transfer socket exists")
+        .permissions()
+        .mode();
+    assert_eq!(
+        mode & 0o777,
+        0o600,
+        "the transfer socket is owner-only ({mode:o}), matching the policy — it hands out \\
+         the listener and the lock"
+    );
+
+    drop(session);
+}

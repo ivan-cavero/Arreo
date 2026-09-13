@@ -183,3 +183,47 @@ fn v2_database_migrates_to_v3_keeping_its_audit_rows() {
     assert_eq!(rows[0].kind, arreo_core::store::AuditKind::AuthReject);
     assert_eq!(rows[1].kind, arreo_core::store::AuditKind::Prompt);
 }
+
+#[test]
+fn an_existing_loose_store_is_tightened_by_the_next_open() {
+    // T-0078: an install that predates the policy must be fixed by the first
+    // open of the fixed build, not only by fresh files. A store nobody chmods
+    // carries the ambient umask's mode (0644 at the default) and its -wal/-shm
+    // sidecars with it; the next open must re-apply owner-only to all three.
+    use std::os::unix::fs::PermissionsExt;
+    let dir = std::env::temp_dir().join(format!(
+        "arreo-store-modes-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let db = dir.join("loose.db");
+    let wal = dir.join("loose.db-wal");
+    let shm = dir.join("loose.db-shm");
+
+    // One connection writes and then stays open, so the sidecars exist and
+    // survive while the "next open" runs — the daemon's own shape, where a
+    // background op can hold the store open while another opens it.
+    {
+        let held = SessionStore::open(&db).expect("open");
+        held.save_topology(&panes(1)).expect("save");
+
+        // Widen every file to the mode a pre-fix install would have.
+        for file in [&db, &wal, &shm] {
+            std::fs::set_permissions(file, std::fs::Permissions::from_mode(0o644)).expect("loosen");
+        }
+
+        // The next open (an existing install's very next op) must re-apply the
+        // policy to all three files.
+        let _next = SessionStore::open(&db).expect("reopen");
+        for (file, name) in [(&db, "store"), (&wal, "-wal"), (&shm, "-shm")] {
+            let mode = std::fs::metadata(file).unwrap().permissions().mode() & 0o777;
+            assert_eq!(
+                mode, 0o600,
+                "{name} must be owner-only (0600) after the next open, was {mode:o}"
+            );
+        }
+    }
+
+    std::fs::remove_dir_all(&dir).ok();
+}

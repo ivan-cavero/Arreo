@@ -124,6 +124,45 @@ does **not** defend against.
   not tamper-evident). Tell us anyway if you think one is a real risk; it is a design
   discussion, not a report.
 
+## File permissions
+
+Who may read the daemon's state and connect to its socket (T-0078):
+
+**Owner-only by default: 0600 for files, 0700 for directories.** Every file the
+daemon creates — `<socket>`, `<socket>.db` (pane scrollback — *agent output*: the
+operator's prompts and whatever a tool printed — plus the audit log and the device
+records), its `-wal`/`-shm` sidecars, `<socket>.lock` and `<socket>.handoff` — is the
+operator's private state, and nothing in it is group- or world-reachable by default.
+
+Why not a group-shared default: the store's contents decide the answer. Pane
+scrollback is agent output, and a group-readable mode would leak prompts and tool
+output the moment someone forgets to unshare. An operator who genuinely wants a shared
+runtime can set their umask and share the directory deliberately — the default must
+not leak pane content because someone forgot to unshare.
+
+Where `XDG_RUNTIME_DIR` is unset, the default socket lands in `/tmp` (world-writable),
+so the **file mode is the only control there** — the daemon never relies on a private
+directory that was never asked for.
+
+One asymmetry, stated because it is designed: the **socket's** mode is enforced
+fail-closed (the daemon refuses to serve a group-connectable socket), while the
+**store's** is best-effort with a loud warning — on a filesystem where `chmod`
+fails (some network mounts), the daemon serves the store at the ambient umask
+rather than refuse to start. The socket is the door that hands out the pane API;
+the store is the file, and a daemon that refuses to start because of an exotic
+mount is worse than one that warns. The warning is on stderr at every open that
+fails to tighten.
+
+Upgrade path for existing installs: the policy applies at creation and re-applies at
+every open. The store chmods its files (including re-created `-wal`/`-shm` sidecars)
+on each open, and the lock and socket chmod an existing file on acquire/bind — so a
+store created before this policy is tightened by the first open of the fixed build.
+
+Honest window: SQLite creates its store files itself and cannot be told a creation
+mode, so the chmod follows the open. The window is bounded to a brand-new store's
+first empty pages — before any pane content or audit row exists — and an existing
+store is chmodded by the very open that first touches it.
+
 ## Posture on audits
 
 **No external audit has been performed.** ROADMAP §4 makes "third-party security audit
