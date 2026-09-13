@@ -1,27 +1,26 @@
 ## State snapshot          ← REWRITTEN (not appended) at every checkpoint
-Task: **T-0084 DONE** (`8969e85`) — the handoff-abort racing gate is closed: kill point C
-freezes the incoming daemon and proves the commit was not sent before killing it, with the
-observation (never the verdict) retried up to 8 times and a loud failure if the window is
-unobservable. **All 14 slices green.**
-Where you are: **810 tests / 0 failed / 66 targets**; clippy clean on both toolchains; fmt
-clean; **14/14 slices** (handoff-abort 41 checks, 17 consecutive green runs after the fix);
-sync 14/14; bench 6/6; vet 337, deny 4/4, audit 0, check-targets PASS/SKIP.
-Next step: **T-0087** (wire the keychain bridge into the daemon's spawn — the mechanism is
-proven at a real pty, the production injection is not built) is the highest-value remaining;
-then T-0086 (sync over the mesh), T-0039 (windows deferred), T-0081/T-0082 (adapter batches,
-gated on live CLIs), T-0085 (CI, blocked on the user's T-0063).
+Task: **T-0087 DONE** (`71a383a`) — the keychain bridge reaches the pane: a synced reference
+resolves at the PTY, on both spawn sites and on both restore paths.
+Where you are: **814 tests / 0 failed / 67 targets**; clippy clean on both toolchains; fmt
+clean; **14/14 slices** (persistence 16, handoff-abort 41, tui 80, update 27, mesh 21+1,
+relay 20, theme 33, chaos 8); `xtask sync --check` 14/14; bench 6/6; vet 337, deny 4/4,
+audit 0, check-targets PASS/SKIP.
+Next step: **T-0086** (the sync transport over the mesh — deltas between real machines, the
+conflict copies across two live machines, the JSONC/array merge hazards in their networked
+form; it owes an ADR if it adds a protocol verb); then T-0039 (windows deferred),
+T-0081/T-0082 (adapter batches, gated on live CLIs), T-0085 (CI, blocked on the user's
+T-0063), T-0042's remaining CI half.
 Open workers: (none)
-Known broken: (none — the only intermittent gate, handoff-abort, is fixed this turn)
- · T-0063 (CI never-green — the user's) · Parked: T-0048 needs-human
-**The gate was a race, and it is now measured rather than assumed.** Kill point C's guard —
-"the client's stream is still frozen" — is true after a commit too (the pumps stay parked
-for ever), so the kill landed after the commit on ~half the runs and killed a committed
-incoming: the one state ADR 0021 §2c cannot repair. Before-fix instrumentation showed the
-commit landing 2–32 ms *before* the kill on failing runs and 9–39 ms after on passing ones —
-a millisecond-wide window observed through a `/proc` scan of the same order. The fix freezes
-the incoming with SIGSTOP (read back from `/proc/<pid>/stat`), settles 150 ms, and only kills
-once the absence of the commit is proven; a missed window re-runs the scenario (up to 8) and
-then fails loudly. 17/17 runs green, 41 checks each.
+Known broken: (none) · T-0063 (CI never-green — the user's) · Parked: T-0048 needs-human
+**T-0087 — the bridge, at last.** T-0083 shipped the mechanism and proved it at a real pty;
+this turn wired it into the product, where it matters: `Pane::spawn_with_env` (one
+implementation, two doors), `keychain::spawn_environment(harness, env)` reading only that
+harness's SYNC files, applied at both daemon spawn sites AND both `persist::restore` paths —
+a *restored* pane is where a resumed pi session would otherwise die on a 401. The rule is
+additive (the daemon's own environment wins), which is what keeps the feature from changing
+any existing deployment; an explicitly empty export stays empty, pinned by test. Five
+product-surface tests, 75 consecutive clean runs, four mutations each reddening the right
+test — including "inject every store name", which is the leak made visible.
 ## Event log               ← append-only; newest last; never rewrite
 - 2026-09-10 [turn 1] ledger created; repo at e489fac (docs only); T-0001 + T-0022 (AGENTS.md gardened) done
 - 2026-09-10 [turn 2] T-0002 PTY manager done+pushed (342606c; 9 tests); PROMPT.md v2 synced + ADR 0001 (ef6c595)
@@ -189,3 +188,5 @@ then fails loudly. 17/17 runs green, 41 checks each.
 - 2026-09-13 [turn 76] T-0083 (local half) + T-0073 done. Planner held the security-critical work (the secret-scan reference rule) and the integration: the sync engine's security review returned NOT MERGEABLE with 3 HIGH findings reachable through `arreo sync apply` (F1 reference→syntax injection enabling an `mcp` command block; F2 forged vector → silent overwrite + permanent counter pinning; F3 unquoted `${ARREO_ENV:NAME}` bypassing the by-name refusal AND false-positively refusing omp's dialect); F4–F8 medium/low (Codex hook-trust shape that never occurs, no content-validity parse, 0644 store not repaired, deny-list gaps, empty HOME → relative roots). All eight fixed with mutation-checked tests (`fa13ca9`). T-0073 landed with two pty-level mutations proven (default-on, and the live-pane confirmation removed → six slice checks red). Sibling worker `ConfigSync` was frozen mid-review (told to stop editing, hand back its test diff) — the file-hostile case the brief warned about, handled by messaging rather than racing. Filed T-0087 (daemon-side keychain injection) and updated T-0083 with what it deliberately did not do. Battery: 810/66, both clippys, fmt, 13/14 slices (handoff-abort = parked T-0084), sync 14/14, bench 6/6, gates green.
 
 - 2026-09-14 [turn 77] T-0084 closed — the last red slice. Diagnosed by instrumenting the slice (kill timestamp vs the commit row's `ts_ms`: 2–32 ms before on failures, 9–39 ms after on passes) rather than by argument; fixed by freezing the incoming daemon with SIGSTOP before deciding, so the verdict is proven and only the observation is retried; a second pre-existing flake (point B's single-shot read of the abort audit row, ~3/16) found while measuring and fixed with a bounded wait. Evidence in `.loop/evidence/T-0084/racing-gate.txt`. Battery: 810/66, both clippys, fmt, **14/14 slices**, bench 6/6, gates green. Next: T-0087 (keychain wiring), T-0086 (sync over the mesh).
+
+- 2026-09-14 [turn 78] T-0087 done + pushed. The keychain bridge now reaches the pane: `spawn_environment` (arreo-core) reads only the harness's SYNC files and resolves those names from the machine's store; the daemon applies it at Spawn and Split, `persist::restore` at the resume branch and the plain fallback. The rule is additive (daemon env wins; empty-presence pinned). Five tests in `crates/arreo-server/tests/keychain_spawn.rs` drive a real daemon with a fake `pi` on PATH writing what the child saw — 75 consecutive clean runs; four mutations verified (no injection; env-wins removed; whole-keychain leak; resume-branch removed). The adversarial pass found two *test* bugs: `${VAR:-UNSET}` cannot distinguish empty from missing (now `${VAR-UNSET}`), and the restore test raced the detached spawn snapshot (now waits for the record — the rule T-0072's slice learned). Battery: 814/67, both clippys, fmt, 14/14 slices, sync 14/14, bench 6/6, gates green. Next: T-0086 (sync over the mesh).
