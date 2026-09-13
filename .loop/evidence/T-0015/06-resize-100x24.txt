@@ -1,24 +1,24 @@
 ┌this machine · socket─────┐┌▶ ● gamma [working] ▏█▏ peak    3M ───────────────────────────────────┐
-│  ◉ question              ││GAMMA-MARKER                                                          │
-│   beta        3M █░░░░░░░││                                                                      │
-│   Proceed? [y/n]         ││                                                                      │
-│  ● working               ││                                                                      │
-│   alpha       3M █░░░░░░░││                                                                      │
-│ ▸ gamma       3M █░░░░░░░││                                                                      │
-│                          ││                                                                      │
-│                          ││                                                                      │
-│                          ││                                                                      │
-│                          ││                                                                      │
-│                          ││                                                                      │
-│                          ││                                                                      │
-│                          ││                                                                      │
-│                          ││                                                                      │
-│                          ││                                                                      │
-│                          ││                                                                      │
-│                          ││                                                                      │
-│                          ││                                                                      │
-│                          ││                                                                      │
-│                          ││                                                                      │
-│                          ││                                                                      │
+│  ◉ question              ││GAMMA-MARKER 0                                                        │
+│   beta        3M █░░░░░░░││GAMMA-MARKER 1                                                        │
+│   Proceed? [y/n]         ││GAMMA-MARKER 2                                                        │
+│  ● working               ││GAMMA-MARKER 3                                                        │
+│ ▸ gamma       1M █░░░░░░░││GAMMA-MARKER 4                                                        │
+│  ○ idle                  ││GAMMA-MARKER 5                                                        │
+│   alpha       3M █░░░░░░░││GAMMA-MARKER 6                                                        │
+│                          ││GAMMA-MARKER 7                                                        │
+│                          ││GAMMA-MARKER 8                                                        │
+│                          ││GAMMA-MARKER 9                                                        │
+│                          ││GAMMA-MARKER 10                                                       │
+│                          ││GAMMA-MARKER 11                                                       │
+│                          ││GAMMA-MARKER 12                                                       │
+│                          ││GAMMA-MARKER 13                                                       │
+│                          ││GAMMA-MARKER 14                                                       │
+│                          ││GAMMA-MARKER 15                                                       │
+│                          ││GAMMA-MARKER 16                                                       │
+│                          ││GAMMA-MARKER 17                                                       │
+│                          ││GAMMA-MARKER 18                                                       │
+│                          ││GAMMA-MARKER 19                                                       │
+│                          ││GAMMA-MARKER 20                                                       │
 └──────────────────────────┘└──────────────────────────────────────────────────────────────────────┘
-/MARK  1 matching lines · Esc clears
+/MARK  36 matching lines · Esc clears

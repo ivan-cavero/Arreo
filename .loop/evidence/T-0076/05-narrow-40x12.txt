@@ -1,12 +1,12 @@
 ┌this machine …┐┌▶ ● gamma [working] ▏█┐
-│  ◉ question  ││GAMMA-MARKER          │
-│   beta       ││                      │
-│   Proceed? … ││                      │
-│  ● working   ││                      │
-│   alpha      ││                      │
-│ ▸ gamma      ││                      │
-│              ││                      │
-│              ││                      │
-│              ││                      │
+│  ◉ question  ││GAMMA-MARKER 0        │
+│   beta       ││GAMMA-MARKER 1        │
+│   Proceed? … ││GAMMA-MARKER 2        │
+│  ● working   ││GAMMA-MARKER 3        │
+│ ▸ gamma      ││GAMMA-MARKER 4        │
+│  ○ idle      ││GAMMA-MARKER 5        │
+│   alpha      ││GAMMA-MARKER 6        │
+│              ││GAMMA-MARKER 7        │
+│              ││GAMMA-MARKER 8        │
 └──────────────┘└──────────────────────┘
-3 panes · j/k · Enter · w · t · / · ? ·…
+3 panes · ? keys · q quit

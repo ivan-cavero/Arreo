@@ -1,30 +1,30 @@
-┌this machine · socket─────┐┌◉ beta [question] ▶─────────────────────────┐┌● alpha [working]───────────────────────────┐
-│  ◉ question              ││Proceed? [y/n]                              ││ALPHA-MARKER                                │
-│ ▸ beta        3M █░░░░░░░││                                            ││                                            │
-│   Proceed? [y/n]         ││                                            ││                                            │
-│  ● working               ││                                            ││                                            │
-│   alpha       3M █░░░░░░░││                                            ││                                            │
-│   gamma       3M █░░░░░░░││                                            ││                                            │
-│                          ││                                            ││                                            │
-│                          ││        ┌keys────────────────────────────────────────┐                                    │
-│                          ││        │ j/k ↑/↓    move the cursor                 │                                    │
-│                          ││        │ Enter      attach the pane (or open the wal│                                    │
-│                          ││        │ Tab        next pane                       │                                    │
-│                          ││        │ w          wall ↔ focus                    │                                    │
-│                          ││        │ t          theme picker                    │                                    │
-│                          │└────────│ /          search the transcript           │────────────────────────────────────┘
-│                          │┌● gamma │ [ ]        sidebar narrower / wider        │
-│                          ││GAMMA-MA│ PgUp/PgDn  scroll the transcript           │
-│                          ││        │ Home/End   oldest line / live output       │
-│                          ││        │ ?          this list                       │
-│                          ││        │ q / Esc    quit                            │
-│                          ││        └────────────────────────────────────────────┘
-│                          ││                                            │
-│                          ││                                            │
-│                          ││                                            │
+┌this machine · socket─────┐┌◉ beta [question]───────────────────────────┐┌● gamma [working]───────────────────────────┐
+│  ◉ question              ││Proceed? [y/n]                              ││GAMMA-MARKER 51                             │
+│   beta        3M █░░░░░░░││                                            ││GAMMA-MARKER 52                             │
+│   Proceed? [y/n]         ││                                            ││GAMMA-MARKER 53                             │
+│  ● working               ││                                            ││GAMMA-MARKER 54                             │
+│   gamma       1M █░░░░░░░││                                            ││GAMMA-MARKER 55                             │
+│  ○ idle   ┌keys──────────────────────────────────────────────────────────────────────────────────────────┐           │
+│ ▸ alpha   │ j/k ↑/↓    move the cursor                                                                   │           │
+│           │ Enter      attach the pane (or open the wall tile)                                           │           │
+│           │ Tab        next pane                                                                         │           │
+│           │ w          wall ↔ focus                                                                      │           │
+│           │ t          theme picker                                                                      │           │
+│           │ /          search the transcript                                                             │           │
+│           │ [ ]        sidebar narrower / wider                                                          │           │
+│           │ PgUp/PgDn  scroll the transcript                                                             │───────────┘
+│           │ Home/End   oldest line / live output                                                         │
+│           │ s          spawn an agent: <id> <program> [args…]                                            │
+│           │ i          send text to the attached pane                                                    │
+│           │ x          kill the attached pane (confirm)                                                  │
+│           │ m          machines: list · a add · r rename · x remove                                      │
+│           │ g          trust: this machine's grants · a grant · x revoke                                 │
+│           │ ?          this list                                                                         │
+│           │ q / Esc    quit                                                                              │
+│           └──────────────────────────────────────────────────────────────────────────────────────────────┘
 │                          ││                                            │
 │                          ││                                            │
 │                          ││                                            │
 │                          ││                                            │
 └──────────────────────────┘└────────────────────────────────────────────┘
-3 panes · j/k move · Enter attach · Tab cycle · w wall · t theme · / search · ? keys · q quit
+3 panes · j/k move · Enter attach · s/i/x agents · m machines · g trust · w wall · t theme · / find · ? keys · q quit

@@ -3,9 +3,9 @@
 │   beta        3M █░░░░░░░││                                                                                          │
 │   Proceed? [y/n]         ││                                                                                          │
 │  ● working               ││                                                                                          │
-│▶  alpha       3M █░░░░░░░││                                                                                          │
-│   gamma       3M █░░░░░░░││                                                                                          │
-│                          ││                                                                                          │
+│▶  gamma       1M █░░░░░░░││                                                                                          │
+│  ○ idle                  ││                                                                                          │
+│   alpha       3M █░░░░░░░││                                                                                          │
 │                          ││                                                                                          │
 │                          ││                                                                                          │
 │                          ││                                                                                          │
@@ -27,4 +27,4 @@
 │                          ││                                                                                          │
 │                          ││                                                                                          │
 └──────────────────────────┘└──────────────────────────────────────────────────────────────────────────────────────────┘
-3 panes · j/k move · Enter attach · Tab cycle · w wall · t theme · / search · ? keys · q quit
+3 panes · j/k move · Enter attach · s/i/x agents · m machines · g trust · w wall · t theme · / find · ? keys · q quit

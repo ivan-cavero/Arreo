@@ -1,20 +1,20 @@
-┌this machine · socket─────┐┌◉ beta [question] ▶─────────────────────────┐┌● alpha [working]───────────────────────────┐
-│  ◉ question              ││Proceed? [y/n]                              ││ALPHA-MARKER                                │
-│ ▸ beta        3M █░░░░░░░││                                            ││                                            │
-│   Proceed? [y/n]         ││                                            ││                                            │
-│  ● working               ││                                            ││                                            │
-│   alpha       3M █░░░░░░░││                                            ││                                            │
-│   gamma       3M █░░░░░░░││                                            ││                                            │
-│                          ││                                            ││                                            │
-│                          ││                                            ││                                            │
-│                          ││                                            ││                                            │
-│                          ││         ┌theme: arreo (256)────────────────────────┐                                     │
-│                          ││         │▸ arreo  built-in                         │                                     │
-│                          ││         │  tokyonight  built-in                    │                                     │
-│                          ││         │  catppuccin  built-in                    │                                     │
+┌this machine · socket─────┐┌◉ beta [question]───────────────────────────┐┌● gamma [working]───────────────────────────┐
+│  ◉ question              ││Proceed? [y/n]                              ││GAMMA-MARKER 55                             │
+│   beta        3M █░░░░░░░││                                            ││GAMMA-MARKER 56                             │
+│   Proceed? [y/n]         ││                                            ││GAMMA-MARKER 57                             │
+│  ● working               ││                                            ││GAMMA-MARKER 58                             │
+│   gamma       1M █░░░░░░░││                                            ││GAMMA-MARKER 59                             │
+│  ○ idle                  ││                                            ││GAMMA-MARKER 60                             │
+│ ▸ alpha       3M █░░░░░░░││                                            ││GAMMA-MARKER 61                             │
+│                          ││                                            ││GAMMA-MARKER 62                             │
+│                          ││                                            ││GAMMA-MARKER 63                             │
+│                          ││         ┌theme: arreo (256)────────────────────────┐ARKER 64                             │
+│                          ││         │▸ arreo  built-in                         │ARKER 65                             │
+│                          ││         │  tokyonight  built-in                    │ARKER 66                             │
+│                          ││         │  catppuccin  built-in                    │ARKER 67                             │
 │                          │└─────────│  gruvbox  built-in                       │─────────────────────────────────────┘
-│                          │┌● gamma [│  system  built-in                        │
-│                          ││GAMMA-MAR│                                          │
+│                          │┌○ alpha [│  system  built-in                        │
+│                          ││ALPHA-MAR│                                          │
 │                          ││         │                                          │
 │                          ││         └──────────────────────────────────────────┘
 │                          ││                                            │
@@ -27,4 +27,4 @@
 │                          ││                                            │
 │                          ││                                            │
 └──────────────────────────┘└────────────────────────────────────────────┘
-3 panes · j/k move · Enter attach · Tab cycle · w wall · t theme · / search · ? keys · q quit
+3 panes · j/k move · Enter attach · s/i/x agents · m machines · g trust · w wall · t theme · / find · ? keys · q quit

@@ -1,7 +1,7 @@
 tui_attach_30panes_ms (perf-budget.toml): 300
-measured first correct frame: 87 ms
+measured first correct frame: 89 ms
 panes: 30 (each emitting a marker every 500 ms => working)
-one `PanesDetail` round trip (incl. handshake): 122 ms
+one `PanesDetail` round trip (incl. handshake): 144 ms
 pty: 60 rows x 160 cols
 pass: true
 

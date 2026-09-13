@@ -1,20 +1,20 @@
-┌this machine · socket─────┐┌◉ beta [question] ▶─────────────────────────┐┌● alpha [working]───────────────────────────┐
-│  ◉ question              ││Proceed? [y/n]                              ││ALPHA-MARKER                                │
-│ ▸ beta        3M █░░░░░░░││                                            ││                                            │
-│   Proceed? [y/n]         ││                                            ││                                            │
-│  ● working               ││                                            ││                                            │
-│   alpha       3M █░░░░░░░││                                            ││                                            │
-│   gamma       3M █░░░░░░░││                                            ││                                            │
-│                          ││                                            ││                                            │
-│                          ││                                            ││                                            │
-│                          ││                                            ││                                            │
-│                          ││                                            ││                                            │
-│                          ││                                            ││                                            │
-│                          ││                                            ││                                            │
-│                          ││                                            ││                                            │
+┌this machine · socket─────┐┌◉ beta [question]───────────────────────────┐┌● gamma [working]───────────────────────────┐
+│  ◉ question              ││Proceed? [y/n]                              ││GAMMA-MARKER 49                             │
+│   beta        3M █░░░░░░░││                                            ││GAMMA-MARKER 50                             │
+│   Proceed? [y/n]         ││                                            ││GAMMA-MARKER 51                             │
+│  ● working               ││                                            ││GAMMA-MARKER 52                             │
+│   gamma       3M █░░░░░░░││                                            ││GAMMA-MARKER 53                             │
+│  ○ idle                  ││                                            ││GAMMA-MARKER 54                             │
+│ ▸ alpha       3M █░░░░░░░││                                            ││GAMMA-MARKER 55                             │
+│                          ││                                            ││GAMMA-MARKER 56                             │
+│                          ││                                            ││GAMMA-MARKER 57                             │
+│                          ││                                            ││GAMMA-MARKER 58                             │
+│                          ││                                            ││GAMMA-MARKER 59                             │
+│                          ││                                            ││GAMMA-MARKER 60                             │
+│                          ││                                            ││GAMMA-MARKER 61                             │
 │                          │└────────────────────────────────────────────┘└────────────────────────────────────────────┘
-│                          │┌● gamma [working]───────────────────────────┐
-│                          ││GAMMA-MARKER                                │
+│                          │┌○ alpha [idle] ▶────────────────────────────┐
+│                          ││ALPHA-MARKER                                │
 │                          ││                                            │
 │                          ││                                            │
 │                          ││                                            │
@@ -27,4 +27,4 @@
 │                          ││                                            │
 │                          ││                                            │
 └──────────────────────────┘└────────────────────────────────────────────┘
-3 panes · j/k move · Enter attach · Tab cycle · w wall · t theme · / search · ? keys · q quit
+3 panes · j/k move · Enter attach · s/i/x agents · m machines · g trust · w wall · t theme · / find · ? keys · q quit
