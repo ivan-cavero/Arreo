@@ -185,7 +185,9 @@ pub fn restore(db: &Path, adapters: &AdapterRegistry) -> Result<Vec<RestoredPane
                 // whose id did not survive — must say so: without the line,
                 // the restored pane looks resumed and is a fresh child, which
                 // is exactly the failure the loud contract exists to prevent.
-                if let Some(reason) = no_resume_reason(record.harness.as_deref(), record.session_id.as_deref()) {
+                if let Some(reason) =
+                    no_resume_reason(record.harness.as_deref(), record.session_id.as_deref())
+                {
                     loud.push(reason);
                 }
                 spawn_plain(&record).map(|pane| (pane, None))

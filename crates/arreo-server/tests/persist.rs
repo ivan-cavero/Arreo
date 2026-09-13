@@ -297,7 +297,10 @@ fn the_no_resume_reason_names_why_a_harness_record_went_plain() {
     };
     // A record that never claimed a harness stays silent: nothing was lost.
     assert_eq!(reason(None, None), None);
-    assert_eq!(reason(None, Some("01a099cd-2d35-74c4-90c6-d0e3b10011b5")), None);
+    assert_eq!(
+        reason(None, Some("01a099cd-2d35-74c4-90c6-d0e3b10011b5")),
+        None
+    );
     // An unknown harness with an id: the registry has no strategy for it.
     let unknown = reason(Some("ghost"), Some("01a099cd-2d35-74c4-90c6-d0e3b10011b5"))
         .expect("unknown harness is loud");
