@@ -18,6 +18,7 @@ use arreo_core::identity::{DeviceId, Role};
 use arreo_core::proto::{AgentState, Message, VERSION};
 use arreo_core::theme::{Depth, Variant};
 use arreo_tui::client::{default_socket, Client, PaneSummary, Target};
+use arreo_tui::exit;
 use arreo_tui::fleet::{Code, Fleet, GrantPreview, Outcome};
 use arreo_tui::model::PaneView;
 use arreo_tui::settings;
@@ -46,6 +47,11 @@ async fn main() -> anyhow::Result<()> {
     let mut theme: Option<String> = None;
     let mut variant: Option<String> = None;
     let mut depth: Option<String> = None;
+    // T-0073: the opt-in exit. `None` = nobody said, so the config file (if
+    // any) is the answer; `Some(true)` = `--shutdown-on-exit`, `Some(false)` =
+    // `--no-shutdown-on-exit`, which overrules a config that says true.
+    let mut shutdown_flag: Option<bool> = None;
+    let mut assume_yes = false;
     let mut args = std::env::args().skip(1).peekable();
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -71,11 +77,15 @@ async fn main() -> anyhow::Result<()> {
             "--theme" => theme = args.next(),
             "--variant" => variant = args.next(),
             "--depth" => depth = args.next(),
+            "--shutdown-on-exit" => shutdown_flag = Some(true),
+            "--no-shutdown-on-exit" => shutdown_flag = Some(false),
+            "--yes" => assume_yes = true,
             "--help" | "-h" => {
                 println!(
                     "usage: arreo-tui [--socket PATH] [--theme NAME] \
                      [--variant dark|light] [--depth truecolor|256|16|none]"
                 );
+                println!("                 [--shutdown-on-exit | --no-shutdown-on-exit] [--yes]");
                 println!("       arreo-tui --machine NAME [--config PATH]   (a machine, by name)");
                 println!(
                     "       arreo-tui --remote HOST:PORT --peer DEVICE_ID [--account A] \
@@ -88,6 +98,27 @@ async fn main() -> anyhow::Result<()> {
                 println!("  --remote  a daemon on another machine, at a known address");
                 println!("  --peer    that machine's device id (as `arreo devices list` shows it)");
                 println!("  --identity  this device's identity dir (default: the standard one)");
+                println!();
+                println!("the opt-in exit (default off: quitting leaves the daemon alone)");
+                println!(
+                    "  --shutdown-on-exit  quitting also drain-stops *this machine's* daemon:"
+                );
+                println!("             it flushes every pane's ring and checkpoints its topology,");
+                println!(
+                    "             then exits 0 — never a kill, never an unlink while serving."
+                );
+                println!(
+                    "             Refused on a --machine/--remote target (the flag is about a"
+                );
+                println!("             local daemon). The same opt-in is tui.exit_kills_daemon in");
+                println!("             the config file; the flag wins over the config.");
+                println!(
+                    "  --no-shutdown-on-exit  quit without stopping the daemon, even when the"
+                );
+                println!("             config says tui.exit_kills_daemon = true (this run only)");
+                println!("  --yes      do not ask before stopping (for scripts). Otherwise live");
+                println!("             panes, remote sessions and other attached clients open a");
+                println!("             confirmation naming what would die.");
                 println!();
                 println!("keys (mouse works too; ? lists them on screen):");
                 println!("  j/k ↑/↓     move the cursor          Enter  attach the pane");
@@ -127,6 +158,37 @@ async fn main() -> anyhow::Result<()> {
     // name, and only a resolution does — so a name here is one that was resolved,
     // never one that was assumed.
     let mut session = "this machine · socket".to_string();
+    // The opt-in exit (T-0073), resolved **before** the target: a request that
+    // cannot be honored must be refused by name rather than dialed past. The
+    // flag wins over the config file, which is the same file the daemon reads
+    // for its `[relay]` section (`tui.exit_kills_daemon`).
+    let settings_depth = depth
+        .as_deref()
+        .and_then(parse_depth)
+        .unwrap_or_else(Depth::detect);
+    let (settings, settings_problem) = settings::resolve(config.as_deref(), settings_depth);
+    let opt_in = match (shutdown_flag, settings.exit_kills_daemon) {
+        (Some(true), _) => exit::OptIn::Flag,
+        (Some(false), _) => exit::OptIn::Off,
+        (None, true) => exit::OptIn::Config,
+        (None, false) => exit::OptIn::Off,
+    };
+    // The flag and the config key both name *this machine's* daemon, and a TUI
+    // attached to another machine must not try to stop it — but it must not
+    // pretend nothing was asked either. Refused here, on the way in, because
+    // the target's kind is already known from argv.
+    if let Some(target) = remote_target(&machine, remote, peer.as_deref()) {
+        if opt_in != exit::OptIn::Off {
+            eprintln!("{}", exit::remote_refusal(opt_in, &target));
+            std::process::exit(2);
+        }
+    }
+    // `--yes` exists to skip the quit confirmation. With no opt-in there is no
+    // stop and no question, and a script must not believe it said something.
+    if assume_yes && opt_in == exit::OptIn::Off {
+        eprintln!("{}", exit::yes_without_optin());
+        std::process::exit(2);
+    }
     // The trust ledger lives beside the *local* socket (trust is local, T-0059):
     // for a local target that is the socket this TUI reads, and for a remote one
     // it is the default socket — the ledger's home is this machine either way.
@@ -203,7 +265,7 @@ async fn main() -> anyhow::Result<()> {
         Target::Remote(remote) => Some(remote.cert.device().clone()),
     };
     let fleet = Fleet {
-        socket: local_socket,
+        socket: local_socket.clone(),
         // One resolution of "which identity directory is this", the same value
         // `Layout::for_socket` and the pairing flow would read from the
         // environment — carried explicitly so a test can point a ledger at a
@@ -216,8 +278,17 @@ async fn main() -> anyhow::Result<()> {
         theme,
         variant: variant.as_deref().and_then(parse_variant),
         depth: depth.as_deref().and_then(parse_depth),
-        config,
     };
+    let exit_policy = ExitPolicy {
+        shutdown: opt_in != exit::OptIn::Off,
+        assume_yes,
+    };
+    let startup = Startup {
+        settings,
+        settings_problem,
+        exit: exit_policy,
+    };
+    let identity = Identity { role, device };
 
     enable_raw_mode()?;
     crossterm::execute!(
@@ -227,14 +298,31 @@ async fn main() -> anyhow::Result<()> {
     )?;
     let backend = CrosstermBackend::new(std::io::stdout());
     let mut terminal = Terminal::new(backend)?;
-    let result = run(target, session, request, fleet, role, device, &mut terminal).await;
+    let result = run(
+        target,
+        session,
+        request,
+        startup,
+        fleet,
+        identity,
+        &mut terminal,
+    )
+    .await;
     disable_raw_mode()?;
     crossterm::execute!(
         std::io::stdout(),
         event::DisableMouseCapture,
         crossterm::terminal::LeaveAlternateScreen
     )?;
-    result
+    let exit = result?;
+    if exit == Exit::StopDaemon {
+        // T-0073: the operator's one "I am done" gesture. Now that the TUI has
+        // left the terminal and dropped its connection, hand the daemon the
+        // graceful drain-stop (T-0012 semantics, through the CLI that owns that
+        // path) and let its exit code be this process's.
+        std::process::exit(exit::stop_local_daemon(&local_socket));
+    }
+    Ok(())
 }
 
 /// Enough of a device id to name it on screen without filling the sidebar.
@@ -301,9 +389,63 @@ struct ThemeRequest {
     theme: Option<String>,
     variant: Option<Variant>,
     depth: Option<Depth>,
-    /// `--config PATH` (T-0076): the same file the daemon reads, for its `[tui]`
-    /// section. `$ARREO_CONFIG` is the fallback, resolved by `settings`.
-    config: Option<PathBuf>,
+}
+
+/// The opt-in exit as this run resolved it (T-0073): the flag's answer over the
+/// config file's, and whether the operator asked not to be prompted.
+#[derive(Debug, Clone, Copy)]
+struct ExitPolicy {
+    /// Quitting stops the local daemon (never true on a remote target: that is
+    /// refused on the way in).
+    shutdown: bool,
+    /// `--yes`: skip the quit confirmation.
+    assume_yes: bool,
+}
+
+/// What the UI loop decided on its way out (T-0073).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Exit {
+    /// Quit only: the daemon keeps serving (the default).
+    Quit,
+    /// Quit, then drain-stop the local daemon.
+    StopDaemon,
+}
+
+/// Everything `main` resolved before the terminal was taken: what the config
+/// file asked for, whether it could be read at all, and how this run exits.
+///
+/// One struct rather than four parameters because they are one fact — "how this
+/// process was told to behave" — and they travel together from the argv loop
+/// (which has to resolve the opt-in before the target is dialed) into `run`.
+struct Startup {
+    settings: settings::Settings,
+    /// The status line for a config file that could not be used.
+    settings_problem: Option<String>,
+    exit: ExitPolicy,
+}
+
+/// What this device may do (T-0074): its role, and its id when it has one. Both
+/// come from the same match on the target, so they travel together.
+struct Identity {
+    role: Role,
+    device: Option<DeviceId>,
+}
+
+/// The target's human label when it is on another machine, for the opt-in's
+/// refusal (T-0073). `None` for a local target — the only case the opt-in can
+/// be honored in.
+fn remote_target(
+    machine: &Option<String>,
+    remote: Option<SocketAddr>,
+    peer: Option<&str>,
+) -> Option<String> {
+    if let Some(name) = machine.as_deref() {
+        return Some(format!("another machine (--machine {name})"));
+    }
+    remote.map(|addr| match peer {
+        Some(peer) => format!("another machine (--remote {addr}, peer {peer})"),
+        None => format!("another machine (--remote {addr})"),
+    })
 }
 
 fn parse_variant(raw: &str) -> Option<Variant> {
@@ -334,11 +476,11 @@ async fn run(
     target: Target,
     session: String,
     request: ThemeRequest,
+    startup: Startup,
     fleet: Fleet,
-    role: Role,
-    device: Option<DeviceId>,
+    identity: Identity,
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Exit> {
     let mut app = App::new();
     // Which machine, and over what (T-0061): shown in the sidebar once, not
     // repeated on every row — one sidebar is one machine's panes today.
@@ -346,14 +488,24 @@ async fn run(
     // What this device may do (T-0074). A viewer's control keys render disabled
     // with the daemon's own denial sentence rather than failing after the
     // keypress, and the local socket is always `owner` (no gate applies there).
-    app.role = role;
-    app.device = device;
+    app.role = identity.role;
+    app.device = identity.device;
     let depth = request.depth.unwrap_or_else(Depth::detect);
     app.theme = ThemeState::with_depth(depth, request.variant.unwrap_or_default());
-    // `[tui]` settings (T-0076): from the same config file the daemon reads,
-    // plus what the terminal itself decides (NO_COLOR implies still).
-    let (settings, settings_problem) = settings::resolve(request.config.as_deref(), depth);
+    // `[tui]` settings (T-0076, T-0073): from the same config file the daemon
+    // reads, plus what the terminal itself decides (NO_COLOR implies still).
+    // Resolved by `main`, because the opt-in exit has to be known before the
+    // target is dialed (a remote target refuses it).
+    let Startup {
+        settings,
+        settings_problem,
+        exit: exit_policy,
+    } = startup;
     app.settings = settings;
+    // The socket the daemon stop would be sent to (T-0073): the local one, and
+    // only ever used when the opt-in was honored — which a remote target never
+    // reaches.
+    let local_socket = fleet.socket.clone();
     if let Some(name) = request.theme.as_deref() {
         if let Err(e) = app.theme.select(name) {
             // A bad --theme is worth saying out loud, not silently ignoring.
@@ -386,17 +538,34 @@ async fn run(
     ));
 
     let mut needs_draw = true;
-    loop {
+    // The loop's value: whether it is leaving to stop the daemon (T-0073).
+    // Every exit from it assigns, which is why this is a loop expression rather
+    // than a flag initialized to a value nothing reads.
+    let stop_daemon = 'ui: loop {
         if event::poll(Duration::from_millis(50))? {
             match event::read()? {
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
-                    if !app.on_key(key.code) {
-                        break;
-                    }
-                    // The operator acted: the one-shot result's moment is over
-                    // (and a fresh one, if the key queued a verb, will replace
-                    // it when its answer lands).
+                    // The previous answer's moment is over: the operator acted.
+                    // Cleared *before* the key is dispatched, so a key whose own
+                    // answer is a line — a declined confirmation (T-0073) — has
+                    // something to keep.
                     app.result = None;
+                    if !app.on_key(key.code) {
+                        // `q`/Esc asked to quit. With the opt-in on, quitting
+                        // also drain-stops the local daemon — behind the
+                        // guards: nothing live means nothing to ask about, and
+                        // anything live opens a confirmation that names it
+                        // first (T-0073). `--yes` is the scripted "do not ask".
+                        if exit_policy.shutdown && !exit_policy.assume_yes {
+                            let doomed = exit::doomed(app.model.panes(), &local_socket);
+                            if doomed.is_empty() {
+                                break 'ui true;
+                            }
+                            app.confirm = Some(exit::shutdown_confirm(&doomed, &local_socket));
+                        } else {
+                            break 'ui exit_policy.shutdown;
+                        }
+                    }
                     needs_draw = true;
                 }
                 Event::Mouse(mouse) => {
@@ -434,6 +603,7 @@ async fn run(
                         .map(|s| PaneView {
                             id: s.id.clone(),
                             state: state_name(&s.state),
+                            alive: s.alive,
                             ram_kb: s.ram_kb,
                             lines: Vec::new(),
                             ram_history: s.ram_history.clone(),
@@ -503,6 +673,10 @@ async fn run(
                         })
                         .await;
                 }
+                // The quit confirmation's `yes` (T-0073): leave the loop with
+                // the stop armed. Nothing is sent to the daemon from here —
+                // the drain-stop runs after the terminal is handed back.
+                Action::QuitDaemon => break 'ui true,
                 _ => {
                     let fleet = fleet.clone();
                     let tx = tx.clone();
@@ -532,9 +706,12 @@ async fn run(
             terminal.draw(|frame| app.render(frame))?;
             needs_draw = false;
         }
-    }
+    };
     poller.abort();
-    Ok(())
+    Ok(match stop_daemon {
+        true => Exit::StopDaemon,
+        false => Exit::Quit,
+    })
 }
 
 /// One verb from the UI, run on the held connection (T-0074).
@@ -658,6 +835,9 @@ async fn run_fleet_action(fleet: Fleet, action: Action, tx: tokio::sync::mpsc::S
             }
         }
         Action::Spawn { .. } | Action::Kill { .. } | Action::Send { .. } => None,
+        // Answered by the event loop before it ever gets here (T-0073): a quit
+        // is not a fleet verb.
+        Action::QuitDaemon => None,
     };
     if let Some(outcome) = outcome {
         let _ = tx.send(Poll::Fleet { action, outcome }).await;

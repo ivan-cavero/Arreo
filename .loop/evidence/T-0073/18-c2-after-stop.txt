@@ -1,0 +1,3 @@
+T-0073(c2) — confirmed with omega live: TUI exited: true;
+daemon gone: true. omega's `sleep 20` keeps running (the daemon
+says so itself) and exits on its own.

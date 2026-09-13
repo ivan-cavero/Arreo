@@ -209,6 +209,12 @@ pub enum Action {
     TrustRevoke {
         device: String,
     },
+    /// Quit, and take the opt-in's drain-stop with it (T-0073). The only action
+    /// the UI queues for itself: the quit confirmation's `yes` produces it, and
+    /// the main loop answers it by leaving the event loop with the stop armed.
+    /// Nothing is sent to the daemon here — the stop happens after the terminal
+    /// is handed back, through the CLI's own `server stop`.
+    QuitDaemon,
 }
 
 /// A one-line prompt (T-0074). What Enter does with the text is decided by
@@ -1557,6 +1563,9 @@ impl App {
             | Action::Kill { .. }
             | Action::Send { .. }
             | Action::TrustPreview { .. } => {}
+            // Never reaches here: the main loop answers a quit before it asks
+            // the fleet for anything (T-0073).
+            Action::QuitDaemon => {}
         }
     }
 
@@ -1762,10 +1771,16 @@ impl App {
             K::Esc | K::Char('n') | K::Char('q') => {
                 // The CLI's own line for a human who did not confirm, so a
                 // cancelled grant reads the same as one declined at the CLI.
+                //
+                // Held on `result`, not `status` (T-0073): the status line
+                // is rewritten by the 1 Hz pane poll, and a refusal that can
+                // be wiped before it is read is not a refusal. This is the
+                // same surface a verb's answer uses, and for the same
+                // reason.
                 let cancel = confirm.cancel.clone();
                 self.confirm = None;
                 if let Some(line) = cancel {
-                    self.status = line;
+                    self.result = Some(line);
                 }
             }
             _ => {}

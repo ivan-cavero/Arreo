@@ -1,0 +1,59 @@
+T-0073 mutation proof — the two load-bearing checks
+===================================================
+
+Method: apply the mutation, rebuild `arreo-tui`, run `cargo xtask e2e --slice tui`,
+record which checks go red, revert, re-run to confirm green. Nothing else changes.
+
+(i) The flag's default flipped to on
+------------------------------------
+Mutation: `crates/arreo-tui/src/main.rs`, the `ExitPolicy` built for the run —
+`shutdown: opt_in != exit::OptIn::Off` becomes `shutdown: true`.
+
+Result: RED, 77 passed / 3 failed.
+
+    [FAIL] tui: q quits cleanly: TUI still running after q
+    [FAIL] tui: T-0073(a): a default quit leaves the daemon serving: TUI exited: false, daemon answers: true, daemon pid: Some(3755190)
+
+Reading: with the default on, a plain `q` no longer quits at all — the live
+panes in the T-0015 fixture open the quit confirmation instead, which is exactly
+what "default off" means for this ticket. The (a) check goes red because the TUI
+is still up; it asserts `quit_clean && serving && daemon_pid.is_some()`, so a
+prompt holding the loop open fails it rather than passing it for the wrong
+reason. (This is why the check was strengthened after the first mutation run:
+the first version asserted only that the daemon still answered, and passed on a
+TUI that had not exited.)
+
+(ii) The live-pane confirmation removed
+---------------------------------------
+Mutation: `crates/arreo-tui/src/main.rs`, the quit branch — the
+`if doomed.is_empty() { break } / app.confirm = Some(shutdown_confirm(...))`
+pair replaced by an unconditional `break 'ui true`.
+
+Result: RED, 74 passed / 6 failed.
+
+    [FAIL] tui: T-0073(c): a flag quit with a live pane asks first, naming what dies: the confirmation did not name the live pane
+    [FAIL] tui: T-0073(c): `n` aborts the quit — the TUI is still up: the TUI exited despite the declined confirmation
+    [FAIL] tui: T-0073(c): ...and the daemon is untouched: the daemon stopped after a declined confirmation
+    [FAIL] tui: T-0073(c): ...with the CLI's own refusal line on the status: the declined confirmation said nothing
+    [FAIL] tui: T-0073(c): the pane can be killed over the protocol: the kill verb refused
+    [FAIL] tui: T-0073(c2): the confirmation is what stands between q and the stop: the confirmation did not name omega
+
+Reading: without the confirmation a `q` with a live pane goes straight through
+and the daemon dies, which is the whole thing the guard exists to prevent. The
+"pane can be killed" and (c2) failures are downstream of the case's daemon
+already being gone (there is nothing left to kill, and no second prompt to
+confirm).
+
+Reverted: both mutations are out of the tree; the final run is
+`cargo xtask e2e --slice tui` -> `tui: 80 passed, 0 failed`.
+
+Not mutation-checked
+--------------------
+The remote-target refusal is asserted as a loud, distinct outcome instead of by
+mutation: the slice runs `arreo-tui --remote ... --shutdown-on-exit`,
+`--machine ... --config <exit_kills_daemon = true>`, and `--yes` alone without a
+pty, and requires exit code 2 plus the refusal's own text (captured in
+`20-refusals.txt`). A mutation there would be "the refusal is deleted", which is
+the same check read from the other side — there is no second code path it could
+silently fall through to, because the refusal happens before the terminal is
+taken.

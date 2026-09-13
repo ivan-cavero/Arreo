@@ -1,0 +1,3 @@
+T-0073(b3) — the flag over the file: --no-shutdown-on-exit with
+tui.exit_kills_daemon = true. TUI exited: true;
+`arreo panes` afterwards: exit_ok=true (the daemon is up)

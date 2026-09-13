@@ -1,0 +1,2 @@
+T-0073(b2) — the config key, no flag: [tui] exit_kills_daemon = true.
+TUI exited: true; daemon gone: true

@@ -28,6 +28,25 @@ pub struct Settings {
     /// No blinking, no pulsing: the `question` group keeps its dot shape and
     /// its label, and stays still.
     pub reduce_motion: bool,
+    /// The *file's* answer to "quitting this TUI also drain-stops the local
+    /// daemon" (T-0073). `false` is the default and the common case; the
+    /// run's `--shutdown-on-exit`/`--no-shutdown-on-exit` overrule it, which
+    /// is why the flag's answer is composed with this in
+    /// [`shutdown_on_exit`] rather than folded in here.
+    pub exit_kills_daemon: bool,
+}
+
+/// The run's answer to "quitting stops the local daemon" (T-0073): the flag
+/// wins, the config file is the default, and neither means off.
+///
+/// A separate function because the two sources have different strengths: the
+/// flag is a decision about *this run* and the file is a standing preference,
+/// so `--no-shutdown-on-exit` must be able to overrule a file that says true
+/// (a script quitting a TUI on a machine configured for the opt-in must be
+/// able to say no).
+#[must_use]
+pub fn shutdown_on_exit(flag: Option<bool>, file: bool) -> bool {
+    flag.unwrap_or(file)
 }
 
 /// The config file this process should read: `--config`, else `$ARREO_CONFIG`
@@ -48,6 +67,7 @@ pub fn resolve(explicit: Option<&Path>, depth: Depth) -> (Settings, Option<Strin
     // Motion is the last signal left on a NO_COLOR terminal; do not spend it.
     let mut settings = Settings {
         reduce_motion: depth == Depth::NoColor,
+        exit_kills_daemon: false,
     };
     let Some(path) = config_path(explicit) else {
         return (settings, None);
@@ -56,6 +76,7 @@ pub fn resolve(explicit: Option<&Path>, depth: Depth) -> (Settings, Option<Strin
         // The file can only ever ask for still.
         Ok(file) => {
             settings.reduce_motion |= file.reduce_motion == Some(true);
+            settings.exit_kills_daemon = file.exit_kills_daemon == Some(true);
             (settings, None)
         }
         Err(error) => (settings, Some(format!("tui settings: {error}"))),
@@ -136,5 +157,58 @@ mod tests {
             Some(explicit),
             "--config is the explicit choice"
         );
+    }
+
+    /// The opt-in (T-0073): off unless the file asks, and the flag is the
+    /// run's word over the file's standing preference.
+    #[test]
+    fn the_daemon_stop_is_off_unless_asked_and_the_flag_beats_the_file() {
+        // Nothing asked: off. This is the default the whole ticket turns on.
+        assert!(!resolve(None, Depth::Truecolor).0.exit_kills_daemon);
+        assert!(!shutdown_on_exit(None, false));
+
+        let on = temp_config("exit-on", "[tui]\nexit_kills_daemon = true\n");
+        assert!(
+            resolve(Some(&on), Depth::Truecolor).0.exit_kills_daemon,
+            "the documented key must work"
+        );
+        assert!(shutdown_on_exit(None, true), "the file is the default");
+        let _ = std::fs::remove_file(&on);
+
+        // The flag wins in both directions: a file that says true is overruled
+        // by `--no-shutdown-on-exit`, and a file that says false by
+        // `--shutdown-on-exit`.
+        assert!(
+            !shutdown_on_exit(Some(false), true),
+            "--no-shutdown-on-exit must overrule a config that says true"
+        );
+        assert!(shutdown_on_exit(Some(true), false));
+
+        let off = temp_config("exit-off", "[tui]\nexit_kills_daemon = false\n");
+        assert!(!resolve(Some(&off), Depth::Truecolor).0.exit_kills_daemon);
+        let _ = std::fs::remove_file(&off);
+
+        // A broken file is not a request for the opt-in, and it is reported.
+        let broken = temp_config("exit-broken", "[tui\nexit_kills_daemon = ");
+        let (settings, problem) = resolve(Some(&broken), Depth::Truecolor);
+        assert!(!settings.exit_kills_daemon);
+        assert!(
+            problem.is_some(),
+            "a broken file must reach the status line"
+        );
+        let _ = std::fs::remove_file(&broken);
+
+        // A key of the wrong type is the same kind of fact (T-0073 reuses the
+        // `reduce_motion` contract), not a silent `false`.
+        let wrong = temp_config("exit-wrong", "[tui]\nexit_kills_daemon = \"yes\"\n");
+        let (settings, problem) = resolve(Some(&wrong), Depth::Truecolor);
+        assert!(!settings.exit_kills_daemon);
+        assert!(
+            problem
+                .as_ref()
+                .is_some_and(|p| p.contains("exit_kills_daemon")),
+            "the report must name the key: {problem:?}"
+        );
+        let _ = std::fs::remove_file(&wrong);
     }
 }

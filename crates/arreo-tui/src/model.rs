@@ -10,6 +10,11 @@ pub struct PaneView {
     pub id: String,
     /// Engine state name: working|idle|question|blocked|done|unknown.
     pub state: &'static str,
+    /// Whether the pane's process is still running, as the daemon reports it
+    /// (`PaneDetail::alive`). The sidebar renders the state, not this — but the
+    /// opt-in exit (T-0073) has to name the panes a drain-stop would leave
+    /// behind, and a pane whose child already exited is not one of them.
+    pub alive: bool,
     pub ram_kb: u64,
     pub lines: Vec<String>,
     /// Recent peak RSS samples for the sparkline (T-0040): oldest first, KiB.

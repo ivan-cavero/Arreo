@@ -24,6 +24,7 @@ fn views() -> Vec<PaneView> {
     vec![PaneView {
         id: "alpha".into(),
         state: "working",
+        alive: true,
         ram_kb: 1024,
         lines: vec!["alpha output".into()],
         ram_history: Vec::new(),
@@ -425,9 +426,14 @@ fn the_grant_confirmation_shows_the_fingerprint_and_queues_the_grant() {
             role: "viewer".into(),
         }
     );
-    // Cancelling says what the CLI says when a human does not confirm.
+    // Cancelling says what the CLI says when a human does not confirm — on the
+    // line the status bar holds (T-0073: the 1 Hz poll rewrites `status`, so a
+    // refusal kept there could be wiped before it is read).
     app.on_key(KeyCode::Esc);
-    assert_eq!(app.status, "machines trust: not confirmed; nothing changed");
+    assert_eq!(
+        app.result.as_deref(),
+        Some("machines trust: not confirmed; nothing changed")
+    );
     assert_eq!(app.take_action(), None);
 }
 

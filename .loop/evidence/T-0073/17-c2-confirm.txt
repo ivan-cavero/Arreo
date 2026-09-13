@@ -1,0 +1,30 @@
+┌this machine · socket─────┐┌(no pane attached — Enter on a sidebar row)───────────────────────────────────────────────┐
+│  ? unknown               ││                                                                                          │
+│▶  omega       3M █░░░░░░░││                                                                                          │
+│                          ││                                                                                          │
+│                          ││                                                                                          │
+│                          ││                                                                                          │
+│                          ││                                                                                          │
+│                          ││                                                                                          │
+│                          ││                                                                                          │
+│                      ┌stop this machine's daemon on exit?─────────────────────────────────────┐                      │
+│                      │quitting will drain-stop the daemon at                                  │                      │
+│                      │/tmp/arreo-e2e-tui73-c2-3886280.sock (flush every pane's ring,          │                      │
+│                      │checkpoint its topology, exit 0).                                       │                      │
+│                      │the panes keep running, but nothing will be watching them; restart the  │                      │
+│                      │daemon to restore them from the checkpoint.                             │                      │
+│                      │live panes (1): omega                                                   │                      │
+│                      │every other attached client loses its daemon connection.                │                      │
+│                      │type 'yes' to confirm, or Esc                                           │                      │
+│                      │                                                                        │                      │
+│                      └ y confirm · Esc cancel─────────────────────────────────────────────────┘                      │
+│                          ││                                                                                          │
+│                          ││                                                                                          │
+│                          ││                                                                                          │
+│                          ││                                                                                          │
+│                          ││                                                                                          │
+│                          ││                                                                                          │
+│                          ││                                                                                          │
+│                          ││                                                                                          │
+└──────────────────────────┘└──────────────────────────────────────────────────────────────────────────────────────────┘
+1 panes · j/k move · Enter attach · s/i/x agents · m machines · g trust · w wall · t theme · / find · ? keys · q quit

@@ -48,6 +48,18 @@ pub fn run(rest: &[String]) -> ExitCode {
         .join("evidence")
         .join("T-0079");
     let _ = std::fs::create_dir_all(&evidence_dir_79);
+    // T-0073's captures: the opt-in exit, case by case — the frames a reviewer
+    // reads for "the flag stops the daemon", "the live-pane prompt asks and `n`
+    // aborts", and "a remote target is refused". Written on every run: the
+    // confirmation is a *screen*, and a check that only asserts a substring
+    // cannot show what the operator would have seen.
+    let evidence_dir_73 = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("workspace root")
+        .join(".loop")
+        .join("evidence")
+        .join("T-0073");
+    let _ = std::fs::create_dir_all(&evidence_dir_73);
     if evidence {
         let _ = std::fs::create_dir_all(&evidence_dir);
         let _ = std::fs::create_dir_all(&evidence_dir_76);
@@ -726,6 +738,35 @@ pub fn run(rest: &[String]) -> ExitCode {
         "TUI still running after q",
     );
 
+    // ---- T-0073(a): the default is unchanged ------------------------------
+    //
+    // The TUI is a client, not an owner (T-0015): `q` quit it and the daemon
+    // this whole slice has been driving is still serving. Both halves are in
+    // this check on purpose — the TUI must be *gone* (a prompt holding it open
+    // is not a quit) and the daemon must answer. It is the check the opt-in's
+    // default turns red if it ever flips: nothing here passes
+    // `--shutdown-on-exit`.
+    let (serving, panes_out) = cli(&cli_bin, &socket, &["panes"]);
+    let daemon_pid = daemon_pid_naming(&socket);
+    let quit_clean = session.exited();
+    check(
+        "T-0073(a): a default quit leaves the daemon serving",
+        quit_clean && serving && daemon_pid.is_some(),
+        &format!("TUI exited: {quit_clean}, daemon answers: {serving}, daemon pid: {daemon_pid:?}"),
+    );
+    let _ = std::fs::write(
+        evidence_dir_73.join("01-default-quit-daemon-serving.txt"),
+        format!(
+            "T-0073(a) — `q` with no opt-in: the TUI is gone, the daemon is not.\n\
+             \n\
+             socket {} exists (a serving daemon holds it)\n\
+             daemon pid (by /proc argv scan): {daemon_pid:?}\n\
+             `arreo panes --socket {}` -> exit_ok={serving}:\n{panes_out}\n",
+            socket.display(),
+            socket.display(),
+        ),
+    );
+
     // ---- T-0076: every depth a terminal can be, and the motion switch -------
     //
     // One session per terminal shape against the same daemon (beta is still
@@ -1115,24 +1156,365 @@ pub fn run(rest: &[String]) -> ExitCode {
 
     // Kill every pane before the daemon goes, so no `sh` survives the slice,
     // then quit the TUI cleanly.
+    //
+    // Over the protocol, and checked: `arreo` has no `kill` subcommand, so the
+    // old `cli(..., ["kill", id])` here was a silent no-op that left 30 panes
+    // running past the end of the run. A cleanup whose failure is swallowed is
+    // not a cleanup.
+    let mut killed = 0usize;
     for id in &wall_ids {
-        let _ = cli(&cli_bin, &wall_socket, &["kill", id]);
+        if kill_pane(&wall_socket, id) {
+            killed += 1;
+        }
     }
+    check(
+        "the wall's panes are killed before their daemon goes",
+        killed == wall_ids.len(),
+        &format!("killed {killed} of {} wall panes", wall_ids.len()),
+    );
     wall.send("q");
     std::thread::sleep(Duration::from_millis(500));
     drop(wall);
     drop(wall_server);
-    let _ = std::fs::remove_file(&wall_socket);
-    let mut wall_db = wall_socket.clone().into_os_string();
-    wall_db.push(".db");
-    let _ = std::fs::remove_file(&wall_db);
+    for path in sidecars(&wall_socket) {
+        let _ = std::fs::remove_file(path);
+    }
+
+    // The main fixture's own panes (alpha, beta, gamma): the same rule, and the
+    // daemon is still up to take the kill.
+    for (id, _) in &panes {
+        let _ = kill_pane(&socket, id);
+    }
 
     drop(session);
     drop(server);
-    let _ = std::fs::remove_file(&socket);
-    let mut db = socket.into_os_string();
-    db.push(".db");
-    let _ = std::fs::remove_file(&db);
+    for path in sidecars(&socket) {
+        let _ = std::fs::remove_file(path);
+    }
+
+    // ---- T-0073: the opt-in exit -------------------------------------------
+    //
+    // The default is checked above, on the daemon this whole slice has been
+    // driving. What is left is the opt-in itself, each case on its **own**
+    // daemon (the good cases end with the daemon gone, so they cannot share
+    // one): the flag, the config key, the override that beats it, the
+    // confirmation with a live pane, `--yes`, and the refusal on a target that
+    // is not this machine.
+    let config_73 =
+        std::env::temp_dir().join(format!("arreo-e2e-tui73-{}.toml", std::process::id()));
+    std::fs::write(&config_73, "[tui]\nexit_kills_daemon = true\n")
+        .expect("write the T-0073 config");
+    let config_arg_73 = config_73.to_str().expect("utf-8 temp path").to_string();
+
+    // (b) `--shutdown-on-exit`, nothing live: no prompt, a clean stop.
+    if let Some(case) = Daemon::start(&server_bin, &cli_bin, "b", &[]) {
+        if let Some(mut tui) =
+            TuiSession::start_with(&tui_bin, &case.socket, &["--shutdown-on-exit"], &[])
+        {
+            std::thread::sleep(Duration::from_secs(3));
+            let _ = std::fs::write(evidence_dir_73.join("10-b-before-quit.txt"), tui.screen());
+            tui.send("q");
+            let stopped = wait_exit(&mut tui, Duration::from_secs(20));
+            let transcript = String::from_utf8_lossy(&tui.transcript()).to_string();
+            check(
+                "T-0073(b): --shutdown-on-exit quits with nothing live (no prompt)",
+                stopped,
+                "the TUI never exited after q",
+            );
+            // T-0012's contract: the daemon's last act is removing the socket
+            // file, and the process is gone with it. Both, because a socket
+            // left behind would be the "unlink while serving" failure read the
+            // other way round.
+            let socket_gone = !case.socket.exists();
+            let process_gone = wait_daemon_gone(&case.socket, Duration::from_secs(5));
+            check(
+                "T-0073(b): the daemon is gone (process + socket file, per T-0012)",
+                socket_gone && process_gone,
+                &format!(
+                    "socket exists: {}, process: {}",
+                    !socket_gone, !process_gone
+                ),
+            );
+            check(
+                "T-0073(b): nothing answers on the socket afterwards",
+                !case.serving(&cli_bin),
+                "the daemon still answers after the stop",
+            );
+            check(
+                "T-0073(b): the stop was the CLI's own line (server stopped)",
+                transcript.contains("server stopped (pid"),
+                "the CLI's stop line never reached the terminal",
+            );
+            let _ = std::fs::write(
+                evidence_dir_73.join("11-b-after-stop.txt"),
+                format!(
+                    "T-0073(b) — `arreo-tui --shutdown-on-exit`, no panes, `q`.\n\
+                     \n\
+                     TUI exited: {stopped}\n\
+                     socket file removed (the daemon's last act, T-0012): {socket_gone}\n\
+                     no daemon process names the socket: {process_gone}\n\
+                     `arreo panes` afterwards: exit_ok={}\n\
+                     the CLI's own stop line reached the terminal: {}\n\
+                     \n\
+                     --- the stop line ---\n{}\n",
+                    case.serving(&cli_bin),
+                    transcript.contains("server stopped (pid"),
+                    transcript
+                        .lines()
+                        .find(|line| line.contains("server stopped"))
+                        .unwrap_or("<not found>"),
+                ),
+            );
+        }
+        drop(case);
+    }
+
+    // (b2) the same opt-in, from the config the daemon already reads.
+    if let Some(case) = Daemon::start(&server_bin, &cli_bin, "b2", &[]) {
+        if let Some(mut tui) =
+            TuiSession::start_with(&tui_bin, &case.socket, &["--config", &config_arg_73], &[])
+        {
+            std::thread::sleep(Duration::from_secs(3));
+            tui.send("q");
+            let stopped = wait_exit(&mut tui, Duration::from_secs(20));
+            let gone =
+                !case.socket.exists() && wait_daemon_gone(&case.socket, Duration::from_secs(5));
+            check(
+                "T-0073(b2): tui.exit_kills_daemon = true stops the daemon too",
+                stopped && gone,
+                &format!("exited: {stopped}, daemon gone: {gone}"),
+            );
+            let _ = std::fs::write(
+                evidence_dir_73.join("12-b2-config-quit.txt"),
+                format!(
+                    "T-0073(b2) — the config key, no flag: [tui] exit_kills_daemon = true.\n\
+                     TUI exited: {stopped}; daemon gone: {gone}\n"
+                ),
+            );
+        }
+        drop(case);
+    }
+
+    // (b3) `--no-shutdown-on-exit` overrules a config that says true.
+    if let Some(case) = Daemon::start(&server_bin, &cli_bin, "b3", &[]) {
+        if let Some(mut tui) = TuiSession::start_with(
+            &tui_bin,
+            &case.socket,
+            &["--config", &config_arg_73, "--no-shutdown-on-exit"],
+            &[],
+        ) {
+            std::thread::sleep(Duration::from_secs(3));
+            tui.send("q");
+            let stopped = wait_exit(&mut tui, Duration::from_secs(20));
+            let still_serving = case.serving(&cli_bin);
+            check(
+                "T-0073(b3): --no-shutdown-on-exit overrules the config for the run",
+                stopped && still_serving,
+                &format!("exited: {stopped}, daemon still serving: {still_serving}"),
+            );
+            let _ = std::fs::write(
+                evidence_dir_73.join("13-b3-no-shutdown-override.txt"),
+                format!(
+                    "T-0073(b3) — the flag over the file: --no-shutdown-on-exit with\n\
+                     tui.exit_kills_daemon = true. TUI exited: {stopped};\n\
+                     `arreo panes` afterwards: exit_ok={still_serving} (the daemon is up)\n"
+                ),
+            );
+        }
+        drop(case);
+    }
+
+    // (c) a live pane: the confirmation asks first, and `n` aborts.
+    if let Some(case) = Daemon::start(&server_bin, &cli_bin, "c", &[("zeta", "sleep 60")]) {
+        if let Some(mut tui) =
+            TuiSession::start_with(&tui_bin, &case.socket, &["--shutdown-on-exit"], &[])
+        {
+            // Long enough for the sidebar to have zeta *and* for its state to
+            // settle, so the guard is reading a live pane rather than racing
+            // the first poll.
+            std::thread::sleep(Duration::from_secs(4));
+            tui.send("q");
+            std::thread::sleep(Duration::from_millis(600));
+            let prompt = tui.screen();
+            let _ = std::fs::write(evidence_dir_73.join("14-c-confirm.txt"), &prompt);
+            check(
+                "T-0073(c): a flag quit with a live pane asks first, naming what dies",
+                prompt.contains("stop this machine's daemon on exit?")
+                    && prompt.contains("live panes (1): zeta"),
+                "the confirmation did not name the live pane",
+            );
+            tui.send("n");
+            std::thread::sleep(Duration::from_millis(600));
+            let after = tui.screen();
+            let _ = std::fs::write(evidence_dir_73.join("15-c-after-n.txt"), &after);
+            check(
+                "T-0073(c): `n` aborts the quit — the TUI is still up",
+                !tui.exited(),
+                "the TUI exited despite the declined confirmation",
+            );
+            check(
+                "T-0073(c): ...and the daemon is untouched",
+                case.serving(&cli_bin) && case.socket.exists(),
+                "the daemon stopped after a declined confirmation",
+            );
+            check(
+                "T-0073(c): ...with the CLI's own refusal line on the status",
+                after.contains("shutdown-on-exit: not confirmed; nothing changed"),
+                "the declined confirmation said nothing",
+            );
+            // The same opt-in still works after the abort: kill the pane (so no
+            // `sh` outlives the case), wait for the sidebar to drop it, then
+            // quit again — nothing live now, so no prompt and a clean stop.
+            check(
+                "T-0073(c): the pane can be killed over the protocol",
+                kill_pane(&case.socket, "zeta"),
+                "the kill verb refused",
+            );
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while Instant::now() < deadline && sidebar_region(&tui.screen()).contains("zeta") {
+                std::thread::sleep(Duration::from_millis(200));
+            }
+            tui.send("q");
+            let stopped = wait_exit(&mut tui, Duration::from_secs(20));
+            let gone =
+                !case.socket.exists() && wait_daemon_gone(&case.socket, Duration::from_secs(5));
+            check(
+                "T-0073(c): after the abort the same opt-in still stops the daemon",
+                stopped && gone,
+                &format!("exited: {stopped}, daemon gone: {gone}"),
+            );
+            let _ = std::fs::write(
+                evidence_dir_73.join("16-c-after-abort-stop.txt"),
+                format!(
+                    "T-0073(c) — declined once, then quit again with nothing live.\n\
+                     TUI exited: {stopped}; daemon gone: {gone}\n"
+                ),
+            );
+        }
+        drop(case);
+    }
+
+    // (c2) a live pane, confirmed: `y` is what stops it.
+    if let Some(case) = Daemon::start(&server_bin, &cli_bin, "c2", &[("omega", "sleep 20")]) {
+        if let Some(mut tui) =
+            TuiSession::start_with(&tui_bin, &case.socket, &["--shutdown-on-exit"], &[])
+        {
+            std::thread::sleep(Duration::from_secs(4));
+            tui.send("q");
+            std::thread::sleep(Duration::from_millis(600));
+            let prompt = tui.screen();
+            let _ = std::fs::write(evidence_dir_73.join("17-c2-confirm.txt"), &prompt);
+            check(
+                "T-0073(c2): the confirmation is what stands between q and the stop",
+                prompt.contains("stop this machine's daemon on exit?")
+                    && prompt.contains("live panes (1): omega"),
+                "the confirmation did not name omega",
+            );
+            tui.send("y");
+            let stopped = wait_exit(&mut tui, Duration::from_secs(20));
+            let gone =
+                !case.socket.exists() && wait_daemon_gone(&case.socket, Duration::from_secs(5));
+            check(
+                "T-0073(c2): `y` confirms, and the daemon stops with the pane live",
+                stopped && gone,
+                &format!("exited: {stopped}, daemon gone: {gone}"),
+            );
+            // The pane's child outlives the daemon by design ("children keep
+            // running") and self-terminates: `sleep 20`, so the case cannot
+            // leave a stray behind for longer than that.
+            let _ = std::fs::write(
+                evidence_dir_73.join("18-c2-after-stop.txt"),
+                format!(
+                    "T-0073(c2) — confirmed with omega live: TUI exited: {stopped};\n\
+                     daemon gone: {gone}. omega's `sleep 20` keeps running (the daemon\n\
+                     says so itself) and exits on its own.\n"
+                ),
+            );
+        }
+        drop(case);
+    }
+
+    // (d) `--yes`: the scripted path skips the question. A live pane is the
+    // hard case for it, and the proof that no prompt appeared is that `q`
+    // *completed* — a prompt holds the loop open until it is answered.
+    if let Some(case) = Daemon::start(&server_bin, &cli_bin, "d", &[("sigma", "sleep 20")]) {
+        if let Some(mut tui) = TuiSession::start_with(
+            &tui_bin,
+            &case.socket,
+            &["--shutdown-on-exit", "--yes"],
+            &[],
+        ) {
+            std::thread::sleep(Duration::from_secs(4));
+            let _ = std::fs::write(evidence_dir_73.join("19-d-before-quit.txt"), tui.screen());
+            tui.send("q");
+            let stopped = wait_exit(&mut tui, Duration::from_secs(20));
+            let gone =
+                !case.socket.exists() && wait_daemon_gone(&case.socket, Duration::from_secs(5));
+            check(
+                "T-0073(d): --yes stops without asking, live pane or not (scripts)",
+                stopped && gone,
+                &format!("exited: {stopped}, daemon gone: {gone}"),
+            );
+        }
+        drop(case);
+    }
+
+    // The refusal: the flag names *this machine's* daemon, and a TUI attached
+    // to another machine must not stop it. Run without a pty on purpose — the
+    // refusal happens before the terminal is touched, which is what makes it a
+    // startup fact rather than a screen the operator has to read.
+    let refusal_cases: [(&str, &[&str], &str); 3] = [
+        (
+            "flag",
+            &[
+                "--remote",
+                "127.0.0.1:1",
+                "--peer",
+                "deadbeef",
+                "--shutdown-on-exit",
+            ],
+            "--shutdown-on-exit",
+        ),
+        (
+            "config",
+            &["--machine", "build", "--config", &config_arg_73],
+            "tui.exit_kills_daemon = true",
+        ),
+        (
+            "yes",
+            &["--socket", "/tmp/arreo-tui-73-nothing.sock", "--yes"],
+            "--yes",
+        ),
+    ];
+    let mut refusal_text = String::new();
+    for (name, args, needle) in refusal_cases {
+        let output = std::process::Command::new(&tui_bin)
+            .args(args)
+            .output()
+            .expect("run arreo-tui");
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let code = output.status.code();
+        check(
+            &format!("T-0073: {name}: the refusal is loud and distinct (exit 2)"),
+            code == Some(2) && text.contains(needle),
+            &format!("code {code:?}: {text}"),
+        );
+        refusal_text.push_str(&format!(
+            "$ arreo-tui {}\nexit {code:?}\n{text}\n\n",
+            args.join(" ")
+        ));
+    }
+    check(
+        "T-0073: the remote refusal says what it refuses",
+        refusal_text.contains("must not stop that machine's daemon"),
+        "the refusal did not say it refuses a remote daemon",
+    );
+    let _ = std::fs::write(evidence_dir_73.join("20-refusals.txt"), &refusal_text);
+    let _ = std::fs::remove_file(&config_73);
 
     if failures == 0 {
         println!("tui: {passes} passed, 0 failed");
@@ -1269,4 +1651,177 @@ fn read_message(stream: &mut std::os::unix::net::UnixStream) -> Option<arreo_cor
     let mut body = vec![0u8; u32::from_le_bytes(len) as usize];
     stream.read_exact(&mut body).ok()?;
     arreo_core::proto::codec::decode(&body).ok()
+}
+
+/// Kill a pane over the protocol.
+///
+/// There is no `arreo kill` subcommand — the verb is on the wire (`Message::Kill`,
+/// which is what the TUI's own `x` sends) and the CLI never grew a front door for
+/// it. A slice that wants a pane gone must speak the protocol, and it must check
+/// the answer: a cleanup that silently fails is how panes outlive the run.
+fn kill_pane(socket: &std::path::Path, id: &str) -> bool {
+    use arreo_core::proto::{client_versions, Message, VERSION};
+
+    let Some(mut stream) = std::os::unix::net::UnixStream::connect(socket).ok() else {
+        return false;
+    };
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+    if write_message(
+        &mut stream,
+        &Message::Hello {
+            v: VERSION,
+            client: "xtask-tui-slice".to_string(),
+            wants: client_versions(),
+        },
+    )
+    .is_none()
+    {
+        return false;
+    }
+    if !matches!(read_message(&mut stream), Some(Message::Welcome { .. })) {
+        return false;
+    }
+    if write_message(
+        &mut stream,
+        &Message::Kill {
+            v: VERSION,
+            id: id.to_string(),
+        },
+    )
+    .is_none()
+    {
+        return false;
+    }
+    matches!(read_message(&mut stream), Some(Message::Ok { .. }))
+}
+
+/// One fresh daemon for a T-0073 case, on its own socket, with the panes the
+/// case asked for.
+///
+/// Its own daemon because the good cases *end* with the daemon gone: sharing
+/// one would make every later case depend on the earlier ones' outcome. Drop
+/// removes the socket and its store, so a case cannot leak a file into the
+/// next.
+struct Daemon {
+    socket: PathBuf,
+    /// The RAII handle, held for the case's whole life and never read: its
+    /// `Drop` is the kill + reap, and `Daemon::drop` (which runs first) removes
+    /// the files.
+    _server: TestServer,
+}
+
+impl Daemon {
+    /// Start a daemon and spawn `panes` (`id`, shell body) into it. `None` (with
+    /// the reason printed) when either step fails — the caller's checks then
+    /// never run, which is a failure the slice reports as such rather than a
+    /// silent pass.
+    fn start(
+        server_bin: &std::path::Path,
+        cli_bin: &std::path::Path,
+        tag: &str,
+        panes: &[(&str, &str)],
+    ) -> Option<Self> {
+        let socket =
+            std::env::temp_dir().join(format!("arreo-e2e-tui73-{tag}-{}.sock", std::process::id()));
+        for path in sidecars(&socket) {
+            let _ = std::fs::remove_file(path);
+        }
+        let server =
+            TestServer::spawn(server_bin, &socket, &format!("T-0073 {tag} server")).ok()?;
+        wait_bound(&socket);
+        for (id, body) in panes {
+            let (ok, out) = cli(cli_bin, &socket, &["spawn", id, "/bin/sh", "-c", body]);
+            if !ok {
+                println!("[FAIL] tui: T-0073 {tag}: spawn {id}: {out}");
+                return None;
+            }
+        }
+        Some(Self {
+            socket,
+            _server: server,
+        })
+    }
+
+    /// Whether this daemon is still serving: the socket answers **and** a verb
+    /// comes back. A connect alone would pass on a socket nobody drains, which
+    /// is exactly the state "unlinked while serving" would leave.
+    fn serving(&self, cli_bin: &std::path::Path) -> bool {
+        std::os::unix::net::UnixStream::connect(&self.socket).is_ok()
+            && cli(cli_bin, &self.socket, &["panes"]).0
+    }
+}
+
+impl Drop for Daemon {
+    fn drop(&mut self) {
+        // `server` drops after this body (fields drop last), so the daemon is
+        // killed and reaped before the files go.
+        for path in sidecars(&self.socket) {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+/// `<socket>` and the files the daemon keeps beside it.
+fn sidecars(socket: &std::path::Path) -> Vec<PathBuf> {
+    ["", ".db", ".db-wal", ".db-shm", ".lock"]
+        .iter()
+        .map(|suffix| {
+            let mut path = socket.as_os_str().to_os_string();
+            path.push(suffix);
+            PathBuf::from(path)
+        })
+        .collect()
+}
+
+/// The pid of the daemon serving `socket`, by the same /proc scan `arreo server
+/// stop` resolves its pid from: a process whose argv names `arreo-server` and
+/// this socket. `None` = no such process (a zombie has an empty cmdline, so it
+/// reads as gone — which is what "not serving" means).
+fn daemon_pid_naming(socket: &std::path::Path) -> Option<u32> {
+    let want = socket.to_string_lossy().to_string();
+    for entry in std::fs::read_dir("/proc").ok()?.filter_map(|e| e.ok()) {
+        // `continue`, never `?`: /proc holds non-numeric entries and
+        // unreadable pids, and either must skip rather than end the scan.
+        let pid: u32 = match entry.file_name().to_string_lossy().parse() {
+            Ok(pid) => pid,
+            Err(_) => continue,
+        };
+        let cmdline = match std::fs::read(format!("/proc/{pid}/cmdline")) {
+            Ok(cmdline) => cmdline,
+            Err(_) => continue,
+        };
+        let parts: Vec<&str> = cmdline
+            .split(|b| *b == 0)
+            .filter_map(|s| std::str::from_utf8(s).ok())
+            .collect();
+        if parts.iter().any(|p| p.ends_with("arreo-server")) && parts.iter().any(|p| *p == want) {
+            return Some(pid);
+        }
+    }
+    None
+}
+
+/// Wait (bounded) for the daemon process to leave the process table.
+fn wait_daemon_gone(socket: &std::path::Path, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if daemon_pid_naming(socket).is_none() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    daemon_pid_naming(socket).is_none()
+}
+
+/// Wait (bounded) for a pty session's process to exit. The reader thread drains
+/// the master, so a chatty child cannot block on a full pipe while we wait.
+fn wait_exit(tui: &mut TuiSession, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if tui.exited() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    tui.exited()
 }

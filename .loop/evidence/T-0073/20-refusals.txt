@@ -1,0 +1,15 @@
+$ arreo-tui --remote 127.0.0.1:1 --peer deadbeef --shutdown-on-exit
+exit Some(2)
+arreo-tui: --shutdown-on-exit stops this machine's daemon, and this TUI is attached to another machine (--remote 127.0.0.1:1, peer deadbeef). Quitting here must not stop that machine's daemon: drop the flag (or pass --no-shutdown-on-exit) to quit this TUI and leave it running.
+
+
+$ arreo-tui --machine build --config /tmp/arreo-e2e-tui73-3886280.toml
+exit Some(2)
+arreo-tui: tui.exit_kills_daemon = true asks quitting to stop this machine's daemon, and this TUI is attached to another machine (--machine build). Quitting here must not stop that machine's daemon: pass --no-shutdown-on-exit to override the config for this run.
+
+
+$ arreo-tui --socket /tmp/arreo-tui-73-nothing.sock --yes
+exit Some(2)
+arreo-tui: --yes skips the quit confirmation, which only exists when quitting also stops the daemon: pass --shutdown-on-exit (or set tui.exit_kills_daemon = true), or drop --yes.
+
+

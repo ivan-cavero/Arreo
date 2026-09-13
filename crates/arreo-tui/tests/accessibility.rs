@@ -32,6 +32,7 @@ fn view(id: &str, state: &'static str) -> PaneView {
     PaneView {
         id: id.to_string(),
         state,
+        alive: true,
         ram_kb: 3 * 1024,
         lines: vec![format!("{id} output")],
         ram_history: Vec::new(),
@@ -521,6 +522,7 @@ fn motion_is_off_when_the_switch_says_so() {
     // `[tui] reduce_motion = true`: still.
     app.settings = Settings {
         reduce_motion: true,
+        ..Settings::default()
     };
     let still = draw(&mut app, 10, 60);
     assert_eq!(blinking_cells(&still), 0, "reduce_motion must still it");

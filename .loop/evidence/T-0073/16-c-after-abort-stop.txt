@@ -1,0 +1,2 @@
+T-0073(c) — declined once, then quit again with nothing live.
+TUI exited: true; daemon gone: true

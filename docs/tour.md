@@ -164,6 +164,40 @@ reads (`--config PATH` or `$ARREO_CONFIG`), and `NO_COLOR` implies the same.
 And at 80×24 the frame is laid out for it — the sidebar gives up columns before
 the pane region does — so a small terminal degrades instead of glitching.
 
+### Quitting: the TUI is a client, not an owner
+
+`q`/Esc quits the TUI and leaves the daemon — and every pane it holds — exactly
+as it was. That is the default and it does not change.
+
+If you started the daemon *and* the TUI together and want one gesture that means
+"I am done", `arreo-tui --shutdown-on-exit` (or `[tui] exit_kills_daemon = true`
+in the same config file; the flag wins) makes quitting also **drain-stop the
+local daemon**, with `arreo server stop`'s semantics: every pane's ring is
+flushed, the topology is checkpointed, the socket is removed and the daemon
+exits 0. It is never a kill, and never an unlink while something is still
+serving. The panes' processes keep running (the daemon says so itself when it
+goes); starting it again restores them from the checkpoint.
+
+Three guards, all of them loud:
+
+- **Another machine's daemon is never touched.** `--shutdown-on-exit` names
+  *this* machine's daemon, so a `--machine`/`--remote` target refuses it by name
+  (exit 2) instead of quietly ignoring the request. `--no-shutdown-on-exit`
+  overrides a config that says `true`, for one run.
+- **Nothing dies by surprise.** With live panes (or remote sessions the daemon's
+  audit ledger records) quitting opens a confirmation that names them before
+  anything happens; `n`/Esc declines and the daemon keeps serving, with the
+  CLI's own `not confirmed; nothing changed` line on the status bar. `--yes`
+  skips the question for scripts.
+- **`--yes` alone is a usage error**: there is no question to skip without the
+  opt-in, and a flag that does nothing is a script that believes it said
+  something.
+
+A local session is recorded nowhere — the daemon keys sessions by device and the
+local socket has no device — so the confirmation cannot count the other local
+clients attached to the daemon; it says what stopping does to them rather than
+inventing a number.
+
 If you want the daemon managed for you instead of started by hand, `arreo service
 install` writes the unit for this OS and, on Linux with a systemd user session,
 enables and starts it.
@@ -207,7 +241,7 @@ table — but this table is what the code does.
 | Keys and certificates | `<identity>/identity/root.key` (the server's root), `identity/devices/<id>.cert` (pinned devices) | `identity_root()`, same file. Mode 0600/0700. |
 | The machine-directory cache | `<identity>/identity/machines.cache` | `arreo machines`; a mirror that a successful relay read replaces whole, never a source. |
 | Themes | `$ARREO_THEME_DIR`, then `$XDG_CONFIG_HOME/arreo/themes`, then `<repo>/.arreo/themes`, then `./.arreo/themes` | `default_dirs()` in `arreo_core::theme::loader`. Five themes are embedded in the binary (`arreo`, `tokyonight`, `catppuccin`, `gruvbox`, `system`), so a static build still has a theme with no data dir. The `arreo` built-in *is* [`design/BRAND.md`](../design/BRAND.md) §2, token for token, and a test compares the two files rather than a copy of the table. |
-| TUI settings | the `[tui]` section of the file named by `--config` or `$ARREO_CONFIG` | `TuiSettings::load` in `arreo_core::relay::config` — one parser for the one config file, so the TUI and the daemon cannot disagree about what it means. Today: `reduce_motion`. |
+| TUI settings | the `[tui]` section of the file named by `--config` or `$ARREO_CONFIG` | `TuiSettings::load` in `arreo_core::relay::config` — one parser for the one config file, so the TUI and the daemon cannot disagree about what it means. Today: `reduce_motion` (still the attention pulse) and `exit_kills_daemon` (quitting also drain-stops the local daemon; `--shutdown-on-exit`/`--no-shutdown-on-exit` overrule it for one run). |
 | Relay configuration | the file given by `--config PATH` or `$ARREO_CONFIG` | Shared by the daemon and the CLI (`arreo_core::relay::config`). A `[relay]` section with `enabled = true` starts the outbound session; **disabled is the default**, and no relay is needed for a local-only machine. |
 | The daemon's service unit | `~/.config/systemd/user/arreo.service`, or `~/Library/LaunchAgents/dev.arreo.daemon.plist` | `unit_path()` in `arreo_core::lifecycle`, written by `arreo service install`. Windows has no unit file: the verb prints the `sc.exe` script instead. |
 | Relay state | `<state-dir>/relay.db`, plus the pairing mailbox socket/tcp listener | `arreo-relay serve --state-dir DIR`. See [relay-deploy.md](relay-deploy.md). |
