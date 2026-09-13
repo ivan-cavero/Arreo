@@ -21,7 +21,14 @@
 //!   nullable and added by `ALTER TABLE`, so a v7 row (every pane recorded
 //!   before this) keeps its program/args/scrollback and restores exactly as it
 //!   did — no orphan databases, nothing dropped.
-//! - `open` runs `migrate()` (v1→…→v8 `CREATE TABLE IF NOT EXISTS`,
+//! - v9 (T-0083): + `sync_vectors(file, machine, counter)` and
+//!   `sync_revisions(id, file, machine, counter, created_ms, reason, content)` —
+//!   the harness config sync's version vectors and its append-only history. The
+//!   vector answers "has the peer seen everything I have", the history answers
+//!   "put back what was there" (`arreo sync revert`). Content is stored as the
+//!   bytes that were on disk, because a re-rendered copy would restore
+//!   something the operator never wrote.
+//! - `open` runs `migrate()` (v1→…→v9 `CREATE TABLE IF NOT EXISTS`,
 //!   `ALTER TABLE`, version bumps); future versions append a step. Data is
 //!   never dropped by a migration — the migration test pins a surviving rollup
 //!   row and a surviving v7 pane row.
@@ -36,6 +43,7 @@ use std::path::PathBuf;
 use thiserror::Error;
 
 use crate::fixtures::scan_secrets;
+use crate::sync::vectors::Vector;
 
 #[derive(Debug, Error)]
 pub enum SessionError {
@@ -65,7 +73,7 @@ pub enum SessionError {
     },
 }
 
-pub const SCHEMA_VERSION: u32 = 8;
+pub const SCHEMA_VERSION: u32 = 9;
 
 /// One pane's persisted record: how to respawn it + what it showed.
 #[derive(Debug, Clone, PartialEq)]
@@ -770,6 +778,35 @@ impl SessionStore {
             conn.execute_batch(
                 "ALTER TABLE panes ADD COLUMN harness TEXT;
                  ALTER TABLE panes ADD COLUMN session_id TEXT;",
+            )?;
+        }
+        // v9 (T-0083): harness config sync — the file's version vector and its
+        // history. Two tables rather than one, because they answer different
+        // questions and are written at different rates: the vector is "how far
+        // has each machine got" (one row per machine per file, rewritten on
+        // every push) and the history is "what did the file look like before"
+        // (append-only, and the thing `arreo sync revert` reads).
+        //
+        // The revision stores the file's **bytes**. That is deliberate: the
+        // point of history is to put back what was there, and a normalised or
+        // re-rendered copy would restore something the operator never wrote.
+        // The bytes are the ones the scan already approved — a synced file
+        // carries references, never secrets (T-0083) — and the store is 0600,
+        // which is the same protection the file on disk has.
+        //
+        // `reason` is text, not an enum, for the same reason `audit.action` is:
+        // the row has to stay readable after a future version adds a reason, and
+        // a reader that cannot decode a value would have to skip the row.
+        if version < 9 {
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS sync_vectors(
+                   file TEXT NOT NULL, machine TEXT NOT NULL, counter INTEGER NOT NULL,
+                   PRIMARY KEY (file, machine));
+                 CREATE TABLE IF NOT EXISTS sync_revisions(
+                   id INTEGER PRIMARY KEY AUTOINCREMENT,
+                   file TEXT NOT NULL, machine TEXT NOT NULL, counter INTEGER NOT NULL,
+                   created_ms INTEGER NOT NULL, reason TEXT NOT NULL, content BLOB NOT NULL);
+                 CREATE INDEX IF NOT EXISTS sync_revisions_file ON sync_revisions(file, id);",
             )?;
         }
         conn.execute(
@@ -1665,6 +1702,145 @@ impl SessionStore {
         )?;
         Ok(bytes.max(0) as u64)
     }
+
+    /// A file's version vector (T-0083): every machine that has pushed it, and
+    /// the counter it is at.
+    ///
+    /// Read as a whole because that is how it is used: a receiver compares its
+    /// own vector with the incoming one, so a partial read would be a wrong
+    /// answer rather than a slow one.
+    pub fn sync_vector(&self, file: &str) -> Result<Vector, SessionError> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT machine, counter FROM sync_vectors WHERE file = ?1 ORDER BY machine",
+        )?;
+        let rows = stmt.query_map(params![file], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?;
+        let mut pairs = Vec::new();
+        for row in rows {
+            let (machine, counter) = row?;
+            pairs.push((machine, counter.max(0) as u64));
+        }
+        Ok(Vector::from_pairs(pairs))
+    }
+
+    /// Every file the store has a vector for, in name order.
+    pub fn sync_files(&self) -> Result<Vec<String>, SessionError> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare("SELECT DISTINCT file FROM sync_vectors ORDER BY file")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        let mut files = Vec::new();
+        for row in rows {
+            files.push(row?);
+        }
+        Ok(files)
+    }
+
+    /// Record `machine`'s counter for `file`.
+    pub fn sync_set_counter(
+        &self,
+        file: &str,
+        machine: &str,
+        counter: u64,
+    ) -> Result<(), SessionError> {
+        let conn = self.lock()?;
+        conn.execute(
+            "INSERT INTO sync_vectors(file, machine, counter) VALUES (?1, ?2, ?3)
+             ON CONFLICT(file, machine) DO UPDATE SET counter = excluded.counter",
+            params![file, machine, clamp_ms(counter)],
+        )?;
+        Ok(())
+    }
+
+    /// Append a revision of `file` and return its row id.
+    ///
+    /// Append-only and never pruned by anything here: the history is the
+    /// undo affordance (`arreo sync revert`), and an undo that only reaches
+    /// back as far as a retention policy nobody can see is not one. The bytes
+    /// are stored as given.
+    pub fn sync_record_revision(
+        &self,
+        file: &str,
+        machine: &str,
+        counter: u64,
+        reason: &str,
+        content: &[u8],
+        created_ms: u64,
+    ) -> Result<i64, SessionError> {
+        let conn = self.lock()?;
+        conn.execute(
+            "INSERT INTO sync_revisions(file, machine, counter, created_ms, reason, content)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                file,
+                machine,
+                clamp_ms(counter),
+                clamp_ms(created_ms),
+                reason,
+                content
+            ],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    /// A file's revisions, newest first, without their content.
+    ///
+    /// Metadata only on purpose: `arreo sync history` lists these and a revert
+    /// that needs the bytes asks for one by id ([`SessionStore::sync_content`]),
+    /// so listing a long history does not read every version of the file into
+    /// memory to print four columns.
+    pub fn sync_revisions(&self, file: &str) -> Result<Vec<SyncRevision>, SessionError> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, file, machine, counter, created_ms, reason
+             FROM sync_revisions WHERE file = ?1 ORDER BY id DESC",
+        )?;
+        let rows = stmt.query_map(params![file], |row| {
+            Ok(SyncRevision {
+                id: row.get(0)?,
+                file: row.get(1)?,
+                machine: row.get(2)?,
+                counter: row.get::<_, i64>(3)?.max(0) as u64,
+                created_ms: row.get::<_, i64>(4)?.max(0) as u64,
+                reason: row.get(5)?,
+            })
+        })?;
+        let mut revisions = Vec::new();
+        for row in rows {
+            revisions.push(row?);
+        }
+        Ok(revisions)
+    }
+
+    /// One revision's bytes, by id.
+    pub fn sync_content(&self, id: i64) -> Result<Option<Vec<u8>>, SessionError> {
+        let conn = self.lock()?;
+        conn.query_row(
+            "SELECT content FROM sync_revisions WHERE id = ?1",
+            params![id],
+            |row| row.get::<_, Vec<u8>>(0),
+        )
+        .optional()
+        .map_err(SessionError::from)
+    }
+}
+
+/// One stored revision of a synced file (T-0083), without its bytes.
+///
+/// `machine` and `counter` are who created this revision and at what count, so
+/// a history reads as "workbox's revision 4" rather than "some bytes from
+/// Tuesday" — the question an operator asks when a provider list breaks is
+/// which machine's edit they are looking at.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SyncRevision {
+    pub id: i64,
+    pub file: String,
+    pub machine: String,
+    pub counter: u64,
+    pub created_ms: u64,
+    /// `push`, `sync`, `conflict` or `revert`: what produced this revision.
+    pub reason: String,
 }
 
 /// A millisecond bound as SQLite's signed integer, clamped.
@@ -1675,6 +1851,10 @@ impl SessionStore {
 /// Clamping is the honest conversion, because the two ranges agree everywhere
 /// below the epoch-plus-292-million-years point where a millisecond timestamp
 /// stops being meaningful anyway.
+///
+/// The sync counters (T-0083) use it too: they are `u64` for the same reason
+/// timestamps are, and the same `as i64` would turn "every revision" into a
+/// negative number.
 fn clamp_ms(value: u64) -> i64 {
     value.min(i64::MAX as u64) as i64
 }
@@ -2228,5 +2408,133 @@ mod trust_store_tests {
         assert_eq!(rows[0].device_id, phone);
         assert_eq!(rows[0].role, Role::Viewer);
         assert!(rows[0].is_live());
+    }
+}
+
+#[cfg(test)]
+mod sync_store_tests {
+    use super::*;
+
+    fn scratch(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "arreo-sync-store-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        dir.join("store.db")
+    }
+
+    /// A vector is one row per machine and a re-set replaces it: the count is
+    /// where a machine *is*, not a history of where it has been.
+    #[test]
+    fn a_vector_is_a_counter_per_machine() {
+        let store = SessionStore::open_memory().expect("store");
+        assert!(store
+            .sync_vector("opencode.jsonc")
+            .expect("read")
+            .is_empty());
+        store
+            .sync_set_counter("opencode.jsonc", "workbox", 1)
+            .expect("set");
+        store
+            .sync_set_counter("opencode.jsonc", "rpi5", 3)
+            .expect("set");
+        store
+            .sync_set_counter("opencode.jsonc", "workbox", 2)
+            .expect("replace");
+        let vector = store.sync_vector("opencode.jsonc").expect("read");
+        assert_eq!(vector.summary(), "rpi5:3,workbox:2");
+        assert_eq!(vector.get("mac"), 0, "a machine that never pushed is at 0");
+        assert_eq!(store.sync_files().expect("files"), ["opencode.jsonc"]);
+        // Files do not leak into each other.
+        assert!(store.sync_vector("models.json").expect("read").is_empty());
+    }
+
+    /// Every revision is kept, newest first, and the bytes come back exactly.
+    #[test]
+    fn history_keeps_every_revision_and_returns_the_bytes() {
+        let store = SessionStore::open_memory().expect("store");
+        let first = store
+            .sync_record_revision(
+                "opencode.jsonc",
+                "workbox",
+                1,
+                "push",
+                b"{\"a\":1}\n",
+                1_000,
+            )
+            .expect("record");
+        let second = store
+            .sync_record_revision("opencode.jsonc", "rpi5", 1, "sync", b"{\"a\":2}\n", 2_000)
+            .expect("record");
+        let revisions = store.sync_revisions("opencode.jsonc").expect("read");
+        assert_eq!(revisions.len(), 2);
+        assert_eq!(revisions[0].id, second, "newest first");
+        assert_eq!(revisions[0].machine, "rpi5");
+        assert_eq!(revisions[0].reason, "sync");
+        assert_eq!(revisions[1].id, first);
+        assert_eq!(revisions[1].created_ms, 1_000);
+        assert_eq!(
+            store.sync_content(second).expect("content"),
+            Some(b"{\"a\":2}\n".to_vec())
+        );
+        assert_eq!(store.sync_content(9_999).expect("missing"), None);
+    }
+
+    /// A store written before this version opens, reports the new version, and
+    /// can use the new tables — the migration adds them without touching what
+    /// was there.
+    #[test]
+    fn a_v8_store_migrates_to_v9_and_keeps_its_rows() {
+        let path = scratch("migrate");
+        {
+            let conn = Connection::open(&path).expect("open");
+            conn.execute_batch(
+                "CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT);
+                 INSERT INTO meta(key, value) VALUES ('schema_version', '8');
+                 CREATE TABLE panes(id TEXT PRIMARY KEY, program TEXT NOT NULL, args TEXT NOT NULL,
+                   cols INTEGER NOT NULL, rows INTEGER NOT NULL, harness TEXT, session_id TEXT);
+                 CREATE TABLE scrollback(pane TEXT NOT NULL, line_no INTEGER NOT NULL,
+                   text TEXT NOT NULL, PRIMARY KEY (pane, line_no));
+                 INSERT INTO panes(id, program, args, cols, rows) VALUES ('p1', 'sh', '[]', 80, 24);",
+            )
+            .expect("v8 store");
+        }
+        let store = SessionStore::open(&path).expect("migrate");
+        assert_eq!(store.schema_version().expect("version"), SCHEMA_VERSION);
+        assert_eq!(store.load_topology().expect("panes").len(), 1);
+        store
+            .sync_set_counter("opencode.jsonc", "workbox", 1)
+            .expect("the new table is usable");
+        assert!(store.sync_content(1).expect("no such revision").is_none());
+    }
+
+    /// Revisions and vectors survive a reopen: the undo affordance is on disk,
+    /// not in the process that wrote it.
+    #[test]
+    fn vectors_and_history_survive_a_reopen() {
+        let path = scratch("durable");
+        {
+            let store = SessionStore::open(&path).expect("store");
+            store
+                .sync_set_counter("opencode.jsonc", "workbox", 4)
+                .expect("set");
+            store
+                .sync_record_revision("opencode.jsonc", "workbox", 4, "push", b"clean\n", 7_000)
+                .expect("record");
+        }
+        let store = SessionStore::open(&path).expect("reopen");
+        assert_eq!(
+            store.sync_vector("opencode.jsonc").expect("read").summary(),
+            "workbox:4"
+        );
+        let revisions = store.sync_revisions("opencode.jsonc").expect("read");
+        assert_eq!(revisions.len(), 1);
+        assert_eq!(
+            store.sync_content(revisions[0].id).expect("content"),
+            Some(b"clean\n".to_vec())
+        );
     }
 }

@@ -45,13 +45,17 @@ struct RelaySection {
 /// The `[tui]` section of a configuration file (T-0076).
 ///
 /// The TUI's corner of the same file: `reduce_motion` turns the attention
-/// pulse into a still cue. A key the TUI does not know is ignored like any
-/// other unknown key — the file is shared, and refusing to start over a typo
-/// in someone else's section would be the wrong trade.
+/// pulse into a still cue, and `exit_kills_daemon` opts the TUI into
+/// drain-stopping the local daemon when it quits (T-0073). A key the TUI does
+/// not know is ignored like any other unknown key — the file is shared, and
+/// refusing to start over a typo in someone else's section would be the wrong
+/// trade.
 #[derive(Debug, Clone, Deserialize)]
 struct TuiSection {
     #[serde(default)]
     reduce_motion: Option<bool>,
+    #[serde(default)]
+    exit_kills_daemon: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -70,6 +74,12 @@ pub struct TuiSettings {
     /// `Some(true)` = no blinking or pulsing, `Some(false)` = the file asked
     /// for motion, `None` = the file does not say.
     pub reduce_motion: Option<bool>,
+    /// `Some(true)` = quitting this TUI should also drain-stop the *local*
+    /// daemon (T-0073), `Some(false)` = the file asked for the opposite,
+    /// `None` = the file does not say. `None` is not `false`: the TUI's
+    /// `--shutdown-on-exit`/`--no-shutdown-on-exit` flags are the run's word,
+    /// and an unset key must leave them the only answer.
+    pub exit_kills_daemon: Option<bool>,
 }
 
 impl TuiSettings {
@@ -96,7 +106,8 @@ impl TuiSettings {
             detail: e.to_string(),
         })?;
         Ok(Self {
-            reduce_motion: parsed.tui.and_then(|tui| tui.reduce_motion),
+            reduce_motion: parsed.tui.as_ref().and_then(|tui| tui.reduce_motion),
+            exit_kills_daemon: parsed.tui.as_ref().and_then(|tui| tui.exit_kills_daemon),
         })
     }
 }
@@ -314,6 +325,43 @@ mod tests {
             Some(false)
         );
         let _ = std::fs::remove_file(&off);
+    }
+
+    /// `tui.exit_kills_daemon` (T-0073): the opt-in to stopping the local
+    /// daemon when the TUI quits. An unset key must stay `None` — the flag is
+    /// the run's word, and a default of `false` here would be a second answer
+    /// to "did anyone ask for this".
+    #[test]
+    fn the_exit_kills_daemon_key_is_read_beside_reduce_motion() {
+        let missing = std::env::temp_dir().join("arreo-tui-config-does-not-exist-73.toml");
+        assert_eq!(
+            TuiSettings::load(&missing).expect("missing file is not an error"),
+            TuiSettings::default()
+        );
+
+        let on = write("[tui]\nexit_kills_daemon = true\n");
+        let settings = TuiSettings::load(&on).expect("ok");
+        assert_eq!(settings.exit_kills_daemon, Some(true));
+        assert_eq!(settings.reduce_motion, None, "one key is not the other");
+        let _ = std::fs::remove_file(&on);
+
+        // An explicit false is a value, not an absence: the TUI's flag may
+        // still overrule it, but the file's word must not be lost here.
+        let off = write("[tui]\nexit_kills_daemon = false\nreduce_motion = true\n");
+        let settings = TuiSettings::load(&off).expect("ok");
+        assert_eq!(settings.exit_kills_daemon, Some(false));
+        assert_eq!(settings.reduce_motion, Some(true), "both keys, one file");
+        let _ = std::fs::remove_file(&off);
+
+        // A wrong type is the caller's to report, the same contract
+        // `reduce_motion` set — and the reason names the key.
+        let wrong_type = write("[tui]\nexit_kills_daemon = \"yes\"\n");
+        let error = TuiSettings::load(&wrong_type).expect_err("wrong type");
+        assert!(
+            error.to_string().contains("exit_kills_daemon"),
+            "the reason must name the key: {error}"
+        );
+        let _ = std::fs::remove_file(&wrong_type);
     }
 
     /// A file the user named that does not parse, or that types a key wrongly,

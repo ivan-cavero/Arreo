@@ -27,6 +27,7 @@ mod reattach_slice;
 mod relay_slice;
 mod release_check;
 mod release_slice;
+mod sync_check;
 mod theme_slice;
 mod tui_slice;
 mod update_slice;
@@ -36,7 +37,7 @@ fn main() -> ExitCode {
     let (cmd, rest) = match args.split_first() {
         Some((first, rest)) => (first.as_str(), rest),
         None => {
-            eprintln!("usage: xtask <e2e|bench|conpty-smoke|check-targets> [options]");
+            eprintln!("usage: xtask <e2e|bench|conpty-smoke|check-targets|sync --check> [options]");
             return ExitCode::from(2);
         }
     };
@@ -49,9 +50,10 @@ fn main() -> ExitCode {
         "adapters" => adapters_check::run(rest),
         "package" => package::package(rest),
         "release-check" => release_check::release_check(rest),
+        "sync" => sync_check::run(rest),
         other => {
             eprintln!("unknown xtask command: {other}");
-            eprintln!("usage: xtask <e2e|bench|conpty-smoke|check-targets> [options]");
+            eprintln!("usage: xtask <e2e|bench|conpty-smoke|check-targets|sync --check> [options]");
             ExitCode::from(2)
         }
     }

@@ -18,6 +18,7 @@ pub mod relay;
 pub mod state;
 #[cfg(feature = "sqlite")]
 pub mod store;
+pub mod sync;
 pub mod theme;
 #[cfg(feature = "transport")]
 pub mod transport;
@@ -37,5 +38,18 @@ pub(crate) fn write_private_bytes(path: &std::path::Path, bytes: &[u8]) -> std::
     }
     let mut file = options.open(path)?;
     file.write_all(bytes)?;
-    file.sync_all()
+    file.sync_all()?;
+    // **`mode` is a creation mode, not a guarantee** (review F6). `OpenOptions`
+    // honours it only when `O_CREAT` actually creates the file, so a store that
+    // already exists — written by an older version, restored from a backup, or
+    // chmodded by an editor — kept its old mode while the caller's warning said
+    // it had been rewritten owner-only. A file holding this machine's provider
+    // keys is the last place to leave that to chance, so the mode is applied to
+    // the open file, which cannot race a replacement of the path.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
 }

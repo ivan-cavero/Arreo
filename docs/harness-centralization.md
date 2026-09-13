@@ -142,7 +142,7 @@ differently — and one of them does not support the brace form at all — sync 
 | --- | --- | --- | --- |
 | opencode | `{env:NAME}` | works; key absent → 401 (load-bearing, so it is genuinely reading the env) | `{env:NAME}` |
 | pi | `$NAME` or `${NAME}` | both work (both sent a working request) | `${NAME}` |
-| omp | `$NAME` **only** | `${NAME}` sent literally → 401 | `$NAME` |
+| omp | the **bare variable name** | `$NAME` and `${NAME}` are sent literally as the bearer token → 401 (measured twice, the second time through a proxy logging the Authorization header; T-0080) | the bare name |
 | others | unknown | untried | refuse until verified |
 
 These dialects are the same table the scan needs (change 2 above), and the
@@ -331,3 +331,89 @@ class table in §2 explains why).
 - Nothing in this note was exercised on a second machine: the mesh, the conflict
   copy and `arreo sync revert` are §3.8's design, described here only through the
   per-machine path/key resolution that the sync must perform.
+
+## 7. Implementation notes (T-0083, the local half)
+
+The design above is T-0075's. This section records what T-0083 actually shipped
+and where the implementation differs from the prose — the prose is the survey's
+reading, the code is the measured behaviour, and where they disagree the code
+won (each disagreement is called out).
+
+**What shipped, and where.** `crates/arreo-core/src/sync/` is the mechanism:
+`presets.rs` (the registry of §2), `paths.rs` (symbolic-path resolution, §3.11),
+`vectors.rs` (per-file version vectors), `merge.rs` (keep-both conflicts and the
+three hazards), `keychain.rs` (the bridge), and `engine.rs` (the flow, over the
+machine's own store — the vectors and the history live in the daemon's SQLite
+store, schema v9). The CLI verbs are `arreo sync …` (`list`, `push`, `payload`,
+`apply`, `history`, `revert`, `conflicts`, `merge`, `env`, `secret set|list`).
+`cargo xtask sync --check` drives the §4 story on two isolated roots.
+
+**The class check runs before the scan, and the scan is reused.** A LOCAL file
+is refused as "not syncable", before it is read — `auth.json` does not even have
+to exist for the refusal. The scan is `fixtures::scan_secrets`, never a second
+scanner; the neutral reference form `${ARREO_ENV:NAME}` is translated to a
+harness spelling *for the scan* so the reference predicate can see it (the file
+on disk is untouched). A user-declared path gets the LOCAL deny-list of §1's
+rule set as code: credential-store names, `*.db`/`*.sqlite` and sidecars,
+`sessions`/`node_modules`/`cache`/`logs`/`blobs`/`run` components, logs and
+locks, key material, and Codex `hooks.state.*.trusted_hash` blocks (a content
+rule, refused before the scan because it is untransferable rather than dirty).
+
+**The omp dialect correction.** §3.2's table says omp's native reference is
+`$NAME`. T-0080 measured the header omp actually sends and both sigil forms are
+forwarded verbatim as the bearer token (401); the working form is the bare
+variable name. The preset follows the measurement: omp's dialect is the bare
+name, and the payload's neutral form lands as the bare name on an omp machine.
+The scanner's `is_env_reference` already documented this; the doc's §3.2 row is
+the stale one.
+
+**The residual is closed here, not in the scanner.** `is_env_reference` calls
+an all-uppercase literal a reference (deliberately — the bare name is omp's
+dialect). The sync path closes it: `receive` refuses a file whose references
+this machine cannot resolve, **by name**, with the command that fixes it. A
+literal that only looks like a name therefore cannot ride along, and a real
+reference on a machine without the value is an actionable message instead of
+the provider's 401 (T-0075 measured that 401).
+
+**The neutral payload.** A payload carries the file with every reference in the
+neutral `${ARREO_ENV:NAME}` form, so the bytes on the wire are not any one
+machine's spelling; the receiver rewrites them into its own dialect before the
+file lands. Normalisation is pure text substitution over value spans (comments,
+key order and formatting survive), which is also how the absolute-path rule
+reads "a value".
+
+**Keep-both, not newest-wins.** A concurrent payload is written as
+`<name>.conflict-<machine>-<ts>.<ext>` beside the untouched live file, and the
+losing bytes are recorded in the local history (reason `conflict`), so
+consuming the copy later loses nothing. One case a vector alone gets wrong is
+protected too: a version vector counts *published* revisions, so before
+anything is written the live file's bytes are checked against the newest
+recorded revision — a live file the history has never seen (an edit made here
+and not yet pushed, or a hand-written config) takes the keep-both path even
+when the payload is strictly newer. `arreo sync merge <file>` is the explicit
+reconciliation: provider objects merge, `plugin` arrays union (sets,
+not replacement), a scalar both sides changed refuses with the key's path, a
+commented document refuses (this merge re-emits what it parsed, and dropping
+the operator's comments silently is the one outcome worse than refusing), and a
+sibling `opencode.json` is folded in and renamed aside (`.reconciled-<ts>`,
+never deleted) after the write gate has refused it.
+
+**The write gate.** Writing `opencode.jsonc` while `opencode.json` exists is
+refused, because opencode merges both (verified). The gate is data: the preset
+carries `sibling_merges`, so a harness that does not merge siblings is never
+given the rule.
+
+**The keychain bridge.** The file carries the name; the value is injected at
+PTY spawn from the machine's own store (a 0600 `$XDG_CONFIG_HOME/arreo/
+secrets.json`, written by `arreo sync secret set NAME` with the value on stdin,
+never argv and never echoed). The injection itself is the environment a spawn
+applies — `keychain::plan(...).environment()` — and the slice proves it by
+spawning a real pty child per root and observing each root's own value. The
+daemon's spawn site (`arreo-server`) is T-0086's to wire; the mechanism is here
+and `arreo sync env <file>` reports, by name, which variables this machine has
+and which it lacks.
+
+**What is T-0086's.** The transport: carrying `SyncPayload` over the mesh, the
+outbox, watching files, and conflict copies across two live machines. The
+exchange itself is a local function (`payload`/`receive`), so the slice already
+runs the whole §4 story on two isolated roots with no network.

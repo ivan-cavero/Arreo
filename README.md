@@ -145,7 +145,10 @@ Named plainly, because a roadmap item is not a feature:
   records the reserved URLs and says they are reserved.
 - **No mobile apps and no web client.** The phone and browser surfaces are roadmap
   work; today the clients are the CLI and the TUI.
-- **No config sync.** Agreeing on a file across machines is unbuilt.
+- **No config sync *yet* over the mesh.** The mechanism is built (T-0083: per-file
+  presets, version vectors, history and revert, the keychain bridge, a reference-aware
+  secret scan) and proven on two isolated roots by `cargo xtask sync --check`; the
+  transport between real machines is T-0086.
 - **No auto-update and no live handoff.** Upgrading means building and restarting.
 - **No plugin runtime.** `arreo-plugin-api` is an empty shell so the license boundary
   and the workspace shape are settled; nothing loads plugins.

@@ -98,10 +98,7 @@ fn the_measured_provider_shapes_are_flagged() {
     for shape in shapes {
         // Bare, and behind a field name that carries no hint at all: the token
         // rule is value-shaped, so the field must not decide it.
-        assert!(
-            !scan_secrets(shape).is_empty(),
-            "a bare {shape} is a token"
-        );
+        assert!(!scan_secrets(shape).is_empty(), "a bare {shape} is a token");
         assert!(
             !scan_secrets(&format!("token: {shape}")).is_empty(),
             "and stays one behind an innocent field name: {shape}"
@@ -113,7 +110,8 @@ fn the_measured_provider_shapes_are_flagged() {
 /// token rules run on the value, not on the field.
 #[test]
 fn a_reference_shaped_field_does_not_hide_a_token() {
-    let findings = scan_secrets(r#"apiKey: {env:VBK_PROD_KEY} # was sk-0123456789abcdefghijklmnop"#);
+    let findings =
+        scan_secrets(r#"apiKey: {env:VBK_PROD_KEY} # was sk-0123456789abcdefghijklmnop"#);
     assert!(
         findings.iter().any(|f| f.contains("sk-")),
         "the literal beside the reference is still found: {findings:?}"

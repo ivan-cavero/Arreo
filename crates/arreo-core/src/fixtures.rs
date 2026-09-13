@@ -374,9 +374,7 @@ pub fn is_env_reference(value: &str) -> bool {
     }
     for (open, close) in [("{env:", '}'), ("${", '}')] {
         if let Some(rest) = value.strip_prefix(open) {
-            return rest
-                .strip_suffix(close)
-                .is_some_and(|name| is_env_name(name));
+            return rest.strip_suffix(close).is_some_and(is_env_name);
         }
     }
     if let Some(rest) = value.strip_prefix('$') {
@@ -462,7 +460,8 @@ pub fn scan_secrets(text: &str) -> Vec<String> {
                 "aws_secret",
                 "client_secret",
             ] {
-                if lower.contains(key) && line.len() > lower.find(key).unwrap_or(0) + key.len() + 8 {
+                if lower.contains(key) && line.len() > lower.find(key).unwrap_or(0) + key.len() + 8
+                {
                     findings.push(format!("line {n}: possible secret assignment ({key})"));
                     break;
                 }

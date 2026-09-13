@@ -99,6 +99,19 @@ fn usage() -> ExitCode {
     eprintln!("  arreo update verify <path> [--sig <path>] [--manifest <path>] [--json]");
     eprintln!("      check an artifact against the key pinned in this repo: prints the key id and");
     eprintln!("      digest, refuses (exit 1) otherwise, and has no flag that skips the check");
+    eprintln!("  arreo sync list|push <file>|payload <file>|apply <payload>|history|revert|conflicts|merge|env");
+    eprintln!(
+        "      harness config sync (ROADMAP §3.8): presets per harness, symbolic paths resolved"
+    );
+    eprintln!(
+        "      per machine, every revision kept locally, keep-both on a conflict. `arreo sync`"
+    );
+    eprintln!(
+        "      alone prints the verbs. Secrets never travel: the file carries the variable's"
+    );
+    eprintln!(
+        "      NAME and each machine resolves it (`arreo sync secret set NAME`, value on stdin)"
+    );
     eprintln!("  arreo machines list [--json] [--all] [--offline] [--config PATH]");
     eprintln!("  arreo machines status [<name>] [--json] [--offline]   (0 ok, 2 usage, 3 unknown machine, 4 relay unreachable, 5 conflict)");
     eprintln!(
@@ -156,6 +169,7 @@ fn main() -> ExitCode {
         Some("devices") => cmd_devices(&args[2..]),
         Some("pair") => cmd_pair(&args[2..]),
         Some("machines") => machines::run(&args[2..]),
+        Some("sync") => sync::run(&args[2..]),
         Some("update") => update::run(&args[2..]),
         _ => usage(),
     }
@@ -164,6 +178,8 @@ fn main() -> ExitCode {
 mod machines;
 
 mod remote;
+
+mod sync;
 
 mod update;
 
