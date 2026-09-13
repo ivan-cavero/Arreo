@@ -1,34 +1,13 @@
 ## State snapshot          ← REWRITTEN (not appended) at every checkpoint
-Task: **T-0078 DONE** (`c024ea2`) — the daemon's files are owner-only, at creation. The p1 queue is
-now clear. T-0079, T-0036, T-0038, T-0076, T-0071, T-0070 all done.
-Where you are: 652 workspace tests / 0 failed across 64 targets; clippy clean on **both**
-toolchains; fmt clean; **13 slices green**; bench 6/6; vet 337, deny 4/4, audit 0, check-targets
-PASS/SKIP. The user's Astro `site/` is untracked and untouched.
-Next step: the p2 queue — **T-0037** (the channel half; needs its criteria re-written — it has
-zero open ones after the T-0070 split and no channel exists to fetch yet), **T-0072/T-0074/T-0075**
-(the user's harness/TUI suite), and **T-0042** (the release slice; its sign/verify/refuse half is
-startable now, its chain half needs the channel). Also T-0039 (Windows deferred update, p4) and
-T-0063 (CI, user's).
-Open workers: (none)
+Task: T-0074 (TUI manages the fleet) in flight on worker `TuiManages`; T-0037 (the channel
+half — criteria re-written this turn) in flight on worker `ChannelFetch`.
+Where you are: T-0078 done + pushed (`c024ea2`, ledger `31a26df`) — the p1 queue is clear.
+652 workspace tests / 0 failed / 64 targets; clippy clean on both toolchains; fmt clean;
+13 slices green; bench 6/6; vet 337, deny 4/4, audit 0, check-targets PASS/SKIP.
+Next step: integrate the two workers (own the `xtask/src/main.rs` registration line for
+T-0037 — ChannelFetch was told not to touch it), then run the battery, commit, push.
+Open workers: TuiManages (T-0074) · ChannelFetch (T-0037)
 Known broken: T-0063 (CI never-green — the user is working it) · Parked: T-0048 needs-human
-**T-0078 — the daemon's files are owner-only, at creation.** Measured before: socket 0775, db
-0644 — every local user could read pane scrollback (agent output), proven by reading a pane's
-token out of a 0644 `-wal`. Now 0600 everywhere, at creation: socket (both the fresh bind and
-the inherited/handoff path, fail-closed), store db/wal/shm (after migrate, with the window
-proven empty of sensitive content by the review), lock (creation mode, no window), handoff
-(already done, now tested). The security review verified all six claims (policy enforced at the
-moment it matters on every path) and its findings were addressed: two stale comments corrected,
-the `.handoff` mode test added, the store-vs-socket chmod asymmetry documented in SECURITY.md.
-Findings:
-- **A policy is a statement, not a scatter of chmods** — the mode test's failure mode reads
-  pane content out of the file, and the review's window proof shows the only pre-chmod bytes are
-  the schema version row.
-- **The test must force the conditions the measurement found.** The mode test drives the daemon
-  under umask 0002 (via a shell wrapper) because this box's ambient 077 would make pre-fix files
-  accidentally 0600 — a test that depends on the runner's umask is a test that passes for the
-  wrong reason.
-- **A security review of a mode change is worth it** — it found two stale comments that would
-  have led a future reader to fix the wrong thing, and a coverage gap (no `.handoff` mode test).
 ## Event log               ← append-only; newest last; never rewrite
 - 2026-09-10 [turn 1] ledger created; repo at e489fac (docs only); T-0001 + T-0022 (AGENTS.md gardened) done
 - 2026-09-10 [turn 2] T-0002 PTY manager done+pushed (342606c; 9 tests); PROMPT.md v2 synced + ADR 0001 (ef6c595)
@@ -176,3 +155,5 @@ Findings:
 - 2026-09-13 [turn 70] T-0078 delegated (`FileModes`): the daemon's file modes. Policy: owner-only by default (0600 files / 0700 dirs) because the store holds pane scrollback (agent output), the audit log and device records; nothing group-reachable by default. Applied at creation: the store's db/wal/shm in `SessionStore::open_once` (SQLite creates them, so chmod-after-open with the honest window statement — a brand-new store's first empty pages, before any pane content), the lock in `ExclusiveLock::acquire` (options.mode(0o600), the identity pattern, plus re-chmod for existing files), the socket after bind (the handoff socket already does this). The task's fence was amended to include `lock.rs` (the lock file is created there) and pinned to the existing SECURITY.md. Queue gardening: T-0037 has zero open criteria (all split to T-0070; the channel half needs a channel that does not exist — no signed release has run in CI), and T-0042's `--chain` criterion shares that dependency, while its sign/verify/refuse slice is startable now. Both recorded for the queue, not silently ignored.
 
 - 2026-09-13 [turn 71] T-0078 done + pushed (`c024ea2`): the daemon's files are owner-only, at creation. Policy stated in SECURITY.md (0600/0700, nothing group-reachable by default; /tmp note; upgrade path; the store-vs-socket chmod asymmetry documented); applied at creation — socket in serve_on (fresh bind and inherited/handoff path, fail-closed), store db/wal/shm in open_once after migrate (window proven empty of sensitive content by the review: only meta(schema_version) pre-chmod), lock via options.mode(0o600) + existing-file re-chmod, handoff already 0600 now covered by a test. The security review verified all six claims sound on every path; its findings addressed (two stale handoff.rs comments describing the main socket as never-chmod'd, corrected; the missing .handoff mode test, added with a deterministic window). One residual risk recorded honestly: the fresh bind's create→chmod is two syscalls with no await, a sub-microsecond same-group race at boot, not reproduced, no compensating check on the client path. The mode test drives the daemon under umask 0002 via a shell wrapper — the failing-first property must not depend on the runner's ambient umask (077 here would mask the pre-fix modes). Mutation-checked: removing the socket chmod turns it red reading the pane's token out of the file. 652 tests / 64 targets, 13 slices, bench 6/6, vet 337, deny 4/4, audit 0, check-targets PASS/SKIP.
+
+- 2026-09-13 [turn 72] T-0074 delegated to `TuiManages` (the user's p2: the TUI manages the fleet — agents from the sidebar, machines/trust verbs with the CLI's refusals, confirmations, key docs, interactive evidence). T-0037's channel criteria re-written (it had zero open after the T-0070 split; the fetch half is now startable: a URL + the T-0036 verifier, transport-agnostic, file:// tests, empty channel honest) and delegated to `ChannelFetch`. Both workers told: `xtask/src/main.rs` is mine for T-0037's registration (TuiManages owns it) — no collision.
