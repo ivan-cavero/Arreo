@@ -53,6 +53,16 @@ Windows — making §3.11's "a release is not a release if any OS is red" mechan
       loud skip with the owning task named (T-0019's no-delegation precedent) and the Unix
       chain still runs; a skip is never counted as a pass in the CI summary.
 
+## Re-scope (2026-09-13)
+
+**The CI-matrix half (criteria 4–5) is deferred.** Its files — `.github/workflows/ci.yml`
+(the matrix rows) and `nightly-bench.yml` — are the user's concurrent work (T-0063,
+CI never-green; the loop holds that file for them). The hermetic half (criteria 1–3, 6–7)
+is startable and independent: the channel T-0037 built exists, so `--chain` can drive the
+whole story against a `file://` channel with no network. The workflow wiring the slice needs
+is reported as text in the worker's evidence for a later pass, once T-0063 settles; the
+slice and `docs/release.md` land now.
+
 ## Notes
 
 - The other tasks in this slice each wire their own slice (`update`, `handoff`, the

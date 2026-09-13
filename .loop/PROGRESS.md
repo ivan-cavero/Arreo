@@ -1,30 +1,21 @@
 ## State snapshot          ← REWRITTEN (not appended) at every checkpoint
-Task: **T-0072 DONE** (`355b737`) — session resume: pi pinned, opencode continued/resumed,
-schema v8, live-proofed 16/16. **T-0075 DONE** (`c31eacd`) — the harness survey. **T-0077
-DONE** (`d9a6773`) — the handoff candidate's process tree dies with it. Ledger: `26c4097`.
-Where you are: **726 tests / 0 failed / 66 targets**; clippy clean both toolchains; fmt clean;
-12/13 slices green — the one red (`--slice handoff-abort`) is a pre-existing racing gate
-(reproduced at a7abcd8, before T-0077/T-0072) filed as **T-0084** with the mechanism; bench
-6/6; vet 337, deny 4/4, audit 0, check-targets PASS/SKIP.
-Next step: the p2 queue is clear. Remaining: **T-0042** (the release slice — startable now
-that the channel exists; its workflow half collides with the user's T-0063 CI file, so the
-slice/docs land and the workflow wiring waits or is done carefully), **T-0080** (escape-aware
-signals — the OSC/BEL mis-detection, reproduced end-to-end), **T-0083** (config sync),
-T-0081/T-0082 (gated adapter batches), T-0084 (the racing gate), T-0039 (windows deferred).
-Open workers: (none)
-Known broken: T-0063 (CI never-green — the user's; its gitleaks red was FIXED this turn via a
-triaged allowlist entry — the scanner now exits 0) · Parked: T-0048 needs-human
-**T-0072 landed — session resume, data-driven.** The adapter registry (state/registry.rs)
-selects per program/harness with NO per-harness Rust branch; the review verified the
-`{session}` injection surface is closed by construction (whole-element argv, exec, ids only
-ever generated v4/captured ses_/stored). Schema v8 is additive with a real v7-DB test. The
-worker proved a live snapshot-ordering race (capture clobbered by a later spawn snapshot) and
-gated the writers; the review's Finding A (silent fallback for named-harness records) and B
-(ungated shutdown snapshot over non-transactional save_topology) fixed and mutation-checked;
-Finding C (pi-record SKIP misclassified) fixed. The relay exchange test was itself a racing
-gate — fixed by spawning the marker before A boots (pre-existing, 8/8 + 4/4 green after).
-**T-0084 filed:** the After kill point of handoff-abort samples a coin flip (freeze signal
-stays true after commit); pre-dates T-0077/T-0072; three candidate fixes named.
+Task: **T-0080** (escape-aware state signals — the OSC/BEL mis-detection) on worker
+`EscapeSignals`; **T-0042** (the release slice, hermetic half) on worker `ReleaseSlice`.
+Where you are: turn 74 landed T-0072/T-0075/T-0077 (`b2e4526`). 726 tests / 0 failed / 66
+targets; clippy clean both toolchains; fmt clean; 12/13 slices green (the red one is the
+parked T-0084 racing gate); bench 6/6; vet 337, deny 4/4, audit 0, check-targets PASS/SKIP.
+Next step: integrate the two workers (T-0080 is daemon/state: reviewer + mutation-test the
+escape-parse; T-0042 is the release slice: sign→verify→refuse + the file:// chain), full
+battery, commit with scoped adds, push, ledger.
+Open workers: EscapeSignals (T-0080) · ReleaseSlice (T-0042)
+Known broken: T-0063 (CI never-green — the user's; its gitleaks red was fixed this turn)
+ · Parked: T-0048 needs-human
+**This turn's two.** T-0080 proves an ESC-aware parse fixes the mis-detection (§6 dogfood:
+a pane that prints one hyperlink reports Blocked today — reproduced through the product),
+records TUI-mode fixtures (the gap that let the bug ship), and adds omp as a first-class
+adapter. T-0042 is re-scoped to its hermetic half (the workflow files stay the user's during
+T-0063 — the reason is in the task file): sign→verify→refuse on a real release build and a
+file:// chain through the whole update story.
 ## Event log               ← append-only; newest last; never rewrite
 - 2026-09-10 [turn 1] ledger created; repo at e489fac (docs only); T-0001 + T-0022 (AGENTS.md gardened) done
 - 2026-09-10 [turn 2] T-0002 PTY manager done+pushed (342606c; 9 tests); PROMPT.md v2 synced + ADR 0001 (ef6c595)
@@ -180,3 +171,5 @@ stays true after commit); pre-dates T-0077/T-0072; three candidate fixes named.
 - 2026-09-13 [turn 74] Probed both harnesses live before specifying T-0072 (pi `--session-id` pins ids and its `--mode json` prints the session envelope; opencode's interactive TUI prints no id but `--continue` needs none and `--format json` carries `sessionID`) — the design decision (resume *strategy* in adapter data) is recorded in the task file. T-0072 delegated to `HarnessResume`, T-0075 (docs survey; only pi/opencode/omp installed, rest `untried`) to `HarnessSurvey`, both with the interference rule (both drive the real CLIs — isolate session stores) since they run concurrently.
 
 - 2026-09-13 [turn 74] T-0072 done + pushed: harness-aware session resume. Delegated to `HarnessResume` with a probed design (pi pins ids, opencode continues) recorded in the task file; `HarnessSurvey` ran in parallel and delivered the 18-harness matrix + centralization design. The survey proved an OSC/BEL mis-detection end-to-end (a pane printing one hyperlink reports Blocked — reproduced through the real product) → filed T-0080; filed T-0081/T-0082/T-0083 from its follow-ups. The gitleaks CI gate was RED on HEAD (a public root key in a T-0067 transcript revision still in history) — allowlisted with triage after the exact CI command reproduced exit 1; now 0. The review of T-0072 was a different agent (ReviewResume): mergeable-with-required-changes; its three findings fixed by the planner (loud no-resume reason + regression test, mutation-red when silenced; gated shutdown snapshot + real transaction; pi-record fail instead of SKIP). Two pre-existing flaky gates surfaced and were handled honestly: relay_daemon's exchange test (fixed by reordering — 8/8 and 4/4 green after) and handoff-abort (parked as T-0084 with the mechanism; it reproduced at a7abcd8 before either T-0077 or T-0072). A /tmp tmpfs at 90% was one environmental amplifier — cleaned (t38/pubcheck/relsim leftovers) and the relay suite went 3/3. Battery: 726/66, both clippys, fmt, 12/13 slices, bench 6/6, gates green. Commits: `d9a6773` (T-0077 code), `6943ed1`+reword-deferred (task records), `c31eacd`+`ee7c260` (survey + gitleaks repair), `355b737` (T-0072), `8df5b85` (relay test), `26c4097` (docs).
+
+- 2026-09-13 [turn 75] Spawned `EscapeSignals` (T-0080: ESC-aware bell, TUI fixtures, omp adapter) and `ReleaseSlice` (T-0042, hermetic half — CI matrix deferred with the reason in the task file: `.github/workflows` is the user's during T-0063). Both disjoin the shared tree; neither may touch `.github/workflows`, `site/`, or stage anything.
