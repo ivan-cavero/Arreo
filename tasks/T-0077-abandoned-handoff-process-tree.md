@@ -1,7 +1,7 @@
 ---
 id: T-0077
 title: A timed-out handoff leaves the candidate's descendants behind
-status: proposed
+status: done
 priority: 3
 depends_on: []
 phase: 2
@@ -40,18 +40,21 @@ abandons a process.
 
 ## Scope fence
 
-`crates/arreo-cli/src/update.rs` (the timeout path in `wait_for_takeover`), and
-whichever crate gains the group-kill helper.
+`crates/arreo-cli/src/update.rs` (the timeout path in `wait_for_takeover`),
+`crates/arreo-cli/Cargo.toml` (the group-kill syscall), and
+`crates/arreo-cli/tests/update_server.rs` — **amended 2026-09-13**: the regression
+test belongs beside the existing hanging-candidate test in the file that already
+owns this verb's contract, rather than in a new file for one assertion.
 
 ## Acceptance criteria
 
-- [ ] The candidate is spawned into its **own process group**
+- [x] The candidate is spawned into its **own process group**
       (`std::os::unix::process::CommandExt::process_group`, std, no new dependency).
-- [ ] On timeout the whole group is signalled, not the leader alone; the test
+- [x] On timeout the whole group is signalled, not the leader alone; the test
       spawns a candidate that forks a child and asserts **no** descendant survives.
-- [ ] The existing behaviour is unchanged on the happy path: a candidate that
+- [x] The existing behaviour is unchanged on the happy path: a candidate that
       takes over is never signalled, and its process group is irrelevant to it.
-- [ ] If the group-kill needs a syscall the crate does not have, the dependency
+- [x] If the group-kill needs a syscall the crate does not have, the dependency
       decision is recorded in the ledger per AGENTS.md — and the alternative
       (a supervisor process, or a `kill` subprocess) is named with its rejection
       reason rather than skipped.
@@ -60,6 +63,24 @@ whichever crate gains the group-kill helper.
 
 The repro is a three-line fixture: a script that answers `--version` and then
 sleeps, run against a live daemon with `--timeout-secs 2`.
+
+## Dependency decision (2026-09-13)
+
+`rustix = { version = "0.38", features = ["process"] }` added to `crates/arreo-cli`.
+**No crate enters the graph**: rustix 0.38.44 is already compiled for this target
+through arreo-core's PTY adoption (`crates/arreo-core/Cargo.toml`, same version and
+feature set), so there is no new supply-chain entry and nothing for `cargo vet` to
+weigh. Rejected alternatives, named rather than skipped:
+
+- **A `kill` subprocess** (`kill -9 -<pgid>`): resolves through `PATH`, which is
+  exactly the thing a compiled-in safety check must not depend on — an attacker- or
+  accident-controlled `kill` in front of it would decide whether a process holding
+  live agents' terminals dies.
+- **Hand-rolled `libc::kill`**: a *new* dependency (libc is not in the CLI's graph)
+  plus `unsafe` for one syscall that rustix already wraps safely.
+
+Spawn-side (`process_group(0)`) needs no dependency at all: it is
+`std::os::unix::process::CommandExt`, stable since 1.64.
 
 ## Findings
 
