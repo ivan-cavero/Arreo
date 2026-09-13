@@ -1,26 +1,27 @@
 ## State snapshot          ← REWRITTEN (not appended) at every checkpoint
-Task: **T-0083 DONE** (`e5f355f` + `42d3c5b` + `fa13ca9` hardening) — harness config sync's
-local half; **T-0073 DONE** (`d5f1c64`) — the TUI's opt-in exit that also drain-stops the
-local daemon; **T-0087 filed** (the keychain bridge's daemon wiring); **T-0086** carries the
-transport half.
+Task: **T-0084 DONE** (`8969e85`) — the handoff-abort racing gate is closed: kill point C
+freezes the incoming daemon and proves the commit was not sent before killing it, with the
+observation (never the verdict) retried up to 8 times and a loud failure if the window is
+unobservable. **All 14 slices green.**
 Where you are: **810 tests / 0 failed / 66 targets**; clippy clean on both toolchains; fmt
-clean; **13/14 slices green** — `handoff-abort` is the parked T-0084 racer (pre-existing,
-reproduced at `a7abcd8`); sync slice 14/14; tui 80, update 27, mesh 21+1, persistence 16,
-theme 33, relay 20, chaos 8; bench 6/6; vet 337, deny 4/4, audit 0, check-targets PASS/SKIP.
-Next step: **T-0084** (the handoff-abort racing gate — the only red slice) or **T-0087** (the
-keychain wiring); then T-0086 (sync over the mesh), T-0039 (windows deferred), T-0081/T-0082
-(adapter batches, gated on live CLIs), T-0085 (CI, blocked on T-0063).
+clean; **14/14 slices** (handoff-abort 41 checks, 17 consecutive green runs after the fix);
+sync 14/14; bench 6/6; vet 337, deny 4/4, audit 0, check-targets PASS/SKIP.
+Next step: **T-0087** (wire the keychain bridge into the daemon's spawn — the mechanism is
+proven at a real pty, the production injection is not built) is the highest-value remaining;
+then T-0086 (sync over the mesh), T-0039 (windows deferred), T-0081/T-0082 (adapter batches,
+gated on live CLIs), T-0085 (CI, blocked on the user's T-0063).
 Open workers: (none)
-Known broken: `--slice handoff-abort` intermittent (T-0084, mechanism + evidence filed)
+Known broken: (none — the only intermittent gate, handoff-abort, is fixed this turn)
  · T-0063 (CI never-green — the user's) · Parked: T-0048 needs-human
-**The security review earned its keep this turn.** The sync engine's own slice exchanged only
-payloads the engine itself produced, so all three HIGH findings lived in the hostile-payload
-path: a reference could splice `mcp` command syntax into the receiver's config (F1), a forged
-version vector turned keep-both into a silent overwrite and could pin a third machine's counter
-for ever (F2), and an unquoted `${ARREO_ENV:NAME}` bypassed the by-name refusal while
-false-positively refusing omp's own dialect (F3). All eight findings fixed, each with a test the
-planner mutation-checked by removing the fix. The lesson for T-0086: exchanging real payloads
-between machines is exactly what makes those paths live.
+**The gate was a race, and it is now measured rather than assumed.** Kill point C's guard —
+"the client's stream is still frozen" — is true after a commit too (the pumps stay parked
+for ever), so the kill landed after the commit on ~half the runs and killed a committed
+incoming: the one state ADR 0021 §2c cannot repair. Before-fix instrumentation showed the
+commit landing 2–32 ms *before* the kill on failing runs and 9–39 ms after on passing ones —
+a millisecond-wide window observed through a `/proc` scan of the same order. The fix freezes
+the incoming with SIGSTOP (read back from `/proc/<pid>/stat`), settles 150 ms, and only kills
+once the absence of the commit is proven; a missed window re-runs the scenario (up to 8) and
+then fails loudly. 17/17 runs green, 41 checks each.
 ## Event log               ← append-only; newest last; never rewrite
 - 2026-09-10 [turn 1] ledger created; repo at e489fac (docs only); T-0001 + T-0022 (AGENTS.md gardened) done
 - 2026-09-10 [turn 2] T-0002 PTY manager done+pushed (342606c; 9 tests); PROMPT.md v2 synced + ADR 0001 (ef6c595)
@@ -186,3 +187,5 @@ between machines is exactly what makes those paths live.
 - 2026-09-13 [turn 76] T-0083 started. The scanner half done by the planner (security-critical, held): `is_env_reference` + the measured prefixes + per-prefix minimum runs + the masker sharing the predicate. Verified at the product surface — the two negative controls from T-0075's own probe re-run through `arreo record`: `{env:VAR}` now records (was refused), `token: vbk_pro_…` now refused (was missed), a literal in the apiKey field still refused. Mutation-checked both ways. The residual (an all-uppercase literal with no provider prefix reads as a reference) is documented in the code and closed by the sync path refusing an unresolved name by name — the worker's criterion. T-0083 re-scoped to its local half; T-0086 filed for the transport half. `ConfigSync` delegated the local half.
 
 - 2026-09-13 [turn 76] T-0083 (local half) + T-0073 done. Planner held the security-critical work (the secret-scan reference rule) and the integration: the sync engine's security review returned NOT MERGEABLE with 3 HIGH findings reachable through `arreo sync apply` (F1 reference→syntax injection enabling an `mcp` command block; F2 forged vector → silent overwrite + permanent counter pinning; F3 unquoted `${ARREO_ENV:NAME}` bypassing the by-name refusal AND false-positively refusing omp's dialect); F4–F8 medium/low (Codex hook-trust shape that never occurs, no content-validity parse, 0644 store not repaired, deny-list gaps, empty HOME → relative roots). All eight fixed with mutation-checked tests (`fa13ca9`). T-0073 landed with two pty-level mutations proven (default-on, and the live-pane confirmation removed → six slice checks red). Sibling worker `ConfigSync` was frozen mid-review (told to stop editing, hand back its test diff) — the file-hostile case the brief warned about, handled by messaging rather than racing. Filed T-0087 (daemon-side keychain injection) and updated T-0083 with what it deliberately did not do. Battery: 810/66, both clippys, fmt, 13/14 slices (handoff-abort = parked T-0084), sync 14/14, bench 6/6, gates green.
+
+- 2026-09-14 [turn 77] T-0084 closed — the last red slice. Diagnosed by instrumenting the slice (kill timestamp vs the commit row's `ts_ms`: 2–32 ms before on failures, 9–39 ms after on passes) rather than by argument; fixed by freezing the incoming daemon with SIGSTOP before deciding, so the verdict is proven and only the observation is retried; a second pre-existing flake (point B's single-shot read of the abort audit row, ~3/16) found while measuring and fixed with a bounded wait. Evidence in `.loop/evidence/T-0084/racing-gate.txt`. Battery: 810/66, both clippys, fmt, **14/14 slices**, bench 6/6, gates green. Next: T-0087 (keychain wiring), T-0086 (sync over the mesh).
