@@ -1,0 +1,35 @@
+# T-0079 — the baseline, measured by the planner before the fix
+
+After the fix lands the *before* number is unreproducible without reverting, so it is
+recorded here. The mechanism is the one the TUI's `state_for` uses: per pane, a
+`Wait` for each candidate state with a 150 ms timeout, serially — and a *working* pane
+is in neither state, so it pays both timeouts. Driven through the CLI's `wait` verb,
+which speaks the same protocol to the same socket, with 30 panes each emitting output
+(the shape that fails today).
+
+```
+panes up: 30
+--- one Panes round trip (the cheap part) ---
+  panes: 15 ms
+--- the serial per-pane pass the TUI does today: 2 Wait calls × 30 panes ---
+  serial state resolution: 11674 ms  (budget for the whole first frame: 300 ms)
+
+So the poll pass alone is ~11674 ms before any frame can be correct.
+```
+
+**10,325 ms of state resolution alone**, against a **300 ms** budget for the whole
+first frame — 34× over budget before a single pixel is painted. The cheap part is not
+the problem: one `Panes` round trip over the same 30-pane wall is **21 ms** (and that
+includes ~15 ms of CLI process startup, so an in-process call is a few ms).
+
+That ratio is the whole finding: the sidebar's per-pane blocking waits cost ~490×
+the batched round trip that could replace them. It also fixes the frame's shape —
+the fix is not to make the waits faster but to stop asking per pane at all.
+
+## Why the number is 10.3 s and not the 9 s the task estimated
+
+The task's estimate (30 × ~300 ms) assumed both timeouts expire back to back. The
+extra ~0.4 s is per-call overhead: each `wait` is its own process in this harness
+(connect, handshake, timeout, disconnect), which the TUI pays in-process instead.
+The task's arithmetic was right about the mechanism and pessimistic by ~10% about
+the wall clock — the conclusion (an order of magnitude over budget) is unchanged.
