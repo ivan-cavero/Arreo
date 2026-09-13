@@ -637,7 +637,28 @@ pub struct AdoptSeed {
 
 impl Pane {
     /// Spawn `program` with `args` in a fresh PTY of `cols`×`rows`.
+    ///
+    /// The child inherits this process's environment, exactly as it always has.
+    /// [`Pane::spawn_with_env`] is the same spawn with entries added — the door
+    /// the daemon uses for the keychain bridge (T-0087).
     pub fn spawn(program: &str, args: &[&str], cols: u16, rows: u16) -> Result<Self, PtyError> {
+        Self::spawn_with_env(program, args, cols, rows, &[])
+    }
+
+    /// The same spawn with `env` **added** to the child's environment.
+    ///
+    /// Added, not replaced: the child still inherits everything this process
+    /// has, and a name in `env` that is already inherited is set to the passed
+    /// value — which is why the caller (the keychain bridge) never passes a name
+    /// the daemon already carries. One spawn implementation with two doors,
+    /// rather than two implementations that can drift.
+    pub fn spawn_with_env(
+        program: &str,
+        args: &[&str],
+        cols: u16,
+        rows: u16,
+        env: &[(String, String)],
+    ) -> Result<Self, PtyError> {
         let pty_system = native_pty_system();
         let pair = pty_system.openpty(PtySize {
             rows,
@@ -647,6 +668,9 @@ impl Pane {
         })?;
         let mut cmd = CommandBuilder::new(program);
         cmd.args(args);
+        for (name, value) in env {
+            cmd.env(name, value);
+        }
         let child = pair.slave.spawn_command(cmd)?;
         drop(pair.slave);
         Self::assemble(

@@ -41,7 +41,7 @@ use std::path::{Path, PathBuf};
 
 use crate::fixtures::is_env_reference;
 use crate::sync::paths::{MachineEnv, PathError};
-use crate::sync::presets::Dialect;
+use crate::sync::presets::{self, Class, Dialect};
 
 /// The neutral spelling the *payload* carries.
 ///
@@ -541,6 +541,127 @@ pub fn plan(text: &str, secrets: &SecretStore, machine: &str) -> InjectionPlan {
         resolved,
         missing,
     }
+}
+
+/// The environment a pane's spawn must apply, and the names this machine could
+/// not supply (T-0087).
+///
+/// Distinct from [`InjectionPlan`], which answers the same question for **one
+/// file** and is the sync verb's door. This one answers it for a *harness*: the
+/// daemon knows which adapter a pane runs under, not which config the operator
+/// edited, so it reads every synced file that harness owns and collects the
+/// names they carry.
+pub struct SpawnInjection {
+    vars: Vec<(String, String)>,
+    missing: Vec<String>,
+}
+
+impl SpawnInjection {
+    /// The `(name, value)` pairs to apply to the child.
+    #[must_use]
+    pub fn environment(&self) -> &[(String, String)] {
+        &self.vars
+    }
+
+    /// The names the harness's files reference and this machine does not hold.
+    #[must_use]
+    pub fn missing(&self) -> &[String] {
+        &self.missing
+    }
+
+    /// Nothing to inject — a harness with no preset, no synced file, or no
+    /// reference in any of them.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.vars.is_empty() && self.missing.is_empty()
+    }
+}
+
+/// The environment a spawn must apply so `harness`'s synced files resolve on
+/// this machine (T-0087).
+///
+/// ## The precedence, and why it is this way round
+///
+/// **A name the daemon's own environment already carries is left alone.** The
+/// injection is therefore strictly additive: it can supply what is missing and
+/// can never change a value the operator set for the daemon — which is what
+/// makes landing this feature unable to alter any existing deployment. A daemon
+/// started with `export VBK_PROD_KEY=…` keeps giving its children that value
+/// even if the keychain holds a different one, and the common case the feature
+/// exists for (systemd, no shell, no exports) is untouched by the rule because
+/// there is nothing to prefer.
+///
+/// Note what this does *not* affect: [`SecretStore::resolve`]'s own
+/// store-then-environment order, which is what `arreo sync env` reports through.
+/// The two agree on the predicate — a name resolves when either place holds it —
+/// so a name reported as resolved is always a name the spawn supplies; only the
+/// *value* differs when both hold one, and a value is never printed by either
+/// door.
+///
+/// ## What it reads, and what it refuses to read
+///
+/// Only `Class::Sync` files of the harness's own preset: the LOCAL ones
+/// (`auth.json`, the session stores, the caches) are this machine's and are
+/// never read for names, which is the same fence the sync engine enforces for
+/// writing. A file that is absent contributes nothing — a machine that has never
+/// received the config has nothing to resolve, and the pane still spawns.
+#[must_use]
+pub fn spawn_environment(harness: &str, env: &MachineEnv) -> SpawnInjection {
+    let Some(preset) = presets::presets()
+        .iter()
+        .find(|preset| preset.harness.id() == harness)
+    else {
+        return SpawnInjection {
+            vars: Vec::new(),
+            missing: Vec::new(),
+        };
+    };
+    let mut names: Vec<String> = Vec::new();
+    for entry in preset.files {
+        if entry.class != Class::Sync {
+            continue;
+        }
+        let Ok(path) = env.resolve(entry.path) else {
+            // A root this machine does not set: the sync verb is where that is
+            // reported by name, and a pane must not fail to spawn over it.
+            continue;
+        };
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        for name in references(&text) {
+            if !names.contains(&name) {
+                names.push(name);
+            }
+        }
+    }
+    if names.is_empty() {
+        return SpawnInjection {
+            vars: Vec::new(),
+            missing: Vec::new(),
+        };
+    }
+    // A store this machine cannot open is treated as an empty one: the pane
+    // still spawns, and the names below are reported as missing, which is the
+    // honest answer to "does this machine hold them".
+    let store = SecretStore::default_path(env)
+        .ok()
+        .and_then(|path| SecretStore::open(path).ok());
+    let mut vars = Vec::new();
+    let mut missing = Vec::new();
+    for name in names {
+        // The daemon's own environment wins — see the note above. This is also
+        // what keeps a hand-exported variable working, which the design's own
+        // step 0 relies on.
+        if std::env::var_os(&name).is_some() {
+            continue;
+        }
+        match store.as_ref().and_then(|store| store.resolve(&name)) {
+            Some(value) => vars.push((name, value)),
+            None => missing.push(name),
+        }
+    }
+    SpawnInjection { vars, missing }
 }
 
 #[cfg(test)]

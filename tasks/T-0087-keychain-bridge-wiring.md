@@ -3,7 +3,7 @@ id: T-0087
 title: Wire the keychain bridge into the daemon's spawn — a synced reference resolves at the PTY
 phase: 4
 priority: 2
-status: proposed
+status: done
 depends_on: [T-0083]
 scope:
   - crates/arreo-core/src/pty.rs
@@ -29,25 +29,39 @@ its key.
 
 ## Acceptance criteria
 
-- [ ] **The minimal, principled injection set.** The daemon resolves, for a pane about to
+- [x] **The minimal, principled injection set.** The daemon resolves, for a pane about to
       spawn, the synced files of the adapter that pane runs under (T-0072's registry), takes
       the env-reference names those files carry, and injects the keychain values for exactly
       those names — never the whole keychain. A pane whose adapter has no synced files gets
       no injection, and the daemon's own environment still wins for a name it already has
       (the keychain is the fallback, not the override).
-- [ ] **`Pane::spawn` gains an env parameter** (or a `spawn_with_env` sibling — whichever
+- [x] **`Pane::spawn` gains an env parameter** (or a `spawn_with_env` sibling — whichever
       keeps the two existing call sites honest) without changing the default behaviour: the
       current callers pass nothing and get today's env.
-- [ ] **Proven at the product surface**: in an isolated daemon (own identity, own
+- [x] **Proven at the product surface**: in an isolated daemon (own identity, own
       `$XDG_CONFIG_HOME`), a synced pi file referencing `VBK_PROD_KEY` is set only in the
       keychain store; a spawned pi pane's child process has the variable (assert via a pane
       that prints `env | grep`), and a pane whose adapter has no synced files does not.
       A daemon with the variable in its own environment keeps its own value even when the
       keychain differs.
-- [ ] The by-name report (`arreo sync env`) and the receive-time refusal from T-0083 stay
+- [x] The by-name report (`arreo sync env`) and the receive-time refusal from T-0083 stay
       the operator-facing doors; the injection is invisible to them.
-- [ ] No new dependency; `--slice persistence` and the handoff suites stay green (the
+- [x] No new dependency; `--slice persistence` and the handoff suites stay green (the
       spawn signature change touches the restore path).
+
+## Landed (2026-09-14)
+
+`keychain::spawn_environment(harness, env)` reads only the harness's `Class::Sync` files,
+collects the names they carry, and resolves them from this machine's store; the daemon
+applies the result at both spawn sites (Spawn, Split) and `persist::restore` applies it on
+both of its paths (the resume branch and the plain fallback) — a restored pane is the same
+pane. `Pane::spawn_with_env` is one implementation with two doors, so `spawn` and the
+injecting spawn cannot drift.
+
+Five tests in `crates/arreo-server/tests/keychain_spawn.rs`, 75 consecutive clean runs, and
+four mutations each reddening the test it should — including "inject every name the store
+holds", which is the leak this feature must not become (`.loop/evidence/T-0087/`). The
+missing-secret notice names the variable and is asserted to carry no value.
 
 ## Notes
 

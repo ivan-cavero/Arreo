@@ -1,0 +1,84 @@
+T-0087 — the keychain bridge reaches the pane
+=============================================
+
+WHAT WAS MISSING
+----------------
+T-0083 proved the *mechanism* (`keychain::plan(...).environment()` is the exact
+environment a PTY spawn must apply, exercised at a real pty in the sync slice) but
+nothing in the product applied it: `Pane::spawn` took no environment, so a synced
+`$VBK_PROD_KEY` resolved only if the variable happened to be in the daemon's own
+environment. A daemon started by systemd — no shell, no exports — could not run the
+synced config §3.8 tells the operator to write.
+
+THE WIRING
+----------
+- `crates/arreo-core/src/sync/keychain.rs::spawn_environment(harness, env)`: reads only
+  the `Class::Sync` files of that harness's preset, collects the names they carry
+  (`references`), and resolves each from this machine's store. LOCAL files are never
+  read for names — the same fence the sync engine enforces for writing.
+- `crates/arreo-core/src/pty.rs::Pane::spawn_with_env`: one spawn implementation, two
+  doors (`spawn` delegates with an empty slice), so the two cannot drift.
+- `crates/arreo-server/src/daemon.rs::PaneEntry::keychain_env` (both spawn sites, Spawn
+  and Split) and the same helper in `persist.rs` (both the resume branch and the plain
+  fallback) — a *restored* pane is the same pane, and a resumed pi session on a machine
+  whose keychain holds the key must get it or the resume dies on a 401.
+
+THE RULE, AND WHY THAT WAY ROUND
+--------------------------------
+A name the daemon's own environment already carries is **left alone**: the injection is
+strictly additive, so landing this feature cannot change the behaviour of any existing
+deployment. The common case it exists for (systemd, nothing exported) is unaffected by
+the rule because there is nothing to prefer. `arreo sync env`'s own predicate is
+unchanged — a name resolves when either place holds it — so a name it reports as
+resolved is always a name the spawn supplies.
+
+THE PROOF (`crates/arreo-server/tests/keychain_spawn.rs`, 5 tests, 75 consecutive
+clean runs)
+------------------------------------------------------------------------------
+A real daemon per test, an isolated root (own `$XDG_CONFIG_HOME`, own
+`$PI_CODING_AGENT_DIR`, own identity, own socket), a synced `models.json` naming the
+variable, a store holding it, and a **fake `pi`** on the daemon's PATH whose script
+writes the values it saw to a file. The child writes, the test reads — no protocol
+plumbing between the assertion and the fact.
+
+1. `a_synced_reference_reaches_the_harness_child_and_nothing_else` — the pi pane's child
+   sees the keychain's value; a `/bin/sh` pane (no preset claims it) sees UNSET; and the
+   store's *other* key, which no synced file references, is **not** injected — the
+   instrument for the leak this feature must not become.
+2. `a_variable_the_daemon_already_has_is_not_overridden` — with the variable in the
+   daemon's own environment, the child sees the daemon's value.
+3. `an_inherited_but_empty_value_is_not_replaced_by_the_keychain` — the boundary of that
+   rule, pinned: presence is what decides, so an explicitly-empty export stays empty.
+4. `a_machine_without_the_secret_still_spawns_the_pane` — no secret is not a spawn
+   failure, the pane runs, and the daemon's notice names the variable; the notice and
+   the whole captured stderr are asserted to carry **no value** and not to mention the
+   unreferenced name either.
+5. `a_restored_pane_gets_the_keychain_value_too` — daemon SIGKILLed after the record is
+   on disk, probe deleted, second daemon on the same socket: the restored pane's child
+   gets the keychain's value.
+
+MUTATIONS (each run by the planner; each reddens the test it should)
+-------------------------------------------------------------------
+A. injection removed from the Spawn site        -> test 1 FAILS ("never saw value…, wrote UNSET|UNSET")
+B. `std::env::var_os` guard removed (env loses) -> test 2 FAILS
+C. `spawn_environment` returns every store name -> tests 1 and 2 FAIL, showing
+   "value-from-the-keychain-9d21|never-referenced" — the leak, made visible
+D. the resume branch's `keychain_env` removed   -> test 5 FAILS ("wrote UNSET|UNSET")
+
+TWO TEST BUGS THE ADVERSARIAL PASS FOUND (in the test, not the product)
+-----------------------------------------------------------------------
+- The probe used `${VAR:-UNSET}`, which treats *empty* as unset — so the empty-value
+  boundary test could not tell "empty" from "missing". Changed to `${VAR-UNSET}`, which
+  substitutes only when the name is absent.
+- The restore test killed the daemon the instant the probe appeared, racing the
+  detached spawn snapshot; when the snapshot lost, the restore had nothing to read and
+  the test reported a product failure the product did not have. It now waits for the
+  record to be on disk before the kill (the same rule T-0072's slice learned).
+
+BATTERY
+-------
+814 tests / 0 failed / 67 targets; clippy clean on both toolchains; fmt clean;
+14/14 slices (persistence 16, handoff-abort 41, tui 80, update 27, mesh 21+1);
+`xtask sync --check` 14/14; bench 6/6; vet 337, deny 4/4, audit 0, check-targets
+PASS/SKIP. No new dependency: `Pane::spawn_with_env` is std, and the helper reuses
+T-0083's `SecretStore`/`presets`.

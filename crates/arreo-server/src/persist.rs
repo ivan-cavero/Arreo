@@ -22,7 +22,7 @@
 //! `/tmp/arreo-x.sock.db`). No config needed, no second path to lose.
 
 use arreo_core::pty::{ExitState, Pane};
-use arreo_core::state::AdapterRegistry;
+use arreo_core::state::{Adapter, AdapterRegistry};
 use arreo_core::store::{SessionStore, StoredPane};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -190,11 +190,18 @@ pub fn restore(db: &Path, adapters: &AdapterRegistry) -> Result<Vec<RestoredPane
                 {
                     loud.push(reason);
                 }
-                spawn_plain(&record).map(|pane| (pane, None))
+                spawn_plain(&record, adapter).map(|pane| (pane, None))
             }
             Some((args, session)) => {
                 let args_ref: Vec<&str> = args.iter().map(String::as_str).collect();
-                match Pane::spawn(&record.program, &args_ref, record.cols, record.rows) {
+                let env = keychain_env(adapter);
+                match Pane::spawn_with_env(
+                    &record.program,
+                    &args_ref,
+                    record.cols,
+                    record.rows,
+                    &env,
+                ) {
                     Ok(pane) => {
                         let pane = Arc::new(pane);
                         // A run that survives the grace (or exits cleanly) is
@@ -212,14 +219,14 @@ pub fn restore(db: &Path, adapters: &AdapterRegistry) -> Result<Vec<RestoredPane
                                     "harness refused the resume (exit {code}); respawning plainly"
                                 ));
                                 drop(pane); // already reaped
-                                spawn_plain(&record).map(|pane| (pane, None))
+                                spawn_plain(&record, adapter).map(|pane| (pane, None))
                             }
                             _ => Ok((pane, session)),
                         }
                     }
                     Err(e) => {
                         loud.push(format!("resume spawn failed: {e}; respawning plainly"));
-                        spawn_plain(&record).map(|pane| (pane, None))
+                        spawn_plain(&record, adapter).map(|pane| (pane, None))
                     }
                 }
             }
@@ -256,11 +263,37 @@ pub fn restore(db: &Path, adapters: &AdapterRegistry) -> Result<Vec<RestoredPane
     Ok(out)
 }
 
-fn spawn_plain(record: &StoredPane) -> Result<Arc<Pane>, String> {
+fn spawn_plain(record: &StoredPane, adapter: &Adapter) -> Result<Arc<Pane>, String> {
     let args: Vec<&str> = record.args.iter().map(String::as_str).collect();
-    Pane::spawn(&record.program, &args, record.cols, record.rows)
+    let env = keychain_env(adapter);
+    Pane::spawn_with_env(&record.program, &args, record.cols, record.rows, &env)
         .map(Arc::new)
         .map_err(|e| format!("respawn failed: {e}"))
+}
+
+/// The environment a restored pane's spawn must apply (T-0087).
+///
+/// A restored pane is the same pane: a pi session resumed on a machine whose
+/// keychain holds the provider key must get it, or the resume the whole task
+/// exists for dies on a 401. Same rule, same function as the daemon's spawn —
+/// derived from the adapter the record resolves to, so a record whose harness
+/// has no synced file gets nothing.
+fn keychain_env(adapter: &Adapter) -> Vec<(String, String)> {
+    let Some(harness) = adapter.harness_id() else {
+        return Vec::new();
+    };
+    let env = arreo_core::sync::paths::MachineEnv::from_process(
+        &arreo_core::mesh::default_machine_name(),
+    );
+    let injection = arreo_core::sync::keychain::spawn_environment(harness, &env);
+    if !injection.missing().is_empty() {
+        eprintln!(
+            "persist: the synced {harness} config references {} this machine does not hold \
+             (the resumed harness will answer the provider's own error)",
+            injection.missing().join(", ")
+        );
+    }
+    injection.environment().to_vec()
 }
 
 /// The one line a fallen-back (or skipped) restore prints: the pane id, the

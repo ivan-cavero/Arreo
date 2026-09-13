@@ -102,6 +102,39 @@ impl PaneEntry {
         AdapterRegistry::builtin().for_program(program).clone()
     }
 
+    /// The environment this pane's spawn must apply (T-0087): the keychain
+    /// values for the reference names the harness's synced files carry.
+    ///
+    /// **Only the names the files actually name**, never the whole keychain: a
+    /// program the operator runs would otherwise see every key this machine
+    /// holds. A program no preset claims (`/bin/sh`, anything else) gets an
+    /// empty slice and today's environment, which is why this is derived from
+    /// the adapter rather than from "is there a keychain at all".
+    ///
+    /// The missing names are reported once per spawn, by name and without
+    /// values: a machine that has the synced file but not the secret is the one
+    /// case where the harness will fail later with the provider's own error
+    /// (T-0075 measured a live 401), and the operator should read the reason
+    /// here rather than infer it from the harness.
+    fn keychain_env(adapter: &Adapter) -> Vec<(String, String)> {
+        let Some(harness) = adapter.harness_id() else {
+            return Vec::new();
+        };
+        let env = arreo_core::sync::paths::MachineEnv::from_process(
+            &arreo_core::mesh::default_machine_name(),
+        );
+        let injection = arreo_core::sync::keychain::spawn_environment(harness, &env);
+        if !injection.missing().is_empty() {
+            eprintln!(
+                "daemon: the synced {harness} config references {} this machine does not hold; \
+                 set them with `arreo sync secret set <NAME>` (the harness will answer the \
+                 provider's own error until then)",
+                injection.missing().join(", ")
+            );
+        }
+        injection.environment().to_vec()
+    }
+
     /// The one constructor (T-0072): an adapter — its patterns AND its resume
     /// strategy — plus the harness session the pane is on.
     ///
@@ -2201,9 +2234,11 @@ async fn dispatch(message: &Message, registry: &Registry, db: &std::path::Path) 
             // Fork off the async worker (chaos-found, T-0009).
             let program = program.clone();
             let (cols, rows) = (*cols, *rows);
+            // The keychain bridge (T-0087): resolved here, applied in the child.
+            let env = PaneEntry::keychain_env(&adapter);
             let spawned = tokio::task::spawn_blocking(move || {
                 let args_ref: Vec<&str> = args_owned.iter().map(String::as_str).collect();
-                Pane::spawn(&program, &args_ref, cols, rows)
+                Pane::spawn_with_env(&program, &args_ref, cols, rows, &env)
             })
             .await;
             let pane = match spawned {
@@ -2560,9 +2595,10 @@ async fn dispatch(message: &Message, registry: &Registry, db: &std::path::Path) 
                 _ => (None, spec.args.clone()),
             };
             let (cols, rows) = (*cols, *rows);
+            let env = PaneEntry::keychain_env(&adapter);
             let spawned = tokio::task::spawn_blocking(move || {
                 let args_ref: Vec<&str> = args_owned.iter().map(String::as_str).collect();
-                Pane::spawn(&program, &args_ref, cols, rows)
+                Pane::spawn_with_env(&program, &args_ref, cols, rows, &env)
             })
             .await;
             match spawned {
