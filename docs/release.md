@@ -4,16 +4,25 @@
 > releases, no tags, no published crates, and the `arreo.dev` URLs below are
 > **reserved names, not working endpoints** — the domain has no DNS record.
 >
-> What *is* real, as of T-0036: a minisign public key is committed at
+> What *is* real, as of T-0037: a minisign public key is committed at
 > [`supply-chain/arreo.pub`](../supply-chain/arreo.pub) and compiled into every
 > binary; `arreo_core::update::verify` refuses an artifact whose signature is
-> missing, foreign, or wrong; `arreo update verify` is the user door onto it; and
-> [`.github/workflows/release.yml`](../.github/workflows/release.yml) builds the
-> three targets, signs every artifact and the manifest, and fails hard if any of
-> that does not hold. The **tag job has never run with a real key** — the secret
-> `MINISIGN_SECRET_KEY` exists in the repository's secret store, but no tag has
-> been pushed through it. That is the one line of this document that CI cannot
-> vouch for, and it is written here rather than implied.
+> missing, foreign, or wrong; `arreo update verify` is the user door onto it; the
+> release channel — a URL plus a signed index, fetched transport-agnostically
+> (`file://` and `https://` share every line except the fetcher) and verified
+> before a byte of it is believed — is real, so `arreo update --check` and the
+> anonymous `arreo update` work against any channel that publishes the index;
+> and [`.github/workflows/release.yml`](../.github/workflows/release.yml) builds
+> the three targets and signs every artifact and the manifest. The **one release
+> step the channel needs that the job does not do yet** is to write and sign
+> `arreo-index.json` (see [The release index](#the-release-index)) — no tag has
+> been pushed, so nothing on that path has run, and the gap is written here
+> rather than implied. The **tag job has never run with a
+> real key** — the secret `MINISIGN_SECRET_KEY` exists in the repository's secret
+> store, but no tag has been pushed through it. That is the one line of this
+> document that CI cannot vouch for, and it is written here rather than implied.
+> An empty channel ("no releases yet") is therefore the honest state of the world
+> today, and `--check` reports it as such rather than as an error.
 >
 > Machine-checked today: `cargo xtask package --dry-run` (in CI on every PR)
 > validates the cargo-dist skeleton *and* the signed-release structure — that the
@@ -196,19 +205,34 @@ material on every PR.
 
 ## Updating a client in place
 
-While there is no release channel, a client can still be updated from a binary you
-already have (T-0070):
+A client can be updated from a binary you already have (T-0070) or, since T-0037,
+from the release channel:
 
 ```console
-$ arreo update --from /path/to/a/newer/arreo
+$ arreo update --from /path/to/a/newer/arreo     # a binary you already have
 installed /home/you/.cargo/bin/arreo
 version: arreo 0.1.0
 previous kept at /home/you/.cargo/bin/arreo.prev
 resumed pane build from /run/user/1000/arreo.sock (4 line(s) after 0)
 
-$ arreo update --rollback          # put the previous binary back
-$ arreo update --check             # refused: this build has no channel (see below)
+$ arreo update                                   # the newest signed release from the channel
+fetching arreo 0.1.0 (arreo-x86_64-unknown-linux-gnu) from https://github.com/ivan-cavero/Arreo/releases/latest/download/
+installed /home/you/.cargo/bin/arreo
+version: arreo 0.1.0
+previous kept at /home/you/.cargo/bin/arreo.prev
+
+$ arreo update --check                           # what the channel says, nothing else
+channel:  https://github.com/ivan-cavero/Arreo/releases/latest/download/
+version:  0.1.0
+artifact: arreo-x86_64-unknown-linux-gnu (for x86_64-unknown-linux-gnu)
+
+$ arreo update --rollback                        # put the previous binary back
 ```
+
+Until the first release is published the channel is empty, and both `--check` and
+the anonymous update answer with "no releases yet" and exit 0 rather than failing:
+there is nothing wrong with an empty channel, only with one that cannot be
+verified.
 
 ### The invariant
 
@@ -240,15 +264,68 @@ crash between any two steps leaves a runnable binary there — the old one befor
 step 4, the new one after. The reasoning, and the rejected two-rename design, are
 in [ADR 0020](../specs/adr/0020-client-update-swap.md).
 
-### What `--check` refuses
+### The release channel: `--check` and the anonymous update
 
-`arreo update` with no `--from` is the **anonymous** path: fetch a release and
-verify its signature before staging it. The verifier for it exists as of T-0036 —
-`arreo update verify` checks an artifact against the key compiled into this
-binary — but the *channel* that fetches a signed index and its artifacts is
-T-0037, and this build has none. So `--check` says exactly that and exits 2 rather
-than pretending. Installing an artifact nobody verified is the one thing an
-updater must never do quietly.
+The channel is a **URL** — `https://github.com/ivan-cavero/Arreo/releases/latest/download/`
+by default — plus the files under it. `ARREO_CHANNEL_URL` (or `--channel`) points
+the client at another one, and a `file://` channel is a first-class transport,
+not a test seam: a self-hosted install that mirrors releases inside a firewall is
+a real deployment, and it is what lets the whole update story be exercised with
+no network at all.
+
+```console
+$ ARREO_CHANNEL_URL=https://github.com/ivan-cavero/Arreo/releases/latest/download/ \
+    arreo update --check
+channel:  https://github.com/ivan-cavero/Arreo/releases/latest/download/
+version:  0.1.0
+artifact: arreo-x86_64-unknown-linux-gnu (for x86_64-unknown-linux-gnu)
+  key    076F2F7CEBE0AF51 (pinned in supply-chain/arreo.pub, compiled into this binary)
+  sha256 1f0c…e4 (the index)
+install it with `arreo update`
+```
+
+**An empty channel is "no releases yet" with exit 0** — the honest answer before a
+first release, not an error. A channel whose index exists but cannot be verified
+is the opposite: a broken release job, or an attack, and it is refused (exit 1)
+with the verifier's own sentence naming the file, plus the channel URL it came
+from. The refusal is always one of the five typed ones from [`update verify`](#where-signatures-live-and-how-to-check-one)
+— an operator who has seen one has seen them all.
+
+`arreo update` with no `--from` is the anonymous form: fetch the index, verify
+it, fetch the artifact it names for this machine, verify that, and hand the
+verified file to the same install path `--from` uses — there is one install path
+in this codebase, not two. Nothing is trusted until the verifier has accepted it:
+an unsigned, tampered, or foreign-signed index or artifact stops the verb before
+anything is staged.
+
+### The release index
+
+The channel serves a small signed file the release job publishes, `arreo-index.json`
+and its `arreo-index.json.minisig`:
+
+```json
+{
+  "version": "0.1.0",
+  "artifacts": {
+    "x86_64-unknown-linux-gnu": "arreo-x86_64-unknown-linux-gnu",
+    "x86_64-pc-windows-msvc": "arreo-x86_64-pc-windows-msvc.exe",
+    "aarch64-apple-darwin": "arreo-aarch64-apple-darwin"
+  }
+}
+```
+
+The index is signed and verified like any other artifact, and it deliberately
+carries **no digests**: `SHA256SUMS` remains the only trusted digest source, and
+the artifact's own signature is what binds its bytes. What the index adds is the
+two facts a digest manifest cannot carry — the version, and which artifact is for
+which machine. An index that names no build for the machine asking is refused by
+name ("release 0.1.0 does not ship a build for …") rather than guessing.
+
+**The one release-job step the channel needs**: `sign-and-publish` must write
+`arreo-index.json` (the tag name and the per-target artifact names) into `dist/`
+before the signing loop, so the loop's existing `minisign -S … -m dist/SHA256SUMS`
+step covers it too. This is a T-0042/release-job change, recorded here because
+nothing publishes the index yet.
 
 ### When the path belongs to a package manager
 
@@ -264,6 +341,7 @@ a `sudo` over the package manager's files.
 | Shell | `https://arreo.dev/install.sh` | Reserved; domain has no DNS record |
 | PowerShell | `https://arreo.dev/install.ps1` | Reserved; domain has no DNS record |
 | Homebrew | `brew install arreo/tap/arreo` | The `arreo/homebrew-arreo` tap named in `[workspace.metadata.dist]` does not exist |
+| Update channel | `https://github.com/ivan-cavero/Arreo/releases/latest/download/` | Real (the T-0037 default; serves `arreo-index.json`, the artifacts and their signatures once a release is published) |
 
 Until a release exists, the only install path is building this checkout:
 `cargo build --workspace` ([docs/tour.md](tour.md) has the walkthrough). An

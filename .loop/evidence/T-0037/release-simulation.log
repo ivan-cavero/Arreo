@@ -1,0 +1,61 @@
+
+########## 1. --check against the signed channel
+channel:  file:///tmp/arreo-channel-sim/run/channel/
+version:  0.1.0
+artifact: arreo-sim (for x86_64-unknown-linux-gnu)
+  key    11A0D55DC921BBEC (pinned in supply-chain/arreo.pub, compiled into this binary)
+  sha256 115f07c4bb34ebf5635122ad7501d3b62993681ecd748ff660d85279a65afcf1 (the index)
+install it with `arreo update`
+exit=0
+
+########## 2. --check --json
+{"artifact":"arreo-sim","available":true,"channel":"file:///tmp/arreo-channel-sim/run/channel/","digest":"115f07c4bb34ebf5635122ad7501d3b62993681ecd748ff660d85279a65afcf1","key_id":"11A0D55DC921BBEC","target":"x86_64-unknown-linux-gnu","version":"0.1.0"}
+exit=0
+
+########## 3. --check with ARREO_CHANNEL_URL in the environment and no flag
+channel:  file:///tmp/arreo-channel-sim/run/channel/
+version:  0.1.0
+artifact: arreo-sim (for x86_64-unknown-linux-gnu)
+  key    11A0D55DC921BBEC (pinned in supply-chain/arreo.pub, compiled into this binary)
+  sha256 115f07c4bb34ebf5635122ad7501d3b62993681ecd748ff660d85279a65afcf1 (the index)
+install it with `arreo update`
+exit=0
+
+########## 4. the anonymous update: fetch, verify, install
+fetching arreo 0.1.0 (arreo-sim) from file:///tmp/arreo-channel-sim/run/channel/
+installed /tmp/arreo-channel-sim/run/arreo
+version: arreo 0.1.0
+previous kept at /tmp/arreo-channel-sim/run/arreo.prev
+exit=0
+installed == channel artifact (byte-identical)
+.prev keeps the replaced binary: yes
+arreo 0.1.0
+the installed binary runs
+
+########## 5. --rollback puts the replaced binary back
+rolled back to arreo 0.1.0 (/tmp/arreo-channel-sim/run/arreo)
+exit=0
+
+########## 6. a tampered index: one flipped byte, the valid signature carried over
+update: /tmp/arreo-channel-sim/run/state-t/channel/arreo-index.json: signature does not authenticate this file (The signature verification failed)
+update: the channel at file:///tmp/arreo-channel-sim/run/channel-tampered/ served the file this refusal names; nothing was installed
+exit=1
+
+########## 7. the anonymous update against the tampered channel is refused before installing
+update: /tmp/arreo-channel-sim/run/state-t/channel/arreo-index.json: signature does not authenticate this file (The signature verification failed)
+update: the channel at file:///tmp/arreo-channel-sim/run/channel-tampered/ served the file this refusal names; nothing was installed
+exit=1
+arreo 0.1.0
+the binary was not replaced
+
+########## 8. an unsigned index is the verifier's MissingSignature, not an empty channel
+update: /tmp/arreo-channel-sim/run/state-u/channel/arreo-index.json: no signature at /tmp/arreo-channel-sim/run/state-u/channel/arreo-index.json.minisig — refusing an unverified artifact
+update: the channel at file:///tmp/arreo-channel-sim/run/channel-unsigned/ served the file this refusal names; nothing was installed
+exit=1
+
+########## 9. an empty channel is 'no releases yet', exit 0
+no releases yet at file:///tmp/arreo-channel-sim/run/channel-empty/
+nothing is published on this channel yet; when a release is, `arreo update` will fetch it and verify it before installing anything
+exit=0
+{"artifact":null,"available":false,"channel":"file:///tmp/arreo-channel-sim/run/channel-empty/","version":null}
+exit=0

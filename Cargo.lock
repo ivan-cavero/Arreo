@@ -135,6 +135,7 @@ dependencies = [
  "rusqlite",
  "rustix 0.38.44",
  "rustls",
+ "rustls-native-certs",
  "serde",
  "serde_json",
  "sha2",

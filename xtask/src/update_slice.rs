@@ -608,7 +608,277 @@ fn slice(report: &mut Report) {
     let after_lock = run_cli(&sandbox, &installed, &["--version"], CLI_DEADLINE);
     version_points.push(("after the lock refusal", after_lock.ok()));
 
-    // ---- 7. runnable at every point ----------------------------------------
+    // ---- 8. the channel: `--check`, and what it refuses --------------------
+    //
+    // A channel is a URL, and a `file://` one is a directory — the same transport
+    // a self-hosted mirror inside a firewall serves. It is also why everything
+    // here runs with no network: the sandbox points `ARREO_CHANNEL_URL` at an
+    // empty `file://` channel precisely so no case in this slice can reach
+    // GitHub by accident.
+    let channel = root.join("channel");
+    if let Err(e) = fs::create_dir_all(&channel) {
+        report.check(
+            "the channel directory can be made",
+            false,
+            &format!("{}: {e}", channel.display()),
+        );
+        return;
+    }
+    let channel_url = format!("file://{}/", channel.display());
+    let default_channel = format!("file://{}/", root.join("channel-default").display());
+    let check = |args: &[&str]| run_cli(&sandbox, &installed, args, CLI_DEADLINE);
+
+    // (a) An empty channel: exit 0, and the answer said out loud. This is the
+    // state the repository is in today, and a check that failed here would be
+    // wrong every day until launch.
+    let r = check(&["update", "--check", "--channel", &channel_url]);
+    report.check(
+        "an empty channel reports \"no releases yet\" with exit 0",
+        r.ok() && r.output.contains("no releases yet") && r.output.contains(&channel_url),
+        &format!("exited {:?} saying {:?}", r.code, first_line(&r.output)),
+    );
+    report.say(format!(
+        "update: `--check` against an empty channel: exit {:?}, {:?}",
+        r.code,
+        first_line(&r.output)
+    ));
+    let r = check(&["update", "--check", "--channel", &channel_url, "--json"]);
+    report.check(
+        "`--check --json` answers with one machine-readable object",
+        r.ok() && r.output.trim().starts_with('{') && r.output.contains("\"available\":false"),
+        &format!("exited {:?} saying {:?}", r.code, first_line(&r.output)),
+    );
+
+    // (b) An index with no signature beside it is a **broken release**, not an
+    // empty channel, and the verifier's own sentence names what it looked for.
+    let index = channel.join("arreo-index.json");
+    if let Err(e) = fs::write(&index, br#"{"version":"9.9.9","artifacts":{}}"#) {
+        report.check(
+            "the unsigned index fixture can be written",
+            false,
+            &format!("{}: {e}", index.display()),
+        );
+        return;
+    }
+    let r = check(&["update", "--check", "--channel", &channel_url]);
+    report.check(
+        "an unsigned index is refused with the verifier's sentence, naming the file",
+        r.code == Some(1)
+            && r.output.contains("no signature at")
+            && r.output.contains("arreo-index.json.minisig")
+            && r.output.contains(&channel_url),
+        &format!("exited {:?} saying {:?}", r.code, first_line(&r.output)),
+    );
+    report.say(format!(
+        "update: the unsigned index was refused: exit {:?}, {}",
+        r.code,
+        first_line(&r.output)
+    ));
+
+    // (c) A signature that is not a signature — corruption, or a file that was
+    // never one — is refused as a bad signature, naming the file.
+    if let Err(e) = fs::write(
+        channel.join("arreo-index.json.minisig"),
+        b"this is not a minisign signature\n",
+    ) {
+        report.check(
+            "the bad-signature fixture can be written",
+            false,
+            &format!("{}: {e}", channel.display()),
+        );
+        return;
+    }
+    let r = check(&["update", "--check", "--channel", &channel_url]);
+    report.check(
+        "a signature that is not a signature is refused as a bad one",
+        r.code == Some(1)
+            && r.output.contains("signature does not authenticate")
+            && r.output.contains("arreo-index.json.minisig"),
+        &format!("exited {:?} saying {:?}", r.code, first_line(&r.output)),
+    );
+
+    // (d) **The anonymous update refuses before it installs anything.** No
+    // `--from`, a channel whose index cannot be verified: the verb stops at the
+    // index, prints the verifier's sentence, and leaves the install byte-identical
+    // with nothing staged beside it.
+    let r = run_cli(
+        &sandbox,
+        &installed,
+        &["update", "--channel", &channel_url],
+        CLI_DEADLINE,
+    );
+    report.check(
+        "the anonymous update refuses before it installs anything",
+        r.code == Some(1)
+            && r.output.contains("signature does not authenticate")
+            && same_bytes(&installed, &baseline).unwrap_or(false)
+            && !staged.exists(),
+        &format!(
+            "exited {:?} saying {:?}; {installed_path} vs {baseline_path}: same={}",
+            r.code,
+            first_line(&r.output),
+            same_bytes(&installed, &baseline).unwrap_or(false)
+        ),
+    );
+    report.say(format!(
+        "update: the anonymous update against the broken channel: exit {:?}, {}",
+        r.code,
+        first_line(&r.output)
+    ));
+
+    // (e) One precedence for the channel URL: the flag wins over the environment,
+    // and the environment is read when there is no flag.
+    let r = run_cli_env(
+        &sandbox,
+        &installed,
+        &[("ARREO_CHANNEL_URL", &channel_url)],
+        &["update", "--check", "--channel", &default_channel],
+        CLI_DEADLINE,
+    );
+    report.check(
+        "`--channel` wins over ARREO_CHANNEL_URL",
+        r.ok() && r.output.contains("no releases yet"),
+        &format!("exited {:?} saying {:?}", r.code, first_line(&r.output)),
+    );
+    let r = run_cli_env(
+        &sandbox,
+        &installed,
+        &[("ARREO_CHANNEL_URL", &channel_url)],
+        &["update", "--check"],
+        CLI_DEADLINE,
+    );
+    report.check(
+        "ARREO_CHANNEL_URL is read when no --channel is given",
+        r.code == Some(1) && r.output.contains("signature does not authenticate"),
+        &format!("exited {:?} saying {:?}", r.code, first_line(&r.output)),
+    );
+
+    // (f)+(g) The half that needs *signed* bytes. The workspace ships no signer
+    // (T-0036: the key exists only as a CI secret), so these cases use the real
+    // `minisign` when the machine has it and report a loud skip otherwise — never
+    // a pass. `arreo-core`'s own tests assert the same accept path
+    // deterministically, writing the format from `ed25519-dalek`.
+    match minisign() {
+        Some(minisign) => {
+            let keys = root.join("channel-keys");
+            let fixture = fs::create_dir_all(&keys)
+                .map_err(|e| format!("{}: {e}", keys.display()))
+                .and_then(|()| throwaway_keypair(&minisign, &keys));
+            match fixture {
+                Ok((_public, secret, public_text)) => {
+                    // A signed index and a signed artifact, exactly as a release
+                    // job publishes them.
+                    let artifact = channel.join("arreo-candidate");
+                    let signed_index = format!(
+                        "{{\"version\":\"9.9.9\",\"artifacts\":{{\"{}\":\"arreo-candidate\"}}}}",
+                        arreo_core::update::channel::host_target()
+                    );
+                    let prepared =
+                        copy_with_tail(&cli_bin, &artifact, b"\n# the channel's candidate\n")
+                            .and_then(|()| {
+                                fs::write(&index, signed_index.as_bytes())
+                                    .map_err(|e| format!("{}: {e}", index.display()))
+                            })
+                            .and_then(|()| sign(&minisign, &secret, &index))
+                            .and_then(|()| sign(&minisign, &secret, &artifact));
+                    if let Err(e) = prepared {
+                        report.check("the signed channel fixture can be published", false, &e);
+                    } else {
+                        // (f) The product binary still refuses it: its trust set is
+                        // the key compiled into it, and this key is not that key.
+                        let r = check(&["update", "--check", "--channel", &channel_url]);
+                        report.check(
+                            "a real signature from a key this build does not trust is refused by key id",
+                            r.code == Some(1)
+                                && r.output.contains("signed by key")
+                                && r.output.contains("this build trusts 076F2F7CEBE0AF51"),
+                            &format!("exited {:?} saying {:?}", r.code, first_line(&r.output)),
+                        );
+                        report.say(format!(
+                            "update: a throwaway minisign key's signature: exit {:?}, {}",
+                            r.code,
+                            first_line(&r.output)
+                        ));
+
+                        // (g) The accept path: the *same* signed bytes, checked
+                        // through the channel code with the trust set the fixture was
+                        // signed for — and then handed to the very install path
+                        // `--from` uses, so a verified artifact becomes an install
+                        // without a second copy of the install logic.
+                        match arreo_core::update::verify::TrustSet::parse(&public_text) {
+                            None => report.check(
+                                "the throwaway public key parses",
+                                false,
+                                "minisign wrote a public key this build cannot parse",
+                            ),
+                            Some(trust) => match fetch_and_verify(&trust, &channel_url, &root) {
+                                Err(e) => report.check(
+                                    "a signed index is fetched and verified",
+                                    false,
+                                    &e,
+                                ),
+                                Ok((release, verified)) => {
+                                    report.check(
+                                        "a signed index is fetched, verified and reports its version and artifact",
+                                        release.version == "9.9.9"
+                                            && release.artifact == "arreo-candidate"
+                                            && verified.artifact.ends_with("arreo-candidate"),
+                                        &format!(
+                                            "version {:?}, artifact {:?}, verified {}",
+                                            release.version,
+                                            release.artifact,
+                                            verified.artifact.display()
+                                        ),
+                                    );
+                                    let fetched = verified.artifact.display().to_string();
+                                    let r = run_cli(
+                                        &sandbox,
+                                        &installed,
+                                        &["update", "--from", &fetched, "--no-reexec"],
+                                        CLI_DEADLINE,
+                                    );
+                                    report.check(
+                                        "the verified artifact installs through the same path --from uses",
+                                        r.ok()
+                                            && same_bytes(&installed, &verified.artifact)
+                                                .unwrap_or(false),
+                                        &format!(
+                                            "exited {:?} saying {:?}",
+                                            r.code,
+                                            first_line(&r.output)
+                                        ),
+                                    );
+                                    report.say(format!(
+                                        "update: the channel's verified artifact was installed through \
+                                         --from: exit {:?}, {}",
+                                        r.code,
+                                        first_line(&r.output)
+                                    ));
+                                    let after_channel =
+                                        run_cli(&sandbox, &installed, &["--version"], CLI_DEADLINE);
+                                    version_points
+                                        .push(("after the channel install", after_channel.ok()));
+                                }
+                            },
+                        }
+                    }
+                }
+                Err(e) => report.check("the throwaway keypair can be made", false, &e),
+            }
+        }
+        None => {
+            report.skip(
+                "a real signature from a key this build does not trust is refused by key id",
+                "minisign is not installed on this machine",
+            );
+            report.skip(
+                "a signed index is fetched, verified and installed through the channel code",
+                "minisign is not installed on this machine",
+            );
+        }
+    }
+
+    // ---- 9. runnable at every point ----------------------------------------
     //
     // The crash-safety *property* is unit-tested in `arreo-core` (a crash between
     // the swap's steps leaves the old or the new binary at the path, never
@@ -727,7 +997,15 @@ struct Sandbox {
 
 impl Sandbox {
     fn new(root: PathBuf) -> Result<Self, String> {
-        for dir in ["home", "state", "data", "config", "run", "arreo-state"] {
+        for dir in [
+            "home",
+            "state",
+            "data",
+            "config",
+            "run",
+            "arreo-state",
+            "channel-default",
+        ] {
             fs::create_dir_all(root.join(dir))
                 .map_err(|e| format!("{}/{dir}: {e}", root.display()))?;
         }
@@ -743,7 +1021,16 @@ impl Sandbox {
             .env("XDG_DATA_HOME", self.root.join("data"))
             .env("XDG_CONFIG_HOME", self.root.join("config"))
             .env("XDG_RUNTIME_DIR", self.root.join("run"))
-            .env("ARREO_STATE_DIR", self.root.join("arreo-state"));
+            .env("ARREO_STATE_DIR", self.root.join("arreo-state"))
+            // The channel every invocation reads unless it is told otherwise: an
+            // **empty `file://` directory** in the scratch. The anonymous update
+            // is a real path now, and a slice that reached the built-in default
+            // would dial GitHub — which is exactly the test-that-fails-on-a-plane
+            // the task forbids.
+            .env(
+                "ARREO_CHANNEL_URL",
+                format!("file://{}/", self.root.join("channel-default").display()),
+            );
         command
     }
 }
@@ -917,9 +1204,23 @@ impl std::fmt::Display for Run {
 /// Run a binary, bounded: a command that runs past `deadline` is killed and
 /// reported as a failure that carries what it had printed.
 fn run_cli(sandbox: &Sandbox, bin: &Path, args: &[&str], deadline: Duration) -> Run {
+    run_cli_env(sandbox, bin, &[], args, deadline)
+}
+
+/// The same, with extra environment: how the channel precedence is tested.
+fn run_cli_env(
+    sandbox: &Sandbox,
+    bin: &Path,
+    env: &[(&str, &str)],
+    args: &[&str],
+    deadline: Duration,
+) -> Run {
     let start = Instant::now();
-    let mut child = match sandbox
-        .command(bin)
+    let mut command = sandbox.command(bin);
+    for (key, value) in env {
+        command.env(key, value);
+    }
+    let mut child = match command
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -1200,4 +1501,106 @@ fn take_lock(path: &Path) -> Result<File, String> {
             path.display()
         )),
     }
+}
+
+/// Fetch and verify the channel's newest release with the trust set the fixture
+/// was signed for.
+///
+/// This is the anonymous update's fetch half, driven through the real channel
+/// code — the only part the product binary cannot exercise in a test, because its
+/// trust set is the key compiled into it, and the secret of that key is nowhere
+/// on this machine (T-0036's precedent: the accept path is proved against keys
+/// whose secrets are in the test's hand).
+fn fetch_and_verify(
+    trust: &arreo_core::update::verify::TrustSet,
+    url: &str,
+    root: &Path,
+) -> Result<
+    (
+        arreo_core::update::channel::Release,
+        arreo_core::update::verify::Verified,
+    ),
+    String,
+> {
+    let channel = arreo_core::update::channel::Channel::new(url).map_err(|e| e.to_string())?;
+    let work = root.join("channel-work");
+    let release = arreo_core::update::channel::check(trust, &channel, &work)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "the signed channel reports no release".to_string())?;
+    let verified = arreo_core::update::channel::fetch(trust, &channel, &release, &work)
+        .map_err(|e| e.to_string())?;
+    Ok((release, verified))
+}
+
+/// `minisign`, if this machine has it.
+///
+/// The workspace ships no signer (that is the T-0036 decision: the key exists
+/// only as a CI secret), so a case that needs *signed* bytes outside the library's
+/// own tests needs the real tool. When it is absent the case reports a loud skip
+/// naming what is missing, never a pass — the T-0019 no-delegation precedent.
+fn minisign() -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .map(|dir| dir.join("minisign"))
+        .find(|candidate| candidate.is_file())
+}
+
+/// A throwaway minisign keypair in `dir`, plus its public key text.
+///
+/// `-W` makes the key unencrypted, which is the shape CI keys are made in and the
+/// shape a test can feed to `-S` without a password prompt.
+fn throwaway_keypair(minisign: &Path, dir: &Path) -> Result<(PathBuf, PathBuf, String), String> {
+    let public = dir.join("throwaway.pub");
+    let secret = dir.join("throwaway.key");
+    let generated = Command::new(minisign)
+        .arg("-G")
+        .arg("-W")
+        .arg("-p")
+        .arg(&public)
+        .arg("-s")
+        .arg(&secret)
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|e| format!("running minisign -G: {e}"))?;
+    if !generated.status.success() {
+        return Err(format!(
+            "minisign -G failed: {}",
+            String::from_utf8_lossy(&generated.stderr).trim()
+        ));
+    }
+    let text = fs::read_to_string(&public).map_err(|e| format!("{}: {e}", public.display()))?;
+    Ok((public, secret, text))
+}
+
+/// Sign `file` with `secret`, writing the sibling `.minisig` a release job would
+/// ship.
+fn sign(minisign: &Path, secret: &Path, file: &Path) -> Result<(), String> {
+    let mut child = Command::new(minisign)
+        .arg("-S")
+        .arg("-s")
+        .arg(secret)
+        .arg("-m")
+        .arg(file)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("running minisign -S: {e}"))?;
+    // minisign reads a password from stdin unless the key is unencrypted; one
+    // empty line is what its own release job feeds for the same shape.
+    if let Some(mut stdin) = child.stdin.take() {
+        use std::io::Write as _;
+        let _ = stdin.write_all(b"\n");
+    }
+    let output = child
+        .wait_with_output()
+        .map_err(|e| format!("waiting for minisign -S: {e}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "minisign -S failed on {}: {}",
+            file.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(())
 }

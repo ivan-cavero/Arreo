@@ -1,0 +1,19 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.38s
+     Running tests/update.rs (target/debug/deps/update-488d102f50320511)
+
+running 12 tests
+test check_refuses_an_index_whose_signature_is_not_a_signature ... ok
+test a_candidate_that_cannot_run_leaves_the_install_untouched ... ok
+test the_channel_comes_from_the_flag_then_the_environment ... ok
+test check_refuses_an_unsigned_index_with_the_verifiers_sentence ... ok
+test check_reports_no_releases_yet_on_an_empty_channel ... ok
+test a_bad_invocation_is_refused_without_touching_the_install ... ok
+test installing_the_binary_that_is_already_installed_changes_nothing ... ok
+test the_anonymous_update_refuses_before_installing_anything ... ok
+test a_second_updater_is_refused_while_the_lock_is_held ... ok
+test the_json_reports_whether_anything_changed ... ok
+test the_new_binary_finishes_the_command_after_the_swap ... ok
+test an_install_then_a_rollback_returns_the_original_bytes ... ok
+
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.41s
+

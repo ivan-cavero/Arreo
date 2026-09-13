@@ -85,6 +85,12 @@ fn usage() -> ExitCode {
     );
     eprintln!("      invite also names the account and relay, so `arreo machines add` can register the new");
     eprintln!("  arreo pair --join \"four words\" --uri arreo://pair?... [--name N] [--json]   (this device joins)");
+    eprintln!("  arreo update [--check] [--channel URL] [--json]   (fetch, verify, install)");
+    eprintln!("      without --from: fetch the newest signed release from the channel, verify it");
+    eprintln!(
+        "      against the key pinned in this repo, and install it; --check only reports what"
+    );
+    eprintln!("      the channel publishes (an empty channel is \"no releases yet\", exit 0)");
     eprintln!("  arreo update --from <path> [--json] [--no-reexec] [--reattach-pane ID]");
     eprintln!("      replace this binary in place (atomic; keeps the previous as .prev);");
     eprintln!(

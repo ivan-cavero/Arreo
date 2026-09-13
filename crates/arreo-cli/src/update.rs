@@ -15,12 +15,18 @@
 //!
 //! ## Where the artifact comes from, and why that is not a shortcut
 //!
-//! `--from <path>` names a binary the operator already has. That is a real
-//! feature — installing a build you made, or one you fetched and inspected — and
-//! it is where a channel source will feed in. The **anonymous** form (`arreo
-//! update` with no `--from`), which fetches and verifies a signed release, needs
-//! the signing key of T-0036 and is deliberately absent: this verb refuses rather
-//! than installing something it cannot verify. See `--check`.
+//! `--from <path>` names a binary the operator already has — a real feature
+//! (installing a build you made, or one you fetched and inspected). The
+//! **anonymous** form (`arreo update` with no `--from`) asks the release channel
+//! for the newest release instead: the index is fetched and verified against the
+//! key compiled into this binary, then the artifact is fetched and verified the
+//! same way, and only then does the file it produced enter the install path
+//! `--from` uses. There is one install path, not two, and one verifier, not two —
+//! see `arreo_core::update::channel`, which owns the fetch and never installs.
+//!
+//! `--check` is the same fetch with the install left out: it reports the version
+//! and artifact the channel publishes (or "no releases yet"), and refuses an
+//! index it cannot verify with the verifier's own sentence.
 //!
 //! ## Re-exec
 //!
@@ -33,6 +39,8 @@
 //! makes a client restart cheap rather than a fresh start.
 
 use crate::ExitCode;
+use arreo_core::update::channel::{self, Channel};
+use arreo_core::update::verify::TrustSet;
 use arreo_core::update::{self, resume, UpdateError};
 
 /// Exit codes, small and stable (the vocabulary the rest of the CLI uses).
@@ -62,26 +70,13 @@ pub fn run(rest: &[String]) -> ExitCode {
         }
     };
 
-    if args.check {
-        // The channel half (T-0037) needs a signed index and the signing key's
-        // custodian; this build has neither, and saying so is the honest answer.
-        // Installing a binary from a URL this version cannot verify would be the
-        // opposite of what the rest of this file is for.
-        println!(
-            "update: no release channel is configured in this build. Arreo is pre-launch: \
-             there is no published artifact to check or fetch."
-        );
-        println!(
-            "        Install a binary you already have with `arreo update --from <path>`; the \
-             signed anonymous path is T-0037."
-        );
-        return ExitCode::from(USAGE);
-    }
-
-    if args.server {
-        return server(&args);
-    }
-
+    // One updater at a time — and `--check` takes the same lock before it
+    // touches the channel work dir: a check shares <state>/channel/ with a
+    // concurrent update, and while the verifier accepts only bytes it read
+    // itself (so the race is fail-safe either way), the lock makes the race
+    // impossible instead of merely harmless. The lock is an OS lock held by
+    // this open file, so a killed updater cannot leave it stale — see
+    // `arreo_core::update`.
     let current = match update::current_binary() {
         Ok(path) => path,
         Err(e) => {
@@ -89,9 +84,6 @@ pub fn run(rest: &[String]) -> ExitCode {
             return ExitCode::from(FAILED);
         }
     };
-
-    // One updater at a time. The lock is an OS lock held by this open file, so a
-    // killed updater cannot leave it stale — see `arreo_core::update`.
     let _lock = match update::UpdateLock::acquire(&current) {
         Ok(lock) => lock,
         Err(UpdateError::Locked(path)) => {
@@ -104,20 +96,33 @@ pub fn run(rest: &[String]) -> ExitCode {
         }
     };
 
+    if args.check {
+        return check(&args);
+    }
+
+    if args.server {
+        return server(&args);
+    }
+
     if args.rollback {
         return rollback(&current, &args);
     }
 
-    let Some(source) = args.from.as_deref() else {
-        eprintln!(
-            "update: nothing to install. Pass --from <path> with a binary you have, or \
-             --rollback, or --check."
-        );
-        usage();
-        return ExitCode::from(USAGE);
+    // **Where the artifact comes from.** `--from` names one the operator already
+    // has; without it, the channel is asked for the newest release, which is
+    // fetched and verified before this process will look at it. Both end at the
+    // same `install`, so an anonymous update is a `--from` update whose source
+    // came off the wire — there is no second install path to keep in step.
+    let source = match args.from.clone() {
+        Some(path) => std::path::PathBuf::from(path),
+        None => match fetch_release(&args) {
+            Ok(Some(path)) => path,
+            Ok(None) => return OK.into(),
+            Err(code) => return ExitCode::from(code),
+        },
     };
 
-    match install(&current, std::path::Path::new(source), &args) {
+    match install(&current, &source, &args) {
         Ok((outcome, hand_over)) => {
             // **Report before handing over.** `exec` replaces this process image,
             // so anything printed afterwards is never printed at all — the first
@@ -142,6 +147,163 @@ pub fn run(rest: &[String]) -> ExitCode {
             eprintln!("update: {e}");
             ExitCode::from(exit_code(&e))
         }
+    }
+}
+
+/// The channel the operator configured: `--channel`, else `ARREO_CHANNEL_URL`,
+/// else the built-in default.
+///
+/// The precedence lives in one place because two answers to "which channel" would
+/// let `--check` and `arreo update` look at different ones.
+fn configured_channel(args: &Args) -> Result<Channel, String> {
+    let (url, origin) = match &args.channel {
+        Some(url) => (url.clone(), "--channel"),
+        None => match std::env::var("ARREO_CHANNEL_URL") {
+            Ok(url) => (url, "ARREO_CHANNEL_URL"),
+            Err(_) => (channel::DEFAULT_URL.to_string(), "the default channel"),
+        },
+    };
+    Channel::new(url).map_err(|e| format!("{origin}: {e}"))
+}
+
+/// `arreo update --check` — what the channel publishes, and nothing else.
+///
+/// ## Exit codes, and why an empty channel is 0
+///
+/// **0** the check ran: either "no releases yet", or the version and artifact the
+/// channel reports. **1** a refusal — the index has no signature, was signed by a
+/// key this build does not trust, or changed after signing, and the verifier's own
+/// sentence is printed. **2** usage: a channel URL this build cannot fetch.
+///
+/// An empty channel is *not* an error, because it is not the failure of anything:
+/// before a first release there is genuinely nothing to report, and a script that
+/// treated "no releases yet" as a failure would be wrong every day until launch.
+fn check(args: &Args) -> ExitCode {
+    let channel = match configured_channel(args) {
+        Ok(channel) => channel,
+        Err(message) => {
+            eprintln!("update: {message}");
+            usage();
+            return ExitCode::from(USAGE);
+        }
+    };
+    let release = match channel::check(TrustSet::pinned(), &channel, &channel::work_dir()) {
+        Ok(release) => release,
+        Err(e) => return ExitCode::from(refuse(&channel, &e)),
+    };
+
+    match release {
+        Some(release) => {
+            if args.json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "channel": channel.url(),
+                        "available": true,
+                        "version": release.version,
+                        "target": release.target,
+                        "artifact": release.artifact,
+                        "key_id": release.key_id,
+                        "digest": release.digest,
+                    })
+                );
+            } else {
+                println!("channel:  {}", channel.url());
+                println!("version:  {}", release.version);
+                println!("artifact: {} (for {})", release.artifact, release.target);
+                println!(
+                    "  key    {} (pinned in supply-chain/arreo.pub, compiled into this binary)",
+                    release.key_id
+                );
+                println!("  sha256 {} (the index)", release.digest);
+                println!("install it with `arreo update`");
+            }
+        }
+        None => {
+            if args.json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "channel": channel.url(),
+                        "available": false,
+                        "version": serde_json::Value::Null,
+                        "artifact": serde_json::Value::Null,
+                    })
+                );
+            } else {
+                println!("no releases yet at {}", channel.url());
+                println!(
+                    "nothing is published on this channel yet; when a release is, `arreo update` \
+                     will fetch it and verify it before installing anything"
+                );
+            }
+        }
+    }
+    OK.into()
+}
+
+/// Print a channel refusal the way the verifier wrote it, and name the channel
+/// that served it.
+///
+/// The sentence is the verifier's own — `MissingSignature`, `UnknownKeyId`,
+/// `BadSignature`, `DigestMismatch` — and never a paraphrase, so an operator who
+/// has seen one refusal has seen them all. The second line adds the one thing the
+/// sentence cannot know: the URL the file came from, because the sentence names
+/// the local copy the check wrote.
+fn refuse(channel: &Channel, error: &channel::Error) -> u8 {
+    eprintln!("update: {error}");
+    if matches!(error, channel::Error::Verify(_)) {
+        eprintln!(
+            "update: the channel at {} served the file this refusal names; nothing was installed",
+            channel.url()
+        );
+    }
+    FAILED
+}
+
+/// The anonymous half: ask the channel for the newest release, fetch it, verify
+/// it, and return the local path the install path should be handed.
+///
+/// `Ok(None)` is an empty channel — nothing to install, and nothing wrong. Every
+/// refusal returns the exit code it should be reported as, having already printed
+/// the verifier's sentence.
+fn fetch_release(args: &Args) -> Result<Option<std::path::PathBuf>, u8> {
+    let channel = configured_channel(args).map_err(|message| {
+        eprintln!("update: {message}");
+        usage();
+        USAGE
+    })?;
+    let work = channel::work_dir();
+    let release = match channel::check(TrustSet::pinned(), &channel, &work) {
+        Ok(Some(release)) => release,
+        Ok(None) => {
+            if args.json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "changed": false,
+                        "channel": channel.url(),
+                        "available": false,
+                    })
+                );
+            } else {
+                println!("no releases yet at {channel}; nothing to install");
+            }
+            return Ok(None);
+        }
+        Err(e) => return Err(refuse(&channel, &e)),
+    };
+    // One line before a download that can take a while — and never in `--json`
+    // mode, where a second object would be a second answer to one question.
+    if !args.json {
+        println!(
+            "fetching arreo {} ({}) from {channel}",
+            release.version, release.artifact
+        );
+    }
+    match channel::fetch(TrustSet::pinned(), &channel, &release, &work) {
+        Ok(verified) => Ok(Some(verified.artifact)),
+        Err(e) => Err(refuse(&channel, &e)),
     }
 }
 
@@ -790,17 +952,31 @@ const SERVER_BINARY_NAME: &str = "arreo-server.exe";
 
 fn usage() {
     eprintln!(
-        "usage: arreo update --from <path> [--json] [--no-reexec] [--reattach-pane ID] [--socket PATH]"
+        "usage: arreo update [--channel URL | ARREO_CHANNEL_URL=URL] [--json] [--no-reexec] [--reattach-pane ID] [--socket PATH]"
+    );
+    eprintln!(
+        "       arreo update --from <path> [--json] [--no-reexec] [--reattach-pane ID] [--socket PATH]"
     );
     eprintln!("       arreo update --rollback [--json]");
-    eprintln!("       arreo update --check");
+    eprintln!("       arreo update --check [--channel URL] [--json]");
     eprintln!("       arreo update verify <path> [--sig <path>] [--manifest <path>] [--json]");
     eprintln!(
         "       arreo update --server --from <path> [--json] [--socket PATH] [--timeout-secs N]"
     );
     eprintln!("  --from      a binary to install in place of this one (already on disk)");
+    eprintln!(
+        "  --channel   the release channel to fetch from (a URL): file:// for a mirror or a test,"
+    );
+    eprintln!("              https:// for the default (ARREO_CHANNEL_URL, else this repository's");
+    eprintln!("              GitHub Releases `latest` URL). Only read by --check and the anonymous update");
     eprintln!("  --rollback  put the previous binary back");
-    eprintln!("  --check     report the available version from the release channel (needs T-0037)");
+    eprintln!(
+        "  --check     report the version and artifact the channel publishes, verifying the index"
+    );
+    eprintln!(
+        "              first; an empty channel is \"no releases yet\", and the verifier's refusal"
+    );
+    eprintln!("              (exit 1) is what an unsigned or altered index gets");
     eprintln!(
         "  verify      check an artifact's minisign signature against the key compiled into this \
          binary; prints the key id and digest, and refuses (exit 1) with no bypass"
@@ -823,6 +999,9 @@ struct Args {
     no_reexec: bool,
     reattach_pane: Option<String>,
     socket: Option<String>,
+    /// Where the anonymous update reads from. `None` means `ARREO_CHANNEL_URL`,
+    /// else the built-in default — see `configured_channel`.
+    channel: Option<String>,
     /// Replace the **server** binary and hand the daemon over to it (T-0038),
     /// instead of swapping this client binary (T-0070). Two different
     /// operations with the same verb because they are one story to an operator
@@ -855,6 +1034,10 @@ fn parse(rest: &[String]) -> Result<Args, String> {
             }
             "--socket" => {
                 args.socket = Some(value()?);
+                i += 2;
+            }
+            "--channel" => {
+                args.channel = Some(value()?);
                 i += 2;
             }
             "--server" => {
@@ -890,6 +1073,29 @@ fn parse(rest: &[String]) -> Result<Args, String> {
     if args.rollback && (args.from.is_some() || args.check) {
         return Err(
             "--rollback installs the previous binary; it takes no --from or --check".into(),
+        );
+    }
+    if args.check
+        && (args.from.is_some() || args.server || args.no_reexec || args.reattach_pane.is_some())
+    {
+        // `--check` reports what the channel publishes and installs nothing, so a
+        // flag that describes an install — or the daemon swap — would be obeyed
+        // silently, which is exactly the class of flag this verb refuses.
+        return Err(
+            "--check only reports what the channel publishes; it takes no --from, --server, \
+             --no-reexec or --reattach-pane"
+                .into(),
+        );
+    }
+    if args.channel.is_some() && (args.from.is_some() || args.rollback || args.server) {
+        // `--channel` names where the *anonymous* update reads from; a `--from`
+        // install never reads a channel, `--rollback` only reads `.prev`, and the
+        // server half has no channel story yet (T-0038). Accepting it silently
+        // would let an operator believe a channel was consulted when it was not.
+        return Err(
+            "--channel names where the anonymous update fetches from; it cannot be combined with \
+             --from, --rollback or --server"
+                .into(),
         );
     }
     if args.server && (args.reattach_pane.is_some() || args.no_reexec) {
@@ -1263,6 +1469,16 @@ mod tests {
         // `--rollback` and `--from` are different intentions; obeying both would
         // mean installing and uninstalling in one command.
         assert!(parse(&args(&["--rollback", "--from", "/tmp/x"])).is_err());
+        // `--check` reports what the channel publishes and installs nothing, so a
+        // flag that describes an install (or the daemon swap) alongside it is a
+        // usage error rather than a silently ignored one.
+        assert!(parse(&args(&["--check", "--from", "/tmp/x"])).is_err());
+        assert!(parse(&args(&["--check", "--server"])).is_err());
+        assert!(parse(&args(&["--check", "--no-reexec"])).is_err());
+        // `--channel` names where the anonymous update reads from; `--from` never
+        // reads a channel.
+        assert!(parse(&args(&["--channel", "file:///tmp/x", "--from", "/tmp/y"])).is_err());
+        assert!(parse(&args(&["--channel", "file:///tmp/x", "--server"])).is_err());
     }
 
     /// `arreo update verify` takes one positional artifact and nothing that could

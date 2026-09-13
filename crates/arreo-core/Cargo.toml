@@ -34,6 +34,15 @@ quinn = { version = "0.11", optional = true }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"], optional = true }
 rcgen = { version = "0.13", optional = true }
 snow = { version = "0.9", optional = true }
+# Release channel (T-0037): the `https://` transport of `update::channel` is a
+# TLS 1.3 client built on the `rustls` above, with the **platform** certificate
+# store as its roots. `rustls-native-certs` is already in `Cargo.lock` at 0.8.4
+# (via `rustls-platform-verifier`, a dependency of quinn-proto) and already
+# exempted in `supply-chain/config.toml`, so this adds no crate to the graph —
+# the same standard the `rustix` note above set. It is optional behind the same
+# `transport` feature: a build with no TLS refuses an `https` channel URL at
+# the point the operator typed it rather than at the first fetch.
+rustls-native-certs = { version = "0.8", optional = true }
 portable-pty = "0.9"
 # PTY adoption (T-0038 stage 0): a master descriptor handed over by the daemon
 # being replaced arrives over `SCM_RIGHTS`, which needs `sendmsg`/`recvmsg`
@@ -93,4 +102,4 @@ sqlite = ["dep:rusqlite"]
 # because a local-only build (and the plugin host) has no use for it, and
 # because `ring` is a C dependency: dropping this feature is what keeps a
 # pure-Rust surface available to `check-targets` for foreign targets.
-transport = ["dep:quinn", "dep:rustls", "dep:rcgen", "dep:snow"]
+transport = ["dep:quinn", "dep:rustls", "dep:rcgen", "dep:snow", "dep:rustls-native-certs"]

@@ -1,0 +1,22 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.59s
+     Running unittests src/lib.rs (target/debug/deps/arreo_core-8b360760760b7841)
+
+running 15 tests
+test update::channel::tests::a_file_url_is_decoded_and_must_be_absolute ... ok
+test update::channel::tests::an_empty_channel_is_no_releases_not_an_error ... ok
+test update::channel::tests::an_index_signed_by_a_stranger_is_refused_by_key_id ... ok
+test update::channel::tests::a_tampered_index_is_refused_as_a_bad_signature_naming_the_file ... ok
+test update::channel::tests::a_verified_index_that_is_not_json_is_refused ... ok
+test update::channel::tests::a_signed_index_reports_the_newest_version_and_its_artifact ... ok
+test update::channel::tests::an_artifact_with_no_signature_is_refused ... ok
+test update::channel::tests::an_index_with_no_signature_is_refused_and_names_what_it_looked_for ... ok
+test update::channel::tests::an_artifact_name_that_is_a_path_is_refused ... ok
+test update::channel::tests::a_tampered_artifact_is_refused_as_a_bad_signature ... ok
+test update::channel::tests::the_transport_is_chosen_by_scheme_alone ... ok
+test update::channel::tests::the_default_channel_is_this_repositorys_releases_url ... ok
+test update::channel::tests::an_index_without_a_build_for_this_platform_is_refused_by_name ... ok
+test update::channel::tests::a_signed_artifact_is_fetched_verified_and_made_runnable ... ok
+test update::channel::tests::file_and_https_channels_differ_only_in_their_fetcher ... ok
+
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 206 filtered out; finished in 0.09s
+

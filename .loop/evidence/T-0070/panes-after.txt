@@ -41,7 +41,6 @@ tick-5
 tick-6
 tick-7
 tick-8
-tick-9
 --- pane-5 (read exited Some(0)) ---
 PANE-5-MARKER
 tick-1
@@ -63,7 +62,6 @@ tick-5
 tick-6
 tick-7
 tick-8
-tick-9
 --- pane-7 (read exited Some(0)) ---
 PANE-7-MARKER
 tick-1

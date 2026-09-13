@@ -50,6 +50,16 @@
 //! releases it when the process ends — cleanly, by signal, or by `SIGKILL`. No
 //! timeout, no liveness probe, no stale case.
 
+/// The release channel (T-0037): a URL, a signed index, and the verified artifact
+/// that comes out of it — the anonymous `arreo update` half.
+pub mod channel;
+
+/// The `https://` transport of [`channel`] (T-0037): one GET, over the TLS stack
+/// this workspace already ships. Private: what a caller names is a channel URL,
+/// not a transport.
+#[cfg(feature = "transport")]
+mod https;
+
 pub mod resume;
 
 /// Release signature verification (T-0036): the one door every artifact passes
@@ -191,6 +201,18 @@ pub fn stage(source: &Path, current: &Path) -> Result<PathBuf, UpdateError> {
     fs::write(&staged, &bytes).map_err(|e| UpdateError::io(&staged, e))?;
     set_executable_like(&staged, current)?;
     Ok(staged)
+}
+
+/// Make a fetched artifact executable, so it passes the gate a `--from`
+/// candidate passes.
+///
+/// `stage` refuses a candidate that cannot run, and a file written by a download
+/// has no execute bit — so the channel path would be refused for a reason that
+/// says nothing about the artifact. Only the owner bit is added; the *installed*
+/// file's mode still comes from the binary being replaced (see
+/// `set_executable_like`), so this cannot widen an install.
+pub fn mark_executable(path: &Path) -> Result<(), UpdateError> {
+    set_executable_like(path, path)
 }
 
 /// Give `path` the mode of the binary it will replace, plus owner-execute.
