@@ -3,7 +3,7 @@ id: T-0080
 title: Escape-aware state signals — an OSC BEL is not a bell, plus omp's adapter and TUI-mode fixtures
 phase: 4
 priority: 2
-status: proposed
+status: done
 depends_on: [T-0017, T-0075]
 scope:
   - adapters/**
