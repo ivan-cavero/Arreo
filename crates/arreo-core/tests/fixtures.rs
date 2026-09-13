@@ -40,6 +40,104 @@ fn secret_scan_flags_keys_before_commit() {
     assert!(clean.is_empty(), "benign output passes");
 }
 
+/// **A reference is not a secret** (T-0083). §3.8 tells the operator to write
+/// `{env:NAME}` instead of a key, and the scan used to refuse exactly that — it
+/// fired on the field name and never looked at the value — while letting a real
+/// key through under a different field name. Both halves are pinned here, in
+/// every dialect T-0075 measured: opencode `{env:NAME}`, pi `$NAME` and
+/// `${NAME}`, omp the bare variable name.
+#[test]
+fn a_reference_is_not_a_secret_in_any_dialect() {
+    for line in [
+        r#""apiKey": "{env:VBK_PROD_KEY}""#,
+        r#"apiKey: $VBK_PROD_KEY"#,
+        r#"apiKey: ${VBK_PROD_KEY}"#,
+        r#"apiKey: VBK_PROD_KEY"#,
+        r#"OPENAI_API_KEY=${OPENAI_API_KEY}"#,
+        r#"client_secret = $MY_CLIENT_SECRET"#,
+    ] {
+        assert!(
+            scan_secrets(line).is_empty(),
+            "a reference must not be flagged: {line} -> {:?}",
+            scan_secrets(line)
+        );
+    }
+}
+
+/// The other half of the same rule: the *same field* holding a literal is still
+/// a secret. A rule that made `apiKey` exempt would trade a false positive for a
+/// false negative — the exact failure the scan exists to prevent.
+#[test]
+fn a_literal_in_the_same_field_is_still_flagged() {
+    for line in [
+        r#""apiKey": "vbk_pro_0123456789abcdef0123456789abcdef01234567""#,
+        r#"apiKey: sk-0123456789abcdefghijklmnop"#,
+        r#"apiKey: AKIAIOSFODNN7EXAMPLE"#,
+        r#"OPENAI_API_KEY=sk-abc123XYZ4567890abcdef"#,
+    ] {
+        assert!(
+            !scan_secrets(line).is_empty(),
+            "a literal must still be flagged: {line}"
+        );
+    }
+}
+
+/// The provider shapes T-0075 measured, plus the JWT the survey's own probe
+/// used. Each is a literal that appears nowhere else, so a real key in the same
+/// shape still fires — the point of a prefix rule rather than a value allowlist.
+#[test]
+fn the_measured_provider_shapes_are_flagged() {
+    let shapes = [
+        "vbk_pro_0123456789abcdef0123456789abcdef01234567",
+        "xai-0123456789abcdefghijklmnopqrstuvwx",
+        "glpat-0123456789abcdefghij",
+        "hf_0123456789abcdefghijklmnop",
+        "AIzaSyA0123456789abcdefghijklmnopqrstuv",
+        "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U",
+    ];
+    for shape in shapes {
+        // Bare, and behind a field name that carries no hint at all: the token
+        // rule is value-shaped, so the field must not decide it.
+        assert!(
+            !scan_secrets(shape).is_empty(),
+            "a bare {shape} is a token"
+        );
+        assert!(
+            !scan_secrets(&format!("token: {shape}")).is_empty(),
+            "and stays one behind an innocent field name: {shape}"
+        );
+    }
+}
+
+/// A reference-shaped *value* is not a licence to hide a token beside it: the
+/// token rules run on the value, not on the field.
+#[test]
+fn a_reference_shaped_field_does_not_hide_a_token() {
+    let findings = scan_secrets(r#"apiKey: {env:VBK_PROD_KEY} # was sk-0123456789abcdefghijklmnop"#);
+    assert!(
+        findings.iter().any(|f| f.contains("sk-")),
+        "the literal beside the reference is still found: {findings:?}"
+    );
+}
+
+/// A short run after a prefix is not a token — `ask-me` contains `sk-`. Pinned
+/// because the new prefixes must not lower the bar: `hf_` and `vbk_` are
+/// ordinary word fragments in prose.
+#[test]
+fn short_runs_after_the_new_prefixes_are_not_tokens() {
+    for line in [
+        "the vbk_ prefix and the hf_ prefix are documented here",
+        "xai- is three letters",
+        "AIza is the start of a google key",
+    ] {
+        assert!(
+            scan_secrets(line).is_empty(),
+            "prose mentioning a prefix is not a secret: {line} -> {:?}",
+            scan_secrets(line)
+        );
+    }
+}
+
 #[test]
 fn empty_session_records_and_replays_cleanly() {
     let rec = Fixture::record(&["/bin/true"], Duration::from_secs(10)).expect("record true");

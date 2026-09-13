@@ -1992,7 +1992,15 @@ fn redact(prompt: &str) -> (String, bool) {
                         .iter()
                         .any(|word| lower.contains(word));
                     let long_enough = !value.is_empty() && value.len() >= 8;
+                    // The same rule the scanner uses (T-0083): a value that names
+                    // a variable is not the secret, so masking it would rewrite
+                    // the operator's config into a sentence that no longer says
+                    // what it said. The two must agree, or the scan flags a line
+                    // the masker leaves alone (or the reverse) — see
+                    // `find_token`'s note.
+                    let is_reference = crate::fixtures::is_env_reference(value);
                     if !value.is_empty()
+                        && !is_reference
                         && (names_a_secret || (long_enough && lower.contains("key")))
                     {
                         line = format!("{key}[REDACTED:value]");

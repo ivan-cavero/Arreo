@@ -1,0 +1,59 @@
+T-0083 — the reference-aware scan, measured at the product surface
+==================================================================
+
+The two negative controls come from T-0075's own probe
+(.loop/evidence/T-0075/existing-scan-secrets-e2e.txt), re-run verbatim against
+the same verb (`arreo record`) after the change. Same commands, same shapes:
+
+BEFORE (T-0075, recorded in that file's transcript)
+---------------------------------------------------
+$ arreo record sh -c 'echo "  \"apiKey\": \"{env:VBK_PROD_KEY}\""' -o f.pty
+record: refusing to save — possible secrets detected:      <-- FALSE POSITIVE
+exit=1
+
+$ arreo record sh -c 'echo "  token: vbk_pro_0123…"' -o b.pty
+recorded 1 events                                            <-- MISS
+exit=0
+
+AFTER (this turn)
+-----------------
+$ arreo record sh -c 'echo "  \"apiKey\": \"{env:VBK_PROD_KEY}\""' -o f.pty
+recorded 1 events (34 bytes) -> f.pty
+exit=0                                                       <-- the correct config is now writable
+
+$ arreo record sh -c 'echo "  token: vbk_pro_0123…"' -o b.pty
+record: refusing to save — possible secrets detected:
+  line 1: possible verboo api key
+exit=1                                                       <-- the miss is closed
+
+$ arreo record sh -c 'echo "  \"apiKey\": \"vbk_pro_0123…\""' -o a.pty
+record: refusing to save — possible secrets detected:
+  line 1: possible verboo api key
+  line 1: possible secret assignment (apikey)
+exit=1                                                       <-- a literal in the same field still fires
+
+Both halves of the criterion, on the real binary, in the direction §3.8 needs.
+
+MUTATION PROOF (tests, not vibes)
+---------------------------------
+A) reference rule removed (`let reference = false`):
+   a_reference_is_not_a_secret_in_any_dialect ... FAILED
+   (the other 8 tests stayed green — the rule is not load-bearing for anything else)
+B) the measured `vbk_` prefix removed (array count adjusted, or the crate does not
+   compile — a signal in itself):
+   the_measured_provider_shapes_are_flagged ... FAILED
+   (8 passed, 1 failed)
+
+Neither half can be dropped silently: the false positive and the false negative
+are each pinned by a test that goes red when the half is removed.
+
+THE RESIDUAL, STATED
+--------------------
+A literal that happens to be shaped like an environment variable name — all
+uppercase, no provider prefix — is indistinguishable from a reference by text
+scan alone, and `is_env_reference` calls it one (that is omp's only working
+dialect, so the alternative refuses the correct configuration). What closes it is
+the sync path, not more scanning: T-0083 refuses a file whose reference does not
+resolve to a variable on the receiving machine, by name. Every provider-prefixed
+literal is caught by the token rule, which reads the value's shape and never
+consults the reference predicate.

@@ -271,19 +271,41 @@ fn coalesce(events: Vec<Event>) -> Vec<Event> {
     out
 }
 
-/// The prefixes whose tokens are secret-shaped, and the shortest run after a
-/// prefix that is worth calling a token.
+/// The prefixes whose tokens are secret-shaped, the label the scan reports, and
+/// the shortest run after the prefix that is worth calling a token.
 ///
 /// Shared by the scanner and the masker on purpose: when the two disagreed about
 /// what a token is, the scanner flagged a line the masker left alone — a secret
 /// on disk beside `redacted = 1`. One definition, two callers.
-pub const TOKEN_PREFIXES: [(&str, &str); 5] = [
-    ("sk-", "api key (sk- prefix)"),
-    ("AKIA", "aws access key id"),
-    ("ghp_", "github token"),
-    ("gho_", "github oauth token"),
-    ("xox", "slack token"),
+///
+/// The run length is per prefix rather than global because the prefixes differ
+/// in how much entropy follows them: `sk-` is distinctive enough that eight
+/// characters mean something, while `AIza` (Google) and `eyJ` (a JWT's base64url
+/// header) are ordinary letter runs — `AIza is the start of a key` is prose, and
+/// a three-letter `eyJ` word is not a token. The shapes and their lengths come
+/// from the harness survey's measured probes (T-0075/T-0080); the older five are
+/// unchanged so the fixtures and audit rows they were tuned against stay put.
+pub const TOKEN_PREFIXES: [(&str, &str, usize); 11] = [
+    ("sk-", "api key (sk- prefix)", 8),
+    ("AKIA", "aws access key id", 16),
+    ("ghp_", "github token", 8),
+    ("gho_", "github oauth token", 8),
+    ("xox", "slack token", 8),
+    ("vbk_", "verboo api key", 8),
+    ("xai-", "xai api key", 8),
+    ("glpat-", "gitlab token", 8),
+    ("hf_", "huggingface token", 8),
+    // A Google API key is exactly `AIza` + 35; 30 keeps a near-miss out while
+    // catching every real one.
+    ("AIza", "google api key", 30),
+    // A JWT is three dot-separated base64url runs; the run scanner does not stop
+    // at `.`, so the whole token is one run. 40 is well inside the shortest real
+    // token and well outside the word "eyJ" in a sentence.
+    ("eyJ", "jwt", 40),
 ];
+/// The floor any prefix's run must clear: below it nothing is a token, whatever
+/// the prefix. Kept public because it is the number the docs and the tests quote
+/// when they say "a short run is not a token".
 pub const MIN_TOKEN_RUN: usize = 8;
 
 /// The earliest secret-shaped token in `line`: where it starts, how long it is
@@ -295,12 +317,12 @@ pub const MIN_TOKEN_RUN: usize = 8;
 /// `sk-`, and flagging it would have masked a word nobody would call a secret.
 pub fn find_token(line: &str) -> Option<(usize, usize, &'static str)> {
     let mut best: Option<(usize, usize, &'static str)> = None;
-    for (prefix, label) in TOKEN_PREFIXES {
+    for (prefix, label, min_run) in TOKEN_PREFIXES {
         let mut from = 0;
         while let Some(rel) = line[from..].find(prefix) {
             let at = from + rel;
             let run = token_run_len(&line[at + prefix.len()..]);
-            if prefix.len() + run >= MIN_TOKEN_RUN {
+            if prefix.len() + run >= min_run.max(MIN_TOKEN_RUN) {
                 if best.is_none_or(|(seen, _, _)| at < seen) {
                     best = Some((at, prefix.len() + run, label));
                 }
@@ -321,10 +343,82 @@ fn token_run_len(rest: &str) -> usize {
     .unwrap_or(rest.len())
 }
 
+/// Is `value` a **reference** to a secret this machine resolves itself, rather
+/// than the secret? (T-0083.)
+///
+/// §3.8's rule is that a synced file carries the *name* and the machine supplies
+/// the value, so the scan has to tell the two apart or it refuses exactly the
+/// configuration the operator was told to write. The dialects are the ones the
+/// harness survey measured, not a guess: opencode `{env:NAME}`, pi `$NAME` and
+/// `${NAME}`, omp the bare variable name (measured twice — the sigil forms are
+/// sent literally as the bearer token and 401, T-0080).
+///
+/// ## The residual, stated rather than hidden
+///
+/// A literal that happens to be shaped like a variable name — all uppercase, no
+/// prefix any provider uses — is indistinguishable from a reference *here*, and
+/// this function calls it one. That is deliberate: the alternative (flagging
+/// bare names) refuses omp's only working dialect, which is the false positive
+/// this function exists to remove. What closes the gap is not more cleverness in
+/// a text scan but the sync path (T-0083): a file whose reference does not
+/// resolve to a variable on the receiving machine is refused by name. Every
+/// provider-prefixed literal is still caught by [`find_token`], which reads the
+/// value's shape and never consults this function.
+#[must_use]
+pub fn is_env_reference(value: &str) -> bool {
+    let value = value
+        .trim()
+        .trim_matches(|c| c == '"' || c == '\'' || c == ',' || c == ';');
+    if value.is_empty() {
+        return false;
+    }
+    for (open, close) in [("{env:", '}'), ("${", '}')] {
+        if let Some(rest) = value.strip_prefix(open) {
+            return rest
+                .strip_suffix(close)
+                .is_some_and(|name| is_env_name(name));
+        }
+    }
+    if let Some(rest) = value.strip_prefix('$') {
+        return is_env_name(rest);
+    }
+    // omp's dialect: the bare name. See the residual note above.
+    is_env_name(value)
+}
+
+/// Does `name` look like an environment variable rather than a secret? Uppercase
+/// letters, digits and underscores, starting with a letter, with at least one
+/// letter — the shape every shell, `.env` and container runtime uses.
+fn is_env_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !first.is_ascii_uppercase() {
+        return false;
+    }
+    if name.len() > 64 {
+        return false;
+    }
+    name.chars()
+        .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+}
+
+/// The value side of `line`, if it has an assignment separator: everything after
+/// the first `=` or `:`, trimmed of the quotes and whitespace a config file wraps
+/// it in.
+fn assignment_value(line: &str) -> Option<&str> {
+    let at = line.find(['=', ':'])?;
+    Some(line[at + 1..].trim().trim_matches(['"', '\'']))
+}
+
 /// Flag secret-shaped content. Returns human-readable findings (empty = clean).
-/// Patterns: `sk-`/`AKIA`/`ghp_`/`xox` token prefixes, `BEGIN .* PRIVATE KEY`,
+/// Patterns: the token prefixes in [`TOKEN_PREFIXES`], `BEGIN .* PRIVATE KEY`,
 /// `api[_-]?key` assignments with long values, AWS secret-shaped 40-char
-/// base64 after `aws_secret`, generic `password = <long>` assignments.
+/// base64 after `aws_secret`, generic `password = <long>` assignments — and,
+/// since T-0083, **not** an assignment whose value is an env reference
+/// ([`is_env_reference`]): §3.8 tells the operator to write one, so refusing it
+/// would refuse the correct configuration.
 ///
 /// A token is defined by [`find_token`], the same function the
 /// masker uses: a prefix followed by a long enough run. The scanner and the
@@ -356,19 +450,26 @@ pub fn scan_secrets(text: &str) -> Vec<String> {
             }
         }
         let lower = line.to_lowercase();
-        for key in [
-            "api_key",
-            "apikey",
-            "api-key",
-            "aws_secret",
-            "client_secret",
-        ] {
-            if lower.contains(key) && line.len() > lower.find(key).unwrap_or(0) + key.len() + 8 {
-                findings.push(format!("line {n}: possible secret assignment ({key})"));
-                break;
+        // A reference in the value is the point of §3.8, not a finding: the file
+        // names the variable and the machine holds the secret. Read the value,
+        // never the field name alone — that was the bug.
+        let reference = assignment_value(line).is_some_and(is_env_reference);
+        if !reference {
+            for key in [
+                "api_key",
+                "apikey",
+                "api-key",
+                "aws_secret",
+                "client_secret",
+            ] {
+                if lower.contains(key) && line.len() > lower.find(key).unwrap_or(0) + key.len() + 8 {
+                    findings.push(format!("line {n}: possible secret assignment ({key})"));
+                    break;
+                }
             }
         }
-        if (lower.contains("password") || lower.contains("passwd"))
+        if !reference
+            && (lower.contains("password") || lower.contains("passwd"))
             && line
                 .split(['=', ':'])
                 .nth(1)

@@ -288,6 +288,43 @@ fn an_existing_loose_store_is_tightened_by_the_next_open() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// **A reference survives redaction, even beside a real secret** (T-0083). The
+/// scanner now knows a `{env:NAME}` value is not a secret, but the redactor masks
+/// per line and runs when *any* line in the row was flagged — so without the same
+/// predicate here, a config line naming a variable would be rewritten to
+/// `[REDACTED:value]` whenever another line in the same prompt carried a token.
+/// The audit row would then hold a config that no longer says what it said, which
+/// is the "the scanner and the masker must agree" rule with the sign flipped.
+#[test]
+fn a_reference_survives_redaction_beside_a_real_secret() {
+    let store = SessionStore::open_memory().expect("open");
+    let reference = r#""apiKey": "{env:VBK_PROD_KEY}""#;
+    store
+        .record(&AuditEvent {
+            device: "cli".to_string(),
+            agent: "pane-1".to_string(),
+            prompt: format!("{reference}\nfallback: sk-abc123XYZ4567890abcdef"),
+            ..AuditEvent::new(
+                arreo_core::store::actions::SESSION_CONNECT,
+                AuditKind::Unknown,
+                arreo_core::store::AuditOutcome::Ok,
+                1_700_000_000_000,
+            )
+        })
+        .expect("audit");
+    let rows = store.audit_recent(1).expect("recent");
+    let prompt = &rows[0].prompt;
+    assert!(
+        prompt.contains("{env:VBK_PROD_KEY}"),
+        "the reference is what the operator wrote and what the row must keep: {prompt}"
+    );
+    assert!(
+        !prompt.contains("sk-abc123XYZ4567890abcdef"),
+        "the literal beside it is still masked: {prompt}"
+    );
+    assert!(rows[0].redacted, "and the row says so");
+}
+
 #[test]
 fn session_ids_are_not_secret_scanned_away() {
     // T-0072's safety criterion, second half. Session ids look nothing like the
