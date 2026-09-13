@@ -1330,7 +1330,7 @@ async fn remove(args: &[String]) -> ExitCode {
     // about the operator's intent.
     if row.presence == Presence::Online && !options.force {
         eprintln!(
-            "machines: {name} is online right now (seen {} ago); pass --force to tombstone it              anyway",
+            "machines: {name} is online right now (seen {} ago); pass --force to tombstone it anyway",
             human_age(row.age_secs(now_ms()))
         );
         return ExitCode::from(CONFLICT);

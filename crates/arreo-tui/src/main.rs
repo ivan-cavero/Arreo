@@ -14,13 +14,15 @@
 //! (`Read { from_line }` replays from the cursor, and the transcript is
 //! byte-identical to a run that never dropped).
 
+use arreo_core::identity::{DeviceId, Role};
 use arreo_core::proto::{AgentState, Message, VERSION};
 use arreo_core::theme::{Depth, Variant};
 use arreo_tui::client::{default_socket, Client, PaneSummary, Target};
+use arreo_tui::fleet::{Code, Fleet, GrantPreview, Outcome};
 use arreo_tui::model::PaneView;
 use arreo_tui::settings;
 use arreo_tui::theme::ThemeState;
-use arreo_tui::ui::{App, ViewMode};
+use arreo_tui::ui::{Action, App, ViewMode};
 use crossterm::event::{self, Event, KeyEventKind};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use ratatui::backend::CrosstermBackend;
@@ -39,6 +41,7 @@ async fn main() -> anyhow::Result<()> {
     let mut account: Option<String> = None;
     let mut identity: Option<PathBuf> = None;
     let mut machine: Option<String> = None;
+    let mut attached_to: Option<String> = None;
     let mut config: Option<PathBuf> = None;
     let mut theme: Option<String> = None;
     let mut variant: Option<String> = None;
@@ -85,6 +88,24 @@ async fn main() -> anyhow::Result<()> {
                 println!("  --remote  a daemon on another machine, at a known address");
                 println!("  --peer    that machine's device id (as `arreo devices list` shows it)");
                 println!("  --identity  this device's identity dir (default: the standard one)");
+                println!();
+                println!("keys (mouse works too; ? lists them on screen):");
+                println!("  j/k ↑/↓     move the cursor          Enter  attach the pane");
+                println!("  Tab         next pane                w      wall ↔ focus");
+                println!("  /           search the transcript    t      theme picker");
+                println!("  [ ]         sidebar narrower/wider   PgUp/PgDn, Home/End  scroll");
+                println!("  s           spawn an agent: <id> <program> [args…]");
+                println!("  i           send text to the attached pane (audited as this device)");
+                println!("  x           kill the attached pane (asks first, naming it)");
+                println!("  m           machines: list · a add (pairing code + invite) ·");
+                println!("              r rename · x remove (a machine that is online needs");
+                println!("              the explicit force key) · g this machine's trust grants");
+                println!("  g           trust: a grant a device (fingerprint confirmed) ·");
+                println!("              x revoke (confirmed)");
+                println!("  ?           the key list             q / Esc  quit");
+                println!();
+                println!("A viewer certificate renders send/spawn/kill disabled, with the reason,");
+                println!("instead of failing after the keypress.");
                 return Ok(());
             }
             other => {
@@ -106,10 +127,15 @@ async fn main() -> anyhow::Result<()> {
     // name, and only a resolution does — so a name here is one that was resolved,
     // never one that was assumed.
     let mut session = "this machine · socket".to_string();
+    // The trust ledger lives beside the *local* socket (trust is local, T-0059):
+    // for a local target that is the socket this TUI reads, and for a remote one
+    // it is the default socket — the ledger's home is this machine either way.
+    let local_socket = socket.clone().unwrap_or_else(default_socket);
     let target = if let Some(name) = machine {
         match arreo_core::mesh::resolve::by_name(&name, config.as_deref()).await {
             Ok(resolved) => {
                 session = format!("{} · {}", resolved.name, resolved.target.link());
+                attached_to = Some(resolved.name.clone());
                 resolved.target
             }
             Err(e) => {
@@ -164,6 +190,28 @@ async fn main() -> anyhow::Result<()> {
             (None, None) => Target::Local(socket.unwrap_or_else(default_socket)),
         }
     };
+    // T-0074: this device's role, and the machine it is looking at when that is
+    // not the local one. The role comes from the same certificate the daemon's
+    // gate reads — `owner` on the local socket, where the daemon applies no gate
+    // at all, and the certificate's own role on a remote target.
+    let role = match &target {
+        Target::Local(_) => Role::Owner,
+        Target::Remote(remote) => remote.cert.role(),
+    };
+    let device = match &target {
+        Target::Local(_) => None,
+        Target::Remote(remote) => Some(remote.cert.device().clone()),
+    };
+    let fleet = Fleet {
+        socket: local_socket,
+        // One resolution of "which identity directory is this", the same value
+        // `Layout::for_socket` and the pairing flow would read from the
+        // environment — carried explicitly so a test can point a ledger at a
+        // scratch directory without touching the process environment.
+        identity_root: arreo_core::identity::identity_root(),
+        config: config.clone(),
+        attached_to,
+    };
     let request = ThemeRequest {
         theme,
         variant: variant.as_deref().and_then(parse_variant),
@@ -179,7 +227,7 @@ async fn main() -> anyhow::Result<()> {
     )?;
     let backend = CrosstermBackend::new(std::io::stdout());
     let mut terminal = Terminal::new(backend)?;
-    let result = run(target, session, request, &mut terminal).await;
+    let result = run(target, session, request, fleet, role, device, &mut terminal).await;
     disable_raw_mode()?;
     crossterm::execute!(
         std::io::stdout(),
@@ -198,6 +246,10 @@ fn short_id(id: &str) -> String {
 enum Poll {
     /// A connection state worth showing (reconnecting, and where it is trying).
     Status(String),
+    /// The answer to a verb the UI asked to run (T-0074): the CLI's own line,
+    /// which the status bar holds until the next keypress instead of letting
+    /// the 1 Hz pane poll overwrite it before it is drawn.
+    Result(String),
     /// Sidebar truth for one cycle (pane summaries, or why the cycle failed).
     Panes(Result<Vec<PaneSummary>, String>),
     /// Incremental scrollback for the focused pane (`from_line` = where the
@@ -206,6 +258,39 @@ enum Poll {
         id: String,
         from_line: usize,
         lines: Vec<String>,
+    },
+    /// The answer to a fleet verb the UI asked for (T-0074): the CLI's code,
+    /// the CLI's sentence, and the rows a panel renders. The action travels with
+    /// it, so the UI knows which surface the answer belongs to without guessing
+    /// from the shape of the rows.
+    Fleet { action: Action, outcome: Outcome },
+    /// A grant that cleared every check and now needs the human's word
+    /// (T-0074's fingerprint confirmation). Boxed: a `GrantPreview` carries a
+    /// device key and a rendered line, and the channel carries many polls.
+    ConfirmGrant(Box<GrantPreview>),
+}
+
+/// A verb the UI wants run on the daemon connection the poller already holds
+/// (T-0074).
+///
+/// **The held connection, deliberately.** A spawn/send/kill sent on a fresh
+/// connection would be a second session for the same device on the remote
+/// transport (the far end hands the new handshake to the old one, T-0054) and,
+/// on any transport, a different audit attribution: the daemon records the
+/// device that sent the verb, and the criterion says a send is audited *as the
+/// device*. So the verbs ride the connection the sidebar is already reading.
+enum Command {
+    Spawn {
+        id: String,
+        program: String,
+        args: Vec<String>,
+    },
+    Kill {
+        id: String,
+    },
+    Send {
+        id: String,
+        text: String,
     },
 }
 
@@ -249,12 +334,20 @@ async fn run(
     target: Target,
     session: String,
     request: ThemeRequest,
+    fleet: Fleet,
+    role: Role,
+    device: Option<DeviceId>,
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
 ) -> anyhow::Result<()> {
     let mut app = App::new();
     // Which machine, and over what (T-0061): shown in the sidebar once, not
     // repeated on every row — one sidebar is one machine's panes today.
     app.session = session;
+    // What this device may do (T-0074). A viewer's control keys render disabled
+    // with the daemon's own denial sentence rather than failing after the
+    // keypress, and the local socket is always `owner` (no gate applies there).
+    app.role = role;
+    app.device = device;
     let depth = request.depth.unwrap_or_else(Depth::detect);
     app.theme = ThemeState::with_depth(depth, request.variant.unwrap_or_default());
     // `[tui]` settings (T-0076): from the same config file the daemon reads,
@@ -281,8 +374,16 @@ async fn run(
     // Daemon traffic lives in its own task: a slow socket must never delay
     // input. The UI loop only drains events and applies finished snapshots.
     let (tx, mut rx) = tokio::sync::mpsc::channel::<Poll>(8);
+    // Verbs the UI asks for go the other way, to the task that holds the
+    // connection (T-0074): one connection, one audit attribution.
+    let (commands, command_rx) = tokio::sync::mpsc::channel::<Command>(8);
     let subscription = Arc::new(Mutex::new(Subscription::default()));
-    let poller = tokio::spawn(poll_daemon(target.clone(), tx, Arc::clone(&subscription)));
+    let poller = tokio::spawn(poll_daemon(
+        target.clone(),
+        tx.clone(),
+        command_rx,
+        Arc::clone(&subscription),
+    ));
 
     let mut needs_draw = true;
     loop {
@@ -292,6 +393,10 @@ async fn run(
                     if !app.on_key(key.code) {
                         break;
                     }
+                    // The operator acted: the one-shot result's moment is over
+                    // (and a fresh one, if the key queued a verb, will replace
+                    // it when its answer lands).
+                    app.result = None;
                     needs_draw = true;
                 }
                 Event::Mouse(mouse) => {
@@ -345,6 +450,13 @@ async fn run(
                     app.status = format!("daemon unreachable: {e}");
                 }
                 Poll::Status(line) => app.status = line,
+                Poll::Result(line) => {
+                    // Held until the next keypress: a sentence the frame never
+                    // painted was never a sentence at all.
+                    app.result = Some(line);
+                }
+                Poll::Fleet { action, outcome } => app.apply_fleet(&action, outcome),
+                Poll::ConfirmGrant(preview) => app.show_grant_confirm(*preview),
                 Poll::Delta {
                     id,
                     from_line,
@@ -364,6 +476,42 @@ async fn run(
                 }
             }
             needs_draw = true;
+        }
+        // Verbs the UI queued (T-0074). A daemon verb rides the connection the
+        // poller holds; a fleet verb runs in its own task (the relay is a
+        // network away, and `machines add` waits on a pairing mailbox), and its
+        // answer comes back through the same channel as everything else.
+        while let Some(action) = app.take_action() {
+            match &action {
+                Action::Spawn { id, program, args } => {
+                    let _ = commands
+                        .send(Command::Spawn {
+                            id: id.clone(),
+                            program: program.clone(),
+                            args: args.clone(),
+                        })
+                        .await;
+                }
+                Action::Kill { id } => {
+                    let _ = commands.send(Command::Kill { id: id.clone() }).await;
+                }
+                Action::Send { id, text } => {
+                    let _ = commands
+                        .send(Command::Send {
+                            id: id.clone(),
+                            text: text.clone(),
+                        })
+                        .await;
+                }
+                _ => {
+                    let fleet = fleet.clone();
+                    let tx = tx.clone();
+                    let action = action.clone();
+                    tokio::spawn(async move {
+                        run_fleet_action(fleet, action, tx).await;
+                    });
+                }
+            }
         }
         // Tell the poller what to stream: the focused pane, or every pane
         // while the wall is up (the wall is only honest if its tiles are).
@@ -387,6 +535,144 @@ async fn run(
     }
     poller.abort();
     Ok(())
+}
+
+/// One verb from the UI, run on the held connection (T-0074).
+///
+/// The lines are the CLI's own (`spawned <id>` on success; `spawn: <why>` when
+/// the daemon refuses), because the criterion is that the honesty the CLI
+/// already has is what the TUI shows: a refused spawn names why, and a kill of
+/// a pane that is already gone says so.
+async fn run_command(conn: &mut Client, command: Command) -> String {
+    match command {
+        Command::Spawn { id, program, args } => {
+            let request = Message::Spawn {
+                v: VERSION,
+                id: id.clone(),
+                program,
+                args,
+                cols: 80,
+                rows: 24,
+                memory_max: None,
+                pids_max: None,
+                kill_on_breach: false,
+            };
+            match conn.call(&request).await {
+                Ok(Message::Ok { .. }) => format!("spawned {id}"),
+                Ok(Message::Error { message, .. }) => format!("spawn: {message}"),
+                Ok(other) => format!("spawn: unexpected {other:?}"),
+                Err(e) => format!("spawn: {e}"),
+            }
+        }
+        Command::Kill { id } => {
+            match conn
+                .call(&Message::Kill {
+                    v: VERSION,
+                    id: id.clone(),
+                })
+                .await
+            {
+                Ok(Message::Ok { .. }) => format!("killed {id}"),
+                Ok(Message::Error { message, .. }) => format!("kill: {message}"),
+                Ok(other) => format!("kill: unexpected {other:?}"),
+                Err(e) => format!("kill: {e}"),
+            }
+        }
+        Command::Send { id, text } => {
+            match conn
+                .call(&Message::Send {
+                    v: VERSION,
+                    id: id.clone(),
+                    data: text,
+                })
+                .await
+            {
+                Ok(Message::Ok { .. }) => format!("sent to {id}"),
+                Ok(Message::Error { message, .. }) => format!("send: {message}"),
+                Ok(other) => format!("send: unexpected {other:?}"),
+                Err(e) => format!("send: {e}"),
+            }
+        }
+    }
+}
+
+/// Run one fleet verb and push its answer back to the UI (T-0074).
+///
+/// The trust verbs are synchronous (a local SQLite ledger, plus the authority
+/// index for the pin check), so they run on the blocking pool; the directory
+/// verbs are async because the relay is a network away. `machines add` makes its
+/// own blocking hop for the pairing exchange, which waits on a mailbox.
+async fn run_fleet_action(fleet: Fleet, action: Action, tx: tokio::sync::mpsc::Sender<Poll>) {
+    let outcome = match &action {
+        Action::MachinesList => Some(fleet.machines_list().await),
+        Action::MachinesRename { from, to } => Some(fleet.machines_rename(from, to).await),
+        Action::MachinesRemove { name, force } => Some(fleet.machines_remove(name, *force).await),
+        Action::MachinesAdd { code, uri } => Some(fleet.machines_add(code, uri).await),
+        Action::TrustList => {
+            let fleet = fleet.clone();
+            match tokio::task::spawn_blocking(move || fleet.trust_list()).await {
+                Ok(outcome) => Some(outcome),
+                Err(e) => Some(blocking_failed("machines trust", &e)),
+            }
+        }
+        Action::TrustRevoke { device } => {
+            let fleet = fleet.clone();
+            let device = device.clone();
+            match tokio::task::spawn_blocking(move || fleet.trust_revoke(&device)).await {
+                Ok(outcome) => Some(outcome),
+                Err(e) => Some(blocking_failed("devices revoke", &e)),
+            }
+        }
+        Action::TrustPreview { device, role } => {
+            let fleet = fleet.clone();
+            let device = device.clone();
+            let role = role.clone();
+            match tokio::task::spawn_blocking(move || fleet.trust_preview(&device, &role)).await {
+                Ok(Ok(preview)) => {
+                    // Only a grant that cleared every check reaches the human,
+                    // so the confirmation never asks about something that
+                    // cannot work — the CLI's own order.
+                    let _ = tx.send(Poll::ConfirmGrant(Box::new(preview))).await;
+                    return;
+                }
+                Ok(Err(outcome)) => Some(outcome),
+                Err(e) => Some(blocking_failed("machines trust", &e)),
+            }
+        }
+        Action::TrustGrant { device, role } => {
+            // The checks run again — they are cheap, and refusing a grant that
+            // no longer clears them is the honest answer rather than writing it
+            // blind.
+            let fleet = fleet.clone();
+            let device = device.clone();
+            let role = role.clone();
+            match tokio::task::spawn_blocking(move || {
+                fleet
+                    .trust_preview(&device, &role)
+                    .map(|preview| fleet.trust_grant(&preview))
+            })
+            .await
+            {
+                Ok(Ok(outcome) | Err(outcome)) => Some(outcome),
+                Err(e) => Some(blocking_failed("machines trust", &e)),
+            }
+        }
+        Action::Spawn { .. } | Action::Kill { .. } | Action::Send { .. } => None,
+    };
+    if let Some(outcome) = outcome {
+        let _ = tx.send(Poll::Fleet { action, outcome }).await;
+    }
+}
+
+/// A blocking-pool task that did not finish: the verb did not run, and saying so
+/// is better than a silent no-op.
+fn blocking_failed(verb: &str, e: &tokio::task::JoinError) -> Outcome {
+    Outcome {
+        code: Code::Failure,
+        message: format!("{verb}: the task failed: {e}"),
+        machines: Vec::new(),
+        grants: Vec::new(),
+    }
 }
 
 /// Pane scrollback kept in the view (mirrors the daemon's ring, which is the
@@ -437,6 +723,7 @@ struct Subscription {
 async fn poll_daemon(
     target: Target,
     tx: tokio::sync::mpsc::Sender<Poll>,
+    mut commands: tokio::sync::mpsc::Receiver<Command>,
     subscription: Arc<Mutex<Subscription>>,
 ) {
     let mut tick = tokio::time::interval(Duration::from_secs(1));
@@ -490,6 +777,23 @@ async fn poll_daemon(
                     conn = None;
                     tokio::time::sleep(delay).await;
                     attempt = attempt.saturating_add(1);
+                    continue;
+                }
+                // A verb the UI asked for (T-0074): run it now, on the
+                // connection this task holds, and answer with the CLI's line.
+                // The next pass then runs immediately after it, so what the verb
+                // changed is on the sidebar without waiting out the cadence.
+                Some(command) = commands.recv() => {
+                    let line = match conn.as_mut() {
+                        Some(active) => run_command(active, command).await,
+                        // No connection: the pass below will reconnect and say
+                        // so; the verb is reported as unreachable rather than
+                        // silently dropped.
+                        None => "the daemon is not reachable yet; try again".to_string(),
+                    };
+                    if tx.send(Poll::Result(line)).await.is_err() {
+                        return; // UI is gone.
+                    }
                     continue;
                 }
             }

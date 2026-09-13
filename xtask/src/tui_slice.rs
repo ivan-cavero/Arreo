@@ -519,6 +519,186 @@ pub fn run(rest: &[String]) -> ExitCode {
     session.send("w");
     std::thread::sleep(Duration::from_secs(2));
 
+    // ---- T-0074: the TUI manages the fleet, locally ----------------------
+    //
+    // The sections above read and attached; this one *drives* — keys only
+    // (`s` spawn, `i` send, `x` kill), with the CLI's own sentences asserted
+    // from the raw transcript. A status line is transient by design here (the
+    // 1 Hz pane poll may overwrite it within a second), so asserting that a
+    // sentence was *rendered* reads the bytes the TUI wrote rather than a frame
+    // that may have moved on — that is what makes the checks deterministic.
+    let evidence_dir_74 = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("workspace root")
+        .join(".loop")
+        .join("evidence")
+        .join("T-0074");
+    if evidence {
+        let _ = std::fs::create_dir_all(&evidence_dir_74);
+    }
+    let marker = format!("TUI-SENT-{}", std::process::id());
+
+    // `s`: the spawn prompt is the CLI's own argument shape, quotes included.
+    session.send("s");
+    std::thread::sleep(Duration::from_millis(500));
+    let spawn_prompt = session.screen();
+    if evidence {
+        let _ = std::fs::write(evidence_dir_74.join("00-spawn-prompt.txt"), &spawn_prompt);
+    }
+    check(
+        "s opens the spawn prompt as <id> <program> [args…]",
+        spawn_prompt.contains("spawn · <id> <program> [args…]"),
+        "no spawn prompt on screen",
+    );
+    session.send("delta /bin/sh -c 'cat'");
+    std::thread::sleep(Duration::from_millis(400));
+    session.send("\r");
+    std::thread::sleep(Duration::from_secs(2));
+    let spawned = session.screen();
+    if evidence {
+        let _ = std::fs::write(evidence_dir_74.join("01-spawn.txt"), &spawned);
+    }
+    check(
+        "s spawns the pane and the sidebar gains it",
+        spawned.contains("delta"),
+        "delta missing from the sidebar after the spawn prompt",
+    );
+    // The sentence is rendered via the status bar, so it is read off the
+    // *frame*: ratatui's diff renderer may split a line across cursor moves in
+    // the byte stream, and the reconstructed frame is the honest record of
+    // what was on screen.
+    check(
+        "the status carried the CLI's own line (spawned delta)",
+        spawned.contains("spawned delta"),
+        "spawned delta never reached the status line",
+    );
+    // A refused spawn names why: the id is taken by the pane just spawned.
+    session.send("s");
+    std::thread::sleep(Duration::from_millis(400));
+    session.send("delta /bin/sh -c 'cat'");
+    std::thread::sleep(Duration::from_millis(400));
+    session.send("\r");
+    std::thread::sleep(Duration::from_secs(1));
+    let refused = session.screen();
+    check(
+        "a refused spawn names why (pane \"delta\" already exists)",
+        refused.contains("spawn: pane \"delta\" already exists"),
+        "the refusal line never reached the status",
+    );
+
+    // Focus delta by clicking its sidebar row — looked up on the rendered frame
+    // rather than assumed, because earlier sections spawn panes whose group
+    // order the click depends on.
+    let screen = session.screen();
+    let edge = sidebar_column(&screen);
+    let delta_row = screen
+        .lines()
+        .enumerate()
+        .find(|(_, line)| {
+            edge.is_some_and(|e| {
+                line.chars()
+                    .take(e as usize)
+                    .collect::<String>()
+                    .contains("delta")
+            })
+        })
+        .map(|(row, _)| row);
+    let Some(delta_row) = delta_row else {
+        check(
+            "delta's sidebar row is found for the click",
+            false,
+            "no delta row on screen",
+        );
+        drop(session);
+        drop(server);
+        let _ = std::fs::remove_file(&socket);
+        return ExitCode::FAILURE;
+    };
+    session.send(&format!("\u{1b}[<0;1;{}M", delta_row + 1));
+    std::thread::sleep(Duration::from_secs(1));
+    check(
+        "clicking delta attaches it",
+        session.screen().contains("delta ["),
+        "delta did not take the focused pane",
+    );
+
+    // `i`: send to the attached pane, audited as this device.
+    session.send("i");
+    std::thread::sleep(Duration::from_millis(400));
+    session.send(&marker);
+    std::thread::sleep(Duration::from_millis(300));
+    session.send("\r");
+    std::thread::sleep(Duration::from_secs(2));
+    let sent = session.screen();
+    if evidence {
+        let _ = std::fs::write(evidence_dir_74.join("02-send.txt"), &sent);
+    }
+    check(
+        "i sends the marker to the attached pane and the pane echoes it",
+        sent.contains(&marker),
+        &format!("the marker {marker:?} is not in the pane view"),
+    );
+    check(
+        "the send's answer was the CLI's own line (sent to delta)",
+        sent.contains("sent to delta"),
+        "sent to delta never reached the status",
+    );
+
+    // `x`: kill, behind a confirmation that names the pane.
+    session.send("x");
+    std::thread::sleep(Duration::from_millis(400));
+    let confirm = session.screen();
+    if evidence {
+        let _ = std::fs::write(evidence_dir_74.join("02b-kill-confirm.txt"), &confirm);
+    }
+    check(
+        "x opens a confirmation that names the pane (kill pane delta)",
+        confirm.contains("kill pane delta"),
+        "the kill confirmation did not name delta",
+    );
+    session.send("y");
+    std::thread::sleep(Duration::from_secs(2));
+    let killed = session.screen();
+    if evidence {
+        let _ = std::fs::write(evidence_dir_74.join("03-kill.txt"), &killed);
+    }
+    // The status bar spans the terminal's full width, so the "killed delta"
+    // sentence it carries lives inside the sidebar *region* too; the sidebar
+    // itself is everything above the status row.
+    let killed_body: Vec<&str> = killed.lines().collect();
+    let killed_body = killed_body[..killed_body.len().saturating_sub(1)].join("\n");
+    check(
+        "killed delta left the sidebar",
+        !sidebar_region(&killed_body).contains("delta"),
+        "delta still in the sidebar after the kill",
+    );
+    check(
+        "the kill's answer was the CLI's own line (killed delta)",
+        killed.contains("killed delta"),
+        "killed delta never reached the status",
+    );
+
+    // The dead-pane refusal: `i` still targets the pane that was just killed
+    // (the selection is stale), and the daemon answers with the honest line.
+    session.send("i");
+    std::thread::sleep(Duration::from_millis(400));
+    session.send("still-alive?");
+    std::thread::sleep(Duration::from_millis(300));
+    session.send("\r");
+    std::thread::sleep(Duration::from_secs(1));
+    if evidence {
+        let _ = std::fs::write(
+            evidence_dir_74.join("04-dead-pane-refusal.txt"),
+            session.screen(),
+        );
+    }
+    let dead = session.screen();
+    check(
+        "sending to a dead pane says so (send: pane \"delta\" not found)",
+        dead.contains("send: pane \"delta\" not found"),
+        "the dead-pane refusal never reached the status",
+    );
+
     // Steady state: the app must repaint cells, not the screen. A frame is
     // only what changed, so idle output stays tiny and never clears.
     let before = session.transcript().len();

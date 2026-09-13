@@ -132,6 +132,31 @@ only quits when there is nothing left to dismiss. Ctrl-C on `arreo attach`
 detaches and leaves the pane running — the pane belongs to the daemon, not to
 your terminal.
 
+The fleet keys are the CLI verbs with their refusals — the TUI never invents a
+second sentence for a refusal the CLI would print:
+
+- `s` spawns a pane. The prompt takes `<id> <program> [args…]`, quoting like a
+  shell, so `s` then `build /bin/sh -c 'make -j4'` works; a refused spawn says
+  why (`spawn: pane "build" already exists`).
+- `i` sends to the **attached** pane — attach one with `Enter` first. The send
+  is audited as this device, exactly like `arreo send`.
+- `x` kills the attached pane **behind a confirmation that names it**; `y`
+  confirms, Esc/N cancels.
+- `m` opens the account's machines (`a` add from a pairing code, `r` rename,
+  `x` remove — an online machine's remove asks for the same `f` force the CLI
+  requires). `--machine <name>` flips the whole session's target, so a TUI
+  pointed at another machine manages *that* machine's panes; its trust panel
+  still refuses with the CLI's "trust is local" sentence, because a grant
+  recorded anywhere but the enforcing machine is advice, not access.
+- `g` opens this machine's trust grants (`a` grant a pinned device,
+  fingerprint-confirmed like `--yes`'s prompt; `x` revoke, also confirmed).
+
+Safety is a rendered fact, not a round-trip: a TUI whose device role cannot
+spawn/kill/send shows the daemon's own `VerbDenial::Role` sentence as the reason
+and draws the keys disabled, *before* any keypress — a viewer sees why, instead
+of watching a refusal happen. `q`/Esc quits; the `?` key list shows every binding
+with its confirmation requirement.
+
 Two things are worth knowing before a long session. The pulse on a `question`
 group is the terminal's own slow blink, so it costs no frames; if you want it
 still, put `[tui] reduce_motion = true` in the config file the daemon already

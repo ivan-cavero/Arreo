@@ -1,0 +1,30 @@
+┌beta-machine · relay──────┐┌(no pane attached — Enter on a sidebar row)───────────────────────────────────────────────┐
+│  ○ idle                  ││                                                                                          │
+│▶  beta-pane   3M █░░░░░░░││                                                                                          │
+│                          ││                                                                                          │
+│                          ││                                                                                          │
+│                          ││                                                                                          │
+│                          ││                                                                                          │
+│                          ││                                                                                          │
+│                          ││                                                                                          │
+│                          ││                                                                                          │
+│                          ││                                                                                          │
+│                          ││                                                                                          │
+│                      ┌machines · beta-machine · relay─────────────────────────────────────────┐                      │
+│                      │2 machine(s) from the relay                                             │                      │
+│                      │▶ alpha-machine        online      7s                                   │                      │
+│                      │beta-machine         online      7s                                     │                      │
+│                      │                                                                        │arreo-server: relay sen
+│                      └ a add · r rename · x remove · g trust · Esc close──────────────────────┘                      │
+│                          ││                                                                                          │
+│                          ││                                                                                          │
+│                          ││                                                                                          │
+│                          ││                                                                                          │
+│                          ││                                                                                          │
+│                          ││                                                                                          │
+│                          ││                                                                                          │
+│                          ││                                                                                          │
+│                          ││                                                                                          │
+│                          ││                                                                                          │
+└──────────────────────────┘└──────────────────────────────────────────────────────────────────────────────────────────┘
+2 machine(s) from the relay · j/k move · Enter attach · s/i/x agents · m machines · g trust · w wall · t theme · / find…

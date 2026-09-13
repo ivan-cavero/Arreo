@@ -5,6 +5,7 @@
 //! full JSON engine lands in T-0016 without changing these call sites.
 
 pub mod client;
+pub mod fleet;
 pub mod model;
 pub mod settings;
 pub mod theme;

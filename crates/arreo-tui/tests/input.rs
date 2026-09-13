@@ -52,17 +52,35 @@ fn views() -> Vec<PaneView> {
 fn click_on_sidebar_row_focuses_that_pane() {
     let mut app = App::new();
     app.model.set_panes(views());
-    // Rendered sidebar rows (0-based): 0 = "◉ question" header, 1 = beta,
-    // 2 = "● working" header, 3 = alpha, 4 = gamma.
-    app.on_click(6, 4);
+    // The row argument is the pty row; row 0 is the block's title/border, so
+    // the list starts at row 1. Rendered list rows (0-based, title excluded):
+    // 0 = "◉ question" header, 1 = beta, 2 = "● working" header, 3 = alpha,
+    // 4 = gamma — each on pty row (list + 1).
+    app.on_click(6, 5);
     assert_eq!(app.model.focused_id(), Some("gamma"));
-    app.on_click(6, 1);
-    assert_eq!(app.model.focused_id(), Some("beta"));
-    // Group headers and the pane column are not pane targets.
     app.on_click(6, 2);
     assert_eq!(app.model.focused_id(), Some("beta"));
-    app.on_click(40, 4);
+    // Group headers and the pane column are not pane targets.
+    app.on_click(6, 3);
     assert_eq!(app.model.focused_id(), Some("beta"));
+    app.on_click(40, 5);
+    assert_eq!(app.model.focused_id(), Some("beta"));
+}
+
+#[test]
+fn a_question_line_shifts_the_rows_a_click_maps_to() {
+    let mut app = App::new();
+    let mut panes = views();
+    // beta asks (a rendered indented line under its row), so every later row
+    // moves down one: list rows are 0 q-header, 1 beta, 2 beta's question,
+    // 3 working-header, 4 alpha, 5 gamma — gamma on pty row 6.
+    panes[1].asking = Some("Proceed? [y/n]".to_string());
+    app.model.set_panes(panes);
+    app.on_click(6, 6);
+    assert_eq!(app.model.focused_id(), Some("gamma"));
+    // And the header click still does not focus anything.
+    app.on_click(6, 4);
+    assert_eq!(app.model.focused_id(), Some("gamma"));
 }
 
 #[test]

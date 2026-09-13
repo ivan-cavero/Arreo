@@ -1,0 +1,1 @@
+panes: beta-machine: mesh client handshake: machine vmi3525064 revoked this device's grant, so Hello is refused. Re-grant it with: arreo machines trust dev_0b913843508b1175153a009ff2bb5c08 --machine vmi3525064 --role viewer --yes

@@ -1,0 +1,30 @@
+┌beta-machine · relay──────┐┌(no pane attached — Enter on a sidebar row)───────────────────────────────────────────────┐
+│  ○ idle                  ││                                                                                          │
+│▶  beta-pane   3M █░░░░░░░││                                                                                          │
+│                          ││                                                                                          │
+│                          ││                                                                                          │
+│                          ││                                                                                          │
+│                          ││                                                                                          │
+│                          ││                                                                                          │
+│                          ││                                                                                          │
+│                          ││                                                                                          │
+│                          ││                                                                                          │
+│                       ┌trust · this machine──────────────────────────────────────────────────┐                       │
+│                       │machines trust: "beta-machine" is not this machine (which is          │                       │
+│                       │"vmi3525064", b93984d33b13c6963291ce11d2fc9482). Trust is local: no   │                       │
+│                       │machine — and not the relay — can grant on another's behalf. Run this │                       │
+│                       │on beta-machine itself.                                               │                       │
+│                       │(no grant on this machine)                                            │ arreo-server: relay sen
+│                       │                                                                      │                       │
+│                       └ a grant · x revoke · Esc close───────────────────────────────────────┘                       │
+│                          ││                                                                                          │
+│                          ││                                                                                          │
+│                          ││                                                                                          │
+│                          ││                                                                                          │
+│                          ││                                                                                          │
+│                          ││                                                                                          │
+│                          ││                                                                                          │
+│                          ││                                                                                          │
+│                          ││                                                                                          │
+└──────────────────────────┘└──────────────────────────────────────────────────────────────────────────────────────────┘
+machines trust: "beta-machine" is not this machine (which is "vmi3525064", b93984d33b13c6963291ce11d2fc9482). Trust is …

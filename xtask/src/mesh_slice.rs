@@ -23,7 +23,7 @@
 //! but they are two processes on one box, and anything about real networks is
 //! out of scope by design rather than by omission.
 
-use crate::harness::bins;
+use crate::harness::{bins, TuiSession};
 use arreo_core::identity::{DeviceCert, DeviceKey, Role, RootKey};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitCode, Stdio};
@@ -170,6 +170,23 @@ fn cli_with_deadline(
     let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
     text.push_str(&String::from_utf8_lossy(&output.stderr));
     (output.status.success(), text)
+}
+
+/// Collapse runs of whitespace (T-0074): the TUI panel wraps a long refusal and
+/// the CLI prints it on one line, so comparing the *words* is the comparison
+/// that means something; the layout is the renderer's business.
+fn collapse(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// The words of a frame, with the box-drawing glyphs a centred overlay leaves
+/// between its wrapped lines removed (T-0074): the sidebar's border runs
+/// through the panel, so a wrapped sentence's lines are separated by `│` in the
+/// reconstructed grid — filtering them first lets a sentence that the panel
+/// wrapped be compared word for word with the CLI's single line.
+fn words(text: &str) -> String {
+    let cleaned: String = text.chars().filter(|c| !"│┌┐└┘─".contains(*c)).collect();
+    collapse(&cleaned)
 }
 
 /// The hostname out of a "which is" refusal: `devices revoke --machine` names the
@@ -385,7 +402,7 @@ pub fn run(rest: &[String]) -> ExitCode {
         let _ = std::fs::create_dir_all(&evidence_dir);
     }
 
-    let (server_bin, cli_bin, _tui_bin) = bins();
+    let (server_bin, cli_bin, tui_bin) = bins();
     let relay_bin = debug_bin("arreo-relay");
     for bin in [&server_bin, &cli_bin, &relay_bin] {
         if !bin.exists() {
@@ -800,6 +817,132 @@ pub fn run(rest: &[String]) -> ExitCode {
     if evidence {
         let _ = std::fs::write(evidence_dir.join("04-grant-attach.txt"), &after);
     }
+
+    // ---- T-0074: the TUI manages the fleet, by name ----------------------
+    //
+    // The relay and both machines are still up. This section drives the real
+    // TUI as the account's *client* — an identity and a relay config but no
+    // daemon — attached to beta by name, and proves the parts a local socket
+    // cannot: machines list by name (the account's directory, from the relay)
+    // and the trust refusal for a machine that is not this one. The TUI reads
+    // `arreo_tui::fleet` for both, so the checks assert exactly what that code
+    // produces: the panel rows for `m`, and the CLI's own `--machine <other>`
+    // sentence for `g`.
+    let evidence_dir_74 = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("workspace root")
+        .join(".loop")
+        .join("evidence")
+        .join("T-0074");
+    if evidence {
+        let _ = std::fs::create_dir_all(&evidence_dir_74);
+    }
+    let machine_args: Vec<String> = vec![
+        "--machine".to_string(),
+        BETA.to_string(),
+        "--config".to_string(),
+        client.config.display().to_string(),
+    ];
+    let machine_refs: Vec<&str> = machine_args.iter().map(String::as_str).collect();
+    let identity_dir = client.dir.display().to_string();
+    let mut tui = match TuiSession::start_by_name(
+        &tui_bin,
+        &machine_refs,
+        &[("ARREO_IDENTITY_DIR", identity_dir.as_str())],
+    ) {
+        Some(session) => session,
+        None => {
+            check("the TUI starts attached by machine name", false, "no pty");
+            drop(relay);
+            let _ = std::fs::remove_dir_all(&base);
+            return ExitCode::FAILURE;
+        }
+    };
+    // Attach by name: the sidebar names the machine it is looking at. The first
+    // attach occupies the client's one live relay session, so the poller holds
+    // it; the slice is deliberately generous with the wait (a handshake plus a
+    // directory round trip and a first pane pass).
+    std::thread::sleep(Duration::from_secs(6));
+    let attached = tui.screen();
+    check(
+        "the TUI resolves the machine by name (sidebar says beta-machine · relay)",
+        attached.contains("beta-machine · relay") && attached.contains("beta-pane"),
+        &format!(
+            "session label or pane missing: {:?}",
+            collapse(&attached).chars().take(120).collect::<String>()
+        ),
+    );
+
+    // `m`: the machines panel lists the account, from the relay.
+    tui.send("m");
+    std::thread::sleep(Duration::from_secs(8));
+    let machines = tui.screen();
+    if evidence {
+        let _ = std::fs::write(evidence_dir_74.join("50-machines-by-name.txt"), &machines);
+    }
+    check(
+        "m lists the account's machines by name",
+        machines.contains("alpha-machine") && machines.contains("beta-machine"),
+        &format!(
+            "machines panel missing a name: {:?}",
+            collapse(&machines).chars().take(160).collect::<String>()
+        ),
+    );
+    check(
+        "the list came from the relay",
+        machines.contains("machine(s) from the relay"),
+        "the panel never said where the rows came from",
+    );
+
+    // `g` (inside the machines panel): trust is local, and this TUI is attached
+    // to a machine that is not this one — the CLI's own refusal, verbatim.
+    tui.send("g");
+    std::thread::sleep(Duration::from_secs(3));
+    let trust_frame = tui.screen();
+    if evidence {
+        let _ = std::fs::write(
+            evidence_dir_74.join("51-trust-remote-refusal.txt"),
+            &trust_frame,
+        );
+    }
+    check(
+        "g refuses trust for a machine that is not this one",
+        trust_frame.contains("is not this machine") && trust_frame.contains("Trust is local"),
+        &format!(
+            "no trust refusal on screen: {:?}",
+            collapse(&trust_frame).chars().take(160).collect::<String>()
+        ),
+    );
+    // ...and the sentence is the CLI's own, word for word: the same machine
+    // (same identity dir), the same name, the same formatter round the same core
+    // values. The panel wraps a long refusal and the CLI prints it on one line,
+    // so the comparison is on collapsed whitespace — the words must match, the
+    // layout must not.
+    let (_, cli_refusal) = cli(
+        &client.dir,
+        &client.config,
+        &cli_bin,
+        &[
+            "machines",
+            "trust",
+            "dev_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "--machine",
+            BETA,
+        ],
+    );
+    let cli_collapsed = collapse(&cli_refusal);
+    check(
+        "the TUI's trust refusal is the CLI's own sentence",
+        !cli_collapsed.is_empty() && words(&trust_frame).contains(&cli_collapsed),
+        &format!(
+            "CLI: {cli_collapsed}\nTUI: {}",
+            words(&trust_frame).chars().take(300).collect::<String>()
+        ),
+    );
+
+    tui.send("q");
+    std::thread::sleep(Duration::from_millis(500));
+    drop(tui);
 
     // ---- node isolation: beta dies mid-attach, alpha is untouched ----
     // A pane on alpha, alive throughout. Killing beta must not touch it, and

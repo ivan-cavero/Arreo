@@ -289,6 +289,20 @@ The default is `viewer`: widening a grant is easy, noticing one you did not mean
 not. `owner` is accepted as a synonym when reading certificates, but this surface
 prints and documents the roadmap's word.
 
+### The same surface in the TUI
+
+`arreo-tui` keeps the two panels behind `m` (machines) and `g` (trust), with the
+CLI's own refusals and the same confirmations: removing a machine behind a
+confirmation that names it (an online machine's confirm adds the `f` force key —
+plain `y` is the plain remove, so the relay's refusal still has to happen for the
+force to be asked), granting with the fingerprint shown and confirmed before
+anything is written, revoking confirmed by the device id. A TUI pointed at
+another machine (`--machine <name>`) manages that machine's panes but **cannot**
+list, grant, or revoke its trust: the panel shows the CLI's own sentence —
+`machines trust: <device> is not this machine (which is <name>, <this machine's id>). Trust is local: no machine — and not the relay — can grant on another's behalf. Run this on <device> itself.` — exit 5 semantics —
+because a grant written anywhere but the enforcing machine would be advice. The
+reason is the same one this page states for the CLI: trust does not delegate.
+
 ### The trail
 
 Every grant, every cut, and the first refusal of each session appends an audit row:
