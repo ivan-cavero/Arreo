@@ -3,7 +3,7 @@ id: T-0036
 title: Signed releases — minisign-signed artifacts with fail-closed verification
 phase: 2
 priority: 1
-status: in-progress
+status: done
 depends_on: [T-0020]
 scope:
   - crates/arreo-core/src/update/**
@@ -26,29 +26,29 @@ channels-and-trust, §4 supply chain) — no byte of an update is trusted withou
 
 ## Acceptance criteria
 
-- [ ] Trust decision recorded in `docs/release.md`: **minisign** (one offline ed25519 key,
+- [x] Trust decision recorded in `docs/release.md`: **minisign** (one offline ed25519 key,
       in-process verification, zero egress) over keyless Sigstore — Fulcio/Rekor need
       network + OIDC at update time, and the self-hosted AGPL tier verifies on hosts behind
       zero inbound ports, sometimes offline. Rejected alternative and reason written down.
-- [ ] Public key committed at `supply-chain/arreo.pub` and embedded in the binary
+- [x] Public key committed at `supply-chain/arreo.pub` and embedded in the binary
       (`include_str!`); the secret key exists only as the `MINISIGN_SECRET_KEY` CI secret.
       No signing code in the workspace — verification only.
-- [ ] Tag-triggered `.github/workflows/release.yml` builds the three targets, writes
+- [x] Tag-triggered `.github/workflows/release.yml` builds the three targets, writes
       `SHA256SUMS`, signs every artifact **and** the manifest, and fails hard when any
       artifact lacks its `.minisig` or any signature fails verification against the
       committed key.
-- [ ] `arreo_core::update::verify` returns typed errors per failure mode (`MissingSignature`,
+- [x] `arreo_core::update::verify` returns typed errors per failure mode (`MissingSignature`,
       `UnknownKeyId`, `BadSignature`, `DigestMismatch`, `Io`) — no boolean, no partial
       success, no warn-and-continue branch.
-- [ ] Tamper refusal proven by artifact: `cargo test -p arreo-core --test update_verify`
+- [x] Tamper refusal proven by artifact: `cargo test -p arreo-core --test update_verify`
       flips one byte of a signed fixture and asserts `BadSignature` naming the file; the
       release job repeats it on the just-built artifacts (tampered copy →
       `arreo update verify` non-zero → job fails).
-- [ ] `arreo update verify <path> [--sig <path>]` is the user door: artifact name, key id
+- [x] `arreo update verify <path> [--sig <path>]` is the user door: artifact name, key id
       and digest on success; on failure it names what failed and offers no bypass flag.
-- [ ] Rotation documented as a two-key trust set (current + next): a leaked key becomes a
+- [x] Rotation documented as a two-key trust set (current + next): a leaked key becomes a
       procedure, not an emergency release.
-- [ ] The added verifier crate is vetted — `cargo vet check`, `cargo deny check` and
+- [x] The added verifier crate is vetted — `cargo vet check`, `cargo deny check` and
       `cargo audit` stay green (T-0020's merge gate), exemption/audit in the same change.
 
 ## Notes

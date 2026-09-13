@@ -1,7 +1,7 @@
 ---
 id: T-0079
 title: The wall takes ~9 s to paint 30 panes — the poller is serial and blocks per pane
-status: proposed
+status: done
 priority: 1
 depends_on: [T-0015, T-0040]
 phase: 2
@@ -48,25 +48,25 @@ the enforcement, and `perf-budget.toml` to flip the row to enforced once it pass
 
 ## Acceptance criteria
 
-- [ ] The 30-pane first frame is measured in the `tui` slice and asserted against
+- [x] The 30-pane first frame is measured in the `tui` slice and asserted against
       `perf-budget.toml`'s `tui_attach_30panes_ms` **read from the file, not copied** — and the
       row is flipped to enforced (`phase0 = true`) in the same change.
-- [ ] The measured first frame is under the row's 300 ms with 30 panes each emitting a marker
+- [x] The measured first frame is under the row's 300 ms with 30 panes each emitting a marker
       stream (the shape that makes every `Wait` time out — the case that fails today).
-- [ ] The fix is named for what it is: the poll pass must not serialize per-pane blocking waits.
+- [x] The fix is named for what it is: the poll pass must not serialize per-pane blocking waits.
       The acceptable shapes are (a) one batched request that returns every pane's state, RAM and
       series in a single round-trip, or (b) concurrent per-pane requests with the pass's total
       time bounded independently of pane count. A poll that is still `O(panes)` round-trips must
       justify why that is not `O(panes)` **time**.
-- [ ] **The steady-state cost does not regress**: T-0015's idle-delta budget (< 4 KiB, no
+- [x] **The steady-state cost does not regress**: T-0015's idle-delta budget (< 4 KiB, no
       clear-screen) stays green, and the counting-backend test that asserts zero cells repaint
       while idle stays green. A fix that makes the first frame fast by polling everything every
       tick is not a fix.
-- [ ] The `Wait`-based state resolution is reconsidered rather than merely parallelised: a
+- [x] The `Wait`-based state resolution is reconsidered rather than merely parallelised: a
       blocking wait with a timeout is how the loop *asks* a question it could be *told* the
       answer to. State whether a push/event shape is the right answer, and if it is out of scope,
       say what the cheap version is and what it costs.
-- [ ] A test with **one** pane proves nothing here; the test must have enough panes that a serial
+- [x] A test with **one** pane proves nothing here; the test must have enough panes that a serial
       pass cannot pass it (state the number and why).
 
 ## Verification

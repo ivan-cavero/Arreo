@@ -1,29 +1,39 @@
 ## State snapshot          ← REWRITTEN (not appended) at every checkpoint
-Task: **T-0079 (the 30-pane wall) IN FLIGHT** with worker `WallPoller`. T-0038 is DONE (all six
-criteria); T-0076 done; T-0036 is `todo`.
-Where you are: 629 tests / 61 targets, 13 slices, bench 6/6, all gates green at `e1dffc7`. The
-user's Astro site (`site/`, `.loop/evidence/landing/`) is untracked and untouched.
-Next step: collect `WallPoller`, verify its measurement independently (the slice's number is the
-claim, so re-run it myself), then the battery on the merged tree and commit T-0079.
-Open workers: **WallPoller** (the batched summary request: proto `PaneInfo` detail fields + the
-daemon's one-pass computation + the TUI's single-call poll + the slice's 30-pane measurement)
+Task: **T-0079 DONE** (`22438b6`) and **T-0036 DONE** (`7b691fa`) — the two p1 slices, run in
+parallel on disjoint files. T-0038, T-0076, T-0071, T-0070 all done.
+Where you are: 647 workspace tests / 0 failed across 63 targets; clippy clean on **both**
+toolchains; fmt clean; **13 slices green**; bench 6/6; vet 337, deny 4/4, audit 0, check-targets
+PASS/SKIP. The user's Astro `site/` is untracked and untouched.
+Next step: the remaining queue — **T-0078** (p1: the daemon's store is world-readable and its
+socket group-writable — proven, and until it lands the handoff's honest claim is "closed for
+same-user, open for same-group at the default mode"); then T-0037 (the channel half, whose
+verification now exists thanks to T-0036), T-0072/T-0074/T-0075 (the user's harness/TUI suite),
+T-0042 (release e2e slice, unblocked by T-0036+T-0038), T-0039 (Windows deferred update).
+Open workers: (none)
 Known broken: T-0063 (CI never-green — the user is working it) · Parked: T-0048 needs-human
-**T-0079's baseline, measured by the planner before the fix** (`.loop/evidence/T-0079/baseline-mechanism.txt`):
-30 working panes cost **10,325 ms** of serial state resolution against a **300 ms** budget — 34×
-over, and the batched round trip that replaces it costs **21 ms** (including ~15 ms of CLI startup),
-i.e. the per-pane waits cost ~490× their alternative. The task's ~9 s estimate was right about the
-mechanism and pessimistic by ~10% on the clock (my harness pays process overhead per call that the
-TUI does not). Recorded now because the *before* number is unreproducible once the fix lands.
+**T-0079 — the wall asks once.** `poll_summaries` used to make 4 serial round-trips per pane,
+two of them blocking 150 ms `Wait`s; 30 working panes measured **10,325 ms** against a 300 ms
+budget (baseline recorded before the fix — unreproducible after). Now one `PanesDetail` request
+tells the sidebar everything the daemon already knows: state, asking line, RAM, sparkline. The
+`tui` slice's 30-pane first-frame assertion reads the row from perf-budget.toml (now enforced):
+76-259 ms across 10 runs, all inside budget — with the honest caveat that headroom is ~1.2-4x
+and a slow `/proc` walk bounds the sampling phase under load.
+**T-0036 — signed releases.** `arreo_core::update::verify` (typed errors, key id checked first,
+manifest as the only digest source), `arreo update verify` (no bypass), the release job (signs
+with the env secret, verifies its own build, refuses tamper, then publishes), docs with the
+decision + rejected alternatives + rotation. Human gate cleared by the operator's key.
 Findings:
-- **The frame is not slow, it cannot be correct until the pass finishes** — so the assertion must
-  be "the first frame with all 30 panes visible", not "the frame appeared". A measurement that
-  passes while the wall is still filling would be a false green, and the worker was told so.
-- **The `Wait` primitive is not the bug; asking per pane is.** The daemon already knows each
-  pane's state from its engine, so a blocking wait with a timeout is how the sidebar asks for
-  something it could be told. `Wait` stays for orchestration (`arreo wait --state question` really
-  does want to block).
-- **The budget row was `phase0 = false`** — recorded and enforced by nothing, which is why a
-  34×-over-budget wall sat unnoticed since Phase 0 (the same finding T-0079 was filed from).
+- **A descriptor-identity check that matches inode alone can false-positive across
+  filesystems**: a pty slave's devpts inode and /dev/urandom's devtmpfs inode are both 8 on this
+  box, so a parallel test holding /dev/urandom made a refusal look like a leak — the adopt test
+  flaked only under full-workspace load. Identity is now (device, inode).
+- **The wall was 34× over budget and nothing knew** — the row was `phase0 = false`, recorded and
+  enforced by nothing since Phase 0. The first person to enforce it found a 10-second hole. Same
+  finding as T-0079's origin, now with the number.
+- **A verifier's positive case must be proven or a refuse-everything bug passes.** The tamper
+  tests verify the untampered pair first, so a verifier that refuses everything cannot pass.
+- **`minisign-verify` over hand-rolled ed25519** — the task's Notes record the rejections
+  (signing kept out of the workspace, no network at update time, cargo-dist compatibility).
 ## Event log               ← append-only; newest last; never rewrite
 - 2026-09-10 [turn 1] ledger created; repo at e489fac (docs only); T-0001 + T-0022 (AGENTS.md gardened) done
 - 2026-09-10 [turn 2] T-0002 PTY manager done+pushed (342606c; 9 tests); PROMPT.md v2 synced + ADR 0001 (ef6c595)
@@ -165,3 +175,5 @@ Findings:
 - 2026-09-13 [turn 67] T-0038 DONE — all six criteria (five stages + SQLite). Stage 4 landed: `xtask/src/handoff_abort_slice.rs` (`--slice handoff-abort`, 41 checks) kills -9 a real incoming daemon at three observably distinct moments of a real cut with 8 panes and a live attached client, asserting the full bundle each time (panes alive + contiguous, old daemon serving, client unaware, abort row, retry commits and carries the panes, exactly one daemon); point C asserts the accepted §2c gap honestly (a kill after the commit leaves nobody serving, so it verifies the commit was withheld). The SQLite criterion: `SessionStore::open` now quarantines a corrupt store — files renamed aside (never deleted), stderr + a `store.corrupt` audit row, one call heals (the boot path's store is opened with `?` by a daemon that then exits), the heal is verified and undone if the fresh store will not open, and `SQLITE_IOERR` is excluded because a failing device means the store is not the problem. Two design-changing probes: a corrupt live `-wal` degrades persistence *silently* (every open fails, every `if let Ok` swallows it), and SQLite *silently discards* an unparseable log on restart — hence a header check before the open. Two load-sensitive tests found and both were real: the second healer was quarantining the first's fresh store (now serialized with the codebase's `ExclusiveLock` + re-check), and a cleanup waited exactly its subject's own 5 s drain deadline (now escalates TERM→KILL). Also fixed a slice premise that raced a millisecond-lived file. Verified: 629 tests / 61 targets, 13 slices, bench 6/6, vet/deny/audit/targets green; the quarantine is mutation-checked. The user's `site/` (Astro) is untouched; their T-0036/T-0063 landed in `220b9aa` and T-0036 is now `todo`.
 
 - 2026-09-13 [turn 68] T-0079 delegated (`WallPoller`) with the design pinned by reconnaissance: the sidebar should be *told* the state, not ask per pane — `PaneInfo` gains optional detail fields (state, asking, ram, history) behind an opt-in `detail` flag on `Panes`, the daemon computes it in one pass with the store opened once and no store I/O under the registry lock, the TUI's poll becomes one call, and an explicit tested fallback covers a peer that sends no detail. Planner's independent baseline, recorded before the fix (.loop/evidence/T-0079/baseline-mechanism.txt): 30 working panes cost **10,325 ms** of serial state resolution against a **300 ms** budget (34× over), while the batched round trip that replaces it costs **21 ms** — the per-pane blocking waits cost ~490× their alternative. Also established: the frame cannot be *correct* until the pass finishes, so the slice's assertion must be "first frame with all 30 panes visible" or it could pass while the wall is still filling — the worker was told that explicitly.
+
+- 2026-09-13 [turn 69] T-0079 + T-0036 both landed, two p1 slices in parallel on disjoint files. T-0079: the wall asks once — `PaneInfo` untouched, new `PanesDetail` variant (N-1 both directions, proven with a v0-mirror schema test), the daemon computing state/asking/RAM/history in one pass (entries cloned under the lock then released, 30 `/proc` walks concurrent, ONE store open), the TUI falling back to the old per-pane path on an old daemon. Baseline measured by the planner before the fix: 10,325 ms of serial state resolution vs a 300 ms budget (34x over); after: 76-259 ms across 10 slice runs, budget row flipped to enforced and read from perf-budget.toml. Criterion 5's answer written in the code: state is told, not asked; `Wait` stays for orchestration. T-0036: `arreo_core::update::verify` (TrustSet from the embedded pub file, typed errors, key id checked first, manifest the only digest source), `arreo update verify` (no bypass — `--force` is a usage error), the release job (signs with the env secret, verifies its own build, flips a byte and requires refusal, then publishes), docs (decision + rejections + rotation), 10 tamper tests with an in-process throwaway keypair, real-minisign agreement test. Human gate was cleared by the operator's key (076F2F7CEBE0AF51). One pre-existing test bug found by the full-workspace run: the adopt descriptor-identity check matched inode alone, and devpts inode 8 collides with /dev/urandom's devtmpfs inode 8 — now (device, inode). Verified: 647 tests / 63 targets, 13 slices, bench 6/6, vet 337 (minisign-verify exemption in the same change), deny 4/4, audit 0, check-targets PASS/SKIP. Commits: 22438b6, 7b691fa. README corrected (signing in place, signed release not yet); SECURITY.md verified still accurate.
