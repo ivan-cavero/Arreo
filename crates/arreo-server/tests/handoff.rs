@@ -4487,7 +4487,10 @@ fn the_transfer_socket_is_owner_only() {
     wait_serving(&mut daemon, &socket, Duration::from_secs(10));
 
     let (session, reply) = accepted_handoff(&socket, "mode-check");
-    assert!(matches!(reply, Message::HandoffReady { .. }), "handoff accepted: {reply:?}");
+    assert!(
+        matches!(reply, Message::HandoffReady { .. }),
+        "handoff accepted: {reply:?}"
+    );
 
     let handoff = arreo_core::identity::authority::sidecar(&socket, ".handoff");
     let mode = std::fs::metadata(&handoff)
