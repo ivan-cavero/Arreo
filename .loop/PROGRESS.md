@@ -1,26 +1,18 @@
 ## State snapshot          ← REWRITTEN (not appended) at every checkpoint
-Task: **T-0087 DONE** (`71a383a`) — the keychain bridge reaches the pane: a synced reference
-resolves at the PTY, on both spawn sites and on both restore paths.
-Where you are: **814 tests / 0 failed / 67 targets**; clippy clean on both toolchains; fmt
-clean; **14/14 slices** (persistence 16, handoff-abort 41, tui 80, update 27, mesh 21+1,
-relay 20, theme 33, chaos 8); `xtask sync --check` 14/14; bench 6/6; vet 337, deny 4/4,
-audit 0, check-targets PASS/SKIP.
-Next step: **T-0086** (the sync transport over the mesh — deltas between real machines, the
-conflict copies across two live machines, the JSONC/array merge hazards in their networked
-form; it owes an ADR if it adds a protocol verb); then T-0039 (windows deferred),
-T-0081/T-0082 (adapter batches, gated on live CLIs), T-0085 (CI, blocked on the user's
-T-0063), T-0042's remaining CI half.
-Open workers: (none)
+Task: **T-0086** (the sync transport over the mesh) in flight on worker `SyncTransport`, with
+the planner's design decision recorded in the task file: an appended `Message::Sync` /
+`SyncReply` variant pair carrying the *same* payload the local form produces (so `receive`
+stays the one hardened code path), and **the counter key becomes the authenticated device
+id** — a self-declared machine name let any paired peer pin another machine's counter, and a
+rename would fork it.
+Where you are: **T-0087 DONE** (`71a383a`) — the keychain bridge reaches the pane. 814 tests /
+0 failed / 67 targets; clippy clean both toolchains; fmt clean; **14/14 slices**;
+`xtask sync --check` 14/14; bench 6/6; vet 337, deny 4/4, audit 0, check-targets PASS/SKIP.
+Next step: integrate `SyncTransport` (review + mutation-test the identity override and the
+conflict arm; `--slice compat` is the N−1 referee for the protocol change), then the battery,
+commit, push, ledger.
+Open workers: SyncTransport (T-0086)
 Known broken: (none) · T-0063 (CI never-green — the user's) · Parked: T-0048 needs-human
-**T-0087 — the bridge, at last.** T-0083 shipped the mechanism and proved it at a real pty;
-this turn wired it into the product, where it matters: `Pane::spawn_with_env` (one
-implementation, two doors), `keychain::spawn_environment(harness, env)` reading only that
-harness's SYNC files, applied at both daemon spawn sites AND both `persist::restore` paths —
-a *restored* pane is where a resumed pi session would otherwise die on a 401. The rule is
-additive (the daemon's own environment wins), which is what keeps the feature from changing
-any existing deployment; an explicitly empty export stays empty, pinned by test. Five
-product-surface tests, 75 consecutive clean runs, four mutations each reddening the right
-test — including "inject every store name", which is the leak made visible.
 ## Event log               ← append-only; newest last; never rewrite
 - 2026-09-10 [turn 1] ledger created; repo at e489fac (docs only); T-0001 + T-0022 (AGENTS.md gardened) done
 - 2026-09-10 [turn 2] T-0002 PTY manager done+pushed (342606c; 9 tests); PROMPT.md v2 synced + ADR 0001 (ef6c595)
@@ -190,3 +182,5 @@ test — including "inject every store name", which is the leak made visible.
 - 2026-09-14 [turn 77] T-0084 closed — the last red slice. Diagnosed by instrumenting the slice (kill timestamp vs the commit row's `ts_ms`: 2–32 ms before on failures, 9–39 ms after on passes) rather than by argument; fixed by freezing the incoming daemon with SIGSTOP before deciding, so the verdict is proven and only the observation is retried; a second pre-existing flake (point B's single-shot read of the abort audit row, ~3/16) found while measuring and fixed with a bounded wait. Evidence in `.loop/evidence/T-0084/racing-gate.txt`. Battery: 810/66, both clippys, fmt, **14/14 slices**, bench 6/6, gates green. Next: T-0087 (keychain wiring), T-0086 (sync over the mesh).
 
 - 2026-09-14 [turn 78] T-0087 done + pushed. The keychain bridge now reaches the pane: `spawn_environment` (arreo-core) reads only the harness's SYNC files and resolves those names from the machine's store; the daemon applies it at Spawn and Split, `persist::restore` at the resume branch and the plain fallback. The rule is additive (daemon env wins; empty-presence pinned). Five tests in `crates/arreo-server/tests/keychain_spawn.rs` drive a real daemon with a fake `pi` on PATH writing what the child saw — 75 consecutive clean runs; four mutations verified (no injection; env-wins removed; whole-keychain leak; resume-branch removed). The adversarial pass found two *test* bugs: `${VAR:-UNSET}` cannot distinguish empty from missing (now `${VAR-UNSET}`), and the restore test raced the detached spawn snapshot (now waits for the record — the rule T-0072's slice learned). Battery: 814/67, both clippys, fmt, 14/14 slices, sync 14/14, bench 6/6, gates green. Next: T-0086 (sync over the mesh).
+
+- 2026-09-14 [turn 78] T-0087 done + pushed; T-0086 started with the design decided by the planner (the task file's Design section): one appended variant pair reusing the local payload, `Verb::Admin` gate, and the counter key moving to the **authenticated device id** — the F2 attack class reopened by the network, since `payload.machine` is self-declared and a paired peer could claim another machine's identity. Worker `SyncTransport` delegated with the decision as its contract; `--slice compat` is the acceptance test for the protocol change.
