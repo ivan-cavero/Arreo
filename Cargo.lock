@@ -3262,6 +3262,7 @@ dependencies = [
  "arreo-core",
  "arreo-server",
  "portable-pty",
+ "rustix 0.38.44",
  "tokio",
 ]
 

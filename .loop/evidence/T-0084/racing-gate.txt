@@ -1,0 +1,89 @@
+T-0084 — the handoff-abort slice's third kill point was a coin flip; the fix makes its
+verdict deterministic and its observation honest
+=====================================================================================
+
+THE DEFECT (filed in T-0084, mechanism traced there)
+----------------------------------------------------
+`--slice handoff-abort` kill point C ("every descriptor and the manifest arrived, the
+commit has not been sent") failed about half of its runs with the *committed* outcome:
+
+  [FAIL] c: no cut was recorded (no `handoff` commit row): 1 row(s): {"action":"handoff",…}
+  [FAIL] c: the old daemon is still serving (a client's request is answered): … false
+  [FAIL] c: every pane is alive and still producing: only 0/8 panes answered
+
+Root cause: the guard the slice used to prove "the commit has not happened" — the
+attached client's stream still frozen — is true **after** a commit too (the outgoing
+daemon's pumps stay parked for ever on commit). So the guard could pass with the cut
+already committed, and killing a committed incoming is the one state ADR 0021 §2c says
+the design cannot repair. Reproduced at `a7abcd8` (3/6 full-file runs), i.e. before
+T-0077 or T-0072 touched anything: it was always a race.
+
+MEASUREMENT (this turn, before the fix), instrumenting the After arm with a timestamp
+printed immediately before the kill and comparing it with the commit row's `ts_ms`:
+
+  kill_at_ms=1789334850410   commit ts_ms=1789334850419   -> commit 9 ms AFTER the kill  [pass]
+  kill_at_ms=1789334857423   commit ts_ms=1789334857421   -> commit 2 ms BEFORE the kill [FAIL]
+  kill_at_ms=1789334862181   commit ts_ms=1789334862220   -> 39 ms after              [pass]
+  kill_at_ms=1789334868593   commit ts_ms=1789334868561   -> 32 ms before             [FAIL]
+  kill_at_ms=1789334873514   commit ts_ms=1789334873510   -> 4 ms before              [FAIL]
+  kill_at_ms=1789334876213   commit ts_ms=1789334876238   -> 25 ms after              [pass]
+
+The pre-commit window is a handful of milliseconds wide, and the slice was observing it
+through a `/proc` directory scan of the same order — so the sampling, not the product,
+decided the outcome. (Delaying the kill by 2/5/10/20 ms after the trigger changed
+nothing: by then the commit is long sent, and the trigger itself was the slow part.)
+
+THE FIX (three parts, no product change)
+----------------------------------------
+1. **Freeze, then decide — never race.** Once every terminal has arrived, the slice
+   SIGSTOPs the incoming daemon (`rustix::process::kill_process(…, Signal::Stop)`,
+   already in the graph via arreo-core) and *reads back* `/proc/<pid>/stat` state `T`,
+   so the freeze is evidence rather than an assumption. A stopped process cannot send
+   the commit marker, so the state is then static and the question becomes: was a
+   marker sent *before* the freeze? A `COMMIT_SETTLE` of 150 ms answers it — the
+   outgoing daemon acts on a commit within microseconds (row, listener, exit).
+     * no row and the outgoing still alive  -> the commit provably had not been sent;
+       the kill lands in the window the point exists for;
+     * a row or the outgoing gone -> the window was MISSED.
+2. **A missed window is not a product failure.** On a miss the attempt SIGKILLs the
+   frozen process (a stopped process still dies to SIGKILL, and nothing else can reach
+   it), marks the attempt abandoned, and the scenario is re-run from scratch — up to
+   `C_ATTEMPTS` (8). Killing a committed incoming and then asserting the *pre-commit*
+   bundle would report a product defect the product does not have; re-running samples
+   the window again. **What is retried is the observation; the verdict is proven before
+   every kill.**
+3. **Bounded and loud.** If eight attempts all miss, the point FAILS with a message
+   that says exactly that (verified by forcing `allowed = 0`: the run reports "the
+   window this point exists for … was not observable in 0 attempts on this machine;
+   each attempt froze the incoming daemon 150ms after the last terminal arrived and
+   found the commit already sent"). A silent pass on a missed window is impossible.
+
+Also: `distinct_ptys` now stops as soon as it has seen `PANES` masters, instead of
+walking the rest of the fd table — the transfer sends exactly one master per pane, so
+the answer is known then, and the walk was latency added to the one observation whose
+window is milliseconds wide.
+
+MEASURED AFTER THE FIX
+----------------------
+- 17 consecutive full-slice runs: **17 PASS, 41 checks each, 0 failures** (the 6-run
+  sweep and the 10-run sweep in this session's transcript, plus the runs used to
+  gather the statistics below).
+- The window is still occasionally missed, and the retry converges — recorded honestly
+  rather than hidden: across five consecutive runs the run log showed
+  misses=1, 0, 1, 0, 0 before the successful attempt, and the successful kill landed
+  431–514 ms after the cut began.
+- The kill detail now carries the proof, e.g.:
+  "killed 466.1ms after the cut began, with 8/8 pane terminals and the manifest arrived
+   (signal: 9 (SIGKILL)); the panes were still paused and the outgoing daemon was still
+   serving, so the commit was withheld — proven by freezing the incoming daemon first
+   (150ms of settle showed no commit row and the outgoing daemon alive)".
+
+A SECOND, PRE-EXISTING FLAKE FOUND AND FIXED IN THE SAME PASS
+-------------------------------------------------------------
+With C reliable, a different intermittent failure surfaced at point B: "the aborted cut
+is on the audit trail (`handoff.abort`): no rows" (~3 runs in 16). The row is written by
+the outgoing daemon when its transfer call fails on the dead peer — a *consequence* of
+the kill, asynchronous to it — and the slice read the audit trail exactly once. The
+check now waits up to `ABORT_ROW_DEADLINE` (3 s) for the row, while the checks that
+assert something must NOT appear (no commit row, the old daemon still serving) stay
+single-shot on purpose: waiting for an absence would be waiting for a bug.

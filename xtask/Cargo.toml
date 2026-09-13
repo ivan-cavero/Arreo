@@ -17,4 +17,11 @@ arreo-server = { version = "0.1.0", path = "../crates/arreo-server" }
 # product (arreo-core already depends on it), so no new crate enters the
 # graph and the pty behavior under test is the shipped one.
 portable-pty = "0.9"
+# SIGSTOP for the handoff-abort slice's third kill point (T-0084): the slice has
+# to freeze the incoming daemon to prove, decisively, that the commit marker had
+# not been sent before it kills it — polling for the commit is a race the slice
+# lost ~half the time. rustix 0.38.44 is already compiled for this target through
+# arreo-core's pty adoption at the same version, so this adds no crate to the
+# graph (the same standard T-0077's CLI addition set).
+rustix = { version = "0.38", features = ["process"] }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "time", "io-util", "net"] }

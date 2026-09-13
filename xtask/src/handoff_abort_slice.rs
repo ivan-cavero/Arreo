@@ -97,6 +97,37 @@ const CLI_DEADLINE: Duration = Duration::from_secs(15);
 /// The slice name, for `[PASS]`/`[FAIL]` lines and the transcript.
 const SLICE: &str = "handoff-abort";
 
+/// How long the slice waits, after freezing the incoming daemon, before it
+/// decides whether the commit had already been sent (T-0084).
+///
+/// The freeze is the instrument: a **stopped** process cannot send the commit
+/// marker, so once it is stopped the only question is whether a marker sent
+/// *before* the freeze is still in flight. The outgoing daemon acts on a commit
+/// within microseconds of receiving it (write the row, drop the listener, exit),
+/// so a wait comfortably longer than that settles the question rather than
+/// racing it.
+const COMMIT_SETTLE: Duration = Duration::from_millis(150);
+
+/// How long the slice waits for the outgoing daemon to record the abort it just
+/// suffered (T-0084). The kill destroys the peer; the *record* of it is written
+/// when the outgoing's transfer call fails on the dead connection, which is a
+/// consequence arrived at asynchronously.
+const ABORT_ROW_DEADLINE: Duration = Duration::from_secs(3);
+
+/// Attempts allowed for kill point C.
+///
+/// Its window — every descriptor arrived, the commit not yet sent — is a few
+/// milliseconds wide, and the slice observes it through `/proc` (a directory
+/// scan whose latency is the same order as the window). So the *observation* of
+/// that window is a sample, not a guarantee: when the freeze lands too late the
+/// attempt is abandoned and the scenario re-run, because killing a daemon that
+/// had already committed is the one state the design cannot repair (ADR 0021
+/// §2c) and would report a product failure the product did not have. What is
+/// never sampled is the *verdict*: each attempt either proves the commit was not
+/// sent (and then kills) or refuses to kill. Points A and B are deterministic
+/// and get one attempt each.
+const C_ATTEMPTS: usize = 8;
+
 /// How many panes the cut carries. Eight is stage 2's shape (a full machine), and
 /// it is also what widens the paused window C has to hit: the outgoing daemon
 /// pauses and acknowledges every pump, and the incoming adopts every pane, so
@@ -276,6 +307,10 @@ struct PointOutcome {
     lines: Vec<String>,
     facts: Vec<String>,
     raw: Vec<String>,
+    /// Set by an attempt that refused to kill because the commit had already
+    /// been sent (T-0084): the scenario is abandoned and re-run rather than
+    /// turning a missed observation into a product failure.
+    missed_window: bool,
 }
 
 impl PointOutcome {
@@ -291,6 +326,7 @@ impl PointOutcome {
             )],
             facts: Vec::new(),
             raw: Vec::new(),
+            missed_window: false,
         }
     }
 
@@ -496,6 +532,48 @@ impl Daemon {
 
     fn alive(&mut self) -> bool {
         self.poll().is_none()
+    }
+
+    /// SIGSTOP, and hold direct evidence that it landed.
+    ///
+    /// The signal is sent with `kill(2)` directly rather than through a `kill`
+    /// subprocess: those cost a fork+exec (~1 ms) which is the same order as the
+    /// window this freeze exists to close. The evidence is read back from
+    /// `/proc/<pid>/stat` (state `T`), so a freeze that did not land is a
+    /// failure rather than an assumption.
+    fn freeze(&mut self) -> Result<(), String> {
+        let raw = self.child.id();
+        let pid = rustix::process::Pid::from_raw(raw as i32)
+            .ok_or_else(|| format!("pid {raw} is not a valid process id"))?;
+        rustix::process::kill_process(pid, rustix::process::Signal::Stop)
+            .map_err(|e| format!("SIGSTOP {raw}: {e}"))?;
+        // Read the state back: `T` is stopped. A few microseconds is enough for
+        // the signal to be delivered to a process in user space on this box, and
+        // the read is retried only for that delivery latency, never to wait for
+        // an event.
+        let deadline = Instant::now() + Duration::from_millis(50);
+        loop {
+            if self.state() == Some('T') {
+                return Ok(());
+            }
+            if Instant::now() > deadline {
+                return Err(format!(
+                    "pid {raw} did not enter the stopped state within 50ms (state {:?})",
+                    self.state()
+                ));
+            }
+            std::thread::sleep(Duration::from_micros(200));
+        }
+    }
+
+    /// The process's state letter from `/proc/<pid>/stat` (`T` = stopped,
+    /// `R`/`S` = running or sleeping, `Z` = zombie), or `None` when it is gone.
+    fn state(&self) -> Option<char> {
+        let text = std::fs::read_to_string(format!("/proc/{}/stat", self.child.id())).ok()?;
+        // The command name is parenthesised and may contain spaces; the state is
+        // the first field after the closing paren.
+        text.rsplit_once(") ")
+            .and_then(|(_, rest)| rest.chars().next())
     }
 
     /// SIGKILL, then reap. This is the abort the slice exists to exercise.
@@ -782,6 +860,14 @@ fn distinct_ptys(pid: u32) -> BTreeSet<i64> {
         return out;
     };
     for entry in entries.filter_map(|e| e.ok()) {
+        // **Stop as soon as the answer is known** (T-0084): every caller asks
+        // "has the last pane arrived?", and the transfer sends exactly `PANES`
+        // masters, so a set that has reached `PANES` is already the answer.
+        // Continuing to walk a growing fd table is latency added to the one
+        // observation whose window is milliseconds wide.
+        if out.len() >= PANES {
+            return out;
+        }
         let Ok(target) = std::fs::read_link(entry.path()) else {
             continue;
         };
@@ -881,7 +967,41 @@ fn contiguity_problem(lines: &[String]) -> Option<String> {
 }
 
 /// Run one kill point end to end and return everything it observed.
+/// One kill point, with the attempts its trigger needs.
+///
+/// Points A and B are deterministic and get exactly one attempt: A is a kill
+/// before the process can run, B is triggered by the pausing of the pumps.
+/// Point C's window is milliseconds wide and observed through `/proc`, so its
+/// *observation* is retried — never its verdict, which each attempt proves
+/// before killing (see `KillPoint::After`).
 fn run_point(point: KillPoint, server_bin: &Path, cli_bin: &Path) -> PointOutcome {
+    let allowed = if point == KillPoint::After {
+        C_ATTEMPTS
+    } else {
+        1
+    };
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        let outcome = run_point_attempt(point, server_bin, cli_bin);
+        if !outcome.missed_window {
+            return outcome;
+        }
+        if attempt >= allowed {
+            let mut outcome = outcome;
+            outcome.fail(format!(
+                "the window this point exists for — every descriptor arrived and the commit not \
+                 yet sent — was not observable in {allowed} attempts on this machine; each \
+                 attempt froze the incoming daemon {COMMIT_SETTLE:?} after the last terminal \
+                 arrived and found the commit already sent, so the pre-commit window is shorter \
+                 than this machine's observation latency"
+            ));
+            return outcome;
+        }
+    }
+}
+
+fn run_point_attempt(point: KillPoint, server_bin: &Path, cli_bin: &Path) -> PointOutcome {
     let mut out = PointOutcome::new(point);
     let scratch = match Scratch::new(point.letter()) {
         Ok(scratch) => scratch,
@@ -1083,23 +1203,57 @@ fn run_point(point: KillPoint, server_bin: &Path, cli_bin: &Path) -> PointOutcom
                 ));
                 return out;
             }
-            // **The commit has not happened, checked positively**: the outgoing
-            // daemon paused the pumps before it sent anything and only the
-            // incoming's commit can end this cut, so a still-frozen client
-            // stream is the outgoing daemon still being the one serving panes.
-            // Without this the point can land *after* the commit — measured, on
-            // the first run of this slice — and a committed-then-killed incoming
-            // is the one state the design cannot repair (ADR 0021 §2c: the byte
-            // is authorisation, and the panes are the incoming's by then).
+            // **Freeze the incoming daemon, then ask whether the commit had
+            // been sent** (T-0084). This is the whole determinism of the point:
+            // a *stopped* process cannot send the commit marker, so once it is
+            // stopped, the only remaining question is whether a marker sent
+            // before the freeze is still in flight — and the outgoing daemon
+            // acts on one within microseconds (row, listener, exit), so a wait
+            // of `COMMIT_SETTLE` settles it rather than racing it.
+            //
+            // The signal used to be a bare "the client's stream is still frozen":
+            // the pumps stay parked for ever **after** a commit too, so that
+            // check could not tell the two states apart and the kill landed
+            // after the commit often enough to fail this slice about half the
+            // time (measured; reproduced at `a7abcd8`, before the handoff code
+            // was touched — see `.loop/evidence/T-0084/`).
+            if let Err(e) = incoming.freeze() {
+                out.fail(format!("cannot freeze the incoming daemon: {e}"));
+                return out;
+            }
+            std::thread::sleep(COMMIT_SETTLE);
+            let rows = audit_rows(&sandbox, cli_bin, &socket, "handoff");
+            let row_count = rows.trim().lines().filter(|l| !l.is_empty()).count();
+            let outgoing_exited = old.poll().is_some();
+            if row_count > 0 || outgoing_exited {
+                // **A committed daemon is not killed.** ADR 0021 §2c: past the
+                // marker the panes are the incoming's, and a committed-then-
+                // killed incoming leaves the machine with no serving daemon at
+                // all — the one state the design cannot repair. Reporting that
+                // as this *point's* failure would blame the product for the
+                // slice's own late observation, so the attempt is abandoned and
+                // the scenario re-run.
+                let _ = incoming.kill9();
+                out.missed_window = true;
+                out.note(format!(
+                    "the window was missed: the commit had already been sent when the incoming                      daemon was frozen {COMMIT_SETTLE:?} after the last terminal arrived \
+                     ({fds}/{PANES} terminals; {row_count} commit row(s); the outgoing daemon \
+                     {} ) — abandoning this attempt without killing a committed daemon and \
+                     re-running the scenario",
+                    if outgoing_exited { "had exited" } else { "was still alive" }
+                ));
+                return out;
+            }
+            // The freeze landed pre-commit, so the state is now static: the
+            // incoming cannot advance, and the outgoing is parked in its commit
+            // wait. These are therefore *assertions about the moment*, not a
+            // race with it — a still-frozen client stream is the outgoing daemon
+            // still being the one serving panes.
             let still_paused = attach
                 .newest()
                 .is_some_and(|(_, _, ts, _)| ts.elapsed() >= Duration::from_millis(FREEZE_MS));
             if !incoming.alive() {
                 out.fail("the incoming daemon exited before the kill: the cut committed");
-                return out;
-            }
-            if old.poll().is_some() {
-                out.fail("the outgoing daemon exited before the kill: the cut committed");
                 return out;
             }
             if !still_paused {
@@ -1113,7 +1267,9 @@ fn run_point(point: KillPoint, server_bin: &Path, cli_bin: &Path) -> PointOutcom
                 Ok(status) => format!(
                     "killed {:.1}ms after the cut began, with {fds}/{PANES} pane terminals and \
                      the manifest arrived ({status}); the panes were still paused and the \
-                     outgoing daemon was still serving, so the commit was withheld",
+                     outgoing daemon was still serving, so the commit was withheld — proven by \
+                     freezing the incoming daemon first ({COMMIT_SETTLE:?} of settle showed no \
+                     commit row and the outgoing daemon alive)",
                     t_cut.elapsed().as_secs_f64() * 1000.0
                 ),
                 Err(e) => {
@@ -1265,8 +1421,23 @@ fn run_point(point: KillPoint, server_bin: &Path, cli_bin: &Path) -> PointOutcom
         gap_ticks.1
     ));
     // 5. The abort is on the record — where the outgoing daemon could know it.
-    let abort_rows = audit_rows(&sandbox, cli_bin, &socket, "handoff.abort");
-    let abort_seen = !abort_rows.trim().is_empty();
+    //
+    // **Waited for, not sampled** (T-0084). The row is written by the outgoing
+    // daemon once its transfer fails (the dead peer's connection errors), which
+    // is a *consequence* of the kill rather than part of it: reading once raced
+    // that write and failed the check on a healthy abort (measured, ~3 runs in
+    // 16). The absence checks above stay single-shot for the opposite reason —
+    // waiting for something that must *not* appear would be waiting for a bug.
+    let mut abort_rows = audit_rows(&sandbox, cli_bin, &socket, "handoff.abort");
+    let mut abort_seen = !abort_rows.trim().is_empty();
+    if point != KillPoint::Before && !abort_seen {
+        let deadline = Instant::now() + ABORT_ROW_DEADLINE;
+        while Instant::now() < deadline && !abort_seen {
+            std::thread::sleep(Duration::from_millis(20));
+            abort_rows = audit_rows(&sandbox, cli_bin, &socket, "handoff.abort");
+            abort_seen = !abort_rows.trim().is_empty();
+        }
+    }
     match point {
         // A kills the process before it asked for anything, so there is nothing
         // for the outgoing daemon to record: the assertion is that no *cut* was

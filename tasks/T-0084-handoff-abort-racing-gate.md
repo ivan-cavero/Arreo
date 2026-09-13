@@ -3,7 +3,7 @@ id: T-0084
 title: The handoff-abort slice's "After" kill point races the commit — the freeze signal cannot distinguish pre- from post-commit
 phase: 2
 priority: 3
-status: proposed
+status: done
 depends_on: []
 scope:
   - xtask/src/handoff_abort_slice.rs
@@ -66,6 +66,33 @@ Prior art: the slice already documents this exact surprise once ("Without this t
 land *after* the commit — measured, on the first run of this slice"), and point `Mid` already
 learned the same lesson for the `.handoff` socket ("requiring it here raced the cut on a healthy
 run — measured").
+
+## Fixed (2026-09-13)
+
+**The window is now entered by freezing the incoming daemon, not by racing it.** After
+every terminal has arrived the slice SIGSTOPs the incoming daemon and reads back
+`/proc/<pid>/stat` state `T` — a stopped process cannot send the commit marker, so the
+state is static and the only open question is whether a marker was sent *before* the
+freeze; 150 ms of settle answers it (the outgoing daemon acts on a commit within
+microseconds). Outcome: no row and the outgoing alive → the commit provably had not
+been sent, kill; a row or the outgoing gone → the **window was missed**, so the attempt
+is abandoned *without* killing a committed daemon (ADR 0021 §2c) and the scenario is
+re-run — up to 8 attempts, after which the point fails loudly naming why. What is
+retried is the observation; the verdict is proven before every kill. `distinct_ptys`
+also stops at the `PANES`th master instead of walking the rest of the fd table.
+
+Measured: **17 consecutive runs, 17 PASS, 41 checks each, 0 failures** (from ~50 %
+failure before). The window is still occasionally missed and the retry converges — the
+run log across five consecutive runs showed 1, 0, 1, 0, 0 misses before success, and
+the successful kill landed 431–514 ms into the cut. Both numbers, and the before-fix
+timeline measurements that proved the race (commit landing 2–32 ms *before* the kill on
+failing runs), are in `.loop/evidence/T-0084/racing-gate.txt`.
+
+**A second, pre-existing flake found and fixed while measuring:** point B's audit check
+("the aborted cut is on the audit trail") read the trail exactly once, but the row is
+written by the outgoing daemon when its transfer fails on the dead peer — a
+consequence of the kill, not part of it (~3 runs in 16 failed). It now waits up to 3 s
+for the row; the checks that assert something must *not* appear stay single-shot.
 
 ## Notes
 
