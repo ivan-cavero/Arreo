@@ -3,7 +3,7 @@ id: T-0075
 title: Harness survey — states, resume, custom models/providers for ~20 CLIs + centralization design
 phase: 4
 priority: 2
-status: proposed
+status: done
 depends_on: [T-0017]
 scope:
   - specs/harness-matrix.md
@@ -28,22 +28,22 @@ this box. Every claim names the CLI version it was checked against.
 
 ## Acceptance criteria
 
-- [ ] `specs/harness-matrix.md`: one row per harness with version checked —
+- [x] `specs/harness-matrix.md`: one row per harness with version checked —
       state signals (native hooks/events with exact payload, OSC marks, prompt shapes,
       bell/exit-code behavior, detection latency observed), resume mechanism (exact
       resume argv + session-file location, verified live or marked unverified),
       custom models/providers (config paths, fields, env/secret handling).
-- [ ] `docs/harness-centralization.md`: the sync design note — per-harness which
+- [x] `docs/harness-centralization.md`: the sync design note — per-harness which
       files/fields are safe to sync (e.g. opencode.jsonc provider/model lists incl.
       custom provider verbs) vs machine-local (keys, absolute paths); secret-shape
       rules so keys never sync; conflict/merge pointer to ROADMAP §3.8. The owner's
       case (one opencode.jsonc custom provider edited once → all PCs) must be worked
       as the example end to end on paper.
-- [ ] Evidence: executed transcripts under `.loop/evidence/T-0075/` (commands run
+- [x] Evidence: executed transcripts under `.loop/evidence/T-0075/` (commands run
       verbatim, outputs quoted) — a row without a transcript is marked `untried`,
       never filled from memory. No behavior-changing adapter TOML edits in this task
       (those are adapter-suite v2); notes only.
-- [ ] Follow-ups filed: adapter-suite v2 (new TOMLs, one task per batch) + config-sync
+- [x] Follow-ups filed: adapter-suite v2 (new TOMLs, one task per batch) + config-sync
       implementation task with the matrix row-refs as its input.
 
 ## Verification
