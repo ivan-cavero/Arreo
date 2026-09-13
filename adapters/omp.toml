@@ -1,0 +1,79 @@
+# omp adapter (T-0080) — first-class, same lineage as pi, verified 18.1.16.
+#
+# omp (Oh My Pi) forks pi's agent core: the `--mode json` NDJSON envelope is
+# the same family (session → agent_start → turn_start → message_* → turn_end →
+# agent_end → agent_settled, plus advisor_cost_changed), so the pi adapter's
+# universal-tier shapes transfer. Differences that matter here (harness matrix
+# §3.3, .loop/evidence/T-0075/omp-*.txt):
+# - No `--session-id` pin: resume is `-r <id-prefix|path>` or `-c`, and both
+#   re-open the SAME session file (verified live: `-r 01a099` and `-c` reuse
+#   the file `2026-09-13T08-32-55-914Z_01a099e5-….jsonl`, no new file).
+# - `apiKey` is resolved as a plain `process.env[name]` lookup on the literal
+#   value: write the variable's NAME. Measured twice on this box (once through
+#   a TLS proxy that logs the Authorization header): `apiKey: VBK_TEST_KEY`
+#   works; `$VBK_TEST_KEY` and `${VBK_TEST_KEY}` are sent verbatim as the bearer
+#   token and 401. (The survey's omp-apikey-syntax.txt recorded the same three
+#   outcomes but labelled the working one "plain", which its prose then read as
+#   "a literal key" — see .loop/evidence/T-0080/omp-apikey-env-syntax.txt.)
+#   Config sync must write the NAME, never a sigil.
+# - Session store: `$PI_CODING_AGENT_DIR/sessions/<cwd-slug>/` (default
+#   `~/.omp/agent`), or flat with `--session-dir`.
+#
+# Fixtures: fixtures/omp-{working,question,idle,stress}.pty — recorded live on
+# this box (18.1.16), implications summarized in .loop/evidence/T-0080/.
+
+idle_after_ms = 2000
+question_after_ms = 2000
+blocked_after_ms = 2500
+bell_means_attention = true
+done_on_exit = true
+
+# T-0072 harness-aware resume: omp generates its own session ids and there is
+# no way to tell it one at spawn (no `--session-id` — checked 18.1.16), so the
+# strategy is continuation, mirroring opencode: `-c` resumes the last session
+# for this directory, `-r {session}` resumes by id prefix when the record
+# captured one. The pattern watches the `--mode json` session envelope — the
+# same shape pi prints — so capture works with json-mode panes; an interactive
+# TUI prints none and the continue strategy resumes without one.
+harness = "omp"
+programs = ["omp"]
+
+question_patterns = [
+  "\\[y/n\\]",
+  "\\(y/n\\)",
+  "\\byes\\b.*\\bno\\b",
+  # Model asks back with action verbs + trailing ? (recorded shape: the
+  # question fixture's prompt makes omp ask which files to delete).
+  "which .*\\?.*$",
+  "should i .*\\?.*$",
+  "may i .*\\?.*$",
+  "want me to .*\\?.*$",
+  "confirm.*\\?.*$",
+  "proceed\\?",
+  "\\?\\s*$",
+  "❯\\s*$",
+  "›\\s*$",
+]
+
+error_patterns = [
+  "Traceback \\(most recent call last\\)",
+  "(?m)^(Error|FAILED|FATAL|panic)(:|\\b)",
+  "command not found",
+  "exit code \\d+",
+  "ValueError",
+  "TypeError",
+  "Segmentation fault",
+  # omp-specific: provider/auth failures surface in the json envelope
+  # (stopReason:\"error\", errorStatus — recorded omp-live.txt/omp-error-detail).
+  "errorStatus",
+  "\"stopReason\":\"error\"",
+]
+
+# T-0072 harness-aware resume, part 2. `-r <id>` accepts an id PREFIX (or a
+# path); the full captured uuid is a prefix of itself, so the exact form is
+# covered. Session id shape is pi's: a v4 uuid in the first json envelope.
+[resume]
+kind = "continue"
+argv = ["-c"]
+exact_argv = ["-r", "{session}"]
+session_pattern = '"type":"session".*?"id":"([0-9a-f-]{36})"'

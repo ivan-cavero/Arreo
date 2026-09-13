@@ -1,0 +1,53 @@
+=== T-0080 criterion 4, at the product surface (omp 18.1.16, daemon 2026-09-13 16:26 build) ===
+isolated daemon: XDG_RUNTIME_DIR=/home/dev/dev/Arreo/target/test-scratch/T-0080/prod5/run HOME=/home/dev/dev/Arreo/target/test-scratch/T-0080/omp/home (its own session store)
+
+$ arreo spawn ompjson omp --mode json -p --model verboo/deepseek-v4-flash-0731 'Reply with exactly: ROUTED'
+spawned ompjson
+
+--- the pane record (engine store beside the socket), after reading the pane once:
+    $ arreo read ompjson ; $ arreo panes
+    id        program  harness  session_id
+    hyperlink /bin/sh None None
+    ompjson omp omp 01a09b2a-1eca-777e-a43c-693720f4953f
+    pijson pi pi 977c59be-cbc8-4640-832b-de8ce6e0c68b
+    realbell /bin/sh None None
+
+    (a control: the same daemon's pi pane, whose adapter pins the id at spawn,
+     and a hyperlink pane of /bin/sh, which correctly has no harness)
+
+--- omp's own output envelope that the engine captured (scrollback line 0):
+    {"type":"session","version":3,"id":"01a09b2a-1eca-777e-a43c-693720f4953f","timestamp":"2026-09-13T14:27:04.010Z","cwd":"/tmp"}
+
+--- and resuming THAT captured id re-opens the same session file:
+$ omp -r 01a09b2a --mode json -p --model verboo/deepseek-v4-flash-0731 'Reply with exactly: RESUMED'
+   "type":"session","version":3,"id":"01a09b2a-1eca-777e-a43c-693720f4953f","timestamp":"2026-09-13T14:27:04.010Z","cwd":"/tmp"}
+   session file: -tmp/2026-09-13T14-27-04-010Z_01a09b2a-1eca-777e-a43c-693720f4953f.jsonl  (no new file)
+
+--- and at the same product surface, the attention column (T-0041) for the
+    criterion-3 panes in that daemon:
+$ arreo panes
+              ID  STATE    ALERT
+       hyperlink  exited   
+         ompjson  exited   
+          pijson  exited   
+        realbell  exited   
+
+$ arreo wait hyperlink --state blocked --timeout 3s   (must NOT satisfy)
+wait: pane "hyperlink" exited while waiting
+   exit=1
+$ arreo wait realbell --state blocked --timeout 5s   (the real bell does)
+state=Blocked confidence=inferred:bell pattern=None
+   exit=0
+--- fresh daemon, both panes alive, waited immediately:
+$ arreo panes
+              ID  STATE    ALERT
+       hyperlink  alive    
+        realbell  alive    
+
+$ arreo wait hyperlink --state blocked --timeout 3s
+wait: timeout waiting for Blocked after 3000 ms
+   exit=1
+
+$ arreo wait realbell --state blocked --timeout 5s
+state=Blocked confidence=inferred:bell pattern=None
+   exit=0

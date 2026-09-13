@@ -75,6 +75,8 @@ impl AdapterRegistry {
                         .expect("pi adapter is valid (T-0017 fixtures pin it)"),
                     Adapter::from_toml(include_str!("../../../../adapters/opencode.toml"))
                         .expect("opencode adapter is valid (T-0017 fixtures pin it)"),
+                    Adapter::from_toml(include_str!("../../../../adapters/omp.toml"))
+                        .expect("omp adapter is valid (T-0080 fixtures pin it)"),
                 ],
             )
             .expect("builtin adapters are valid and disjoint (xtask adapters --check)")

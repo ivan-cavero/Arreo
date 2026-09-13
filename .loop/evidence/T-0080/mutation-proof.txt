@@ -1,0 +1,44 @@
+=== T-0080 mutation proof: the escape-aware parse is load-bearing ===
+engine.rs sha256 before/after (must be identical at the end):
+faeac6566d9dab7eb026726de3c8d3c0f10689c94448f58132bcd42e8eebbf9d  crates/arreo-core/src/state/engine.rs
+
+### Mutation A — revert to the pre-fix raw byte scan (bytes.contains(&0x07))
+    (the exact line the task names: crates/arreo-core/src/state/engine.rs:191 pre-fix)
+test bell_means_attention_not_silence ... ok
+test csi_embedded_bel_is_still_a_bell ... ok
+test bare_bel_fixture_means_attention ... ok
+test osc_hyperlink_bel_is_not_a_bell ... FAILED
+test osc_state_survives_feed_boundaries ... FAILED
+test opencode_tui_capture_replay_is_not_blocked ... FAILED
+test osc_terminator_fixture_means_no_attention ... FAILED
+test pi_tui_capture_replay_is_not_blocked ... FAILED
+test osc_terminators_are_not_bells_but_bare_bel_still_is ... FAILED
+test result: FAILED. 21 passed; 6 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.49s
+
+### Mutation B — the parse stops reporting bells at all
+    (scan_bell is still called, its verdict discarded)
+test bell_means_attention_not_silence ... FAILED
+test bare_bel_fixture_means_attention ... FAILED
+test csi_embedded_bel_is_still_a_bell ... FAILED
+test osc_hyperlink_bel_is_not_a_bell ... ok
+test opencode_tui_capture_replay_is_not_blocked ... ok
+test osc_state_survives_feed_boundaries ... FAILED
+test osc_terminators_are_not_bells_but_bare_bel_still_is ... FAILED
+test osc_terminator_fixture_means_no_attention ... ok
+test pi_tui_capture_replay_is_not_blocked ... ok
+test result: FAILED. 22 passed; 5 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.38s
+
+### Restored — sha256 must match the pre-mutation line above
+faeac6566d9dab7eb026726de3c8d3c0f10689c94448f58132bcd42e8eebbf9d  crates/arreo-core/src/state/engine.rs
+test result: ok. 27 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.52s
+### Mutation C — the criterion-4 guard (T-0080 registry completeness)
+Removing the omp line from AdapterRegistry::builtin() must redden
+every_declared_harness_adapter_is_in_the_builtin_registry (a TOML the tests
+can read but the daemon cannot is exactly how omp fell through to default.toml):
+$ cargo test -p arreo-core --test state every_declared
+test every_declared_harness_adapter_is_in_the_builtin_registry ... FAILED
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 27 filtered out
+
+with the line restored:
+test every_declared_harness_adapter_is_in_the_builtin_registry ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 27 filtered out

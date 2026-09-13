@@ -29,24 +29,45 @@ fn adapter_fixtures(name: &str) -> Vec<&'static str> {
             "pi-working.pty",
             "pi-idle.pty",
             "pi-stress.pty",
+            // T-0080: TUI-mode capture (OSC 8 hyperlinks + OSC 0 title —
+            // every BEL an OSC terminator, 60/60; recorded 10 s, 0.84.4).
+            "pi-tui.pty",
         ],
         "opencode" => vec![
             "opencode-question.pty",
             "opencode-working.pty",
             "opencode-idle.pty",
             "opencode-stress.pty",
+            // T-0080: TUI-mode capture (alt-screen, title/colour OSCs, the
+            // iTerm2/kitty probes — every BEL an OSC terminator, 5/5).
+            "opencode-tui.pty",
+        ],
+        "omp" => vec![
+            "omp-question.pty",
+            "omp-working.pty",
+            "omp-idle.pty",
+            "omp-stress.pty",
         ],
         "default" => vec![
             "question-permission.pty",
             "working-stream.pty",
             "idle-shell.pty",
             "vim-edit.pty",
+            // T-0080 synthetic halves: OSC terminators never mean attention;
+            // a bare BEL still does.
+            "osc-terminator.pty",
+            "bell-bare.pty",
         ],
         _ => vec![],
     }
 }
 
-/// Expected trajectory per fixture: (must_see_working_during_flow, end_state).
+/// Expected trajectory per fixture: (must_see_working_during_flow,
+/// attention_during_flow, end_state).
+/// - `attention_during_flow`: `Some(true)` = a Question/Blocked event MUST
+///   fire while output flows (the bare-BEL fixture); `Some(false)` = it must
+///   NEVER (the T-0080 OSC fixtures — replaying them through the engine must
+///   not produce `Blocked`); `None` = the end state decides.
 /// - working fixtures: output flows (Working seen) then ends (Idle after silence).
 /// - question fixtures: end Question (prompt tail + silence).
 /// - idle: ends Idle.
@@ -54,16 +75,22 @@ fn adapter_fixtures(name: &str) -> Vec<&'static str> {
 ///   "¿Querés que convierta...?") → Question is CORRECT there; opencode-stress
 ///   has no question → Idle. The mis-detection review asserts mid-line `?`
 ///   never fires mid-flow (unit tests), not that trailing questions vanish.
-fn expected_trajectory(fixture: &str) -> (bool, arreo_core::state::State) {
+fn expected_trajectory(fixture: &str) -> (bool, Option<bool>, arreo_core::state::State) {
     use arreo_core::state::State as S;
     match fixture {
-        f if f.contains("question") => (true, S::Question),
-        f if f.contains("working") => (true, S::Idle),
-        f if f.contains("idle") => (false, S::Idle),
-        "pi-stress.pty" => (true, S::Question),
-        f if f.contains("stress") => (true, S::Idle),
-        f if f.contains("vim") => (true, S::Idle),
-        _ => (false, S::Unknown),
+        f if f.contains("question") => (true, None, S::Question),
+        f if f.contains("working") => (true, None, S::Idle),
+        f if f.contains("idle") => (false, None, S::Idle),
+        "pi-stress.pty" => (true, None, S::Question),
+        f if f.contains("stress") => (true, None, S::Idle),
+        f if f.contains("vim") => (true, None, S::Idle),
+        // T-0080: OSC-heavy captures must never mean attention.
+        "pi-tui.pty" => (true, Some(false), S::Idle),
+        "opencode-tui.pty" => (true, Some(false), S::Idle),
+        "osc-terminator.pty" => (true, Some(false), S::Idle),
+        // The bare BEL is the one byte that still means attention.
+        "bell-bare.pty" => (true, Some(true), S::Idle),
+        _ => (false, None, S::Unknown),
     }
 }
 
@@ -129,6 +156,7 @@ pub fn run(rest: &[String]) -> ExitCode {
             let mut t = 0u64;
             let mut first_latency: Option<u64> = None;
             let mut saw_working = false;
+            let mut saw_attention = false;
             for chunk in raw.chunks(512) {
                 for event in engine.feed(chunk, t) {
                     if first_latency.is_none() {
@@ -137,6 +165,12 @@ pub fn run(rest: &[String]) -> ExitCode {
                     if matches!(event.state, arreo_core::state::State::Working) {
                         saw_working = true;
                     }
+                    if matches!(
+                        event.state,
+                        arreo_core::state::State::Question | arreo_core::state::State::Blocked
+                    ) {
+                        saw_attention = true;
+                    }
                 }
                 t += 50;
             }
@@ -144,11 +178,23 @@ pub fn run(rest: &[String]) -> ExitCode {
                 let _ = event;
             }
             let end = *engine.state();
-            let (want_flow, want_end) = expected_trajectory(fixture);
+            let (want_flow, want_attention, want_end) = expected_trajectory(fixture);
             let mut ok = true;
             if want_flow && !saw_working {
                 println!("[FAIL] {name}/{fixture}: never Working during flow");
                 ok = false;
+            }
+            if let Some(want) = want_attention {
+                if want && !saw_attention {
+                    println!("[FAIL] {name}/{fixture}: expected attention during flow, got none");
+                    ok = false;
+                }
+                if !want && saw_attention {
+                    println!(
+                        "[FAIL] {name}/{fixture}: OSC terminators produced attention during flow"
+                    );
+                    ok = false;
+                }
             }
             if end != want_end {
                 println!("[FAIL] {name}/{fixture}: end {end:?}, want {want_end:?}");

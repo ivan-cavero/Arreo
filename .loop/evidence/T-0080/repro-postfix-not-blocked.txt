@@ -1,0 +1,20 @@
+=== T-0080 product repro, POST-FIX binary (target/debug/arreo-server rebuilt 2026-09-13 15:55 with the escape-aware engine) ===
+
+$ arreo spawn hyperlink /bin/sh -c 'printf "\033]8;;http://example.com\007click\033]8;;\007"; sleep 60'
+spawned hyperlink
+
+$ arreo read hyperlink
+]8;;http://example.comclick]8;;
+
+$ arreo wait hyperlink --state blocked --timeout 2s   (must NOT satisfy)
+wait: timeout waiting for Blocked after 2000 ms
+exit=1
+
+$ arreo wait hyperlink --state idle --timeout 8s   (the honest state)
+state=Idle confidence=direct:already pattern=None
+exit=0
+
+--- control: a REAL bell in the same daemon still means attention
+spawned realbell
+state=Blocked confidence=inferred:bell pattern=None
+exit=0

@@ -1,0 +1,15 @@
+=== T-0080 fixture scrub + shape check (throwaway test, deleted after the run) ===
+$ cargo test -p arreo-core --test zz_scrub -- --nocapture
+pi-tui.pty: 42640 bytes, 41 events, findings=[], BELs=60, ESC=2247
+opencode-tui.pty: 9640 bytes, 10 events, findings=[], BELs=5, ESC=366
+omp-question.pty: 335 bytes, 2 events, findings=[], BELs=0, ESC=0
+omp-working.pty: 209 bytes, 2 events, findings=[], BELs=0, ESC=0
+omp-idle.pty: 1197 bytes, 2 events, findings=[], BELs=0, ESC=0
+omp-stress.pty: 2295 bytes, 2 events, findings=[], BELs=0, ESC=0
+bell-bare.pty: 209 bytes, 1 events, findings=[], BELs=1, ESC=0
+osc-terminator.pty: 364 bytes, 1 events, findings=[], BELs=3, ESC=5
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+findings=[] for every new fixture => the repo's own scan_secrets sees no secret-shaped content.
+BELs=60 (pi TUI) and BELs=5 (opencode TUI) match the survey's raw captures exactly,
+and every one of them terminates an OSC string (see osc-*/bare-bell counts).

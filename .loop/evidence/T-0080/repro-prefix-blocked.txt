@@ -1,0 +1,11 @@
+=== T-0080 product repro: PRE-FIX daemon (target/debug/arreo-server built 2026-09-13 14:14:53, before the escape-aware engine change) ===
+
+$ arreo spawn hyperlink /bin/sh -c 'printf "\033]8;;http://example.com\007click\033]8;;\007"; sleep 30'
+spawned hyperlink
+
+$ arreo read hyperlink
+]8;;http://example.comclick]8;;
+
+$ arreo wait hyperlink --state blocked --timeout 2s
+wait: pane "hyperlink" exited while waiting
+exit=1

@@ -1,0 +1,71 @@
+# T-0080 evidence index
+
+One sentence: every claim in this task's report has an artifact here — the escape-aware
+parse's mutation proof, the product-level repro before and after, the recorded fixture
+inventory with its provenance, and the live omp resume + routing transcripts.
+
+| Artifact | What it proves |
+| --- | --- |
+| `mutation-proof.txt` | The change is load-bearing, in three directions: reverting the feed line to `bytes.contains(&0x07)` reddens the 6 OSC tests and leaves the bare-BEL ones green; discarding `scan_bell`'s verdict (no bells at all) reddens the 5 bare-BEL tests and leaves the OSC ones green; dropping the omp line from `AdapterRegistry::builtin()` reddens the criterion-4 registry guard. `engine.rs` sha256 is identical before and after. |
+| `repro-prefix-blocked.txt` | The planner's product repro reproduced against a saved **pre-fix** `arreo-server` binary (`target/test-scratch/T-0080/arreo-server-prefix`, built 14:14:53, before the engine change): `arreo wait hyperlink --state blocked` **satisfies** with `state=Blocked`. |
+| `repro-postfix-not-blocked.txt` | The same repro against the rebuilt daemon: the wait for `blocked` **times out** (`exit=1`); the honest state is `Idle`; and a *real* bell pane in the same daemon still reports `state=Blocked confidence=inferred:bell`. |
+| `omp-routing-and-attention.txt` | Criterion 4 at the product surface: the daemon routes a pane running `omp` to `adapters/omp.toml` (the record reads `harness=omp`), the engine captures omp's own session id out of its NDJSON envelope, and `omp -r <captured prefix>` re-opens that exact session file. Plus, in a fresh daemon with both panes alive, `wait hyperlink --state blocked` times out while the bare-bell pane reports `Blocked`. |
+| `omp-resume-live.txt` | omp 18.1.16 resume verified live on this box: `-r <id-prefix>` and `-c` both re-open the same session file and emit the same id; no second file is created. |
+| `fixture-scrub.txt` | The repo's own `scan_secrets` finds nothing secret-shaped in any of the 8 new fixtures; BEL/ESC counts match the survey's raw captures (pi 60 BELs, opencode 5 BELs). |
+| `omp-apikey-env-syntax.txt` | omp's `apiKey` resolution measured through a TLS proxy that logs the Authorization header: the value is the env-var **name** (`VBK_TEST_KEY` works, len 55 = `Bearer ` + 48); `$VBK_TEST_KEY` and `${VBK_TEST_KEY}` are sent verbatim and 401. Corrects the harness matrix's "`$VAR` only" prose. |
+| `adapters-check.txt` | `cargo xtask adapters --check` → `adapters: 24 passed, 0 failed` (15 before T-0080). |
+| `scoped-battery.txt` | The final scoped battery: `cargo fmt -p arreo-core --check` (rc=0), `cargo clippy -p arreo-core --all-targets -- -D warnings` (clean), `cargo test -p arreo-core` (all suites green, `tests/state.rs` at 28), `cargo fmt -p xtask --check` (rc=0), `cargo xtask adapters --check` (24/0), `cargo xtask e2e --slice state` (24/0). |
+
+## The parse
+
+`crates/arreo-core/src/state/engine.rs`: `scan_bell(bytes, &mut osc_active, &mut esc_pending)`
+replaces `if bytes.contains(&0x07)` in `feed`. State machine:
+
+- outside an OSC string: `ESC` → `esc_pending` (the pair is consumed on the next byte),
+  `0x07` → **bell**;
+- `ESC ]` → inside an OSC string;
+- inside: `0x07` (BEL), `0x9c` (C1 ST), `ESC \` (ST) → terminator, **not** a bell;
+  `0x18`/`0x1a` (CAN/SUB) → abort, string over;
+- everything else → unchanged.
+
+`osc_active`/`esc_pending` live on the `Engine`, so an OSC string, its `ESC ]` opener, or the
+`ESC` of an ST can straddle two `feed` calls (the daemon polls arbitrary chunks).
+
+## Tests added (`crates/arreo-core/tests/state.rs`)
+
+| Test | Assertion |
+| --- | --- |
+| `osc_hyperlink_bel_is_not_a_bell` | The product repro as a test: `ESC ]8;;http://example.com BEL click ESC ]8;; BEL` → Working, never Question/Blocked, ends Idle. |
+| `osc_terminators_are_not_bells_but_bare_bel_still_is` | Both halves over 4 OSC terminator shapes (BEL, `ESC \`, C1 `0x9c`, hyperlink open+close) and 3 "OSC then a real bell" shapes. |
+| `osc_state_survives_feed_boundaries` | OSC split mid-content, `ESC` of the opener split, `ESC` of the ST split, and the state not stuck after a split ST. |
+| `csi_embedded_bel_is_still_a_bell` | A BEL inside a CSI (not an OSC) still means attention — the narrowing is OSC-only. |
+| `every_declared_harness_adapter_is_in_the_builtin_registry` | Every `adapters/*.toml` with a `harness` is reachable in `AdapterRegistry::builtin()` and selectable by its declared programs; `omp` (and a path to it) is owned by omp, an unclaimed program by the default. |
+| `pi_tui_capture_replay_is_not_blocked` | The recorded pi TUI capture replays without a Question/Blocked and never ends Blocked. |
+| `opencode_tui_capture_replay_is_not_blocked` | Same for the recorded opencode TUI capture. |
+| `bare_bel_fixture_means_attention` / `osc_terminator_fixture_means_no_attention` | The two synthetic fixtures, replayed: the bare BEL means attention, the OSC terminators never do. |
+
+`xtask/src/adapters_check.rs` additionally asserts, per fixture, an optional
+`attention_during_flow` expectation: `Some(false)` for the three OSC-heavy fixtures (attention
+must never fire during the flow), `Some(true)` for `bell-bare.pty` (it must), `None` elsewhere.
+
+## Fixtures
+
+| Fixture | Kind | Source |
+| --- | --- | --- |
+| `pi-tui.pty` | recorded (re-packed from a raw capture) | `.loop/evidence/T-0075/pi-0.84.4-tui-10s.raw` — pi 0.84.4 TUI, 10 s, 31130 B, 2247 ESC, 60 BELs (all OSC terminators), 41 events, 42 KB |
+| `opencode-tui.pty` | recorded (re-packed) | `.loop/evidence/T-0075/opencode-1.18.30-tui-10s.raw` — opencode 1.18.30 TUI, 10 s, 6979 B, 366 ESC, 5 BELs (all OSC terminators), 10 events |
+| `omp-working.pty` | recorded live this turn | `arreo record omp --model verboo/deepseek-v4-flash-0731 -p 'Reply with exactly: OMP-PROBE-OK'` → `Working...` / `OMP-PROBE-OK` |
+| `omp-question.pty` | recorded live this turn | same model, prompt *"I want to delete some files. Ask me which ones before doing anything. Reply with just that one question and nothing else."* → `Which files would you like me to delete?` |
+| `omp-idle.pty` | recorded live this turn | `arreo record omp models verboo` — the model listing (no model call) |
+| `omp-stress.pty` | recorded live this turn | same model, prompt asking for `?`-heavy Rust; the tail asks nothing |
+| `bell-bare.pty` | synthetic | `/bin/sh -c 'printf … \a'` — one BEL, zero ESC bytes: the real bell |
+| `osc-terminator.pty` | synthetic | OSC 0 title (BEL), OSC 8 hyperlink open/close (BEL), OSC 1337 capability probe (ST) — 3 BELs, 5 ESCs, every BEL a terminator |
+
+Re-packing: the two TUI fixtures are the recorded raw bytes re-windowed into `.pty` events
+(768 B per 10 s capture) because the original PTY transcript was captured with `script(1)`,
+not `arreo record` — the byte stream, which is the whole point of the fixture, is the recorded
+one byte for byte, and the argv header names the command that produced it. `bell-bare.pty`
+and `osc-terminator.pty` are synthetic on purpose (they encode the two halves of the rule; no
+harness in the captures emits a bare BEL), which is exactly what the acceptance criteria ask
+for. Every recorded fixture used an isolated `HOME`/`$PI_CODING_AGENT_DIR` and its own
+`--session-dir` under `target/test-scratch/T-0080`; `scan_secrets` is clean on all eight.

@@ -1,0 +1,2 @@
+{"v":1,"cols":80,"rows":24,"argv":["/bin/sh","-c","printf '\\033]0;build 42\\007compiling modules...\\n\\033]8;;http://example.com\\007click here\\033]8;;\\007\\033]1337;Capabilities\\033\\\\done\\n'"]}
+{"t_ms":10000,"data":"G10wO2J1aWxkIDQyB2NvbXBpbGluZyBtb2R1bGVzLi4uChtdODs7aHR0cDovL2V4YW1wbGUuY29tB2NsaWNrIGhlcmUbXTg7OwcbXTEzMzc7Q2FwYWJpbGl0aWVzG1xkb25lCg=="}

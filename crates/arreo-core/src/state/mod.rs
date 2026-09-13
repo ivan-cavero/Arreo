@@ -7,8 +7,10 @@
 //! - Output flowing → `working` (immediately, latency ≈ 0).
 //! - Silence + prompt-shaped tail → `question (inferred)` with the matched
 //!   pattern (never claimed certain — the label says inferred).
-//! - BEL (`\x07`) → attention immediately (`question` if the tail looks like
-//!   a prompt, else `blocked`).
+//! - A **bare** BEL (`\x07` outside an OSC string) → attention immediately
+//!   (`question` if the tail looks like a prompt, else `blocked`). A BEL that
+//!   terminates an OSC string (window title, hyperlink — `ESC ] … \x07`/ST)
+//!   is a terminator, not a bell (T-0080).
 //! - Error shape + silence → `blocked`.
 //! - Silence + plain tail → `idle`.
 //! - Child exit → `done` with the code (any code — non-zero is still done;

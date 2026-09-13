@@ -101,6 +101,328 @@ fn bell_means_attention_not_silence() {
     );
 }
 
+// ————— T-0080: an OSC BEL is not a bell —————
+
+/// T-0080 product repro: a pane whose whole output is one OSC 8 hyperlink
+/// must NOT report blocked. `ESC ]8;;…` opens the link; the BEL terminates
+/// the OSC string — it is not a ring-the-bell byte.
+#[test]
+fn osc_hyperlink_bel_is_not_a_bell() {
+    let adapter = Adapter::default();
+    let mut engine = Engine::new(adapter, 0);
+    let bytes = b"\x1b]8;;http://example.com\x07click\x1b]8;;\x07";
+    let flow = engine.feed(bytes, 0);
+    assert!(
+        !flow
+            .iter()
+            .any(|e| e.state == State::Question || e.state == State::Blocked),
+        "OSC-terminated BELs are not attention, got {flow:?}"
+    );
+    assert!(
+        flow.iter().any(|e| e.state == State::Working),
+        "the link still rendered (working), got {flow:?}"
+    );
+    let later = engine.feed(b"", 5_000);
+    assert!(
+        !later
+            .iter()
+            .any(|e| e.state == State::Question || e.state == State::Blocked),
+        "silence after a hyperlink must not ask, got {later:?}"
+    );
+    assert_eq!(*engine.state(), State::Idle);
+}
+
+/// Every OSC terminator (BEL, ST = `ESC \`, C1 `0x9c`) closes the string
+/// without ringing a bell — and a real bare BEL after the string still means
+/// attention exactly as before the escape-aware change. This is the
+/// both-halves test: no false positive traded for a false negative.
+#[test]
+fn osc_terminators_are_not_bells_but_bare_bel_still_is() {
+    let adapter = Adapter::default();
+    let osc_only: &[&[u8]] = &[
+        // Window title, BEL-terminated, then plain text.
+        b"\x1b]0;build\x07ready",
+        // opencode's iTerm2 capability probe, ST-terminated.
+        b"\x1b]1337;Capabilities\x1b\\done",
+        // Colour query, C1-ST-terminated.
+        b"\x1b]11;?\x9cdone",
+        // OSC 8 hyperlink open + close.
+        b"\x1b]8;;http://example.com\x07click\x1b]8;;\x07",
+    ];
+    for case in osc_only {
+        let mut engine = Engine::new(adapter.clone(), 0);
+        engine.feed(b"working\n", 0);
+        let flow = engine.feed(case, 100);
+        let later = engine.feed(b"", 5_000);
+        assert!(
+            !flow
+                .iter()
+                .chain(later.iter())
+                .any(|e| e.state == State::Question || e.state == State::Blocked),
+            "OSC terminators alone never mean attention: {case:?} → {flow:?} {later:?}"
+        );
+        assert_eq!(
+            *engine.state(),
+            State::Idle,
+            "OSC terminated string + silence → idle: {case:?}"
+        );
+    }
+
+    let osc_then_bare_bel: &[&[u8]] = &[
+        // Title (BEL-terminated), then a REAL bell.
+        b"\x1b]0;build\x07ready\x07",
+        // Capability probe (ST-terminated), then a REAL bell.
+        b"\x1b]1337;Capabilities\x1b\\done\x07",
+        // Colour query (C1-ST-terminated), then a REAL bell.
+        b"\x1b]11;?\x9cdone\x07",
+    ];
+    for case in osc_then_bare_bel {
+        let mut engine = Engine::new(adapter.clone(), 0);
+        engine.feed(b"working\n", 0);
+        let flow = engine.feed(case, 100);
+        assert!(
+            flow.iter()
+                .any(|e| e.state == State::Question || e.state == State::Blocked),
+            "the bare BEL after the OSC string is attention: {case:?} → {flow:?}"
+        );
+    }
+}
+
+/// The escape stream state must survive feed boundaries: the daemon polls
+/// arbitrary chunks, so an OSC string (or the ESC that opens it) can straddle
+/// two feeds. A BEL one feed later must still be read as that OSC's
+/// terminator, never a bell.
+#[test]
+fn osc_state_survives_feed_boundaries() {
+    let adapter = Adapter::default();
+
+    // OSC string split mid-content.
+    let mut engine = Engine::new(adapter.clone(), 0);
+    engine.feed(b"\x1b]8;;http://exa", 0);
+    let flow = engine.feed(b"mple.com\x07click\x1b]8;;\x07", 100);
+    assert!(
+        !flow
+            .iter()
+            .any(|e| e.state == State::Question || e.state == State::Blocked),
+        "a BEL terminating an OSC opened in an earlier feed is not a bell: {flow:?}"
+    );
+
+    // Feed ending exactly at the ESC of the OSC opener.
+    let mut engine = Engine::new(adapter.clone(), 0);
+    engine.feed(b"work\x1b", 0);
+    let flow = engine.feed(b"]8;;http://example.com\x07", 100);
+    assert!(
+        !flow
+            .iter()
+            .any(|e| e.state == State::Question || e.state == State::Blocked),
+        "ESC split across feeds still opens the OSC: {flow:?}"
+    );
+
+    // Feed ending exactly at the ESC of an ST inside an OSC.
+    let mut engine = Engine::new(adapter.clone(), 0);
+    engine.feed(b"\x1b]1337;Capabilities\x1b", 0);
+    let flow = engine.feed(b"\\", 100);
+    assert!(
+        !flow
+            .iter()
+            .any(|e| e.state == State::Question || e.state == State::Blocked),
+        "ST split across feeds still terminates the OSC: {flow:?}"
+    );
+
+    // And the next feed's BEL is back to being a real bell: the state did
+    // not get stuck inside the closed OSC.
+    for case in [&b"\x1b]0;title\x1b"[..], &b"\x1b]1337;Capabilities\x1b"[..]] {
+        let mut engine = Engine::new(adapter.clone(), 0);
+        engine.feed(b"working\n", 0);
+        engine.feed(case, 100);
+        let flow = engine.feed(b"\\\x07", 200);
+        assert!(
+            flow.iter()
+                .any(|e| e.state == State::Question || e.state == State::Blocked),
+            "after the ST closes the OSC, the next BEL is a real bell: {flow:?}"
+        );
+    }
+}
+
+/// A BEL inside a CSI sequence (not an OSC string) is untouched by the
+/// escape-aware narrowing: it still means attention today and must tomorrow.
+#[test]
+fn csi_embedded_bel_is_still_a_bell() {
+    let adapter = Adapter::default();
+    let mut engine = Engine::new(adapter, 0);
+    engine.feed(b"working\n", 0);
+    // Malformed CSI that smuggles a BEL mid-sequence — not an OSC string, so
+    // the BEL is a real one (strict narrowing: only OSC content changed).
+    let flow = engine.feed(b"\x1b[2;7m\x07", 100);
+    assert!(
+        flow.iter()
+            .any(|e| e.state == State::Question || e.state == State::Blocked),
+        "a BEL outside any OSC string means attention: {flow:?}"
+    );
+}
+
+/// T-0080: a harness adapter declared in `adapters/*.toml` must be *reachable*
+/// by the running daemon. The registry is compiled in ([`AdapterRegistry::
+/// builtin`]), so a new TOML that nobody added there is a file the tests can
+/// read and the daemon cannot: panes of that program silently fall through to
+/// `default.toml`. This is the criterion-4 failure mode for omp, pinned.
+#[test]
+fn every_declared_harness_adapter_is_in_the_builtin_registry() {
+    use arreo_core::state::AdapterRegistry;
+    let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../adapters");
+    let registry = AdapterRegistry::builtin();
+    let mut harnesses = 0usize;
+    for entry in std::fs::read_dir(&root).expect("adapters dir") {
+        let path = entry.expect("dirent").path();
+        if path.extension().is_none_or(|e| e != "toml") {
+            continue;
+        }
+        let adapter = Adapter::load(&path).expect("adapter loads");
+        let Some(harness) = adapter.harness_id() else {
+            continue; // the universal adapter owns everything unclaimed
+        };
+        harnesses += 1;
+        let name = path.file_name().unwrap().to_string_lossy().to_string();
+        assert_eq!(
+            registry.by_harness(harness).map(|a| a.harness_id()),
+            Some(Some(harness)),
+            "{name}: harness {harness:?} is unknown to the builtin registry"
+        );
+        for program in &adapter.programs {
+            assert_eq!(
+                registry.for_program(program).harness_id(),
+                Some(harness),
+                "{name}: program {program:?} does not select harness {harness:?}"
+            );
+        }
+    }
+    assert!(harnesses >= 3, "pi, opencode and omp are all declared");
+    // And the program the T-0080 pane runs is owned by omp, not the default.
+    assert_eq!(
+        AdapterRegistry::builtin()
+            .for_program("/home/me/.bun/bin/omp")
+            .harness_id(),
+        Some("omp"),
+        "a path to omp still matches by basename"
+    );
+    assert_eq!(
+        AdapterRegistry::builtin()
+            .for_program("some-unclaimed-tool")
+            .harness_id(),
+        None,
+        "everything else stays on the universal adapter"
+    );
+}
+
+/// T-0080 recording-based regression: the pi TUI capture (full of OSC 8
+/// hyperlinks and an OSC 0 title — every BEL an OSC terminator, 60/60) must
+/// replay to a non-attention state.
+#[test]
+fn pi_tui_capture_replay_is_not_blocked() {
+    let adapter = Adapter::default();
+    let mut engine = Engine::new(adapter, 0);
+    let raw = load_raw("pi-tui.pty");
+    let mut t = 0u64;
+    for chunk in raw.chunks(512) {
+        let events = engine.feed(chunk, t);
+        assert!(
+            !events
+                .iter()
+                .any(|e| e.state == State::Question || e.state == State::Blocked),
+            "pi TUI bells are OSC terminators, not attention: {events:?}"
+        );
+        t += 50;
+    }
+    let later = engine.feed(b"", t + 5_000);
+    assert!(
+        !later
+            .iter()
+            .any(|e| e.state == State::Question || e.state == State::Blocked),
+        "pi TUI + silence must not ask or block: {later:?}"
+    );
+    assert_ne!(*engine.state(), State::Blocked);
+}
+
+/// T-0080 recording-based regression: the opencode TUI capture (title OSC,
+/// colour queries, the iTerm2/kitty probes — every BEL an OSC terminator,
+/// 5/5) must replay to a non-attention state.
+#[test]
+fn opencode_tui_capture_replay_is_not_blocked() {
+    let adapter = Adapter::default();
+    let mut engine = Engine::new(adapter, 0);
+    let raw = load_raw("opencode-tui.pty");
+    let mut t = 0u64;
+    for chunk in raw.chunks(512) {
+        let events = engine.feed(chunk, t);
+        assert!(
+            !events
+                .iter()
+                .any(|e| e.state == State::Question || e.state == State::Blocked),
+            "opencode TUI bells are OSC terminators, not attention: {events:?}"
+        );
+        t += 50;
+    }
+    let later = engine.feed(b"", t + 5_000);
+    assert!(
+        !later
+            .iter()
+            .any(|e| e.state == State::Question || e.state == State::Blocked),
+        "opencode TUI + silence must not ask or block: {later:?}"
+    );
+    assert_ne!(*engine.state(), State::Blocked);
+}
+
+/// T-0080 synthetic halves, as fixtures: the bare-BEL fixture must produce
+/// attention when replayed; the OSC-terminator fixture must never.
+#[test]
+fn bare_bel_fixture_means_attention() {
+    let adapter = Adapter::default();
+    let mut engine = Engine::new(adapter, 0);
+    let raw = load_raw("bell-bare.pty");
+    let mut t = 0u64;
+    let mut saw_attention = false;
+    for chunk in raw.chunks(512) {
+        let events = engine.feed(chunk, t);
+        if events
+            .iter()
+            .any(|e| e.state == State::Question || e.state == State::Blocked)
+        {
+            saw_attention = true;
+        }
+        t += 50;
+    }
+    assert!(
+        saw_attention,
+        "the bare BEL fixture must mean attention on replay"
+    );
+}
+
+#[test]
+fn osc_terminator_fixture_means_no_attention() {
+    let adapter = Adapter::default();
+    let mut engine = Engine::new(adapter, 0);
+    let raw = load_raw("osc-terminator.pty");
+    let mut t = 0u64;
+    for chunk in raw.chunks(512) {
+        let events = engine.feed(chunk, t);
+        assert!(
+            !events
+                .iter()
+                .any(|e| e.state == State::Question || e.state == State::Blocked),
+            "OSC terminators never mean attention on replay: {events:?}"
+        );
+        t += 50;
+    }
+    let later = engine.feed(b"", t + 5_000);
+    assert!(
+        !later
+            .iter()
+            .any(|e| e.state == State::Question || e.state == State::Blocked),
+        "OSC-terminator fixture + silence must not ask or block: {later:?}"
+    );
+    assert_eq!(*engine.state(), State::Idle);
+}
+
 #[test]
 fn traceback_shape_is_blocked() {
     let adapter = Adapter::default();
@@ -235,7 +557,7 @@ fn multibyte_truncation_never_panics() {
 fn adversarial_shapes_fool_no_adapter() {
     use arreo_core::state::{Adapter, Engine, State};
     let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../adapters");
-    let adapters = ["default.toml", "pi.toml", "opencode.toml"];
+    let adapters = ["default.toml", "pi.toml", "opencode.toml", "omp.toml"];
     // Shapes: ?-heavy code, vim alt-screen, spinner storm, bell-less noise.
     let shapes: &[&[u8]] = &[
         b"fn f() {\n  // what? why? huh?\n  let x = a ? b : c;\n  Ok(x?)\n}\n",
@@ -420,6 +742,32 @@ fn resume_args_and_base_args_are_inverse() {
     let (back, carried) = resume.base_args(&resume.resume_args(&base, None).expect("continue"));
     assert_eq!(back, base);
     assert_eq!(carried, None);
+
+    // omp (T-0080): same lineage as pi's envelope but no `--session-id` —
+    // `-c` continues, `-r {session}` resumes by id prefix, and both re-open
+    // the same file (verified live, 18.1.16, omp-resume2.txt).
+    let omp = Adapter::load(&root.join("omp.toml")).expect("omp loads");
+    let resume = omp.resume.as_ref().expect("omp resumes");
+    assert_eq!(resume.kind(), arreo_core::state::ResumeKind::Continue);
+    let base = vec!["-p".to_string(), "hi".to_string()];
+    assert_eq!(
+        resume.resume_args(&base, None),
+        Some(vec!["-p".to_string(), "hi".to_string(), "-c".to_string()])
+    );
+    let id = "01a099e5-e66a-7568-9bd6-ac330e14b488";
+    let exact = resume
+        .resume_args(&base, Some(id))
+        .expect("exact by prefix");
+    assert_eq!(exact, ["-p", "hi", "-r", id]);
+    let (back, carried) = resume.base_args(&exact);
+    assert_eq!(back, base);
+    assert_eq!(carried.as_deref(), Some(id));
+    // A restore on a restored record must not stack a second `-r`.
+    assert_eq!(
+        resume.resume_args(&back, carried.as_deref()),
+        Some(exact),
+        "a second restore must not stack another -r"
+    );
 }
 
 /// T-0072 capture: the id is learned where the harness prints it. pi's JSON
@@ -477,6 +825,22 @@ fn engines_capture_the_session_id_from_real_output() {
     engine.feed(b"opencode\n> ask anything\n", 0);
     assert_eq!(engine.session(), None);
     assert!(!engine.take_session_learned());
+
+    // omp (T-0080): same NDJSON session envelope as pi (18.1.16, labels its
+    // resume `-r {session}`), so the capture pattern matches the same shape.
+    let omp = Adapter::load(&root.join("omp.toml")).expect("omp loads");
+    let mut engine = Engine::new(omp, 0);
+    engine.feed(b"{\"type\":\"session\",\"version\":3,\"id\":\"", 0);
+    assert_eq!(engine.session(), None, "a partial id is not an id");
+    engine.feed(
+        b"01a099e5-e66a-7568-9bd6-ac330e14b488\",\"cwd\":\"/w\"}\n",
+        10,
+    );
+    assert_eq!(
+        engine.session(),
+        Some("01a099e5-e66a-7568-9bd6-ac330e14b488"),
+        "omp's envelope carries the id"
+    );
 
     // The universal adapter has no strategy and captures nothing.
     let mut engine = Engine::new(Adapter::default(), 0);

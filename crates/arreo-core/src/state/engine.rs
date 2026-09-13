@@ -64,6 +64,74 @@ fn strip_ansi(bytes: &[u8]) -> String {
     out
 }
 
+/// Scan `bytes` for a bare BEL (one that is not an OSC terminator),
+/// maintaining the escape-stream state across feeds.
+///
+/// An OSC string (window title, OSC 8 hyperlink, colour query/set) is opened
+/// by `ESC ]` and runs until a terminator: BEL (`0x07`, the common one), ST
+/// (`ESC \` or C1 `0x9c`), or is aborted by CAN/SUB (`0x18`/`0x1a`). A BEL
+/// that terminates (or aborts) nothing — i.e. is seen outside any OSC string
+/// — is a real ring-the-bell byte and returns `true`.
+///
+/// The state lives on the engine, not the caller: the feed path guarantees no
+/// alignment, so an OSC string or a two-byte escape can straddle two `feed`
+/// calls. `esc_pending` carries an `ESC` seen at the very end of the previous
+/// feed; this feed's first byte decides what it opened — `]` starts an OSC
+/// string, `\` is the ST half (a no-op when nothing is open), anything else
+/// is a two-byte escape that changes nothing here.
+///
+/// The narrowing is strict by construction: every `0x07` outside an OSC
+/// string behaves exactly as before, and no `0x07` inside one ever means
+/// attention.
+fn scan_bell(bytes: &[u8], osc_active: &mut bool, esc_pending: &mut bool) -> bool {
+    let mut bell = false;
+    for &b in bytes {
+        if *esc_pending {
+            // The previous byte was an ESC; this byte completes the pair.
+            *esc_pending = false;
+            if *osc_active {
+                // Inside an OSC string an ESC matters only as the ST half —
+                // and a terminator byte still terminates the string wherever
+                // it lands (a terminal applies BEL from any position).
+                match b {
+                    b'\\' | 0x07 | 0x9c | 0x18 | 0x1a => *osc_active = false,
+                    _ => {}
+                }
+            } else {
+                match b {
+                    // `ESC ]` opens an OSC string.
+                    b']' => *osc_active = true,
+                    // `ESC BEL` outside any OSC: the BEL is a real bell
+                    // (strict narrowing — only OSC content changes meaning).
+                    0x07 => bell = true,
+                    _ => {}
+                }
+            }
+            continue;
+        }
+        if *osc_active {
+            match b {
+                // BEL and C1 ST terminate the OSC string — not a bell.
+                0x07 | 0x9c => *osc_active = false,
+                // CAN/SUB abort the string (ECMA-48 §5.5.2): the string is
+                // over, so a following BEL is a real one again.
+                0x18 | 0x1a => *osc_active = false,
+                // A stray ESC may start an ST; the next byte decides.
+                0x1b => *esc_pending = true,
+                _ => {}
+            }
+        } else {
+            match b {
+                // Any ESC outside a control string: consume the pair.
+                0x1b => *esc_pending = true,
+                0x07 => bell = true,
+                _ => {}
+            }
+        }
+    }
+    bell
+}
+
 /// Last N lines of text (tail matching window).
 fn tail_lines(text: &str, n: usize) -> String {
     let lines: Vec<&str> = text.lines().collect();
@@ -79,8 +147,19 @@ pub struct Engine {
     text: String,
     /// Engine-clock of the last output byte.
     last_output_ms: Option<u64>,
-    /// Whether the last output contained BEL.
+    /// Whether the last output contained a bare BEL (one that terminated no
+    /// OSC string).
     bell_pending: bool,
+    /// Whether the output stream is inside an OSC string (opened by `ESC ]`).
+    /// A BEL/ST inside one terminates it rather than ringing a bell; the
+    /// state persists across feeds because an OSC string can straddle two
+    /// feed calls.
+    osc_active: bool,
+    /// A trailing `ESC` at the end of the previous feed, waiting for the
+    /// byte that decides what it opened (`]` → OSC, `\` → ST, anything else
+    /// → a two-byte escape). Persisted so a feed boundary cannot split an
+    /// escape sequence (T-0080).
+    esc_pending: bool,
     /// Whether an error shape was seen since the last state change.
     error_armed: bool,
     exited: bool,
@@ -115,6 +194,8 @@ impl Engine {
             text: String::new(),
             last_output_ms: None,
             bell_pending: false,
+            osc_active: false,
+            esc_pending: false,
             error_armed: false,
             exited: false,
             session: None,
@@ -188,7 +269,9 @@ impl Engine {
             return events;
         }
         if !bytes.is_empty() {
-            if bytes.contains(&0x07) {
+            // Escape-aware (T-0080): a BEL that terminates an OSC string is
+            // the string's terminator, not a bell; a bare BEL still is.
+            if scan_bell(bytes, &mut self.osc_active, &mut self.esc_pending) {
                 self.bell_pending = true;
             }
             let visible = strip_ansi(bytes);

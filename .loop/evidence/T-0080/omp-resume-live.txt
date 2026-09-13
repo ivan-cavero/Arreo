@@ -1,0 +1,18 @@
+=== omp 18.1.16 resume verification (T-0080) ===
+isolated HOME=/home/dev/dev/Arreo/target/test-scratch/T-0080/omp/home ; session dir=/home/dev/dev/Arreo/target/test-scratch/T-0080/omp/resume/sessions
+
+--- run 1: fresh session
+"type":"session","version":3,"id":"01a09b04-4db2-718a-bf90-3435ea7e944d","timestamp":"2026-09-13T13:45:45.650Z","cwd":"/home/dev/dev/Arreo"}
+files after run 1:
+2026-09-13T13-45-45-650Z_01a09b04-4db2-718a-bf90-3435ea7e944d.jsonl
+
+--- run 2: -r <id prefix>
+resuming with prefix: 01a09b (full id 01a09b04-4db2-718a-bf90-3435ea7e944d)
+"type":"session","version":3,"id":"01a09b04-4db2-718a-bf90-3435ea7e944d","timestamp":"2026-09-13T13:45:45.650Z","cwd":"/home/dev/dev/Arreo"}
+files after run 2:
+2026-09-13T13-45-45-650Z_01a09b04-4db2-718a-bf90-3435ea7e944d.jsonl
+
+--- run 3: -c
+"type":"session","version":3,"id":"01a09b04-4db2-718a-bf90-3435ea7e944d","timestamp":"2026-09-13T13:45:45.650Z","cwd":"/home/dev/dev/Arreo"}
+files after run 3:
+2026-09-13T13-45-45-650Z_01a09b04-4db2-718a-bf90-3435ea7e944d.jsonl

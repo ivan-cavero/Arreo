@@ -189,18 +189,24 @@ id in the session envelope; no new file. Store default
 foreign session files (flag presence verified via `omp --help`).
 
 **Custom models/providers.** `$PI_CODING_AGENT_DIR/models.yml` (probed with
-`omp models verboo` → the six models from the scratch file). **`apiKey` env
-syntax is `$VAR` only:**
+`omp models verboo` → the six models from the scratch file). **`apiKey` is the
+env-var NAME — no sigil.** Measured twice, the second time through a TLS proxy
+that logs the `Authorization` header omp actually sends
+(`.loop/evidence/T-0080/omp-apikey-env-syntax.txt`; the survey's own transcript
+is consistent with it — its "plain" case *was* the bare name):
 
 | `apiKey` value | result |
 | --- | --- |
-| `$VBK_TEST_KEY` | `stopReason: "stop"` — works |
-| `${VBK_TEST_KEY}` | `stopReason: "error"`, `errorStatus: 401` — the braces are sent literally |
+| `VBK_TEST_KEY` (the name) | `stopReason: "stop"` — works; `Bearer ` + the 48-char key |
+| `$VBK_TEST_KEY` | `errorStatus: 401`; `Bearer $VBK_TEST_KEY` sent **verbatim** |
+| `${VBK_TEST_KEY}` | `errorStatus: 401`; `Bearer ${VBK_TEST_KEY}` sent verbatim |
 
-That is a pi/omp divergence worth encoding per-adapter in config sync
-(`.loop/evidence/T-0075/omp-apikey-syntax.txt`). `omp auth-broker` is a full
-credential vault (`serve`/`token`/`login`/`import`/`migrate`/`status`), so omp
-can also fetch keys at launch rather than read them from the file.
+omp resolves the field with a plain `process.env[<literal>]` lookup, so the value
+must be the variable's name. This is a pi/omp divergence worth encoding
+per-adapter in config sync: **pi** takes a literal, `$VAR` or `${VAR}`; **omp**
+takes a literal or the bare name. `omp auth-broker` is a full credential vault
+(`serve`/`token`/`login`/`import`/`migrate`/`status`), so omp can also fetch keys
+at launch rather than read them from the file.
 
 ## 4. Host-artifact detail (CLI absent — proves the hook point, not the behaviour)
 
@@ -235,9 +241,11 @@ can also fetch keys at launch rather than read them from the file.
    does not (default `--tui-mode regular`). Anything that keys "full-screen app"
    off `?1049` is wrong for pi.
 3. **Env-var reference syntax is per-harness**: opencode `{env:VAR}` (verified),
-   pi `$VAR` and `${VAR}` (both verified), omp `$VAR` only (verified — `${VAR}`
-   is sent literally and 401s). Config sync (`arreo.toml`) has to translate or
-   refuse per harness rather than assume one dialect.
+   pi `$VAR` and `${VAR}` (both verified), omp **the bare variable name** — both
+   sigil forms are sent literally and 401 (verified twice, the second time
+   through a proxy that logs the header; corrected 2026-09-13 in T-0080 from this
+   matrix's earlier `$VAR`-only label). Config sync (`arreo.toml`) has to
+   translate or refuse per harness rather than assume one dialect.
 4. **Session persistence differs in kind**: pi/omp write NDJSON `.jsonl` files
    per session (human-readable, greppable, cheap to back up); opencode writes
    rows into a multi-GB SQLite DB that also holds credentials. Resume tooling
@@ -259,7 +267,7 @@ can also fetch keys at launch rather than read them from the file.
 | `opencode-paths.txt` | `opencode debug paths` layout; `debug info` shows the loaded plugin list |
 | `pi-live-json.txt`, `pi-continue.txt`, `pi-live-ok.txt` | pi NDJSON envelope; `-c` restores history across runs (BANANA round-trip) |
 | `pi-resume.txt`, `pi-pin3.txt` | pi `--session <prefix>` and `--session-id` pinning (one file, two turns) |
-| `pi-apikey-syntax.txt`, `omp-apikey-syntax.txt` | pi `$VAR`+`${VAR}` vs omp `$VAR`-only |
+| `pi-apikey-syntax.txt`, `omp-apikey-syntax.txt` | pi `$VAR`+`${VAR}` vs omp (the bare name; corrected in T-0080 — see `T-0080/omp-apikey-env-syntax.txt`) |
 | `opencode-custom-provider.txt`, `opencode-env-subst.txt`, `opencode-project-merge.txt` | custom provider registered; `{env:}` load-bearing; global+project merge |
 | `opencode-live-run.txt`, `opencode-resume.txt`, `opencode-errors-export.txt` | `--format json` sessionID events; `-s`/`-c` resume; export; bad-model exit 1 |
 | `opencode-db-tables.txt` + `session` table read | session/credential storage is SQLite rows |

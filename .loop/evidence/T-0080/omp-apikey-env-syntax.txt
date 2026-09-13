@@ -1,0 +1,38 @@
+=== omp 18.1.16 apiKey env syntax, measured on this box (T-0080) ===
+
+Correction to specs/harness-matrix.md §3.3 / finding 3, measured twice, including
+through a TLS proxy that logs the Authorization header omp actually sends.
+
+Setup: one isolated HOME per case (target/test-scratch/T-0080/omp/form2-*), the
+provider's baseUrl pointed at a local TLS proxy (target/test-scratch/T-0080/mitm/
+proxy.py) that forwards to https://code.verboo.ai and logs the header it sees.
+VBK_TEST_KEY was set in the environment for every run. The key value is never
+printed — the log records only the header length and its first 7 bytes.
+
+--- apiKey: VBK_TEST_KEY        (the env-var NAME, no sigil)
+Working...
+Authorization: <len=55 prefix='Bearer '>          <- the real key: 7 + 48
+
+--- apiKey: $VBK_TEST_KEY       (the survey's claimed-working form)
+401 invalid or expired token
+Authorization: <len=20 prefix='Bearer '>          <- 7 + len("$VBK_TEST_KEY")
+
+--- apiKey: ${VBK_TEST_KEY}
+401 invalid or expired token
+Authorization: <len=22 prefix='Bearer '>          <- 7 + len("${VBK_TEST_KEY}")
+
+Reading: omp resolves `apiKey` through `XP(e)` — a plain `process.env[e]` lookup
+on the literal string, no sigil stripping (dist/cli.js, `function S$(e,t){…let
+s=XP(e);…}`). So the VALUE must be the variable's NAME. Both sigil forms are sent
+verbatim as the bearer token and 401.
+
+The survey's omp-apikey-syntax.txt recorded "plain" as working and "${VAR}" as
+401; the "plain" case there was the NAME (that is why it worked), and its label
+"plain" was read as "a literal key". Both are consistent with this measurement —
+the matrix's prose ("`$VAR` only", and its "pi `$VAR` and `${VAR}` (both
+verified)" comparison) is what is wrong, not the transcript.
+
+What this changes in adapters/omp.toml: the header comment now states the
+measured rule (the value is the env-var name; `$VAR` and `${VAR}` are sent
+literally and 401) rather than the survey's `$VAR`-only phrasing. Config sync for
+omp must write the variable name, not a sigil.
