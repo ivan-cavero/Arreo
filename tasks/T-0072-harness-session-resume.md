@@ -3,7 +3,7 @@ id: T-0072
 title: Harness-aware session resume — reattach resumes pi/opencode sessions, not just scrollback
 phase: 4
 priority: 2
-status: proposed
+status: done
 depends_on: [T-0017, T-0018]
 scope:
   - adapters/**
