@@ -44,7 +44,14 @@ daemon_binary_mb = { phase0 = true, target = 20, unit = "MB" }
 # Later phases (recorded, not yet enforced):
 phone_cold_attach_s = { phase0 = false, target = 1, unit = "s" }
 phone_idle_delta_kbs = { phase0 = false, target = 5, unit = "KB/s" }
-tui_attach_30panes_ms = { phase0 = false, target = 300, unit = "ms" }
+# T-0079 gives this row its mechanism and its enforcement: the `tui` slice
+# (`cargo xtask e2e --slice tui`) drives the real TUI on a real pty against a
+# real daemon holding **30 real panes, each of them working** (the shape that
+# made the old serial poll pay two 150 ms blocking `Wait` timeouts per pane —
+# 10.3 s before the first correct frame), and times the first frame whose
+# sidebar carries all 30 pane ids. The row's number is read from this file, not
+# copied, and the measurement is written to `.loop/evidence/T-0079/`.
+tui_attach_30panes_ms = { phase0 = true, target = 300, unit = "ms" }
 # T-0032 gives this row its mechanism and its enforcement: the `relay` slice
 # (`cargo xtask e2e --slice relay`) starts a real relay, a real peer daemon and
 # the real TUI, then times a real keypress to the peer's output appearing on

@@ -17,10 +17,11 @@
 //! one.
 
 use crate::harness::{bins, cli, wait_bound, TestServer, TuiSession};
+use arreo_core::proto::AgentState;
 use arreo_core::theme::Depth;
 use std::path::PathBuf;
 use std::process::ExitCode;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 pub fn run(rest: &[String]) -> ExitCode {
     let evidence = rest.iter().any(|a| a == "--interactive-evidence");
@@ -36,6 +37,17 @@ pub fn run(rest: &[String]) -> ExitCode {
         .join(".loop")
         .join("evidence")
         .join("T-0076");
+    // T-0079's captures: the 30-pane fixture's states and the measured first
+    // frame. Written on every run, not only under `--interactive-evidence`: the
+    // number this task exists to assert is evidence a reviewer reads, and a
+    // measurement nobody can see after the fact is a claim.
+    let evidence_dir_79 = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("workspace root")
+        .join(".loop")
+        .join("evidence")
+        .join("T-0079");
+    let _ = std::fs::create_dir_all(&evidence_dir_79);
     if evidence {
         let _ = std::fs::create_dir_all(&evidence_dir);
         let _ = std::fs::create_dir_all(&evidence_dir_76);
@@ -69,13 +81,37 @@ pub fn run(rest: &[String]) -> ExitCode {
     };
     wait_bound(&socket);
 
-    // Three panes: one prompt-hung (must sort first), two working.
+    // Three panes, one per state the sidebar distinguishes (T-0079): one
+    // prompt-hung (sorts first), one **genuinely working**, one quiet-but-alive
+    // (idle). The fixture used to be three silent panes, which the old sidebar
+    // reported as `working` for any live pane that was not asking — a
+    // fabrication. Now that the sidebar is *told* the engine's state instead of
+    // being handed a guess (see `arreo_tui::client::poll_summaries`), a silent
+    // pane renders `idle`, because that is what the engine derives: output
+    // flowing is `working`, two seconds of silence is `idle` (its own
+    // `idle_after_ms`). So each pane below is the shape it claims to be — and
+    // the frame this slice asserts carries all three dot shapes, which is more
+    // than the old fixture ever put on screen. gamma's loop is bounded so the
+    // pane outlives the slice but not the run.
     let panes = [
-        ("alpha", "echo ALPHA-MARKER && sleep 120"),
-        ("beta", "sleep 0.5; printf 'Proceed? [y/n] '; sleep 120"),
-        ("gamma", "echo GAMMA-MARKER && sleep 120"),
+        ("alpha", "echo ALPHA-MARKER && sleep 120".to_string()),
+        (
+            "beta",
+            "sleep 0.5; printf 'Proceed? [y/n] '; sleep 120".to_string(),
+        ),
+        (
+            // **Genuinely working, not merely alive.** The cadence is 500 ms
+            // against the engine's 2000 ms `idle_after_ms`: a slower one drifts
+            // to `idle` whenever a poll, a `sleep` and a loaded box line up, and
+            // a fixture that flaps between two states cannot assert either. The
+            // marker repeats so the wall tile streams *live* output rather than
+            // a first line that has long since scrolled off it.
+            "gamma",
+            "i=0; while [ $i -lt 220 ]; do echo \"GAMMA-MARKER $i\"; i=$((i+1)); sleep 0.5; done"
+                .to_string(),
+        ),
     ];
-    for (id, body) in panes {
+    for (id, body) in &panes {
         let (ok, out) = cli(&cli_bin, &socket, &["spawn", id, "/bin/sh", "-c", body]);
         if !ok {
             println!("[FAIL] tui: spawn {id}: {out}");
@@ -95,6 +131,18 @@ pub fn run(rest: &[String]) -> ExitCode {
         println!("[FAIL] tui: beta never entered question state: {out}");
         return ExitCode::FAILURE;
     }
+    // Same precondition for the working pane (T-0079): it must have been
+    // classified `working` before the frame is read, or the check below would be
+    // racing the engine rather than asserting the UI.
+    let (ok, out) = cli(
+        &cli_bin,
+        &socket,
+        &["wait", "gamma", "--state", "working", "--timeout", "10s"],
+    );
+    if !ok {
+        println!("[FAIL] tui: gamma never entered working state: {out}");
+        return ExitCode::FAILURE;
+    }
 
     let mut session = match TuiSession::start(&tui_bin, &socket) {
         Some(session) => session,
@@ -104,8 +152,13 @@ pub fn run(rest: &[String]) -> ExitCode {
         }
     };
 
-    // One poll cycle + a frame.
-    std::thread::sleep(Duration::from_secs(3));
+    // A poll cycle + a frame — and long enough for the states to **settle**
+    // (T-0079). The quiet pane turns `idle` two seconds after its last output,
+    // measured from the poll that saw it, so a frame read at three seconds
+    // catches it mid-transition: sometimes `working`, sometimes `idle`, and a
+    // check that asserts a state cannot be built on a coin flip. Five seconds is
+    // past the last transition the fixture makes; nothing here is racing.
+    std::thread::sleep(Duration::from_secs(5));
     let screen = session.screen();
     if evidence {
         let _ = std::fs::write(evidence_dir.join("01-overview.txt"), &screen);
@@ -147,16 +200,32 @@ pub fn run(rest: &[String]) -> ExitCode {
     );
     // **State is never color-only (T-0076).** Every group header is a dot
     // *shape* plus the state's own word, so the sidebar is readable with no
-    // color at all — and the two are adjacent, not merely both on screen.
+    // color at all — and the two are adjacent, not merely both on screen. All
+    // three states the fixture produces are asserted (T-0079): a dot shape that
+    // only appeared for one state would be a legend, not a language.
+    // The rows actually rendered, for the failure message: a check that says
+    // only "missing" cannot be told from a fixture that never produced the
+    // state, and this one has to distinguish "the UI lost a dot" from "the
+    // engine classified the pane differently".
+    let dot_rows: String = screen
+        .lines()
+        .filter(|line| {
+            ['◉', '●', '○', '⬢', '✓']
+                .iter()
+                .any(|dot| line.contains(*dot))
+        })
+        .map(str::trim)
+        .collect::<Vec<_>>()
+        .join(" | ");
     check(
         "state dots rendered",
-        screen.contains('◉') && screen.contains('●'),
-        "state dots missing",
+        ['◉', '●', '○'].iter().all(|dot| screen.contains(*dot)),
+        &format!("state dots missing; state rows on screen: {dot_rows:?}"),
     );
     check(
         "every state row is a dot shape and its own name",
-        screen.contains("◉ question") && screen.contains("● working"),
-        "a state row carries only a hue",
+        screen.contains("◉ question") && screen.contains("● working") && screen.contains("○ idle"),
+        &format!("a state row carries only a hue; state rows on screen: {dot_rows:?}"),
     );
     check(
         "status bar advertises keys",
@@ -253,9 +322,10 @@ pub fn run(rest: &[String]) -> ExitCode {
     );
 
     // Mouse: click the third pane's sidebar row (SGR report, 1-based).
-    // Layout at 120x30: row 1 = question header, 2 = beta, 3 = working
-    // header, 4 = alpha, 5 = gamma.
-    session.send("\u{1b}[<0;6;5M");
+    // Layout at 120x30 (T-0079): row 1 = question header, 2 = beta, 3 = working
+    // header, 4 = gamma, 5 = idle header, 6 = alpha. gamma is the working pane,
+    // so it is the row this clicks.
+    session.send("\u{1b}[<0;6;4M");
     std::thread::sleep(Duration::from_secs(2));
     let clicked = session.screen();
     if evidence {
@@ -455,6 +525,12 @@ pub fn run(rest: &[String]) -> ExitCode {
     std::thread::sleep(Duration::from_secs(3));
     let during = session.transcript();
     let idle_bytes = during.len() - before;
+    // Said out loud on every run, not only when it fails: "no regression in the
+    // steady state" is a number a reviewer should be able to read, and a budget
+    // that only speaks when breached cannot be compared across changes.
+    println!(
+        "[INFO] tui: idle delta: {idle_bytes} bytes over 3 s (budget < 4096, no clear-screen)"
+    );
     check(
         "steady state repaints deltas only",
         idle_bytes < 4096 && !during[before..].windows(4).any(|w| w == b"\x1b[2J"),
@@ -631,6 +707,246 @@ pub fn run(rest: &[String]) -> ExitCode {
         std::thread::sleep(Duration::from_secs(1));
     }
 
+    // ---- T-0079: the 30-pane wall's first frame --------------------------
+    //
+    // The budget row this asserts is **read from `perf-budget.toml`**, not
+    // copied: the file is the law, and a slice carrying its own constant is a
+    // second source for one fact (the same rule the `reattach` slice follows).
+    //
+    // The fixture is the shape that *fails today*: 30 panes each emitting a
+    // marker every 500 ms, so every one of them is `working` — in neither of
+    // the two states the old poller waited for per pane. That is the whole
+    // point: the old poll path paid two 150 ms blocking `Wait` timeouts per
+    // pane, so 30 working panes could not paint at all for ~9-10 s (the
+    // measured baseline is 10.3 s; see `.loop/evidence/T-0079/`). The panes are
+    // meant to be busy — "make the panes idle so the wall is fast" would be
+    // passing for the wrong reason.
+    let wall_budget_ms = crate::bench::budget_target("tui_attach_30panes_ms");
+    let wall_socket =
+        std::env::temp_dir().join(format!("arreo-e2e-wall-{}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&wall_socket);
+    let wall_server = match TestServer::spawn(&server_bin, &wall_socket, "30-pane server start") {
+        Ok(server) => server,
+        Err(code) => return code,
+    };
+    wait_bound(&wall_socket);
+
+    /// The number of panes in the wall. A serial pass cannot pass this: the
+    /// old path paid 30 × (2 × 150 ms) of blocking waits, so 30 is more than
+    /// enough for the measurement to fail on the old code and pass on the
+    /// batched one — one pane would prove nothing, because one `Wait` pair
+    /// (300 ms) is already near the budget and a single pane cannot show that
+    /// the cost is per-pane. 30 is also the size the budget row names.
+    const WALL_PANES: usize = 30;
+
+    let wall_ids: Vec<String> = (0..WALL_PANES).map(|i| format!("wall-{i:02}")).collect();
+    for (i, id) in wall_ids.iter().enumerate() {
+        // Bounded (`i < 240` ≈ 2 minutes) as well as explicitly killed below:
+        // a test must not leave a process behind, and an unbounded `while :`
+        // would outlive the slice if the daemon were killed before the panes.
+        let body = format!(
+            "i=0; while [ $i -lt 240 ]; do echo \"W{i:02}-$i\"; i=$((i+1)); sleep 0.5; done"
+        );
+        let (ok, out) = cli(
+            &cli_bin,
+            &wall_socket,
+            &["spawn", id, "/bin/sh", "-c", &body],
+        );
+        if !ok {
+            check(
+                "the 30-pane fixture spawns",
+                false,
+                &format!("spawn {id}: {out}"),
+            );
+            drop(wall_server);
+            let _ = std::fs::remove_file(&wall_socket);
+            return ExitCode::FAILURE;
+        }
+    }
+
+    // The daemon's own answer over the verb the TUI now uses — the state of
+    // every pane, told in one reply. Probing it directly is what makes the
+    // fixture's *shape* an assertion rather than an assumption: if a pane were
+    // in `question` or `blocked`, a `Wait` would have resolved it without
+    // timing out, and the measurement would not be measuring the failing case.
+    let mut told: Vec<(String, Option<AgentState>)> = Vec::new();
+    let mut probe_ms: Option<u128> = None;
+    let probe_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < probe_deadline {
+        let attempt = Instant::now();
+        match probe_pane_states(&wall_socket) {
+            Some(panes) if panes.len() == WALL_PANES => {
+                told = panes;
+                probe_ms = Some(attempt.elapsed().as_millis());
+                break;
+            }
+            _ => std::thread::sleep(Duration::from_millis(100)),
+        }
+    }
+    check(
+        "the 30-pane fixture is up",
+        told.len() == WALL_PANES,
+        &format!("{} panes answered", told.len()),
+    );
+    let waited_states: Vec<String> = told
+        .iter()
+        .filter(|(_, state)| {
+            matches!(
+                state,
+                Some(AgentState::Question) | Some(AgentState::Blocked)
+            )
+        })
+        .map(|(_, state)| format!("{state:?}"))
+        .collect();
+    check(
+        "no wall pane is in a state a `Wait` would have resolved",
+        waited_states.is_empty(),
+        &format!(
+            "{} pane(s) were waiting: {waited_states:?}",
+            waited_states.len()
+        ),
+    );
+    check(
+        "the daemon tells every pane's state in one reply",
+        told.iter().all(|(_, state)| state.is_some()),
+        "a pane came back with no state, so the reply is not the detailed shape",
+    );
+    {
+        // Written on every run, not only under `--interactive-evidence`: the
+        // number this task exists to assert is evidence a reviewer reads, and a
+        // measurement nobody can see afterwards is a claim.
+        let mut lines = String::from("pane\tstate\n");
+        for (id, state) in &told {
+            lines.push_str(&format!("{id}\t{state:?}\n"));
+        }
+        lines.push_str(&format!(
+            "\n# one `PanesDetail` round trip (incl. the handshake): {} ms\n",
+            probe_ms.map_or_else(|| "n/a".to_string(), |ms| ms.to_string())
+        ));
+        let _ = std::fs::write(evidence_dir_79.join("fixture-states.tsv"), lines);
+    }
+
+    // **The measurement.** From the moment the TUI process exists to the first
+    // frame whose sidebar carries every pane id — i.e. the first frame that is
+    // *correct*, which is the thing the old code could not produce inside four
+    // seconds.
+    //
+    // The pty is resized to 60×160 before the frame is read, because 30 pane
+    // rows plus their state-group headers do not fit a 30-row terminal: the
+    // measurement is of the poll pass, and a taller pty is the operator's own
+    // terminal, not a favour to the code under test. The resize lands in the
+    // same event loop tick as the startup (the loop polls input every 50 ms),
+    // so it does not hand the poller a head start.
+    let wall_started = Instant::now();
+    let Some(mut wall) = TuiSession::start(&tui_bin, &wall_socket) else {
+        check("the 30-pane TUI session starts", false, "no pty");
+        drop(wall_server);
+        let _ = std::fs::remove_file(&wall_socket);
+        return ExitCode::FAILURE;
+    };
+    wall.resize(60, 160);
+    let mut first_frame_ms: Option<u128> = None;
+    let mut wall_frame = String::new();
+    let frame_deadline = Instant::now() + Duration::from_secs(20);
+    while Instant::now() < frame_deadline {
+        let screen = wall.screen();
+        if wall_ids.iter().all(|id| screen.contains(id.as_str())) {
+            first_frame_ms = Some(wall_started.elapsed().as_millis());
+            wall_frame = screen;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let _ = std::fs::write(evidence_dir_79.join("first-frame-30panes.txt"), &wall_frame);
+    check(
+        "all 30 panes are on the first painted frame",
+        first_frame_ms.is_some(),
+        &format!(
+            "only {} of {WALL_PANES} pane ids were on screen within 20 s",
+            wall_ids
+                .iter()
+                .filter(|id| wall_frame.contains(id.as_str()))
+                .count()
+        ),
+    );
+    // RAM for every pane, which the batched reply carries (`ram_kb`) and the
+    // old path fetched with one `MetricsReq` round-trip per pane. A frame with
+    // 30 readings is evidence the one-pass computation really did the work.
+    let ram_readings = wall_frame
+        .split_whitespace()
+        .filter(|word| {
+            word.len() > 1
+                && (word.ends_with('K') || word.ends_with('M'))
+                && word[..word.len() - 1].parse::<u64>().is_ok()
+        })
+        .count();
+    check(
+        "the one reply carries RAM for every pane",
+        ram_readings >= WALL_PANES,
+        &format!("{ram_readings} RAM readings on the frame"),
+    );
+
+    let measured_ms = first_frame_ms.unwrap_or(u128::MAX);
+    let budget_ok = match &wall_budget_ms {
+        Ok(target) => measured_ms <= u128::from(*target),
+        Err(_) => false,
+    };
+    check(
+        "the 30-pane first frame is inside tui_attach_30panes_ms (read from perf-budget.toml)",
+        budget_ok,
+        &match &wall_budget_ms {
+            Ok(target) => format!(
+                "first correct frame in {measured_ms} ms, budget {target} ms (perf-budget.toml)"
+            ),
+            Err(e) => e.clone(),
+        },
+    );
+    println!(
+        "[INFO] tui: 30-pane first frame: {measured_ms} ms vs {} ms (perf-budget.toml \
+         tui_attach_30panes_ms)",
+        wall_budget_ms
+            .as_ref()
+            .map(u64::to_string)
+            .unwrap_or_else(|_| "?".to_string())
+    );
+    {
+        let _ = std::fs::write(
+            evidence_dir_79.join("measurement.txt"),
+            format!(
+                "tui_attach_30panes_ms (perf-budget.toml): {}\n\
+                 measured first correct frame: {measured_ms} ms\n\
+                 panes: {WALL_PANES} (each emitting a marker every 500 ms => working)\n\
+                 one `PanesDetail` round trip (incl. handshake): {} ms\n\
+                 pty: 60 rows x 160 cols\n\
+                 pass: {budget_ok}\n\
+                 \n\
+                 Measured by `cargo xtask e2e --slice tui`: a real daemon holding\n\
+                 30 real panes, the real TUI on a real pty, timed from the moment\n\
+                 the TUI process exists to the first frame whose sidebar carries\n\
+                 every pane id. The budget number is read from perf-budget.toml.\n",
+                wall_budget_ms
+                    .as_ref()
+                    .map(u64::to_string)
+                    .unwrap_or_else(|_| "?".to_string()),
+                probe_ms.map_or_else(|| "n/a".to_string(), |ms| ms.to_string()),
+            ),
+        );
+    }
+
+    // Kill every pane before the daemon goes, so no `sh` survives the slice,
+    // then quit the TUI cleanly.
+    for id in &wall_ids {
+        let _ = cli(&cli_bin, &wall_socket, &["kill", id]);
+    }
+    wall.send("q");
+    std::thread::sleep(Duration::from_millis(500));
+    drop(wall);
+    drop(wall_server);
+    let _ = std::fs::remove_file(&wall_socket);
+    let mut wall_db = wall_socket.clone().into_os_string();
+    wall_db.push(".db");
+    let _ = std::fs::remove_file(&wall_db);
+
     drop(session);
     drop(server);
     let _ = std::fs::remove_file(&socket);
@@ -709,4 +1025,68 @@ fn sidebar_column(screen: &str) -> Option<u16> {
         .chars()
         .position(|c| c == '┐')
         .map(|col| col as u16 + 1)
+}
+
+/// Ask a daemon for every pane's derived state, over the protocol by hand.
+///
+/// A direct probe rather than a library client, because the point is to read
+/// *the reply the TUI reads* — `PanesDetail` — and to show what is in it: one
+/// reply, every pane's state. Synchronous, bounded (2 s reads, one connection,
+/// two verbs), and closed on the way out.
+fn probe_pane_states(socket: &std::path::Path) -> Option<Vec<(String, Option<AgentState>)>> {
+    use arreo_core::proto::{client_versions, Message, VERSION};
+
+    let mut stream = std::os::unix::net::UnixStream::connect(socket).ok()?;
+    stream.set_read_timeout(Some(Duration::from_secs(2))).ok()?;
+    write_message(
+        &mut stream,
+        &Message::Hello {
+            v: VERSION,
+            client: "xtask-tui-slice".to_string(),
+            wants: client_versions(),
+        },
+    )?;
+    match read_message(&mut stream)? {
+        Message::Welcome { .. } => {}
+        _ => return None,
+    }
+    write_message(
+        &mut stream,
+        &Message::PanesDetail {
+            v: VERSION,
+            panes: Vec::new(),
+        },
+    )?;
+    match read_message(&mut stream)? {
+        Message::PanesDetail { panes, .. } => Some(
+            panes
+                .into_iter()
+                .map(|pane| (pane.id, Some(pane.state)))
+                .collect(),
+        ),
+        _ => None,
+    }
+}
+
+/// Write one length-prefixed frame to a socket.
+fn write_message(
+    stream: &mut std::os::unix::net::UnixStream,
+    message: &arreo_core::proto::Message,
+) -> Option<()> {
+    use std::io::Write;
+    let frame = arreo_core::proto::codec::encode_frame(message).ok()?;
+    stream.write_all(&frame).ok()?;
+    stream.flush().ok()?;
+    Some(())
+}
+
+/// Read exactly one length-prefixed frame from a socket.
+fn read_message(stream: &mut std::os::unix::net::UnixStream) -> Option<arreo_core::proto::Message> {
+    use std::io::Read;
+    // The framing the codec writes: `u32 LE` body length, then the body.
+    let mut len = [0u8; 4];
+    stream.read_exact(&mut len).ok()?;
+    let mut body = vec![0u8; u32::from_le_bytes(len) as usize];
+    stream.read_exact(&mut body).ok()?;
+    arreo_core::proto::codec::decode(&body).ok()
 }

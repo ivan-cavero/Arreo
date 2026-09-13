@@ -145,19 +145,30 @@ fn wait_for(pane: &Pane, needle: &str, timeout: Duration) -> Vec<String> {
 /// Two descriptors with the same inode are two handles on one object, which is
 /// what "the received descriptor is the one that was sent" means, and what
 /// "nothing is left open" is checked against.
-fn descriptor_inode<T: AsRawFd>(fd: &T) -> u64 {
+/// The identity of the open file description `fd` refers to: **(device, inode)**.
+///
+/// Device matters as much as inode. Measured on this box: a pty slave got devpts
+/// inode 8 while `/dev/urandom` is devtmpfs inode 8 — the same number on two
+/// different filesystems. The descriptor-identity check used inode alone, so a
+/// parallel test holding `/dev/urandom` made a refusal look like a leak (and the
+/// test failed only under full-workspace load, when such a test was actually
+/// running). Two descriptors are the same object only when both numbers agree.
+fn descriptor_identity<T: AsRawFd>(fd: &T) -> (u64, u64) {
     let meta = std::fs::metadata(format!("/proc/self/fd/{}", fd.as_raw_fd())).expect("stat");
-    std::os::unix::fs::MetadataExt::ino(&meta)
+    (
+        std::os::unix::fs::MetadataExt::dev(&meta),
+        std::os::unix::fs::MetadataExt::ino(&meta),
+    )
 }
 
-/// Every descriptor in this process that still refers to `inode`.
+/// Every descriptor in this process that still refers to `identity`.
 ///
 /// Read from the process's own descriptor table rather than inferred from a
 /// proxy such as "the peer end became unwritable": a `fork` in a test running
 /// in parallel briefly copies the whole table into the child, and that child's
 /// copy keeps a socket alive without any leak on our side.
 #[cfg(target_os = "linux")]
-fn descriptor_copies(inode: u64) -> Vec<String> {
+fn descriptor_copies(identity: (u64, u64)) -> Vec<String> {
     let mut copies = Vec::new();
     for entry in std::fs::read_dir("/proc/self/fd")
         .expect("read the descriptor table")
@@ -165,7 +176,11 @@ fn descriptor_copies(inode: u64) -> Vec<String> {
     {
         let path = entry.path();
         if let Ok(meta) = std::fs::metadata(&path) {
-            if std::os::unix::fs::MetadataExt::ino(&meta) == inode {
+            if (
+                std::os::unix::fs::MetadataExt::dev(&meta),
+                std::os::unix::fs::MetadataExt::ino(&meta),
+            ) == identity
+            {
                 copies.push(entry.file_name().to_string_lossy().to_string());
             }
         }
@@ -173,25 +188,27 @@ fn descriptor_copies(inode: u64) -> Vec<String> {
     copies
 }
 
-/// Assert that exactly `expected` descriptors of this process refer to `inode`
-/// — for a refusal, that is "no copy beyond the one the test still holds".
+/// Assert that exactly `expected` descriptors of this process refer to
+/// `identity` — for a refusal, that is "no copy beyond the one the test still
+/// holds".
 ///
 /// The observation needs the kernel to expose the descriptor table, which is
 /// `/proc/self/fd` on Linux; elsewhere this is a no-op rather than a guess. The
 /// close it stands for is unconditional on every platform: the descriptor is an
 /// `OwnedFd`, dropped on every path out of `recv_fd` and `Pane::adopt`.
-fn assert_descriptor_copies(inode: u64, expected: usize) {
+fn assert_descriptor_copies(identity: (u64, u64), expected: usize) {
     #[cfg(target_os = "linux")]
     {
-        let copies = descriptor_copies(inode);
+        let copies = descriptor_copies(identity);
+        let (dev, ino) = identity;
         assert_eq!(
             copies.len(),
             expected,
-            "expected {expected} descriptor(s) for inode {inode}, found {copies:?}"
+            "expected {expected} descriptor(s) for device {dev} inode {ino}, found {copies:?}"
         );
     }
     #[cfg(not(target_os = "linux"))]
-    let _ = (inode, expected);
+    let _ = (identity, expected);
 }
 
 /// The `tty-index` a Linux `fdinfo` file carries for a tty descriptor.
@@ -276,7 +293,7 @@ fn send_raw(socket: impl AsFd, passed: impl AsFd, payload: &[u8]) -> usize {
 fn send_fd_round_trips_a_usable_cloexec_descriptor() {
     let (sender, receiver) = UnixStream::pair().expect("transfer socketpair");
     let (passed, mut peer) = UnixStream::pair().expect("descriptor to pass");
-    let inode = descriptor_inode(&passed);
+    let ident = descriptor_identity(&passed);
 
     send_fd(&sender, passed.as_fd()).expect("send the descriptor");
     let received = recv_fd(&receiver, DEFAULT_FD_TRANSFER_TIMEOUT).expect("receive it");
@@ -284,7 +301,7 @@ fn send_fd_round_trips_a_usable_cloexec_descriptor() {
     // It is the same open file description, not a look-alike socket: the
     // process now holds exactly two handles on that object, and bytes written
     // at the peer end come out of the received one.
-    assert_descriptor_copies(inode, 2);
+    assert_descriptor_copies(ident, 2);
     const MARKER: &[u8] = b"same-open-file-description";
     peer.write_all(MARKER).expect("write at the peer end");
     let mut received = std::fs::File::from(received);
@@ -362,7 +379,7 @@ fn recv_fd_adopts_at_most_one_descriptor() {
     let (sender, receiver) = UnixStream::pair().expect("transfer socketpair");
     let (first, _first_peer) = UnixStream::pair().expect("first descriptor");
     let (second, _second_peer) = UnixStream::pair().expect("second descriptor");
-    let (first_inode, second_inode) = (descriptor_inode(&first), descriptor_inode(&second));
+    let (first_ident, second_ident) = (descriptor_identity(&first), descriptor_identity(&second));
 
     // Two descriptors in one message, the way a sender that leaked a
     // descriptor into its control buffer would.
@@ -388,8 +405,8 @@ fn recv_fd_adopts_at_most_one_descriptor() {
     // Neither was adopted or stashed: the only handles left on each object are
     // the ones this test made. A refusal that took the first, or dropped the
     // second on the floor, would leave an extra descriptor behind.
-    assert_descriptor_copies(first_inode, 1);
-    assert_descriptor_copies(second_inode, 1);
+    assert_descriptor_copies(first_ident, 1);
+    assert_descriptor_copies(second_ident, 1);
 }
 
 /// The marker byte cannot bind a transfer on a stream socket — the kernel
@@ -415,7 +432,7 @@ fn recv_fd_adopts_at_most_one_descriptor() {
 fn recv_fd_refuses_a_stream_transfer_queued_behind_a_stale_byte() {
     let (mut sender, receiver) = UnixStream::pair().expect("transfer socketpair");
     let (passed, _keep) = UnixStream::pair().expect("descriptor to pass");
-    let inode = descriptor_inode(&passed);
+    let ident = descriptor_identity(&passed);
 
     // A byte some other writer of a shared channel left in flight — the value
     // of the marker itself.
@@ -432,27 +449,27 @@ fn recv_fd_refuses_a_stream_transfer_queued_behind_a_stale_byte() {
     );
     // Refused, nothing adopted: the only handle on the passed descriptor is
     // still the test's own.
-    assert_descriptor_copies(inode, 1);
+    assert_descriptor_copies(ident, 1);
 
     // And nothing was burned: the transfer is still in the channel, whole, for
     // a caller that reads to the boundary.
     let received =
         recv_fd(&receiver, DEFAULT_FD_TRANSFER_TIMEOUT).expect("the transfer is still queued");
     assert_eq!(
-        descriptor_inode(&received),
-        inode,
+        descriptor_identity(&received),
+        ident,
         "the second receive is the descriptor that was sent"
     );
-    assert_descriptor_copies(inode, 2);
+    assert_descriptor_copies(ident, 2);
     drop(received);
-    assert_descriptor_copies(inode, 1);
+    assert_descriptor_copies(ident, 1);
 }
 
 #[test]
 fn recv_fd_closes_a_descriptor_whose_payload_byte_is_wrong() {
     let (sender, receiver) = UnixStream::pair().expect("transfer socketpair");
     let (passed, _keep) = UnixStream::pair().expect("descriptor to pass");
-    let inode = descriptor_inode(&passed);
+    let ident = descriptor_identity(&passed);
 
     let payload = [FD_PASS_BYTE.wrapping_add(1)];
     assert_eq!(send_raw(&sender, &passed, &payload), payload.len());
@@ -462,7 +479,7 @@ fn recv_fd_closes_a_descriptor_whose_payload_byte_is_wrong() {
         matches!(err, FdTransferError::WrongPayload { got, .. } if got == payload[0]),
         "got {err:?}"
     );
-    assert_descriptor_copies(inode, 1);
+    assert_descriptor_copies(ident, 1);
 }
 
 #[cfg(target_os = "linux")]
@@ -486,13 +503,13 @@ fn recv_fd_closes_a_descriptor_that_arrives_with_no_data_at_all() {
     )
     .expect("seqpacket socketpair");
     let (passed, _keep) = UnixStream::pair().expect("descriptor to pass");
-    let inode = descriptor_inode(&passed);
+    let ident = descriptor_identity(&passed);
 
     assert_eq!(send_raw(&sender, &passed, &[]), 0, "no data bytes");
 
     let err = recv_fd(&receiver, DEFAULT_FD_TRANSFER_TIMEOUT).expect_err("no payload byte");
     assert!(matches!(err, FdTransferError::NoPayload), "got {err:?}");
-    assert_descriptor_copies(inode, 1);
+    assert_descriptor_copies(ident, 1);
 }
 
 /// An empty message on a packet socket is a message, not end-of-stream
@@ -535,7 +552,7 @@ fn recv_fd_waits_out_an_empty_packet_message_instead_of_reading_it_as_eof() {
 #[test]
 fn adopt_refuses_a_descriptor_that_is_not_a_terminal_and_closes_it() {
     let (not_a_tty, _keep) = UnixStream::pair().expect("socketpair");
-    let inode = descriptor_inode(&not_a_tty);
+    let ident = descriptor_identity(&not_a_tty);
     // Hand over the only copy this process holds, so the refusal is the only
     // thing that can close it.
     let fd: OwnedFd = not_a_tty.into();
@@ -544,7 +561,7 @@ fn adopt_refuses_a_descriptor_that_is_not_a_terminal_and_closes_it() {
         .err()
         .expect("a socket is not a terminal");
     assert!(matches!(err, PtyError::NotATerminal), "got {err:?}");
-    assert_descriptor_copies(inode, 0);
+    assert_descriptor_copies(ident, 0);
 }
 
 /// The slave end of a terminal is a terminal too, so only the master check
@@ -559,14 +576,14 @@ fn adopt_refuses_the_slave_end_of_the_terminal() {
     let (sender, master_fd, _pid) = Sender::open("/bin/cat", &[]);
     let slave_path = sender.master.tty_name().expect("a master names its slave");
     let slave = std::fs::File::open(&slave_path).expect("open the slave end");
-    let inode = descriptor_inode(&slave);
-    assert_descriptor_copies(inode, 1);
+    let ident = descriptor_identity(&slave);
+    assert_descriptor_copies(ident, 1);
 
     let err = Pane::adopt(slave.into(), None, AdoptSize { cols: 80, rows: 24 }, spec())
         .err()
         .expect("a slave is not a master");
     assert!(matches!(err, PtyError::NotPtyMaster), "got {err:?}");
-    assert_descriptor_copies(inode, 0);
+    assert_descriptor_copies(ident, 0);
     drop(master_fd);
 }
 

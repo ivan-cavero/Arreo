@@ -5,6 +5,18 @@
 //! (never renumbered) and new fields MUST be `#[serde(default)]`-optional —
 //! that is the whole N−1 mechanism, enforced by the compat test in
 //! `tests/proto.rs` and the rules in ADR 0017 (T-0028).
+//!
+//! **The rule above is about a variant's own fields, and it does not extend to
+//! nested structs** (T-0079, measured). `rmp-serde`'s default is to encode a
+//! struct as a positional array, so `PaneInfo` travels as `[id, alive, alert]`:
+//! a *missing trailing* element decodes to its `#[serde(default)]` value (which
+//! is why a new reader survives an old writer), but an old reader given a
+//! longer array fails the whole frame rather than skipping what it does not
+//! know. A shape that must carry more is therefore a **new struct behind a new
+//! variant** — see [`PaneDetail`] and [`Message::PanesDetail`] — not an
+//! extended one. Extending [`PaneInfo`] would have been invisible to a peer of
+//! the same build and fatal to one a version behind, which is the opposite of
+//! what this file is for.
 
 use serde::{Deserialize, Serialize};
 
@@ -26,6 +38,48 @@ pub struct PaneInfo {
     /// CLI renders no column rather than a lie).
     #[serde(default)]
     pub alert: Option<String>,
+}
+
+/// One pane with the derived detail a sidebar renders (T-0079).
+///
+/// **A separate struct, and that is the N−1 mechanism, not a style choice.**
+/// `rmp-serde` encodes a struct as a *positional array* (its default
+/// `struct_map` config is off), so a struct's field list is its wire contract:
+/// extending [`PaneInfo`] would put a 7-element array in front of a reader that
+/// expects 3, and that reader does not skip the extras — it fails to decode the
+/// whole frame. `#[serde(default)]` covers a *missing trailing element* (which
+/// is what makes a new reader survive an old writer) but nothing can make an
+/// old reader survive a longer array. So a shape that carries more is a **new
+/// shape**: this struct, behind [`Message::PanesDetail`], which a peer that has
+/// never heard of it never asks for and therefore never has to decode.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PaneDetail {
+    pub id: String,
+    pub alive: bool,
+    #[serde(default)]
+    pub alert: Option<String>,
+    /// The engine's derived state for this pane, as the daemon has it now.
+    ///
+    /// Not optional: this struct exists *only* to carry a state, so "no state"
+    /// would be a contradiction rather than a value. `AgentState::Unknown` is
+    /// the engine's own word for "it has not told me yet".
+    pub state: AgentState,
+    /// What a pane in `Question` is waiting on (T-0061): the last non-empty
+    /// line of its output, which *is* the question. `None` when the pane is not
+    /// asking, or is asking by silence — quiet has no text, so nothing is
+    /// invented (absent, never a fabricated prompt).
+    #[serde(default)]
+    pub asking: Option<String>,
+    /// Live RSS of the pane's process tree, KiB (T-0040). `None` means **not
+    /// measured** (no live child, or the sample failed) — never `0`, which
+    /// would render as a real reading of zero.
+    #[serde(default)]
+    pub ram_kb: Option<u64>,
+    /// Recent peak RSS samples for the sparkline, oldest first, KiB (T-0040).
+    /// Empty when the series is empty — the view renders nothing rather than a
+    /// flat line claiming "steady".
+    #[serde(default)]
+    pub ram_history: Vec<u64>,
 }
 
 /// Agent semantic state on the wire (subset of the engine states that
@@ -121,8 +175,28 @@ pub enum Message {
         #[serde(default)]
         kill_on_breach: bool,
     },
-    /// Server → client: pane list.
+    /// Server → client: pane list — id, liveness, alert. Unchanged from v0.
     Panes { v: u32, panes: Vec<PaneInfo> },
+    /// Client → server: the same list **with every pane's derived detail**
+    /// (T-0079), in one reply.
+    ///
+    /// This is what a sidebar asks for, and the reason it exists is that the
+    /// daemon already knows the answer: `PaneEntry::pump` feeds each pane's
+    /// engine from its journal incrementally and `engine_state()` returns the
+    /// derived state, so a client that wants "what is every pane doing right
+    /// now" can be *told* it instead of asking pane by pane. The old sidebar
+    /// asked with two blocking `Wait { timeout_ms: 150 }` calls per pane, which
+    /// on a wall of working panes — panes in neither waited-for state — cost
+    /// 30 × 300 ms before the first frame could be correct.
+    ///
+    /// **A new variant rather than more fields on [`PaneInfo`]**: see
+    /// [`PaneDetail`] for why an extended nested struct is a wire break in the
+    /// one direction `#[serde(default)]` cannot cover. An N−1 daemon answers an
+    /// unknown request with a typed `Error` and keeps the connection open (ADR
+    /// 0017), which is exactly the signal a client needs to fall back to the
+    /// per-pane path — so the fallback is keyed on the *refusal*, not on a flag
+    /// a peer might echo without acting on it.
+    PanesDetail { v: u32, panes: Vec<PaneDetail> },
     /// Client → server: attach to a pane's stream.
     Attach {
         v: u32,
@@ -517,5 +591,121 @@ mod tests {
             err.to_string().contains("not an array"),
             "the refusal says what the shape was: {err}"
         );
+    }
+
+    /// **The T-0079 N−1 window, in both directions, over bytes a peer of this
+    /// build would send.**
+    ///
+    /// The shapes are written by *mirror* types — an old daemon's schema,
+    /// declared here and serialized with the same encoder — so the bytes are
+    /// what a v0 peer really puts on the wire, not a hand-drawn approximation
+    /// of them. This is the case the whole design rests on:
+    ///
+    /// 1. **Old client → new daemon.** A v0 `panes` request (three keys, no
+    ///    detail of any kind) decodes to the bare [`Message::Panes`], which is
+    ///    the listing `arreo panes` asks for. The new verb is not something a
+    ///    v0 client can accidentally send, because it is a different variant.
+    /// 2. **Old daemon → new client.** A v0 `panes` reply — `PaneInfo` as the
+    ///    3-element array the encoder emits — decodes into the current
+    ///    [`PaneInfo`] unchanged. The client's fallback then asks pane by pane
+    ///    (see `arreo_tui::client::poll_summaries`), which is the only correct
+    ///    reading of a peer that has no state to give.
+    /// 3. **New client → old daemon.** A [`Message::PanesDetail`] request fails
+    ///    an old daemon's typed decode, which answers a typed `Error` and keeps
+    ///    the connection open (ADR 0017) — the signal the fallback keys on.
+    /// 4. And the new shape round-trips, so it is a real verb rather than a
+    ///    frame only one side can read.
+    ///
+    /// What removal turns red: extending [`PaneInfo`] instead of adding
+    /// [`PaneDetail`] (case 2 stops decoding at all — the old 3-element array
+    /// hits a struct that wants 7, and serde refuses the frame rather than
+    /// padding it), or making `PanesDetail` a field on `Panes` (case 1 would
+    /// then depend on a v0 peer's tolerance of a key it does not know, which
+    /// is true for a map entry but not for the nested array it also has to
+    /// decode).
+    #[test]
+    fn the_panes_detail_verb_is_new_while_the_bare_listing_is_unchanged() {
+        use crate::proto::codec;
+
+        /// A v0 peer's schema: exactly what shipped before T-0079.
+        #[derive(serde::Serialize, serde::Deserialize, Debug, PartialEq)]
+        #[serde(tag = "op", rename_all = "snake_case")]
+        enum V0Message {
+            Panes { v: u32, panes: Vec<V0PaneInfo> },
+        }
+        #[derive(serde::Serialize, serde::Deserialize, Debug, PartialEq)]
+        struct V0PaneInfo {
+            id: String,
+            alive: bool,
+            alert: Option<String>,
+        }
+
+        // 1. A v0 request decodes to the bare listing, byte-for-byte the same
+        //    variant it always was.
+        let v0_request = rmp_serde::to_vec(&V0Message::Panes {
+            v: 0,
+            panes: vec![],
+        })
+        .expect("encode a v0 request");
+        assert_eq!(
+            codec::decode(&v0_request).expect("a v0 panes request decodes"),
+            Message::Panes {
+                v: 0,
+                panes: vec![],
+            }
+        );
+
+        // 2. A v0 reply decodes into the current struct — the pane shape is
+        //    untouched, so nothing about it can surprise an old reader or a new
+        //    one.
+        let v0_reply = rmp_serde::to_vec(&V0Message::Panes {
+            v: 0,
+            panes: vec![V0PaneInfo {
+                id: "p".into(),
+                alive: true,
+                alert: Some("warn".into()),
+            }],
+        })
+        .expect("encode a v0 reply");
+        let decoded = codec::decode(&v0_reply).expect("a v0 panes reply decodes");
+        let Message::Panes { panes, .. } = decoded else {
+            panic!("a panes reply must decode as Panes");
+        };
+        assert_eq!(
+            panes,
+            vec![PaneInfo {
+                id: "p".into(),
+                alive: true,
+                alert: Some("warn".into()),
+            }],
+            "the v0 pane shape is the current one, field for field"
+        );
+
+        // 3. The new verb is a *different variant*, so a v0 reader never sees
+        //    it: it only ever arrives in answer to a request a v0 client does
+        //    not make. Proving that structurally — the old schema cannot decode
+        //    it at all — is the point: this is why the detail did not go into
+        //    `PaneInfo`.
+        let detail = Message::PanesDetail {
+            v: VERSION,
+            panes: vec![PaneDetail {
+                id: "p".into(),
+                alive: true,
+                alert: Some("warn".into()),
+                state: AgentState::Question,
+                asking: Some("Proceed? [y/n]".into()),
+                ram_kb: Some(2048),
+                ram_history: vec![1024, 2048],
+            }],
+        };
+        let bytes = codec::encode(&detail).expect("encode");
+        assert!(
+            rmp_serde::from_slice::<V0Message>(&bytes).is_err(),
+            "a v0 reader must not be handed a verb it cannot decode — which is \
+             exactly why the detail is a new variant and not more fields"
+        );
+
+        // 4. And it round-trips for a peer that does speak it.
+        assert_eq!(codec::decode(&bytes).expect("decode"), detail);
     }
 }

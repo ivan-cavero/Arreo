@@ -497,7 +497,11 @@ async fn poll_daemon(
         let Some(active) = conn.as_mut() else {
             continue;
         };
-        let summaries = poll_summaries(active).await.map_err(|e| e.to_string());
+        // One request for the whole wall (T-0079): the daemon tells this client
+        // every pane's state, RAM and series, and falls back to asking pane by
+        // pane only for a peer that sent no detail. See
+        // `arreo_tui::client::poll_summaries` for why the sidebar must not ask.
+        let summaries = arreo_tui::client::poll_summaries(active).await;
         // A pass that answered is the thing the attempt counter measures: a
         // connection that opens and then refuses every verb (a role refusal, a
         // peer that is not serving) is not healthy, and backing off is the
@@ -655,100 +659,4 @@ fn merge_views(app: &mut App, views: Vec<PaneView>) {
         }
     }
     app.model.set_panes(merged);
-}
-
-async fn poll_summaries(conn: &mut Client) -> anyhow::Result<Vec<PaneSummary>> {
-    let panes = match conn
-        .call(&Message::Panes {
-            v: VERSION,
-            panes: vec![],
-        })
-        .await
-    {
-        Ok(Message::Panes { panes, .. }) => panes,
-        Ok(Message::Error { message, .. }) => anyhow::bail!("panes: {message}"),
-        Ok(other) => anyhow::bail!("panes: unexpected {other:?}"),
-        Err(e) => anyhow::bail!("{e}"),
-    };
-    let mut out = Vec::new();
-    for pane in panes {
-        // Metrics per pane (best-effort; unknown RAM on error).
-        let ram_kb = match conn
-            .call(&Message::MetricsReq {
-                v: VERSION,
-                id: pane.id.clone(),
-            })
-            .await
-        {
-            Ok(Message::Metrics { rss_bytes, .. }) => rss_bytes / 1024,
-            _ => 0,
-        };
-        // History for the sparkline (T-0040): last hour at 1 m steps, peaks —
-        // best-effort like ram_kb, empty when the daemon has no series yet.
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
-        let ram_history = match conn
-            .call(&Message::MetricsHistory {
-                v: VERSION,
-                id: pane.id.clone(),
-                since_ms: now_ms.saturating_sub(3_600_000),
-                until_ms: u64::MAX,
-                step_ms: 60_000,
-            })
-            .await
-        {
-            Ok(Message::MetricsSeries { rows, .. }) => rows
-                .iter()
-                .map(|row| (row.rss_peak / 1024).max(1))
-                .collect(),
-            _ => Vec::new(),
-        };
-        // State via non-blocking wait (timeout 0 would spin; use short wait
-        // for question, else derive from liveness below).
-        let state = state_for(conn, &pane.id, pane.alive).await;
-        // **What it is asking, for a pane that is asking (T-0061).** Fetched only
-        // in that state, so an ordinary cycle costs exactly what it cost before.
-        // `Read` is a snapshot of the pane's hot ring (`HOT_LINES`), not a
-        // consuming read — several readers see the same lines, which is why the
-        // focused pane's attach and this cannot steal from each other.
-        let asking = if state == AgentState::Question {
-            arreo_tui::client::asking_line(conn, &pane.id).await
-        } else {
-            None
-        };
-        out.push(PaneSummary {
-            id: pane.id,
-            alive: pane.alive,
-            state,
-            ram_kb,
-            ram_history,
-            asking,
-        });
-    }
-    // Attention order is the model's job; keep daemon order here.
-    Ok(out)
-}
-
-/// Resolve one pane's state: ask the daemon to wait ~0 for each actionable
-/// state in priority order (question → blocked → done), else liveness.
-async fn state_for(conn: &mut Client, id: &str, alive: bool) -> AgentState {
-    for want in [AgentState::Question, AgentState::Blocked] {
-        if let Ok(Message::StateEvent { .. }) = conn
-            .call(&Message::Wait {
-                v: VERSION,
-                id: id.to_string(),
-                state: want,
-                timeout_ms: 150,
-            })
-            .await
-        {
-            return want;
-        }
-    }
-    if !alive {
-        return AgentState::Done;
-    }
-    AgentState::Working
 }

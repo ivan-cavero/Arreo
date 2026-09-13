@@ -15,7 +15,7 @@
 
 use arreo_core::proto::{
     classify_op, client_versions, client_versions_from, frame_body_len, negotiate, CodecError,
-    Direction, Message, PaneInfo, MAX_FRAME_BYTES, MIN_VERSION, VERSION,
+    Direction, Message, PaneDetail, PaneInfo, MAX_FRAME_BYTES, MIN_VERSION, VERSION,
 };
 use arreo_core::proto::{codec, AgentState};
 
@@ -351,6 +351,34 @@ fn every_v0_verb_classifies_to_its_side() {
             panic!("v0 corpus has an op the test does not name: {op}");
         }
     }
+}
+
+/// **A verb added after v0 is classified by the same rule as the v0 set**
+/// (T-0079). `panes_detail` is the first request variant added since the corpus
+/// was frozen, and the append-only discipline means the classifier learns it by
+/// the same map-head read — not by a special case, and not by a version bump.
+/// A v0 peer that receives it does not decode it (the typed enum has no such
+/// variant) and answers a typed refusal, which is the signal the sidebar's
+/// fallback keys on.
+#[test]
+fn a_verb_added_after_v0_classifies_as_a_request() {
+    let body = body_of(&Message::PanesDetail {
+        v: VERSION,
+        panes: vec![PaneDetail {
+            id: "p".into(),
+            alive: true,
+            alert: None,
+            state: AgentState::Working,
+            asking: None,
+            ram_kb: Some(1),
+            ram_history: vec![],
+        }],
+    });
+    assert_eq!(
+        classify_op(&body),
+        Some(Direction::Request),
+        "a new client→server verb is a request, classified without a full decode"
+    );
 }
 
 /// An unknown `op` is a request until a newer server says otherwise: a client

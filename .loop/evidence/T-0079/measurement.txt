@@ -1,0 +1,11 @@
+tui_attach_30panes_ms (perf-budget.toml): 300
+measured first correct frame: 223 ms
+panes: 30 (each emitting a marker every 500 ms => working)
+one `PanesDetail` round trip (incl. handshake): 178 ms
+pty: 60 rows x 160 cols
+pass: true
+
+Measured by `cargo xtask e2e --slice tui`: a real daemon holding
+30 real panes, the real TUI on a real pty, timed from the moment
+the TUI process exists to the first frame whose sidebar carries
+every pane id. The budget number is read from perf-budget.toml.

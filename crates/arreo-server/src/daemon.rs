@@ -16,7 +16,7 @@ use arreo_core::identity::role::Verb;
 use arreo_core::identity::{DeviceId, VerifyingKey};
 use arreo_core::metrics::Sampler;
 use arreo_core::proto::codec::{self, CodecError};
-use arreo_core::proto::{AgentState, Message, PaneInfo, VERSION};
+use arreo_core::proto::{AgentState, Message, PaneDetail, PaneInfo, VERSION};
 use arreo_core::pty::{ExitState, Pane};
 use arreo_core::state::{Adapter, Confidence, Engine, State};
 use std::collections::HashMap;
@@ -1092,6 +1092,22 @@ fn engine_state_to_wire(state: State) -> AgentState {
     }
 }
 
+/// The last non-empty line of a pane's hot ring — what a `question` pane is
+/// waiting on (T-0061, served in-batch by T-0079).
+///
+/// `None` when the pane is asking by *silence*: the engine infers `question`
+/// from quiet, and quiet has no text, so a caller shows "waiting" rather than
+/// inventing a prompt. Identical to the client's own `asking_line` rule — a
+/// sidebar must read the same question whether the daemon told it or it asked.
+fn last_nonempty_line(lines: &[String]) -> Option<String> {
+    lines
+        .iter()
+        .rev()
+        .map(|line| line.trim())
+        .find(|line| !line.is_empty())
+        .map(str::to_string)
+}
+
 /// Read exactly one framed message (buffering partial reads).
 async fn read_message(
     reader: &mut (impl AsyncReadExt + Unpin),
@@ -1893,7 +1909,10 @@ fn verb_of(message: &Message) -> Verb {
     match message {
         Message::Hello { .. } => Verb::Hello,
         // Topology and scrollback reads.
-        Message::Panes { .. } | Message::Snapshot { .. } | Message::Delta { .. } => Verb::Panes,
+        Message::Panes { .. }
+        | Message::PanesDetail { .. }
+        | Message::Snapshot { .. }
+        | Message::Delta { .. } => Verb::Panes,
         Message::Read { .. } => Verb::Read,
         Message::Attach { .. } | Message::Resume { .. } => Verb::Attach,
         Message::Wait { .. } => Verb::Wait,
@@ -1941,6 +1960,7 @@ fn op_name(message: &Message) -> &'static str {
         Message::MetricsSeries { .. } => "metrics-series",
         Message::Spawn { .. } => "spawn",
         Message::Panes { .. } => "panes",
+        Message::PanesDetail { .. } => "panes-detail",
         Message::Attach { .. } => "attach",
         Message::Send { .. } => "send",
         Message::Resize { .. } => "resize",
@@ -2079,28 +2099,171 @@ async fn dispatch(message: &Message, registry: &Registry, db: &std::path::Path) 
             if let Err(reply) = check_version(*v) {
                 return Some(reply);
             }
-            let registry = registry.read().await;
-            let mut panes: Vec<PaneInfo> = registry
-                .iter()
-                .map(|(id, entry)| {
+            // The bare listing, unchanged from v0: id, liveness, alert. The
+            // derived detail a sidebar wants is the separate `PanesDetail` verb
+            // below (T-0079) — a new variant rather than more fields on
+            // `PaneInfo`, because `rmp-serde` writes a struct as a positional
+            // array and an old reader cannot skip what it does not know.
+            let mut entries: Vec<(String, Arc<PaneEntry>)> = {
+                let registry = registry.read().await;
+                registry
+                    .iter()
+                    .map(|(id, entry)| (id.clone(), Arc::clone(entry)))
+                    .collect()
+            };
+            entries.sort_by(|a, b| a.0.cmp(&b.0));
+            let panes = entries
+                .into_iter()
+                .map(|(id, entry)| PaneInfo {
                     // The episode's highest fired level, if any (T-0041): the
-                    // attention signal. Read under the same lock as liveness so
-                    // the two cannot disagree about the pane.
-                    let alert = entry
+                    // attention signal. Read beside liveness, on the same entry,
+                    // so the two cannot disagree about the pane.
+                    alert: entry
                         .alert_state
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
                         .level()
-                        .map(|level| level.as_str().to_string());
-                    PaneInfo {
-                        id: id.clone(),
-                        alive: matches!(entry.pane.try_wait(), ExitState::Running),
-                        alert,
-                    }
+                        .map(|level| level.as_str().to_string()),
+                    alive: matches!(entry.pane.try_wait(), ExitState::Running),
+                    id,
                 })
                 .collect();
-            panes.sort_by(|a, b| a.id.cmp(&b.id));
             Some(Message::Panes { v: VERSION, panes })
+        }
+        Message::PanesDetail { v, .. } => {
+            if let Err(reply) = check_version(*v) {
+                return Some(reply);
+            }
+            // **T-0079: the sidebar is told, it does not ask.**
+            //
+            // This daemon already knows every pane's state — `pump` feeds the
+            // engine from the raw journal incrementally and `engine_state`
+            // returns it — so a sidebar that wants the current state gets it
+            // here, in one round-trip, instead of issuing a blocking `Wait` per
+            // pane per candidate state (which is what made a 30-pane wall take
+            // ~9 s: 30 × two 150 ms timeouts on a wall where every pane is
+            // merely working, i.e. in neither waited-for state).
+            //
+            // The pairs are cloned **under** the registry read lock and the
+            // lock is dropped before any work happens: the detail pass pumps
+            // engines, samples `/proc` and reads the store, and holding the
+            // registry read lock across that would stall every other session
+            // (a `Spawn`, a `Kill`, a second sidebar) behind one sidebar's
+            // refresh. The lock's job is a stable iteration, nothing more.
+            let mut entries: Vec<(String, Arc<PaneEntry>)> = {
+                let registry = registry.read().await;
+                registry
+                    .iter()
+                    .map(|(id, entry)| (id.clone(), Arc::clone(entry)))
+                    .collect()
+            };
+            entries.sort_by(|a, b| a.0.cmp(&b.0));
+            let now = now_ms();
+
+            // **Three phases, because their costs differ by two orders of
+            // magnitude.** The engine work is sub-millisecond per pane (it feeds
+            // only the bytes since the last pump); the process-tree sampling is
+            // a system-wide `/proc` walk *per pane* — the dominant cost of this
+            // pass, measured at ~10 ms for 30 panes on a quiet box but up to
+            // ~800 ms when the machine is busy (`.loop/evidence/T-0079/`). Doing
+            // the samples one after another makes the pass pay their *sum*, and
+            // that sum is exactly what a 300 ms first-frame budget cannot
+            // afford. They are independent — each pane has its own [`Sampler`] —
+            // so they run concurrently and the pass is bounded by the slowest
+            // single sample instead of the total. Same work per pass, less wall
+            // time; nothing is skipped and nothing is cached stale.
+            let mut panes: Vec<PaneDetail> = Vec::with_capacity(entries.len());
+            let mut sampling: Vec<(usize, Arc<PaneEntry>, u32)> = Vec::new();
+            for (id, entry) in entries {
+                // The episode's highest fired level, if any (T-0041): the
+                // attention signal. Read beside liveness, on the same entry, so
+                // the two cannot disagree about the pane.
+                let alert = entry
+                    .alert_state
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .level()
+                    .map(|level| level.as_str().to_string());
+                let alive = matches!(entry.pane.try_wait(), ExitState::Running);
+                // Feed the journal, then read the derived state — the same
+                // order `Read` uses, so a pane that printed since the last pass
+                // is classified now rather than one pass late.
+                entry.pump(now);
+                let state = engine_state_to_wire(entry.engine_state());
+                // The tail read is **only** for a pane that is asking: it is
+                // the one case where the state's word is not enough, and an
+                // ordinary pass must not pay for it. `drain` is a snapshot of
+                // the hot ring (`HOT_LINES`), not a consuming read — several
+                // readers see the same lines.
+                let asking = if state == AgentState::Question {
+                    last_nonempty_line(&entry.pane.drain())
+                } else {
+                    None
+                };
+                let pane = PaneDetail {
+                    id,
+                    alive,
+                    alert,
+                    state,
+                    asking,
+                    // Filled by phase 2, below: a live child is the only thing
+                    // worth sampling, and a pane without one keeps `None` —
+                    // "not measured", never 0, which would render as a reading.
+                    ram_kb: None,
+                    ram_history: Vec::new(),
+                };
+                if let Some(pid) = entry.pane.child_pid() {
+                    sampling.push((panes.len(), entry, pid));
+                }
+                panes.push(pane);
+            }
+
+            // Phase 2: the `/proc` walks, all at once. A pane whose sample fails
+            // (the child exited between the check above and the read) keeps
+            // `ram_kb: None`, which is the honest answer.
+            if !sampling.is_empty() {
+                let mut handles = Vec::with_capacity(sampling.len());
+                for (index, entry, pid) in sampling {
+                    handles.push(tokio::task::spawn_blocking(move || {
+                        let mut sampler = entry.sampler.lock().unwrap_or_else(|e| e.into_inner());
+                        (
+                            index,
+                            sampler.sample_tree(pid).ok().map(|s| s.rss_bytes / 1024),
+                        )
+                    }));
+                }
+                for handle in handles {
+                    // A panicked sampler loses one pane's reading, not the
+                    // listing: the pass is best-effort per pane by design.
+                    if let Ok((index, ram_kb)) = handle.await {
+                        panes[index].ram_kb = ram_kb;
+                    }
+                }
+            }
+
+            // Phase 3: the sparkline series, from **one** store open for the
+            // whole batch. Same window and tier the per-pane `MetricsHistory`
+            // verb served (last hour at 1 m steps), and the same `rss_peak/1024`
+            // with a floor of 1 so a live pane is never an all-empty bar — the
+            // values a fallback client renders must be the ones this one
+            // renders. Best-effort like every other metric on this path: without
+            // the store the panes still carry state, and the sparkline renders
+            // nothing rather than a lie.
+            {
+                if let Ok(store) = arreo_core::store::SessionStore::open(db) {
+                    let since = now.saturating_sub(3_600_000);
+                    let (step, _) = history_step(since, now, 60_000);
+                    for pane in &mut panes {
+                        if let Ok(rows) = store.metrics_range(&pane.id, since, now, step) {
+                            pane.ram_history = rows
+                                .iter()
+                                .map(|row| (row.rss_peak / 1024).max(1))
+                                .collect();
+                        }
+                    }
+                }
+            }
+            Some(Message::PanesDetail { v: VERSION, panes })
         }
         Message::Send { v, id, data } => {
             if let Err(reply) = check_version(*v) {
