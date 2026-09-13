@@ -1,0 +1,9 @@
+Mutation checks (each FAILS without the change):
+1. Restore never builds the resume argv (plan disabled in persist::restore):
+   - `a_pinned_record_is_resumed_on_its_resume_argv` FAILED (session None instead of
+     the record's id), 4 passed / 1 failed in tests/persist.rs.
+   - live slice: "no live process carries the pi session id after the restart" -> RED.
+2. Engine capture disabled: `engines_capture_the_session_id_from_real_output` FAILED
+   (None != the pi envelope id).
+3. v8 migration removed: `harness_and_session_round_trip_and_a_v7_row_migrates_untouched`
+   FAILED ("no such column: harness").

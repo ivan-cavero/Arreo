@@ -18,8 +18,68 @@ fn panes(n: usize) -> Vec<StoredPane> {
             cols: 80,
             rows: 24,
             scrollback: vec![format!("scroll-{i}-line-0"), format!("scroll-{i}-line-1")],
+            // Universal-adapter panes: no harness, no session (T-0072). The
+            // harness columns get their own round-trip test below.
+            harness: None,
+            session_id: None,
         })
         .collect()
+}
+
+#[test]
+fn harness_and_session_round_trip_and_a_v7_row_migrates_untouched() {
+    // T-0072: `panes` gained `harness` + `session_id` in place. Two halves, in
+    // one test because they are one contract: a new row round-trips its
+    // harness session, and a row written *before* the columns existed (a v7
+    // database) migrates forward with its program/args/scrollback intact and
+    // both new columns NULL — the honest value for "nothing is known about a
+    // session this version never recorded".
+    let dir = std::env::temp_dir().join(format!("arreo-migv8-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("migv8.db");
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "PRAGMA journal_mode=WAL;
+             CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT);
+             INSERT INTO meta(key, value) VALUES ('schema_version', '7');
+             CREATE TABLE panes(id TEXT PRIMARY KEY, program TEXT NOT NULL,
+               args TEXT NOT NULL, cols INTEGER NOT NULL, rows INTEGER NOT NULL);
+             CREATE TABLE scrollback(pane TEXT NOT NULL, line_no INTEGER NOT NULL,
+               text TEXT NOT NULL, PRIMARY KEY (pane, line_no));
+             INSERT INTO panes VALUES ('old', '/usr/bin/vim', '[\"notes.txt\"]', 100, 30);
+             INSERT INTO scrollback VALUES ('old', 0, 'old-line-0');
+             INSERT INTO scrollback VALUES ('old', 1, 'old-line-1');",
+        )
+        .unwrap();
+    }
+    let store = SessionStore::open(&path).expect("v7 opens and migrates");
+    assert_eq!(
+        store.schema_version().expect("version"),
+        arreo_core::store::SCHEMA_VERSION
+    );
+    let rows = store.load_topology().expect("load");
+    assert_eq!(rows.len(), 1, "the v7 row survived the migration");
+    assert_eq!(rows[0].id, "old");
+    assert_eq!(rows[0].program, "/usr/bin/vim");
+    assert_eq!(rows[0].args, vec!["notes.txt".to_string()]);
+    assert_eq!(rows[0].cols, 100);
+    assert_eq!(rows[0].rows, 30);
+    assert_eq!(rows[0].scrollback, vec!["old-line-0", "old-line-1"]);
+    assert_eq!(rows[0].harness, None, "a pre-v8 row names no harness");
+    assert_eq!(rows[0].session_id, None, "and no session either");
+
+    // A row written by this version keeps its harness session.
+    let mut fresh = panes(1);
+    fresh[0].harness = Some("pi".to_string());
+    fresh[0].session_id = Some("01a099cd-2d35-74c4-90c6-d0e3b10011b5".to_string());
+    store.save_topology(&fresh).expect("save");
+    let back = store.load_topology().expect("load");
+    assert_eq!(back[0].harness.as_deref(), Some("pi"));
+    assert_eq!(
+        back[0].session_id.as_deref(),
+        Some("01a099cd-2d35-74c4-90c6-d0e3b10011b5")
+    );
 }
 
 #[test]
@@ -226,4 +286,48 @@ fn an_existing_loose_store_is_tightened_by_the_next_open() {
     }
 
     std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn session_ids_are_not_secret_scanned_away() {
+    // T-0072's safety criterion, second half. Session ids look nothing like the
+    // credential prefixes the redactor hunts (`sk-`, `AKIA`, `ghp_`, `xox`) —
+    // pi's are v4 UUIDs, opencode's are `ses_<base62>` — and the redaction
+    // scan must leave both alone. Pinned because "add the new prefix to
+    // `TOKEN_PREFIXES`" is a one-line change that would silently replace a
+    // session id with `[REDACTED:...]` in whatever row carried it, and because
+    // the harness-side continuity checks read exactly these strings back.
+    let store = SessionStore::open_memory().expect("open");
+    let pi = "01a099cd-2d35-74c4-90c6-d0e3b10011b5";
+    let opencode = "ses_f65f0f5d3ffeGhl8q7ftjyml5K";
+    store
+        .record(&AuditEvent {
+            device: "cli".to_string(),
+            agent: "pane-1".to_string(),
+            prompt: format!("session {pi}"),
+            detail: Some(format!("harness=opencode session={opencode}")),
+            ..AuditEvent::new(
+                arreo_core::store::actions::SESSION_CONNECT,
+                AuditKind::Unknown,
+                arreo_core::store::AuditOutcome::Ok,
+                1_700_000_000_000,
+            )
+        })
+        .expect("audit");
+    let rows = store.audit_recent(1).expect("recent");
+    assert_eq!(rows.len(), 1);
+    assert!(
+        rows[0].prompt.contains(pi),
+        "pi's session id survived the secret scan: {}",
+        rows[0].prompt
+    );
+    assert!(
+        rows[0]
+            .detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains(opencode)),
+        "opencode's session id survived the secret scan: {:?}",
+        rows[0].detail
+    );
+    assert!(!rows[0].redacted, "neither id is secret-shaped");
 }

@@ -1,0 +1,6 @@
+id=live-oc harness=opencode session_id=ses_f659d9ec1ffeKLRIo1yCT4BjtB
+  args=["run","The codeword is TURQUOISE. Reply with the single word NOTED.","--format","json","--dir","/home/dev/dev/Arreo/target/test-scratch/persistence-live-2967911/oc-work"]
+id=live-pi harness=pi session_id=8fe45016-2c6b-4b6e-a7f6-aad58ea64405
+  args=["-p","The codeword is TURQUOISE. Reply with the single word NOTED.","--mode","json","--session-dir","/home/dev/dev/Arreo/target/test-scratch/persistence-live-2967911/pi-sessions","--session-id","8fe45016-2c6b-4b6e-a7f6-aad58ea64405"]
+id=live-plain harness=None session_id=None
+  args=["-c","echo plain-fallback-marker && sleep 60"]

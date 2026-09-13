@@ -283,3 +283,206 @@ fn opencode_permission_line_carries_its_pattern() {
         question.matched_pattern
     );
 }
+
+/// T-0072: the `[resume]` table is validated as strictly as the patterns. Each
+/// case below looks like a working strategy and silently is not, so each must
+/// be a loud parse failure rather than a pane that quietly stops resuming.
+#[test]
+fn resume_strategies_are_validated_loudly() {
+    let base = "idle_after_ms = 2000\nquestion_after_ms = 2000\nblocked_after_ms = 2500\n\
+                question_patterns = ['x']\nerror_patterns = ['y']\n\
+                harness = 'h'\nprograms = ['h']\n";
+    let bad = [
+        // Not a strategy at all.
+        "[resume]\nkind = 'guess'\nargv = ['--continue']\n",
+        // A `pin` argv that cannot name the session it pinned.
+        "[resume]\nkind = 'pin'\nargv = ['--continue']\n",
+        // A `continue` argv handed an id the harness does not take it for.
+        "[resume]\nkind = 'continue'\nargv = ['--session', '{session}']\n",
+        // `exact_argv` where the id is always known: dead data.
+        "[resume]\nkind = 'pin'\nargv = ['--session-id', '{session}']\nexact_argv = ['-s', '{session}']\n",
+        // `exact_argv` that cannot carry the id.
+        "[resume]\nkind = 'continue'\nargv = ['--continue']\nexact_argv = ['--session', 'x']\n",
+        // A placeholder embedded in a larger word would reach the harness literally.
+        "[resume]\nkind = 'pin'\nargv = ['--session-id={session}']\n",
+        // Two ids in one template: which is the session?
+        "[resume]\nkind = 'pin'\nargv = ['--session-id', '{session}', '--name', '{session}']\n",
+        // Empty argv: nothing to resume with.
+        "[resume]\nkind = 'continue'\nargv = []\n",
+        // An empty element in the argv list.
+        "[resume]\nkind = 'continue'\nargv = ['']\n",
+        // A pattern with two capture groups leaves "which is the id" to convention.
+        "[resume]\nkind = 'continue'\nargv = ['--continue']\nsession_pattern = '\"a\":\"(x)\",\"id\":\"(y)\"'\n",
+        // A pattern with no group can match without ever yielding a session.
+        "[resume]\nkind = 'continue'\nargv = ['--continue']\nsession_pattern = 'ses_[0-9]+'\n",
+        // A pattern that is not a regex.
+        "[resume]\nkind = 'continue'\nargv = ['--continue']\nsession_pattern = '(['\n",
+        // An unknown key inside the table is a typo, not a feature.
+        "[resume]\nkind = 'continue'\nargv = ['--continue']\nresume_flag = '--resume'\n",
+    ];
+    for (i, table) in bad.iter().enumerate() {
+        let text = format!("{base}{table}");
+        assert!(
+            Adapter::from_toml(&text).is_err(),
+            "case {i} must be refused:\n{table}"
+        );
+    }
+
+    // And the honest shapes are accepted, with the strategy readable.
+    let pin = Adapter::from_toml(&format!(
+        "{base}[resume]\nkind = 'pin'\nargv = ['--session-id', '{{session}}']\n"
+    ))
+    .expect("a pin strategy is valid");
+    let resume = pin.resume.as_ref().expect("strategy kept");
+    assert_eq!(resume.kind(), arreo_core::state::ResumeKind::Pin);
+    assert_eq!(resume.argv(), ["--session-id", "{session}"]);
+    assert!(!pin.captures_session(), "no pattern declared");
+
+    let continuation = Adapter::from_toml(&format!(
+        "{base}[resume]\nkind = 'continue'\nargv = ['--continue']\n\
+         exact_argv = ['--session', '{{session}}']\nsession_pattern = '\"sessionID\":\"(ses_[A-Za-z0-9]+)\"'\n"
+    ))
+    .expect("a continue strategy is valid");
+    let resume = continuation.resume.as_ref().expect("strategy kept");
+    assert_eq!(resume.kind(), arreo_core::state::ResumeKind::Continue);
+    assert_eq!(
+        resume.exact_argv(),
+        Some(["--session".to_string(), "{session}".to_string()].as_slice())
+    );
+    assert!(continuation.captures_session());
+
+    // A `[resume]` with no harness id can never be resolved from a record.
+    assert!(Adapter::from_toml(
+        "idle_after_ms = 2000\nquestion_after_ms = 2000\nblocked_after_ms = 2500\n\
+         question_patterns = ['x']\nerror_patterns = ['y']\n\
+         [resume]\nkind = 'continue'\nargv = ['--continue']\n"
+    )
+    .is_err());
+    // A harness with no programs could never be selected for a pane.
+    assert!(Adapter::from_toml(
+        "idle_after_ms = 2000\nquestion_after_ms = 2000\nblocked_after_ms = 2500\n\
+         question_patterns = ['x']\nerror_patterns = ['y']\nharness = 'h'\n"
+    )
+    .is_err());
+    // And programs with no harness would record panes under a harness
+    // that does not exist.
+    assert!(Adapter::from_toml(
+        "idle_after_ms = 2000\nquestion_after_ms = 2000\nblocked_after_ms = 2500\n\
+         question_patterns = ['x']\nerror_patterns = ['y']\nprograms = ['h']\n"
+    )
+    .is_err());
+}
+
+/// The two operations the restore path is built on are inverse: what a spawn
+/// wrote down can be read back and re-applied without growing the argv.
+#[test]
+fn resume_args_and_base_args_are_inverse() {
+    let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../adapters");
+    // pi: pin.
+    let pi = Adapter::load(&root.join("pi.toml")).expect("pi loads");
+    let resume = pi.resume.as_ref().expect("pi resumes");
+    let base = vec!["-p".to_string(), "hi".to_string()];
+    let id = "01a099cd-2d35-74c4-90c6-d0e3b10011b5";
+    let spawned = resume.resume_args(&base, Some(id)).expect("pinned");
+    assert_eq!(spawned, ["-p", "hi", "--session-id", id]);
+    let (back, carried) = resume.base_args(&spawned);
+    assert_eq!(back, base);
+    assert_eq!(carried.as_deref(), Some(id));
+    assert_eq!(
+        resume.resume_args(&back, carried.as_deref()),
+        Some(spawned.clone()),
+        "a second restore must not stack the flag"
+    );
+    // A pin with no id has nothing to pin — and must not fabricate one.
+    assert_eq!(resume.resume_args(&base, None), None);
+
+    // opencode: continue, with and without an id.
+    let opencode = Adapter::load(&root.join("opencode.toml")).expect("opencode loads");
+    let resume = opencode.resume.as_ref().expect("opencode resumes");
+    let base = vec!["--dir".to_string(), "/w".to_string()];
+    assert_eq!(
+        resume.resume_args(&base, None),
+        Some(vec![
+            "--dir".to_string(),
+            "/w".to_string(),
+            "--continue".to_string()
+        ])
+    );
+    let exact = resume
+        .resume_args(&base, Some("ses_abc123"))
+        .expect("exact");
+    assert_eq!(exact, ["--dir", "/w", "--session", "ses_abc123"]);
+    let (back, carried) = resume.base_args(&exact);
+    assert_eq!(back, base);
+    assert_eq!(carried.as_deref(), Some("ses_abc123"));
+    assert_eq!(resume.resume_args(&back, carried.as_deref()), Some(exact));
+    // And the continuation form round-trips too: no id must not be invented.
+    let (back, carried) = resume.base_args(&resume.resume_args(&base, None).expect("continue"));
+    assert_eq!(back, base);
+    assert_eq!(carried, None);
+}
+
+/// T-0072 capture: the id is learned where the harness prints it. pi's JSON
+/// session envelope and opencode's event stream are the two recorded shapes;
+/// an adapter with no pattern (or a harness that prints nothing) learns none,
+/// which is not an error — the `continue` strategy resumes without one.
+#[test]
+fn engines_capture_the_session_id_from_real_output() {
+    use arreo_core::state::{Adapter, Engine};
+    let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../adapters");
+
+    // pi (--mode json): the first line is the session envelope. Split across
+    // two feeds on purpose: a session line can straddle a poll.
+    let pi = Adapter::load(&root.join("pi.toml")).expect("pi loads");
+    let mut engine = Engine::new(pi, 0);
+    assert_eq!(engine.session(), None, "nothing learned before output");
+    engine.feed(b"{\"type\":\"session\",\"version\":3,\"id\":\"", 0);
+    assert_eq!(engine.session(), None, "a partial id is not an id");
+    engine.feed(
+        b"01a099cd-2d35-74c4-90c6-d0e3b10011b5\",\"cwd\":\"/w\"}\n",
+        10,
+    );
+    assert_eq!(
+        engine.session(),
+        Some("01a099cd-2d35-74c4-90c6-d0e3b10011b5"),
+        "pi's envelope carries the id"
+    );
+    assert!(engine.take_session_learned(), "learned from output");
+    assert!(!engine.take_session_learned(), "and only once");
+
+    // A pinned id is not overwritten by whatever output says.
+    let pi = Adapter::load(&root.join("pi.toml")).expect("pi loads");
+    let mut engine = Engine::new(pi, 0);
+    engine.set_session("pinned-id".to_string());
+    engine.feed(
+        b"{\"type\":\"session\",\"id\":\"other-id-0000-0000-0000-000000000000\"}\n",
+        0,
+    );
+    assert_eq!(engine.session(), Some("pinned-id"));
+    assert!(!engine.take_session_learned(), "a pin is not a capture");
+
+    // opencode (--format json): events carry "sessionID":"ses_…".
+    let opencode = Adapter::load(&root.join("opencode.toml")).expect("opencode loads");
+    let mut engine = Engine::new(opencode, 0);
+    engine.feed(
+        b"{\"type\":\"step_start\",\"sessionID\":\"ses_0a1b2C3d4E\",\"part\":{}}\n",
+        0,
+    );
+    assert_eq!(engine.session(), Some("ses_0a1b2C3d4E"));
+
+    // An interactive opencode TUI prints no id (verified live, 1.18.30): the
+    // engine learns nothing and that is not an error.
+    let opencode = Adapter::load(&root.join("opencode.toml")).expect("opencode loads");
+    let mut engine = Engine::new(opencode, 0);
+    engine.feed(b"opencode\n> ask anything\n", 0);
+    assert_eq!(engine.session(), None);
+    assert!(!engine.take_session_learned());
+
+    // The universal adapter has no strategy and captures nothing.
+    let mut engine = Engine::new(Adapter::default(), 0);
+    engine.feed(
+        b"{\"type\":\"session\",\"id\":\"01a099cd-2d35-74c4-90c6-d0e3b10011b5\"}\n",
+        0,
+    );
+    assert_eq!(engine.session(), None);
+}

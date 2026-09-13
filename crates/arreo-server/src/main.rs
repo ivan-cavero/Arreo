@@ -287,12 +287,25 @@ async fn main() {
         signal = shutdown_signal() => {
             eprintln!("arreo-server: {signal} received, draining...");
             let drained = drain(&registry).await;
-            // Persist the final topology (post-T-0018: restart restores it).
-            let panes: Vec<(String, std::sync::Arc<arreo_core::pty::Pane>)> = registry
+            // Persist the final topology (post-T-0018: restart restores it;
+            // T-0072: with each pane's harness + session, so the restore can
+            // resume the harness session).
+            //
+            // The final write serializes with the session-loop snapshot tasks
+            // (review finding B): it reads the registry under the same gate,
+            // so a just-captured session id cannot be clobbered by a later
+            // in-flight snapshot landing after this one.
+            let _gate = arreo_server::daemon::lock_snapshot_gate().await;
+            let panes: Vec<arreo_server::persist::SnapshotPane> = registry
                 .read()
                 .await
                 .iter()
-                .map(|(id, entry)| (id.clone(), std::sync::Arc::clone(&entry.pane)))
+                .map(|(id, entry)| arreo_server::persist::SnapshotPane {
+                    id: id.clone(),
+                    pane: std::sync::Arc::clone(&entry.pane),
+                    harness: entry.harness.clone(),
+                    session_id: entry.session(),
+                })
                 .collect();
             let db = arreo_server::db_path_for(&socket_path);
             if let Err(e) = arreo_server::snapshot(&panes, &db) {

@@ -1,0 +1,22 @@
+test daemon::session_registry_tests::a_spawn_audit_row_never_carries_the_argv ... ok
+test handoff::tests::a_build_string_is_stripped_and_bounded ... ok
+test persist::tests::the_fallback_notice_never_carries_a_session_id ... ok
+test daemon::session_registry_tests::one_device_with_many_sessions_is_one_entry ... ok
+test handoff::tests::the_version_window_is_the_incoming_daemons ... ok
+test daemon::session_registry_tests::registering_and_releasing_leaves_nothing_behind ... ok
+test transport::tests::a_stalled_peer_does_not_block_the_listener ... ok
+test transport::tests::a_pinned_owner_may_drive ... ok
+test daemon::alert_tests::emit_alert_writes_all_three_doors ... ok
+test daemon::alert_tests::critical_always_precedes_kill_in_the_log ... ok
+test transport::tests::a_pinned_viewer_observes_is_refused_writes_and_is_recorded ... ok
+test transport::tests::an_unpinned_device_gets_no_session ... ok
+test transport::tests::a_remote_owner_drives_a_real_pane_and_resumes_the_stream ... ok
+test handoff::tests::bound_write_gives_up_at_the_deadline ... ok
+test handoff::tests::a_trickling_manifest_peer_is_abandoned_at_the_total_deadline ... ok
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.76s
+test unknown_harness_records_take_the_plain_path ... ok
+test a_pinned_record_is_resumed_on_its_resume_argv ... ok
+test save_restore_round_trip_over_real_panes ... ok
+test a_resume_the_harness_refuses_falls_back_loudly_without_blocking_the_rest ... ok
+test restore_never_executes_scrollback ... ok
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.86s

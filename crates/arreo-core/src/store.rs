@@ -15,9 +15,16 @@
 //!   schema has no column a private key could occupy — a device's secret half
 //!   lives in its own 0600 file, never here, because the database is the thing
 //!   that gets copied, backed up and synced.
-//! - `open` runs `migrate()` (v1→v2→v3 `CREATE TABLE IF NOT EXISTS` + version
-//!   bumps); future versions append `migrate_vN` steps. Data is never dropped
-//!   by a migration — the migration test pins a surviving rollup row.
+//! - v8 (T-0072): `panes` gains `harness` + `session_id` — the harness a pane
+//!   runs under and the session it is on, so a restore can resume the *harness
+//!   session* instead of only respawning the command. Both columns are
+//!   nullable and added by `ALTER TABLE`, so a v7 row (every pane recorded
+//!   before this) keeps its program/args/scrollback and restores exactly as it
+//!   did — no orphan databases, nothing dropped.
+//! - `open` runs `migrate()` (v1→…→v8 `CREATE TABLE IF NOT EXISTS`,
+//!   `ALTER TABLE`, version bumps); future versions append a step. Data is
+//!   never dropped by a migration — the migration test pins a surviving rollup
+//!   row and a surviving v7 pane row.
 //!
 //! Audit redaction: prompts are scanned with the fixture secret patterns
 //! (`scan_secrets`); hits are replaced with `[REDACTED:<label>]` and the row
@@ -58,7 +65,7 @@ pub enum SessionError {
     },
 }
 
-pub const SCHEMA_VERSION: u32 = 7;
+pub const SCHEMA_VERSION: u32 = 8;
 
 /// One pane's persisted record: how to respawn it + what it showed.
 #[derive(Debug, Clone, PartialEq)]
@@ -69,6 +76,21 @@ pub struct StoredPane {
     pub cols: u16,
     pub rows: u16,
     pub scrollback: Vec<String>,
+    /// The adapter registry id of the harness this pane runs under (`"pi"`,
+    /// `"opencode"`), or `None` for a pane no adapter claims — the universal
+    /// adapter's panes, and every row written before v8.
+    ///
+    /// The **id**, not the program: a program can be renamed or moved between
+    /// installs, while the id is what the registry resolves back to a resume
+    /// strategy. A record whose harness no adapter knows is restored the
+    /// pre-T-0072 way (respawn the command, replay history).
+    pub harness: Option<String>,
+    /// The harness session this pane is on: the id Arreo pinned at spawn (the
+    /// `pin` strategy) or the one the harness printed and the engine captured
+    /// (the `continue` strategy, when it ever printed one). `None` means "no
+    /// id known" — which for `continue` is normal (it resumes by continuation,
+    /// with no id at all), and for `pin` means there is nothing to resume with.
+    pub session_id: Option<String>,
 }
 
 /// The outcome half of an audit row: what a review reads to tell an intention
@@ -737,6 +759,19 @@ impl SessionStore {
                  CREATE INDEX IF NOT EXISTS machine_trust_device ON machine_trust(device_id);",
             )?;
         }
+        // v8 (T-0072): the harness session a pane is on, beside the command
+        // that respawns it. Two **nullable** columns added in place: a row
+        // written before this version has neither, which is exactly right —
+        // nothing is known about a session Arreo never recorded, and the
+        // restore path for NULL is the pre-T-0072 respawn+history (the
+        // migration must not turn "unknown" into a guess). No default, because
+        // a non-NULL default would be a lie the restore path would act on.
+        if version < 8 && !has_column(conn, "panes", "harness")? {
+            conn.execute_batch(
+                "ALTER TABLE panes ADD COLUMN harness TEXT;
+                 ALTER TABLE panes ADD COLUMN session_id TEXT;",
+            )?;
+        }
         conn.execute(
             "INSERT INTO meta(key, value) VALUES ('schema_version', ?1)
              ON CONFLICT(key) DO UPDATE SET value=excluded.value",
@@ -1193,33 +1228,42 @@ impl SessionStore {
     /// Replace the whole topology snapshot (spawn/exit/drain-tick callers).
     /// Scrollback lines are stored in order (line_no = index).
     pub fn save_topology(&self, panes: &[StoredPane]) -> Result<(), SessionError> {
-        let conn = self
+        let mut conn = self
             .conn
             .lock()
             .map_err(|_| SessionError::Sqlite(rusqlite::Error::InvalidQuery))?;
         // Whole-snapshot replace inside one transaction: readers never see
-        // a half-written topology.
-        let tx_conn: &Connection = &conn;
-        tx_conn.execute("DELETE FROM scrollback", [])?;
-        tx_conn.execute("DELETE FROM panes", [])?;
+        // a half-written topology (a crash between two autocommits would leave
+        // a pane with a scrollback that belongs to nothing — or worse, a pane
+        // that resumed from a previous pane's lines). The review that caught
+        // T-0072's snapshot race found this comment was promise, not code: the
+        // DELETEs and INSERTs autocommitted individually. A real transaction
+        // is what makes the whole replace atomic.
+        let tx = conn.transaction()?;
+        tx.execute("DELETE FROM scrollback", [])?;
+        tx.execute("DELETE FROM panes", [])?;
         for pane in panes {
-            tx_conn.execute(
-                "INSERT INTO panes(id, program, args, cols, rows) VALUES (?1, ?2, ?3, ?4, ?5)",
+            tx.execute(
+                "INSERT INTO panes(id, program, args, cols, rows, harness, session_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                 params![
                     pane.id,
                     pane.program,
                     serde_json::to_string(&pane.args).map_err(SessionError::Json)?,
                     pane.cols as i64,
                     pane.rows as i64,
+                    pane.harness,
+                    pane.session_id,
                 ],
             )?;
             for (line_no, text) in pane.scrollback.iter().enumerate() {
-                tx_conn.execute(
+                tx.execute(
                     "INSERT INTO scrollback(pane, line_no, text) VALUES (?1, ?2, ?3)",
                     params![pane.id, line_no as i64, text],
                 )?;
             }
         }
+        tx.commit()?;
         Ok(())
     }
 
@@ -1229,8 +1273,9 @@ impl SessionStore {
             .conn
             .lock()
             .map_err(|_| SessionError::Sqlite(rusqlite::Error::InvalidQuery))?;
-        let mut stmt =
-            conn.prepare("SELECT id, program, args, cols, rows FROM panes ORDER BY id ASC")?;
+        let mut stmt = conn.prepare(
+            "SELECT id, program, args, cols, rows, harness, session_id FROM panes ORDER BY id ASC",
+        )?;
         let panes = stmt.query_map([], |row| {
             Ok((
                 row.get::<_, String>(0)?,
@@ -1238,11 +1283,13 @@ impl SessionStore {
                 row.get::<_, String>(2)?,
                 row.get::<_, i64>(3)?,
                 row.get::<_, i64>(4)?,
+                row.get::<_, Option<String>>(5)?,
+                row.get::<_, Option<String>>(6)?,
             ))
         })?;
         let mut out = Vec::new();
         for pane in panes {
-            let (id, program, args_json, cols, rows) = pane?;
+            let (id, program, args_json, cols, rows, harness, session_id) = pane?;
             let args: Vec<String> = serde_json::from_str(&args_json).unwrap_or_default();
             let mut lines =
                 conn.prepare("SELECT text FROM scrollback WHERE pane = ?1 ORDER BY line_no ASC")?;
@@ -1256,6 +1303,8 @@ impl SessionStore {
                 cols: cols as u16,
                 rows: rows as u16,
                 scrollback,
+                harness,
+                session_id,
             });
         }
         Ok(out)

@@ -84,10 +84,27 @@ pub struct Engine {
     /// Whether an error shape was seen since the last state change.
     error_armed: bool,
     exited: bool,
+    /// The harness session this pane is on (T-0072): pinned at spawn (the
+    /// `pin` strategy) or learned from output (the strategy's
+    /// `session_pattern`, when the harness happens to print one). `None` means
+    /// "no id known yet" — normal for any pane whose harness prints none.
+    session: Option<String>,
+    /// Bounded carry of text still in flight for capture (a session id line
+    /// can straddle two feeds; the carry carries it across).
+    capture_carry: String,
+    /// Set exactly when an id was learned from output (not when one was
+    /// pinned). The daemon snapshots on this so the record can name a session
+    /// that only output revealed.
+    session_learned: bool,
 }
 
 /// Cap on retained visible text (64 KiB — tail matching only needs the end).
 const TEXT_CAP: usize = 64 * 1024;
+
+/// Cap on the capture carry (T-0072): the session id line is printed near
+/// spawn, so a few KiB of in-flight text is all a straddle can need; a long
+/// matchless run must not grow the carry forever.
+const CAPTURE_CARRY_BYTES: usize = 4096;
 
 impl Engine {
     #[must_use]
@@ -100,12 +117,68 @@ impl Engine {
             bell_pending: false,
             error_armed: false,
             exited: false,
+            session: None,
+            capture_carry: String::new(),
+            session_learned: false,
         }
     }
 
     #[must_use]
     pub fn state(&self) -> &State {
         &self.state
+    }
+
+    /// The harness session this pane is on, if one is known (pinned at spawn
+    /// or captured from output). `None` is not an error: some harnesses never
+    /// print their session.
+    #[must_use]
+    pub fn session(&self) -> Option<&str> {
+        self.session.as_deref()
+    }
+
+    /// Record the id this pane was spawned with (the `pin` strategy). A later
+    /// output capture may not overwrite it — the id Arreo chose at spawn is
+    /// the truth.
+    pub fn set_session(&mut self, id: String) {
+        if self.session.is_none() {
+            self.session = Some(id);
+        }
+    }
+
+    /// Whether the engine learned a session id from output since the last
+    /// call. Set exactly on output capture (never on a pin), so the daemon can
+    /// snapshot when a record gains an id that only output revealed.
+    pub fn take_session_learned(&mut self) -> bool {
+        std::mem::take(&mut self.session_learned)
+    }
+
+    /// Scan fresh visible text for this adapter's session id. The carry joins
+    /// the previous window, so a session line split across two feeds is still
+    /// seen whole; once an id is found (or the pane has no pattern) this never
+    /// scans again.
+    fn capture(&mut self, fresh: &str) {
+        if self.session.is_some() || !self.adapter.captures_session() {
+            return;
+        }
+        self.capture_carry.push_str(fresh);
+        let found = self
+            .adapter
+            .resume
+            .as_ref()
+            .and_then(|resume| resume.capture(&self.capture_carry));
+        if let Some(id) = found {
+            self.session = Some(id);
+            self.session_learned = true;
+            self.capture_carry.clear();
+            return;
+        }
+        if self.capture_carry.len() > CAPTURE_CARRY_BYTES {
+            let mut drop = self.capture_carry.len() - CAPTURE_CARRY_BYTES;
+            while drop > 0 && !self.capture_carry.is_char_boundary(drop) {
+                drop -= 1;
+            }
+            self.capture_carry.drain(..drop);
+        }
     }
 
     /// Feed raw output bytes observed at `now_ms`. Emits transitions.
@@ -132,6 +205,7 @@ impl Engine {
             if self.adapter.match_error(&visible) {
                 self.error_armed = true;
             }
+            self.capture(&visible);
             self.last_output_ms = Some(now_ms);
             // Output flowing → working (from anything except Done).
             if self.state != State::Working {

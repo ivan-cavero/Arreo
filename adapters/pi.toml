@@ -20,6 +20,16 @@ blocked_after_ms = 2500
 bell_means_attention = true
 done_on_exit = true
 
+# T-0072 harness-aware resume, part 1: which panes this adapter owns, and the
+# id the pane record carries. pi lets the caller pin the session id
+# (`--session-id <id>`, "use exact project session ID, creating it if
+# missing"), so Arreo generates the id at spawn and resumes with the same
+# argv — deterministic, no output to read. `[resume]` itself is at the END of
+# this file: a TOML table header captures every key after it, and the pattern
+# arrays below are top-level.
+harness = "pi"
+programs = ["pi"]
+
 question_patterns = [
   "\\[y/n\\]",
   "\\(y/n\\)",
@@ -49,3 +59,14 @@ error_patterns = [
   "Auth checks require",
   "Unknown .* command",
 ]
+
+# T-0072 harness-aware resume, part 2: how the session is resumed. `pin` means
+# Arreo chose the id at spawn, so the same argv names it again. The session
+# pattern is the belt: pi's `--mode json` prints the id in its first envelope
+# (`{"type":"session","version":3,"id":"<uuid>",…}`) and the engine captures
+# it when it can — the pin already knows it, so this is a cross-check rather
+# than the mechanism (pi 0.84.4).
+[resume]
+kind = "pin"
+argv = ["--session-id", "{session}"]
+session_pattern = '"type":"session".*?"id":"([0-9a-f-]{36})"'

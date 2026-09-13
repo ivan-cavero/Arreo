@@ -1,0 +1,5 @@
+arreo-server: device authority ready (root c84519b13ff22fd0…, 0 device(s))
+arreo-server: serving on /home/dev/dev/Arreo/target/test-scratch/persistence-live-2967911/daemon.sock
+arreo-server: device authority ready (root c84519b13ff22fd0…, 0 device(s))
+arreo-server: serving on /home/dev/dev/Arreo/target/test-scratch/persistence-live-2967911/daemon.sock
+daemon: restored 3 pane(s) from /home/dev/dev/Arreo/target/test-scratch/persistence-live-2967911/daemon.sock.db

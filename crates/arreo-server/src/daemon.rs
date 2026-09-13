@@ -18,7 +18,7 @@ use arreo_core::metrics::Sampler;
 use arreo_core::proto::codec::{self, CodecError};
 use arreo_core::proto::{AgentState, Message, PaneDetail, PaneInfo, VERSION};
 use arreo_core::pty::{ExitState, Pane};
-use arreo_core::state::{Adapter, Confidence, Engine, State};
+use arreo_core::state::{Adapter, AdapterRegistry, Confidence, Engine, State};
 use std::collections::HashMap;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -65,6 +65,10 @@ pub struct PaneEntry {
     pub engine: Mutex<Engine>,
     pub fed: Mutex<usize>,
     pub sampler: Mutex<Sampler>,
+    /// The registry id of the adapter this pane runs under (T-0072): what the
+    /// record ships as `harness` and what a restore resolves back to a resume
+    /// strategy. `None` for a pane no adapter claims (the universal adapter).
+    pub harness: Option<String>,
     /// Enforcement guard (T-0019): present when the pane was spawned with a
     /// budget. Held for its Drop (group removal) + breach polls.
     ///
@@ -93,26 +97,65 @@ pub struct PaneEntry {
 }
 
 impl PaneEntry {
-    fn new(pane: Arc<Pane>) -> Self {
-        Self::new_with_guard(pane, None, false)
+    /// The adapter for a pane's program, via the compiled-in registry.
+    fn adapter_for(program: &str) -> Adapter {
+        AdapterRegistry::builtin().for_program(program).clone()
     }
 
-    fn new_with_guard(
+    /// The one constructor (T-0072): an adapter — its patterns AND its resume
+    /// strategy — plus the harness session the pane is on.
+    ///
+    /// The session id lives in the engine, pinned at spawn (`pin` strategy:
+    /// `Some`, so the very first snapshot records it) or learned from output
+    /// (`continue` strategy, when the harness prints one); `take_session_learned`
+    /// is what the daemon snapshots on.
+    fn with_adapter(
         pane: Arc<Pane>,
         guard: Option<arreo_core::enforce::Guard>,
         kill_on_breach: bool,
+        adapter: Adapter,
+        session: Option<String>,
     ) -> Self {
+        let harness = adapter.harness_id().map(str::to_string);
+        let mut engine = Engine::new(adapter, 0);
+        if let Some(id) = session {
+            engine.set_session(id);
+        }
         Self {
             pane,
-            engine: Mutex::new(Engine::new(Adapter::default(), 0)),
+            engine: Mutex::new(engine),
             fed: Mutex::new(0),
             sampler: Mutex::new(Sampler::new()),
+            harness,
             guard: Mutex::new(guard),
             kill_on_breach,
             alert_state: Mutex::new(arreo_core::enforce::AlertState::default()),
             pending_alerts: Mutex::new(Vec::new()),
             last_alert_line: Mutex::new(None),
         }
+    }
+
+    /// The harness session this pane is on, as the snapshot records it: the
+    /// id pinned at spawn, or the one the engine captured from the harness's
+    /// own output, once it has.
+    #[must_use]
+    pub fn session(&self) -> Option<String> {
+        self.engine
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .session()
+            .map(str::to_string)
+    }
+
+    /// Whether this pane's engine learned a session id from output since the
+    /// last call — the signal the session loop snapshots on, so a session that
+    /// only output can reveal still reaches the record.
+    #[must_use]
+    fn take_session_learned(&self) -> bool {
+        self.engine
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take_session_learned()
     }
 
     /// Take ownership of this pane's enforcement guard, after the cut committed
@@ -174,7 +217,20 @@ impl PaneEntry {
         kill_on_breach: bool,
     ) -> Self {
         let (journal, _) = pane.raw_snapshot();
-        let entry = Self::new_with_guard(pane, None, kill_on_breach);
+        // T-0072: the adapter and the session are also derived, not
+        // transferred. The program travels in the adopted spec, so the
+        // registry resolves the same adapter this pane had; and a `pin`
+        // pane's spec carries the resume argv it was spawned with, so the
+        // session id is read back out of it (`base_args`) rather than lost
+        // across the cut — a pane that arrives without its session would write
+        // a record with no id on the incoming daemon's very next snapshot.
+        let spec = pane.spawn_spec();
+        let adapter = Self::adapter_for(&spec.program);
+        let session = adapter
+            .resume
+            .as_ref()
+            .and_then(|resume| resume.base_args(&spec.args).1);
+        let entry = Self::with_adapter(pane, None, kill_on_breach, adapter, session);
         {
             let mut engine = entry.engine.lock().unwrap_or_else(|e| e.into_inner());
             // **The state this engine derives is advisory (F4, stage-2
@@ -391,6 +447,33 @@ impl PaneEntry {
     }
 }
 
+/// Serializes the daemon's snapshot writes (T-0072).
+///
+/// Spawn, kill, split and "a pane learned its session id" each spawn a
+/// **detached** snapshot task, and two detached tasks can land out of order:
+/// the spawn snapshot (whose state has no session id yet) can write *after*
+/// the capture snapshot and clobber the captured id on disk — the record a
+/// boot-restore then acts on loses the very thing the capture existed to
+/// store. Ordering the writes by task-start order fixes it: the last task to
+/// start is the newest state, and the DB always ends there. One daemon serves
+/// one socket, and this product runs one daemon per socket, so a process-wide
+/// gate can never serialize unrelated daemons' snapshots in a way that
+/// matters (they are rare, small writes on distinct files).
+static SNAPSHOT_GATE: std::sync::LazyLock<tokio::sync::Mutex<()>> =
+    std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
+
+/// Take the snapshot gate — the one public door the clean-shutdown path uses
+/// (review finding B, T-0072): the SIGTERM final snapshot in the binary's
+/// main must serialize with the session-loop snapshot tasks, or a just-
+/// captured session id can be clobbered by the shutdown write landing in the
+/// middle of an in-flight one. The gate serializes *writers*, and the write
+/// that lands last carries the newest *state* (each snapshot's content is
+/// read under the gate, from the live registry), so start order never
+/// matters once every writer holds it.
+pub async fn lock_snapshot_gate() -> tokio::sync::MutexGuard<'static, ()> {
+    SNAPSHOT_GATE.lock().await
+}
+
 /// Shared pane registry.
 pub type Registry = Arc<RwLock<HashMap<String, Arc<PaneEntry>>>>;
 
@@ -551,17 +634,34 @@ impl Daemon {
     /// serving). Failures restore partially (bad records skipped loudly) —
     /// a corrupt DB never blocks the daemon.
     async fn restore_boot(&self) {
-        match super::persist::restore(&self.db) {
-            Ok(pairs) => {
-                if pairs.is_empty() {
+        match super::persist::restore(&self.db, arreo_core::state::AdapterRegistry::builtin()) {
+            Ok(restored) => {
+                if restored.is_empty() {
                     return;
                 }
                 let mut registry = self.registry.write().await;
-                for (id, pane) in pairs {
-                    if registry.contains_key(&id) {
+                for pane in restored {
+                    if registry.contains_key(&pane.id) {
                         continue;
                     }
-                    registry.insert(id, Arc::new(PaneEntry::new(pane)));
+                    // The record's own harness decides the adapter (falling
+                    // back to the program for a pre-v8 row); the session it
+                    // resumed is re-hung on the entry so the next snapshot
+                    // keeps it.
+                    let program = pane.pane.spawn_spec().program;
+                    let adapter = arreo_core::state::AdapterRegistry::builtin()
+                        .for_record(pane.harness.as_deref(), &program)
+                        .clone();
+                    registry.insert(
+                        pane.id,
+                        Arc::new(PaneEntry::with_adapter(
+                            pane.pane,
+                            None,
+                            false,
+                            adapter,
+                            pane.session_id,
+                        )),
+                    );
                 }
                 eprintln!(
                     "daemon: restored {} pane(s) from {}",
@@ -578,16 +678,27 @@ impl Daemon {
     /// Snapshot the registry to disk (spawn/kill/shutdown callers). Errors
     /// are logged, never fatal — persistence is best-effort per op.
     pub async fn snapshot(&self) {
-        let panes: Vec<(String, Arc<Pane>)> = self
-            .registry
-            .read()
-            .await
-            .iter()
-            .map(|(id, entry)| (id.clone(), Arc::clone(&entry.pane)))
-            .collect();
+        let _gate = SNAPSHOT_GATE.lock().await;
+        let panes = self.snapshot_panes().await;
         if let Err(e) = super::persist::snapshot(&panes, &self.db) {
             eprintln!("daemon: snapshot failed: {e}");
         }
+    }
+
+    /// The registry, as the record wants it: each pane plus the two facts only
+    /// the entry knows — the harness it runs under and the session it is on.
+    async fn snapshot_panes(&self) -> Vec<super::persist::SnapshotPane> {
+        self.registry
+            .read()
+            .await
+            .iter()
+            .map(|(id, entry)| super::persist::SnapshotPane {
+                id: id.clone(),
+                pane: Arc::clone(&entry.pane),
+                harness: entry.harness.clone(),
+                session_id: entry.session(),
+            })
+            .collect()
     }
 
     /// Serve forever (until the listener errors fatally). Removes a stale
@@ -1847,18 +1958,35 @@ where
         // Persistence: spawn/kill/split mutate the registry — snapshot after
         // them so the DB always reflects the current topology. Async task
         // (never blocks the connection); failures logged, never fatal.
-        if matches!(message, Message::Spawn { .. })
+        //
+        // A pane that just printed its session id (T-0072's capture half) also
+        // makes the record stale without changing the topology, so that is a
+        // snapshot trigger of its own. The flag is consumed by the check, so
+        // each learned id costs exactly one snapshot, and a dispatch that
+        // already snapshots for another reason clears it with the same write.
+        let mutated = matches!(message, Message::Spawn { .. })
             || matches!(message, Message::Kill { .. })
-            || matches!(message, Message::Split { .. })
-        {
+            || matches!(message, Message::Split { .. });
+        let learned = registry
+            .read()
+            .await
+            .values()
+            .any(|entry| entry.take_session_learned());
+        if mutated || learned {
             let registry = Arc::clone(&registry);
             let db = db.clone();
             tokio::spawn(async move {
-                let panes: Vec<(String, Arc<Pane>)> = registry
+                let _gate = SNAPSHOT_GATE.lock().await;
+                let panes: Vec<super::persist::SnapshotPane> = registry
                     .read()
                     .await
                     .iter()
-                    .map(|(id, entry)| (id.clone(), Arc::clone(&entry.pane)))
+                    .map(|(id, entry)| super::persist::SnapshotPane {
+                        id: id.clone(),
+                        pane: Arc::clone(&entry.pane),
+                        harness: entry.harness.clone(),
+                        session_id: entry.session(),
+                    })
                     .collect();
                 if let Err(e) = super::persist::snapshot(&panes, &db) {
                     eprintln!("daemon: snapshot failed: {e}");
@@ -2053,9 +2181,25 @@ async fn dispatch(message: &Message, registry: &Registry, db: &std::path::Path) 
             if let Err(reply) = check_version(*v) {
                 return Some(reply);
             }
+            // The adapter decides: its patterns feed the engine, and — for a
+            // harness whose strategy is `pin` — Arreo picks the session id
+            // here and hands it to the harness at spawn, so the session is
+            // named from the first byte rather than read back out of output.
+            let adapter = arreo_core::state::AdapterRegistry::builtin()
+                .for_program(program)
+                .clone();
+            let (session, args_owned) = match adapter.resume.as_ref() {
+                Some(resume) if resume.kind() == arreo_core::state::ResumeKind::Pin => {
+                    let id = arreo_core::state::new_session_id();
+                    let argv = resume
+                        .resume_args(args, Some(&id))
+                        .expect("a pin strategy always builds argv for an id");
+                    (Some(id), argv)
+                }
+                _ => (None, args.clone()),
+            };
             // Fork off the async worker (chaos-found, T-0009).
             let program = program.clone();
-            let args_owned = args.clone();
             let (cols, rows) = (*cols, *rows);
             let spawned = tokio::task::spawn_blocking(move || {
                 let args_ref: Vec<&str> = args_owned.iter().map(String::as_str).collect();
@@ -2118,7 +2262,13 @@ async fn dispatch(message: &Message, registry: &Registry, db: &std::path::Path) 
             }
             registry.insert(
                 id.clone(),
-                Arc::new(PaneEntry::new_with_guard(pane, guard, *kill_on_breach)),
+                Arc::new(PaneEntry::with_adapter(
+                    pane,
+                    guard,
+                    *kill_on_breach,
+                    adapter,
+                    session,
+                )),
             );
             Some(Message::Ok { v: VERSION })
         }
@@ -2390,8 +2540,25 @@ async fn dispatch(message: &Message, registry: &Registry, db: &std::path::Path) 
                     message: format!("pane {new_id:?} already exists"),
                 });
             }
+            // A split is a NEW pane, so a harness whose strategy is `pin` gets
+            // a NEW session: the split re-pins against the same argv the source
+            // carried (`resume_args` replaces the id in place), because two
+            // panes writing one harness session is one session corrupted, not
+            // one session shared.
             let program = spec.program.clone();
-            let args_owned = spec.args.clone();
+            let adapter = arreo_core::state::AdapterRegistry::builtin()
+                .for_program(&program)
+                .clone();
+            let (session, args_owned) = match adapter.resume.as_ref() {
+                Some(resume) if resume.kind() == arreo_core::state::ResumeKind::Pin => {
+                    let id = arreo_core::state::new_session_id();
+                    let argv = resume
+                        .resume_args(&spec.args, Some(&id))
+                        .expect("a pin strategy always builds argv for an id");
+                    (Some(id), argv)
+                }
+                _ => (None, spec.args.clone()),
+            };
             let (cols, rows) = (*cols, *rows);
             let spawned = tokio::task::spawn_blocking(move || {
                 let args_ref: Vec<&str> = args_owned.iter().map(String::as_str).collect();
@@ -2400,10 +2567,16 @@ async fn dispatch(message: &Message, registry: &Registry, db: &std::path::Path) 
             .await;
             match spawned {
                 Ok(Ok(pane)) => {
-                    registry
-                        .write()
-                        .await
-                        .insert(new_id.clone(), Arc::new(PaneEntry::new(Arc::new(pane))));
+                    registry.write().await.insert(
+                        new_id.clone(),
+                        Arc::new(PaneEntry::with_adapter(
+                            Arc::new(pane),
+                            None,
+                            false,
+                            adapter,
+                            session,
+                        )),
+                    );
                     Some(Message::Ok { v: VERSION })
                 }
                 Ok(Err(e)) => Some(Message::Error {
@@ -3300,8 +3473,9 @@ mod alert_tests {
     use super::*;
 
     fn pane_entry() -> Arc<PaneEntry> {
-        let pane = Pane::spawn("/bin/sh", &["-c", "sleep 30"], 80, 24).expect("spawn");
-        Arc::new(PaneEntry::new(Arc::new(pane)))
+        let pane = Arc::new(Pane::spawn("/bin/sh", &["-c", "sleep 30"], 80, 24).expect("spawn"));
+        let adapter = PaneEntry::adapter_for(&pane.spawn_spec().program);
+        Arc::new(PaneEntry::with_adapter(pane, None, false, adapter, None))
     }
 
     fn temp_db() -> PathBuf {
@@ -3445,6 +3619,40 @@ mod session_registry_tests {
             sessions.counts().is_empty(),
             "1000 rounds left entries behind: {:?}",
             sessions.counts()
+        );
+    }
+
+    /// T-0072 safety: a spawn's audit row carries the *program*, never the
+    /// argv. Since a `pin` harness is spawned with `--session-id <id>`, an
+    /// audit row that recorded the argv would put a harness session id in the
+    /// audit table — a row that outlives the session and is read by people who
+    /// never asked about it. The rule is pinned here because the temptation
+    /// (log the full command line) is real and the change would be invisible.
+    #[test]
+    fn a_spawn_audit_row_never_carries_the_argv() {
+        let message = Message::Spawn {
+            v: VERSION,
+            id: "p1".to_string(),
+            program: "pi".to_string(),
+            args: vec![
+                "--mode".to_string(),
+                "json".to_string(),
+                "--session-id".to_string(),
+                "01a099cd-2d35-74c4-90c6-d0e3b10011b5".to_string(),
+            ],
+            cols: 80,
+            rows: 24,
+            memory_max: None,
+            pids_max: None,
+            kill_on_breach: false,
+        };
+        let row = audited(&message).expect("a spawn is audited");
+        assert_eq!(row.action, arreo_core::store::actions::SPAWN);
+        assert_eq!(row.prompt, "pi", "the program, not the command line");
+        assert!(
+            !row.prompt.contains("01a099cd"),
+            "no session id may reach an audit row: {:?}",
+            row.prompt
         );
     }
 

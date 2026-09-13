@@ -23,6 +23,17 @@ blocked_after_ms = 2500
 bell_means_attention = true
 done_on_exit = true
 
+# T-0072 harness-aware resume, part 1: opencode generates its own session ids
+# and its interactive TUI prints none (1.18.30, probed live), so the strategy
+# is continuation — `--continue` resumes the last session for this directory
+# without an id. When a pane happens to print one (the `--format json` event
+# stream carries `"sessionID":"ses_..."`), the engine captures it and the
+# record resumes with the exact `--session <id>` instead. `[resume]` itself is
+# at the END of this file: a TOML table header captures every key after it,
+# and the pattern arrays below are top-level.
+harness = "opencode"
+programs = ["opencode"]
+
 question_patterns = [
   "\\[y/n\\]",
   "\\(y/n\\)",
@@ -51,3 +62,14 @@ error_patterns = [
   "auto-rejecting",
   "\"status\":\"error\"",
 ]
+
+# T-0072 harness-aware resume, part 2: how the session is resumed. `continue`
+# means the harness picks (opencode has no way to be told an id at spawn), so
+# the pane resumes by continuation by default and by exact id when the record
+# captured one. The pattern watches the `--format json` event stream, the only
+# surface opencode prints `ses_…` on (1.18.30).
+[resume]
+kind = "continue"
+argv = ["--continue"]
+exact_argv = ["--session", "{session}"]
+session_pattern = '"sessionID":"(ses_[A-Za-z0-9]+)"'

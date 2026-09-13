@@ -1,0 +1,16 @@
+[PASS] persistence: 10 panes live with markers
+[PASS] persistence: layout restored (10/10 panes)
+[PASS] persistence: scrollback byte-equal (10/10 markers)
+[info] persistence/live: scratch at /home/dev/dev/Arreo/target/test-scratch/persistence-live-2967911 (isolated HOME/XDG_DATA_HOME)
+[PASS] persistence/live: three panes live (pi pinned, opencode, plain)
+[info] pi record: harness=Some("pi") session=8fe45016-2c6b-4b6e-a7f6-aad58ea64405
+[PASS] persistence/live: pi pane recorded harness=pi + a pinned session id
+[PASS] persistence/live: opencode pane recorded harness=opencode + the id captured from its JSON events
+[PASS] persistence/live: pi session file exists with the pre-crash turn (/home/dev/dev/Arreo/target/test-scratch/persistence-live-2967911/pi-sessions/2026-09-13T10-47-59-186Z_8fe45016-2c6b-4b6e-a7f6-aad58ea64405.jsonl)
+[info] persistence/live: pre-crash session mentions: pi=2 oc=2
+[info] persistence/live: pre-crash pane pids: [2968630]
+[info] persistence/live: daemon SIGKILLed at 1789296530063
+[PASS] persistence/live: layout restored (pi, opencode and the plain pane are back)
+[PASS] persistence/live: pi's resumed child ran and printed 8fe45016-2c6b-4b6e-a7f6-aad58ea64405 beyond what the replayed history already had
+[SKIP] persistence/live: opencode did not continue ses_f659dcc59ffe3q6zujqUqFoMRA after the restart (its own store shows a fresh                  session; restore built the exact `--session` argv, the harness refused it — see                  .loop/evidence/T-0072). Mentions of the captured id stayed at 2.
+persistence: 9 passed, 0 failed

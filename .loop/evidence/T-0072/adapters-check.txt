@@ -1,0 +1,4 @@
+[PASS] pi/pi-working.pty: flow Working, end Idle
+[PASS] pi/pi-idle.pty: flow Working, end Idle
+[PASS] pi/pi-stress.pty: flow Working, end Question
+adapters: 15 passed, 0 failed

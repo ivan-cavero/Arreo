@@ -1,0 +1,7 @@
+arreo-server: device authority ready (root 4c298e684a0d9930…, 0 device(s))
+arreo-server: serving on /home/dev/dev/Arreo/target/test-scratch/persistence-live-2844708/daemon.sock
+arreo-server: device authority ready (root 4c298e684a0d9930…, 0 device(s))
+arreo-server: serving on /home/dev/dev/Arreo/target/test-scratch/persistence-live-2844708/daemon.sock
+daemon: restored 3 pane(s) from /home/dev/dev/Arreo/target/test-scratch/persistence-live-2844708/daemon.sock.db
+arreo-server: SIGTERM received, draining...
+arreo-server: drained 3 pane(s), exiting cleanly (children keep running; restart restores from /home/dev/dev/Arreo/target/test-scratch/persistence-live-2844708/daemon.sock.db)
