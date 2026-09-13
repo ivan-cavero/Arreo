@@ -1,13 +1,39 @@
 ## State snapshot          ← REWRITTEN (not appended) at every checkpoint
-Task: T-0074 (TUI manages the fleet) in flight on worker `TuiManages`; T-0037 (the channel
-half — criteria re-written this turn) in flight on worker `ChannelFetch`.
-Where you are: T-0078 done + pushed (`c024ea2`, ledger `31a26df`) — the p1 queue is clear.
-652 workspace tests / 0 failed / 64 targets; clippy clean on both toolchains; fmt clean;
-13 slices green; bench 6/6; vet 337, deny 4/4, audit 0, check-targets PASS/SKIP.
-Next step: integrate the two workers (own the `xtask/src/main.rs` registration line for
-T-0037 — ChannelFetch was told not to touch it), then run the battery, commit, push.
-Open workers: TuiManages (T-0074) · ChannelFetch (T-0037)
+Task: **T-0037 and T-0074 DONE** (`7f1dde3`, `792fa0c`) — the release channel and the
+TUI-manages-the-fleet both landed and pushed. The p2 queue is now: T-0072
+(harness-session-resume, schema migration + adapter resume strategies, live pi/opencode),
+T-0075 (harness survey — pure docs), and the release slice T-0042 (its sign/verify/refuse
+half is startable; its --chain half needs the T-0037 index on the GitHub channel, which the
+release job does not publish yet — the gap is written in docs/release.md).
+Where you are: **711 tests / 0 failed across 66 targets**; clippy clean on both toolchains;
+fmt clean; **13 slices green** (tui 59, mesh 21+1skip, update 27 incl. the new channel
+checks); bench 6/6; vet 337, deny 4/4, audit 0, check-targets PASS/SKIP.
+Next step: T-0072 (harness-session-resume) — delegate with the fence in its file; it needs
+xtask/src/main.rs (free now), live pi/opencode CLIs for its proof.
+Open workers: (none)
 Known broken: T-0063 (CI never-green — the user is working it) · Parked: T-0048 needs-human
+**T-0037 done — the release channel.** Re-scoped this turn (its criteria were re-written:
+six, startable, since the verifier T-0036 and the swap T-0070 already existed — the only new
+code was the fetch). `channel::check` / `channel::fetch` over a `Fetcher` trait: file:// and
+https:// share every line except the fetcher (proven by a test serving one channel's bytes
+under both). Index is a signed JSON with version + artifact names and NO digests (SHA256SUMS
+stays the only digest source). Fail-closed: an absent index is the only "no releases yet";
+a missing/foreign/bad signature is the verifier's own refusal, never "empty". Anonymous
+update fetches to <state>/channel/, verifies, and hands the verified artifact to the SAME
+--from install path. rustls-native-certs added as a direct optional dep — already in the
+lockfile transitively (quinn) and already vetted; documented in Cargo.toml. The security
+review's one finding (--check didn't take the update lock) fixed and mutation-tested
+(removing the lock turns the new test red, exit 0 vs 3).
+**T-0074 done — the TUI manages the fleet.** s/i/x spawn/send/kill on the held connection
+(audited as the device), m/g machines/trust with the CLI's exact sentences and exit codes,
+pairing add flow, force key for online remove, fingerprint-confirmed grant, viewer-colored
+disabled controls with the daemon's own VerbDenial sentence BEFORE the keypress. One real
+divergence fixed: the CLI's remove-online sentence had a literal 14-space run; now one
+space, so the sentences are byte-identical. Evidence is interactive: tui slice 59 checks
+(spawn→dup-refusal→send→kill→dead-pane, frames), mesh 21 (machines-by-name over a real
+relay, trust-remote parity word-for-word vs the live CLI). Review: security-reviewer
+verified all claims; mutation-tested the two load-bearing gates (viewer denial, kill
+confirm) — both red when the gate is removed.
 ## Event log               ← append-only; newest last; never rewrite
 - 2026-09-10 [turn 1] ledger created; repo at e489fac (docs only); T-0001 + T-0022 (AGENTS.md gardened) done
 - 2026-09-10 [turn 2] T-0002 PTY manager done+pushed (342606c; 9 tests); PROMPT.md v2 synced + ADR 0001 (ef6c595)
@@ -157,3 +183,5 @@ Known broken: T-0063 (CI never-green — the user is working it) · Parked: T-00
 - 2026-09-13 [turn 71] T-0078 done + pushed (`c024ea2`): the daemon's files are owner-only, at creation. Policy stated in SECURITY.md (0600/0700, nothing group-reachable by default; /tmp note; upgrade path; the store-vs-socket chmod asymmetry documented); applied at creation — socket in serve_on (fresh bind and inherited/handoff path, fail-closed), store db/wal/shm in open_once after migrate (window proven empty of sensitive content by the review: only meta(schema_version) pre-chmod), lock via options.mode(0o600) + existing-file re-chmod, handoff already 0600 now covered by a test. The security review verified all six claims sound on every path; its findings addressed (two stale handoff.rs comments describing the main socket as never-chmod'd, corrected; the missing .handoff mode test, added with a deterministic window). One residual risk recorded honestly: the fresh bind's create→chmod is two syscalls with no await, a sub-microsecond same-group race at boot, not reproduced, no compensating check on the client path. The mode test drives the daemon under umask 0002 via a shell wrapper — the failing-first property must not depend on the runner's ambient umask (077 here would mask the pre-fix modes). Mutation-checked: removing the socket chmod turns it red reading the pane's token out of the file. 652 tests / 64 targets, 13 slices, bench 6/6, vet 337, deny 4/4, audit 0, check-targets PASS/SKIP.
 
 - 2026-09-13 [turn 72] T-0074 delegated to `TuiManages` (the user's p2: the TUI manages the fleet — agents from the sidebar, machines/trust verbs with the CLI's refusals, confirmations, key docs, interactive evidence). T-0037's channel criteria re-written (it had zero open after the T-0070 split; the fetch half is now startable: a URL + the T-0036 verifier, transport-agnostic, file:// tests, empty channel honest) and delegated to `ChannelFetch`. Both workers told: `xtask/src/main.rs` is mine for T-0037's registration (TuiManages owns it) — no collision.
+
+- 2026-09-13 [turn 73] T-0037 + T-0074 done and pushed. T-0037 (`7f1dde3`): the release channel — --check and the anonymous update; criteria re-written first (the task had zero open ones; the re-write is in the task file), then two workers (TuiManages for T-0074, ChannelFetch for T-0037) built the code; the security review (an independent security-reviewer) verified 13 channel invariants + all TUI invariants, one Low finding (--check bypassed the update lock) fixed by the planner and mutation-tested (red when the lock is removed: exit 0 vs 3). T-0074 (`792fa0c`): TUI spawn/send/kill + machines/trust panels with CLI-exact sentences; the evidence worker extended the slices (tui 59, mesh 21) with interactive frames under .loop/evidence/T-0074/; the worker's evidence run exposed a real bug (one-shot verb results clobbered by the pane poll; sidebar click mapping under a question line) — fixed in the same commit with regression tests; the CLI's 14-space sentence artifact fixed so both sides are byte-identical. Planner held the xtask/src/main.rs registration line (nothing needed registering — the slice ids already existed), wrote the missing docs (tour key table + machines TUI section), and closed the loop with full battery: 711 tests / 66 targets, 13 slices, bench 6/6, gates all green. Evidence commits: `bfb4d01` (T-0015/38/76/79 refreshes), `bf6d572` (fmt reflow).

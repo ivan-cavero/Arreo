@@ -3,7 +3,7 @@ id: T-0074
 title: TUI manages everything — agents and servers without leaving the wall
 phase: 2
 priority: 2
-status: proposed
+status: done
 depends_on: [T-0015, T-0044, T-0045, T-0059]
 scope:
   - crates/arreo-tui/src/**
@@ -30,18 +30,18 @@ has them (T-0014); this is client wiring + keys + confirmations.
 
 ## Acceptance criteria
 
-- [ ] Agents from the sidebar: spawn (program+args prompt), kill (confirm naming the
+- [x] Agents from the sidebar: spawn (program+args prompt), kill (confirm naming the
       pane), send-to-pane (prompt, audited as the device), working locally and against
       `--machine <name>` with the CLI's exit-code honesty mapped to one-line messages.
-- [ ] Servers from the TUI: machines list with presence, add (invite code flow, T-0058),
+- [x] Servers from the TUI: machines list with presence, add (invite code flow, T-0058),
       rename/remove (T-0057 semantics incl. `--force` for online), trust grant/revoke
       (T-0059 semantics incl. fingerprint confirm) — same refusals the CLI prints,
       no silent divergences.
-- [ ] Safety: destructive keys confirm (`kill`, `remove`, `revoke`); viewer role renders
+- [x] Safety: destructive keys confirm (`kill`, `remove`, `revoke`); viewer role renders
       actions disabled with the reason instead of failing after the keypress.
-- [ ] Keys documented in `--help`/tour; every key has a keyboard equivalent (mouse-first
+- [x] Keys documented in `--help`/tour; every key has a keyboard equivalent (mouse-first
       stays, keyboard-complete per T-0015).
-- [ ] Interactive evidence: scripted pty drives the real `arreo-tui` binary — spawn →
+- [x] Interactive evidence: scripted pty drives the real `arreo-tui` binary — spawn →
       list → send → kill locally plus machines list by name — with frame captures;
       unit tests alone do not close this task.
 

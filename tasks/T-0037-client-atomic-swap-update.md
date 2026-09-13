@@ -3,7 +3,7 @@ id: T-0037
 title: Client atomic swap — update in place, restart, reattach by resume token
 phase: 2
 priority: 2
-status: proposed
+status: done
 depends_on: [T-0012, T-0013, T-0036]
 scope:
   - crates/arreo-core/src/update/**
@@ -50,26 +50,26 @@ GitHub Releases: `https://github.com/<owner>/<repo>/releases/latest/download/` �
 artifacts the T-0036 release job publishes, so `--check` fetches what a real release would
 produce, and an empty channel is reported honestly rather than as an error.
 
-- [ ] **A channel URL is a configuration value**, not a constant in code: read from
+- [x] **A channel URL is a configuration value**, not a constant in code: read from
       `ARREO_CHANNEL_URL` (or a `--channel` flag), defaulting to the repo's GitHub Releases
       `latest` URL. The fetch is transport-agnostic by construction — a URL is a URL, so
       `file://` and `https://` share every line of code except the fetcher; prove it by
       running `--check` against both.
-- [ ] **`arreo update --check`** fetches the channel index, **verifies its signature against
+- [x] **`arreo update --check`** fetches the channel index, **verifies its signature against
       the pinned key (T-0036, fail closed — an unverifiable index is a refusal, never a
       warning)**, and reports the newest version + the artifact name. An **empty** channel is
       reported as "no releases yet" with exit 0 — the honest answer, not an error.
-- [ ] **`arreo update` (anonymous, no `--from`)** fetches the newest artifact, verifies it,
+- [x] **`arreo update` (anonymous, no `--from`)** fetches the newest artifact, verifies it,
       stages it, and **stops before the swap** — the swap is T-0070's `--from` machinery, and
       this task wires the fetch into it, so a verified artifact becomes a `--from`-equivalent
       without duplicating the install logic. A signature failure at any point refuses with the
       typed error naming the file.
-- [ ] **The refusal is the same sentence the verifier uses** — `BadSignature`, `UnknownKeyId`,
+- [x] **The refusal is the same sentence the verifier uses** — `BadSignature`, `UnknownKeyId`,
       `DigestMismatch` — so an operator who sees a refusal can act on it without translating.
-- [ ] **No network in tests**: the slice and tests use `file://` channels in a temp dir (the
+- [x] **No network in tests**: the slice and tests use `file://` channels in a temp dir (the
       transport-agnostic proof is the point; a test that dials the real internet is a test that
       fails on a plane).
-- [ ] `--check` and the anonymous update are exercised end to end in `xtask/src/update_slice.rs`
+- [x] `--check` and the anonymous update are exercised end to end in `xtask/src/update_slice.rs`
       (extend it — a second slice for one story is a defect), with frames/transcripts under
       `.loop/evidence/T-0037/`.
 
