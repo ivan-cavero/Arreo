@@ -390,11 +390,18 @@ fn two_daemons_exchange_a_message_through_the_relay() {
     write_config(&a_config, relay.addr, account, Some(&b_id));
     write_config(&b_config, relay.addr, account, None);
 
-    let mut machine_a = spawn_machine("a", a_dir.clone(), base.join("a.sock"), Some(&a_config));
+    // B boots FIRST and gets its pane before A exists. That order is the
+    // determinism contract of the assertions below: A's probe of B runs when
+    // A's relay session comes up, and the probe answers with B's *current*
+    // pane count — a legitimate one-shot boot probe, not a monitor. If B were
+    // still empty when A's probe fired, A would log "reports 0 pane(s)" and
+    // the same exchange would have happened; asserting "1 pane" on that line
+    // then fails on timing, not on behaviour (measured: intermittent 2/6 solo,
+    // and the whole file failing 3/6 in the suite, including at the commit
+    // before this code was touched). With the marker spawned and acked before
+    // A boots, the count A reports can only be 1.
     let mut machine_b = spawn_machine("b", b_dir.clone(), base.join("b.sock"), Some(&b_config));
-    machine_a.device_id = a_id.clone();
     machine_b.device_id = b_id.clone();
-    machine_a.await_socket();
     machine_b.await_socket();
 
     // B has a pane whose id is the marker: it is what the probe's answer will
@@ -428,9 +435,14 @@ fn two_daemons_exchange_a_message_through_the_relay() {
         );
     }
 
+    let mut machine_a = spawn_machine("a", a_dir.clone(), base.join("a.sock"), Some(&a_config));
+    machine_a.device_id = a_id.clone();
+    machine_a.await_socket();
+
     // Wait for A's probe to report B's panes. That report *is* the message
     // exchange: A opened an encrypted session to B through the relay and asked
-    // it a question.
+    // it a question. Because the marker pre-existed A's boot, the count B
+    // answered is deterministically 1 — see the ordering note above.
     let deadline = Instant::now() + Duration::from_secs(40);
     let mut answer = None;
     while Instant::now() < deadline {
