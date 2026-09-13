@@ -1,0 +1,23 @@
+release: `cargo build --release -p arreo-server` ok in 0.3 s
+release/chain: scratch at /home/dev/dev/Arreo/target/test-scratch/T-0042-chain-3383153 (under the build tree; removed on exit)
+[PASS] release/chain: the channel index is written and signed (no digests — SHA256SUMS is the digest source)
+[PASS] release/chain: `update --check` refuses the foreign-signed index by key id, naming the channel
+release/chain: verify — the index was parsed and verified through channel::check (T-0037) over file://; an https:// channel runs the SAME function — Network::get is the only divergence, proven unit-side by channel.rs's file_and_https_channels_differ_only_in_their_fetcher. The slice drove the shared path, not a lookalike.
+[PASS] release/chain: the shared channel code accepts the same bytes with the fixture's trust set
+[PASS] release/chain: the verified artifact is swapped in byte-identically (installed == verified; .prev == replaced)
+release/chain: first daemon is pid 3383675 on /home/dev/dev/Arreo/target/test-scratch/T-0042-chain-3383153/arreo.sock (spawned by this slice, so its liveness is observable)
+[PASS] release/chain: server handoff, 0 panes: `update --server` cuts to a new pid and nothing is left behind
+release/chain: handoff (0 panes) -> {"changed":true,"handoff":{"daemon":{"from_pid":3383675,"to_pid":3383697}},"installed":"/home/dev/dev/Arreo/target/test-scratch/T-0042-chain-3383153/bin/arreo-server","previous":"/home/dev/dev/Arreo/target/test-scratch/T-0042-chain-3383153/bin/arreo-server.prev","version":"arreo-server 0.1.0"}
+[PASS] release/chain: eight panes are spawned on the serving daemon
+[PASS] release/chain: eight panes are running their counters before the cut
+[PASS] release/chain: the 8-pane cut reports a new daemon pid
+release/chain: handoff (8 panes in flight) -> {"changed":true,"handoff":{"daemon":{"from_pid":3383697,"to_pid":3383919}},"installed":"/home/dev/dev/Arreo/target/test-scratch/T-0042-chain-3383153/bin/arreo-server","previous":"/home/dev/dev/Arreo/target/test-scratch/T-0042-chain-3383153/bin/arreo-server.prev","version":"arreo-server 0.1.0"}
+[PASS] release/chain: no pane was restarted by the cut: every counter continued instead of resetting
+[PASS] release/chain: T-0039's deferred rule on Unix (forced by flag): loud outcome, swap at the path, running agents untouched
+release/chain: the Windows `Handoff::Deferred` branch is cfg(not(unix)) (T-0039) — compiled out on this platform; its real run belongs to the Windows leg of the workflow half (deferred with T-0063). What IS exercised here is the rule: never a silent fallback — the no-daemon swap says "it will run the new binary when it next starts" and touches not one running agent.
+[PASS] release/chain: metrics history returns the recorded series for a live pane
+release/chain: metrics history — the 10 s writer sampled the pane through the cuts; the query renders the CSV the CLI owns (T-0040).
+[SKIP] release/chain: alert ordering: a budgeted pane sorts ahead with its level: no cgroup v2 delegation on this box — the daemon answered "Error { v: 0, message: \"enforce failed: cgroup unavailable: /sys/fs/cgroup/user.slice/user-1001.slice/user@1001.service/app.slice/app-orca-1341966.scope/arreo-alerty-3383919/memory.max: Permission denied (os error 13)\" }" LOUDLY rather than silently running unbudgeted (T-0019; the enforcement slice's own environment-aware precedent). The ordering rule is proven on the emit path by T-0041's daemon.rs unit tests (emit_alert_writes_all_three_doors, critical-precedes-kill) and is exercised live by this same stage on a delegated runner (the workflow half records that leg).
+[PASS] release/chain: the daemon stops cleanly through its own verb
+[PASS] release/chain: the slice's scratch (keypair, channel, binary copies) was removed
+release/chain: 13 passed, 1 skipped, 0 failed

@@ -26,6 +26,7 @@ mod persistence_slice;
 mod reattach_slice;
 mod relay_slice;
 mod release_check;
+mod release_slice;
 mod theme_slice;
 mod tui_slice;
 mod update_slice;
@@ -76,8 +77,9 @@ fn e2e(rest: &[String]) -> ExitCode {
         Some("reattach") => reattach_slice::run(rest),
         Some("handoff-abort") => handoff_abort_slice::run(rest),
         Some("update") => update_slice::run(rest),
+        Some("release") => release_slice::run(rest),
         Some(other) => {
-            eprintln!("xtask e2e: unknown slice {other:?} (have: chaos, api, compat, lifecycle, persistence, state, enforcement, tui, theme, relay, reattach, handoff-abort, mesh, update)");
+            eprintln!("xtask e2e: unknown slice {other:?} (have: chaos, api, compat, lifecycle, persistence, state, enforcement, tui, theme, relay, reattach, handoff-abort, mesh, update, release)");
             ExitCode::from(2)
         }
         None => stub("e2e", rest),

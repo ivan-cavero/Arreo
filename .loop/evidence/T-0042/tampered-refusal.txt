@@ -1,0 +1,7 @@
+verify_with (the shared door, trust set = the throwaway key):
+/home/dev/dev/Arreo/target/test-scratch/T-0042-release-3381514/tampered.bin: signature does not authenticate this file (The signature verification failed)
+the product binary (`arreo update verify <tampered>`) exited Some(1):
+update: /home/dev/dev/Arreo/target/test-scratch/T-0042-release-3381514/tampered.bin: signed by key 5B9595688D80ABE8, this build trusts 076F2F7CEBE0AF51
+
+the digest door, tampered manifest:
+/home/dev/dev/Arreo/target/test-scratch/T-0042-release-3381514/release-server.bin: sha256 is 2b722d794de857ce6f0e9dba4aac5b3add86e8d924ad628abe2b675a1d00cbe8, the trusted manifest says 0000000000000000000000000000000000000000000000000000000000000000

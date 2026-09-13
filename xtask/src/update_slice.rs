@@ -77,7 +77,7 @@ use std::time::{Duration, Instant};
 /// invocation here finishes in well under a second (the reattach budget under test
 /// is 2 s), so this bounds a stall far above any real latency and turns it into a
 /// named FAIL carrying whatever the command had printed.
-const CLI_DEADLINE: Duration = Duration::from_secs(15);
+pub(crate) const CLI_DEADLINE: Duration = Duration::from_secs(15);
 
 /// The panes whose counters carry the invariant. Eight, because the claim is about
 /// *every* PTY-bearing process and one pane would be a sample of one.
@@ -91,11 +91,11 @@ const REATTACH_BUDGET: Duration = Duration::from_secs(2);
 ///
 /// The marker is printed once, at start, and is what makes a restart visible: a
 /// process that was restarted prints it again.
-fn tick_script(n: usize) -> String {
+pub(crate) fn tick_script(n: usize) -> String {
     format!("echo PANE-{n}-MARKER; i=0; while :; do i=$((i+1)); echo tick-$i; sleep 1; done")
 }
 
-fn pane_id(n: usize) -> String {
+pub(crate) fn pane_id(n: usize) -> String {
     format!("pane-{n}")
 }
 
@@ -913,8 +913,13 @@ fn slice(report: &mut Report) {
 ///
 /// The transcript is a side effect of `say`/`check` rather than a second pass, so
 /// the evidence file and the terminal cannot drift apart.
-#[derive(Default)]
-struct Report {
+///
+/// `label` names the slice in every emitted line; the update slice's own label
+/// is `"update: "`, and siblings that share this struct (the T-0042 release
+/// slice) construct their own via [`Report::new`], whose output stays consistent
+/// with the summary line in `finish`/`transcript`.
+pub(crate) struct Report {
+    label: String,
     passes: usize,
     skipped: usize,
     failures: usize,
@@ -923,34 +928,54 @@ struct Report {
     panes_after: String,
 }
 
+impl Default for Report {
+    fn default() -> Self {
+        Self::new("update: ")
+    }
+}
+
 impl Report {
-    fn say(&mut self, line: String) {
+    /// The label every emitted line carries; see the struct docs.
+    pub(crate) fn new(label: &str) -> Self {
+        Self {
+            label: label.to_string(),
+            passes: 0,
+            skipped: 0,
+            failures: 0,
+            lines: Vec::new(),
+            panes_before: String::new(),
+            panes_after: String::new(),
+        }
+    }
+
+    pub(crate) fn say(&mut self, line: impl Into<String>) {
+        let line = line.into();
         println!("{line}");
         self.lines.push(line);
     }
 
-    fn check(&mut self, name: &str, ok: bool, detail: &str) {
+    pub(crate) fn check(&mut self, name: &str, ok: bool, detail: &str) {
         let line = if ok {
             self.passes += 1;
-            format!("[PASS] update: {name}")
+            format!("[PASS] {}{name}", self.label)
         } else {
             self.failures += 1;
-            format!("[FAIL] update: {name}: {detail}")
+            format!("[FAIL] {}{name}: {detail}", self.label)
         };
         self.say(line);
     }
 
-    fn skip(&mut self, name: &str, reason: &str) {
+    pub(crate) fn skip(&mut self, name: &str, reason: &str) {
         self.skipped += 1;
-        self.say(format!("[SKIP] update: {name}: {reason}"));
+        self.say(format!("[SKIP] {}{name}: {reason}", self.label));
     }
 
     /// The summary line, in the format the other slices use, and the exit status
     /// that goes with it: any failure at all is non-zero.
-    fn finish(&self) -> ExitCode {
+    pub(crate) fn finish(&self) -> ExitCode {
         let summary = format!(
-            "update: {} passed, {} skipped, {} failed",
-            self.passes, self.skipped, self.failures
+            "{}{} passed, {} skipped, {} failed",
+            self.label, self.passes, self.skipped, self.failures
         );
         println!("{summary}");
         if self.failures > 0 {
@@ -960,12 +985,12 @@ impl Report {
         }
     }
 
-    fn transcript(&self) -> String {
+    pub(crate) fn transcript(&self) -> String {
         let mut out = self.lines.join("\n");
         out.push('\n');
         out.push_str(&format!(
-            "update: {} passed, {} skipped, {} failed\n",
-            self.passes, self.skipped, self.failures
+            "{}{} passed, {} skipped, {} failed\n",
+            self.label, self.passes, self.skipped, self.failures
         ));
         out
     }
@@ -976,7 +1001,7 @@ impl Report {
 /// Its four binary copies are ~128 MB each, so a failed run must not leave half a
 /// gigabyte in the temporary directory for the next one to trip over; the evidence
 /// that matters is in the transcript.
-struct Scratch(PathBuf);
+pub(crate) struct Scratch(pub(crate) PathBuf);
 
 impl Drop for Scratch {
     fn drop(&mut self) {
@@ -991,12 +1016,12 @@ impl Drop for Scratch {
 /// own `~/.local/state`, and the slice must not depend on — or disturb — whatever
 /// configuration happens to exist on the machine.
 #[derive(Clone)]
-struct Sandbox {
+pub(crate) struct Sandbox {
     root: PathBuf,
 }
 
 impl Sandbox {
-    fn new(root: PathBuf) -> Result<Self, String> {
+    pub(crate) fn new(root: PathBuf) -> Result<Self, String> {
         for dir in [
             "home",
             "state",
@@ -1012,7 +1037,7 @@ impl Sandbox {
         Ok(Self { root })
     }
 
-    fn command(&self, program: &Path) -> Command {
+    pub(crate) fn command(&self, program: &Path) -> Command {
         let mut command = Command::new(program);
         command
             .current_dir(&self.root)
@@ -1054,9 +1079,9 @@ fn scratch_root() -> Result<PathBuf, String> {
 /// This is the half of the invariant that *is* checkable against a pid: the slice
 /// spawned the daemon, so it can ask whether it ever exited, and whether the pid it
 /// handed out is still the pid of the process it started.
-struct Daemon {
+pub(crate) struct Daemon {
     child: Child,
-    id: u32,
+    pub(crate) id: u32,
     cli: PathBuf,
     sandbox: Sandbox,
     socket: PathBuf,
@@ -1065,7 +1090,7 @@ struct Daemon {
 }
 
 impl Daemon {
-    fn spawn(
+    pub(crate) fn spawn(
         sandbox: &Sandbox,
         server_bin: &Path,
         cli_bin: &Path,
@@ -1127,7 +1152,7 @@ impl Daemon {
     /// `try_wait() == None` is the whole of the daemon half of the invariant: it
     /// means the process this slice started has not exited, so nothing signalled it
     /// to death and nothing reaped it out from under the slice.
-    fn still_running(&mut self) -> Result<(), String> {
+    pub(crate) fn still_running(&mut self) -> Result<(), String> {
         match self.child.try_wait() {
             Ok(None) => Ok(()),
             Ok(Some(status)) => Err(format!("the daemon exited with {status}")),
@@ -1141,7 +1166,7 @@ impl Daemon {
     /// leaves every pane's process orphaned and still running, and this counter
     /// script never exits on its own. `arreo server stop` is SIGTERM, the drain
     /// path that stops the panes too.
-    fn stop(&mut self) {
+    pub(crate) fn stop(&mut self) {
         if self.still_running().is_err() {
             return;
         }
@@ -1181,16 +1206,16 @@ impl Drop for Daemon {
 }
 
 /// What one `arreo` invocation did, bounded by a deadline.
-struct Run {
+pub(crate) struct Run {
     /// The exit code, or `None` when the command was killed for running past its
     /// deadline or died on a signal.
-    code: Option<i32>,
-    output: String,
-    elapsed: Duration,
+    pub(crate) code: Option<i32>,
+    pub(crate) output: String,
+    pub(crate) elapsed: Duration,
 }
 
 impl Run {
-    fn ok(&self) -> bool {
+    pub(crate) fn ok(&self) -> bool {
         self.code == Some(0)
     }
 }
@@ -1203,12 +1228,12 @@ impl std::fmt::Display for Run {
 
 /// Run a binary, bounded: a command that runs past `deadline` is killed and
 /// reported as a failure that carries what it had printed.
-fn run_cli(sandbox: &Sandbox, bin: &Path, args: &[&str], deadline: Duration) -> Run {
+pub(crate) fn run_cli(sandbox: &Sandbox, bin: &Path, args: &[&str], deadline: Duration) -> Run {
     run_cli_env(sandbox, bin, &[], args, deadline)
 }
 
 /// The same, with extra environment: how the channel precedence is tested.
-fn run_cli_env(
+pub(crate) fn run_cli_env(
     sandbox: &Sandbox,
     bin: &Path,
     env: &[(&str, &str)],
@@ -1285,7 +1310,7 @@ fn drain<R: Read + Send + 'static>(mut stream: R) -> std::thread::JoinHandle<Str
 }
 
 /// One `arreo read` against the daemon, bounded like every other invocation.
-fn read_pane(sandbox: &Sandbox, bin: &Path, id: &str, socket: &str) -> Run {
+pub(crate) fn read_pane(sandbox: &Sandbox, bin: &Path, id: &str, socket: &str) -> Run {
     run_cli(
         sandbox,
         bin,
@@ -1296,17 +1321,17 @@ fn read_pane(sandbox: &Sandbox, bin: &Path, id: &str, socket: &str) -> Run {
 
 /// What one pane's read says about its counter.
 #[derive(Default, Clone)]
-struct PaneRead {
+pub(crate) struct PaneRead {
     /// Every `tick-N` line, in order.
-    ticks: Vec<u64>,
+    pub(crate) ticks: Vec<u64>,
     /// How many times the pane printed its start marker.
-    markers: usize,
+    pub(crate) markers: usize,
     /// How many times it printed `tick-1`.
-    first_ticks: usize,
+    pub(crate) first_ticks: usize,
 }
 
 impl PaneRead {
-    fn highest(&self) -> u64 {
+    pub(crate) fn highest(&self) -> u64 {
         self.ticks.iter().copied().max().unwrap_or(0)
     }
 }
@@ -1316,7 +1341,7 @@ impl PaneRead {
 /// Whole lines, never substrings: `tick-1` is a prefix of `tick-10`, and a
 /// substring count would report a restart on a pane that had merely been running
 /// for ten seconds.
-fn parse_pane(marker: &str, text: &str) -> PaneRead {
+pub(crate) fn parse_pane(marker: &str, text: &str) -> PaneRead {
     let mut read = PaneRead::default();
     for line in text.lines() {
         let line = line.trim_end();
@@ -1335,7 +1360,7 @@ fn parse_pane(marker: &str, text: &str) -> PaneRead {
 }
 
 /// The pane ids the daemon reports as alive.
-fn alive_panes(listing: &str) -> Vec<String> {
+pub(crate) fn alive_panes(listing: &str) -> Vec<String> {
     listing
         .lines()
         .filter_map(|line| {
@@ -1349,7 +1374,7 @@ fn alive_panes(listing: &str) -> Vec<String> {
 
 /// Per-pane counter evidence, dense enough to read in a transcript: the highest
 /// tick, how many times the pane started, and how many times it printed `tick-1`.
-fn describe(reads: &[PaneRead]) -> String {
+pub(crate) fn describe(reads: &[PaneRead]) -> String {
     reads
         .iter()
         .enumerate()
@@ -1367,12 +1392,12 @@ fn describe(reads: &[PaneRead]) -> String {
 }
 
 /// One pane's raw read, for the evidence file a reviewer reads line by line.
-fn pane_evidence(id: &str, code: Option<i32>, output: &str) -> String {
+pub(crate) fn pane_evidence(id: &str, code: Option<i32>, output: &str) -> String {
     let newline = if output.ends_with('\n') { "" } else { "\n" };
     format!("--- {id} (read exited {code:?}) ---\n{output}{newline}")
 }
 
-fn first_line(text: &str) -> String {
+pub(crate) fn first_line(text: &str) -> String {
     text.lines()
         .find(|line| !line.trim().is_empty())
         .unwrap_or("")
@@ -1385,7 +1410,7 @@ fn first_line(text: &str) -> String {
 /// Length first, then 64 KiB at a time: these are ~128 MB binaries, and reading
 /// two of them fully into memory to answer a yes/no question would allocate a
 /// quarter of a gigabyte to compare them.
-fn same_bytes(a: &Path, b: &Path) -> Result<bool, String> {
+pub(crate) fn same_bytes(a: &Path, b: &Path) -> Result<bool, String> {
     let mut left = File::open(a).map_err(|e| format!("{}: {e}", a.display()))?;
     let mut right = File::open(b).map_err(|e| format!("{}: {e}", b.display()))?;
     let (la, lb) = (
@@ -1421,7 +1446,7 @@ fn same_bytes(a: &Path, b: &Path) -> Result<bool, String> {
 /// Read until `buf` is full or the file ends. `read` may return short, and taking a
 /// short read for the end of the file would compare two files only as far as the
 /// first pipe buffer.
-fn fill(file: &mut File, buf: &mut [u8]) -> std::io::Result<usize> {
+pub(crate) fn fill(file: &mut File, buf: &mut [u8]) -> std::io::Result<usize> {
     let mut filled = 0;
     while filled < buf.len() {
         match file.read(&mut buf[filled..]) {
@@ -1439,7 +1464,7 @@ fn fill(file: &mut File, buf: &mut [u8]) -> std::io::Result<usize> {
 /// `fs::copy` carries the mode across, which is what keeps the copy runnable; the
 /// tail is what makes two candidates out of one binary (an ELF ignores trailing
 /// bytes).
-fn copy_with_tail(source: &Path, destination: &Path, tail: &[u8]) -> Result<(), String> {
+pub(crate) fn copy_with_tail(source: &Path, destination: &Path, tail: &[u8]) -> Result<(), String> {
     fs::copy(source, destination).map_err(|e| format!("copy to {}: {e}", destination.display()))?;
     if tail.is_empty() {
         return Ok(());
@@ -1458,7 +1483,7 @@ fn copy_with_tail(source: &Path, destination: &Path, tail: &[u8]) -> Result<(), 
 /// Unix decides this with a mode bit; a platform that decides by extension cannot
 /// express "present but not runnable" this way, and says so instead of quietly
 /// producing a candidate the verb would happily install.
-fn clear_execute(path: &Path) -> Result<(), String> {
+pub(crate) fn clear_execute(path: &Path) -> Result<(), String> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -1482,7 +1507,7 @@ fn clear_execute(path: &Path) -> Result<(), String> {
 ///
 /// Any failure to take it is returned as a reason, so the caller can skip the
 /// concurrency check loudly instead of reporting a pass it never observed.
-fn take_lock(path: &Path) -> Result<File, String> {
+pub(crate) fn take_lock(path: &Path) -> Result<File, String> {
     let file = fs::OpenOptions::new()
         .create(true)
         .truncate(false)
@@ -1511,7 +1536,7 @@ fn take_lock(path: &Path) -> Result<File, String> {
 /// trust set is the key compiled into it, and the secret of that key is nowhere
 /// on this machine (T-0036's precedent: the accept path is proved against keys
 /// whose secrets are in the test's hand).
-fn fetch_and_verify(
+pub(crate) fn fetch_and_verify(
     trust: &arreo_core::update::verify::TrustSet,
     url: &str,
     root: &Path,
@@ -1538,7 +1563,7 @@ fn fetch_and_verify(
 /// only as a CI secret), so a case that needs *signed* bytes outside the library's
 /// own tests needs the real tool. When it is absent the case reports a loud skip
 /// naming what is missing, never a pass — the T-0019 no-delegation precedent.
-fn minisign() -> Option<PathBuf> {
+pub(crate) fn minisign() -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
     std::env::split_paths(&path)
         .map(|dir| dir.join("minisign"))
@@ -1549,7 +1574,10 @@ fn minisign() -> Option<PathBuf> {
 ///
 /// `-W` makes the key unencrypted, which is the shape CI keys are made in and the
 /// shape a test can feed to `-S` without a password prompt.
-fn throwaway_keypair(minisign: &Path, dir: &Path) -> Result<(PathBuf, PathBuf, String), String> {
+pub(crate) fn throwaway_keypair(
+    minisign: &Path,
+    dir: &Path,
+) -> Result<(PathBuf, PathBuf, String), String> {
     let public = dir.join("throwaway.pub");
     let secret = dir.join("throwaway.key");
     let generated = Command::new(minisign)
@@ -1574,7 +1602,7 @@ fn throwaway_keypair(minisign: &Path, dir: &Path) -> Result<(PathBuf, PathBuf, S
 
 /// Sign `file` with `secret`, writing the sibling `.minisig` a release job would
 /// ship.
-fn sign(minisign: &Path, secret: &Path, file: &Path) -> Result<(), String> {
+pub(crate) fn sign(minisign: &Path, secret: &Path, file: &Path) -> Result<(), String> {
     let mut child = Command::new(minisign)
         .arg("-S")
         .arg("-s")

@@ -29,7 +29,12 @@
 > pinned key parses and its comment names its own key id, that the tag job exists,
 > that it takes the key from the environment, and that it carries no key material.
 > `cargo test -p arreo-core --test update_verify` proves the refusals against a
-> throwaway keypair generated inside the test.
+> throwaway keypair generated inside the test. And
+> [`cargo xtask e2e --slice release`](#the-release-slice) is the executable
+> referee for everything below the tag: it signs, verifies and refuses on the
+> real release daemon, then drives one whole update through a local signed
+> channel — see [The release slice](#the-release-slice) for what it proves and
+> what it still leaves to the CI matrix.
 
 ## What a release does
 
@@ -326,6 +331,103 @@ name ("release 0.1.0 does not ship a build for …") rather than guessing.
 before the signing loop, so the loop's existing `minisign -S … -m dist/SHA256SUMS`
 step covers it too. This is a T-0042/release-job change, recorded here because
 nothing publishes the index yet.
+
+### The release slice
+
+```console
+$ cargo xtask e2e --slice release            # sign → verify → refuse, on real artifacts
+$ cargo xtask e2e --slice release --chain    # the whole story, one command, one transcript
+```
+
+The T-0015/T-0016 precedent applied to releases: the update story gets its own
+executable referee, so "a release is not a release if any OS is red" becomes
+mechanical rather than aspirational. It is **hermetic** — no network, no
+published release, no real signing secret — because the throwaway keypair is
+generated per run under `target/test-scratch/` and every process runs with
+`HOME`/XDG/`ARREO_STATE_DIR` pointed inside the scratch. The scratch (keypair,
+channel, binary copies) is removed on exit; the evidence is what survives, under
+[`.loop/evidence/T-0042/`](../.loop/evidence/T-0042/index.md).
+
+**Standalone (`--slice release`).** The release job's own "verify, and refuse"
+step, run on the dev box: `cargo build --release -p arreo-server` once; a
+throwaway keypair generated, never committed and never reused; a fixture *and* a
+copy of that real binary signed; both verified against the generated public key
+through `arreo_core::update::verify::verify_with` — the same door the channel and
+`arreo update verify` call; then **one byte flipped**, and two refusals demanded:
+the shared verifier's `signature does not authenticate this file`, naming the
+artifact, and the product binary's own `arreo update verify`, exiting **1** and
+naming the artifact and both key ids (the tampered file is signed by the
+throwaway key, so the product refuses by key id before it even reaches the
+bytes). The digest door is exercised too: the signed `SHA256SUMS` verifies and
+matches the artifact, and a tampered entry is refused by name — the manifest is
+the only digest source, and the index carries none.
+
+**Chain (`--slice release --chain`).** One command, one transcript, one
+pass/fail line per stage, against a `file://` channel in the scratch — the same
+transport a self-hosted mirror behind a firewall serves:
+
+1. **index** — `arreo-index.json` (T-0037's format: a version and the
+   per-target artifact, **no digests**) written and signed, beside the signed
+   artifacts and the signed `SHA256SUMS`.
+2. **verify** — `arreo update --check` refuses the foreign-signed index by key
+   id (exit 1, naming the channel), while the *same* bytes are accepted through
+   `channel::check` + `channel::fetch` with the trust set the fixture was signed
+   for. The slice drives the shared code path, not a lookalike: `file://` and
+   `https://` differ only in the fetcher (proven unit-side by
+   `file_and_https_channels_differ_only_in_their_fetcher`), so a green slice
+   exercises the real path.
+3. **client atomic swap** — the verified artifact goes through the same install
+   path `--from` uses (T-0070), and the swap is proven byte-for-byte: installed
+   == verified, `.prev` == the binary it replaced, and the new binary runs.
+4. **server handoff** — the real swap through `arreo update --server` (T-0038):
+   first a cut with **zero panes**, then a cut with **eight counter panes
+   printing**, asserting the T-0070 marker-continuity proof across the cut (each
+   pane's marker and `tick-1` appear exactly once and its counter is past where
+   it was — nothing restarted, only re-parented), plus the daemon pid change and
+   the old daemon's exit.
+5. **the deferred path** — T-0039's rule, forced on Unix by flag. The Windows
+   branch is `#[cfg(not(unix))]` in `arreo-cli/src/update.rs`, so on Unix the
+   slice runs the rule's Unix-observable instance: a swap with no daemon to hand
+   over to is reported **loudly** ("no daemon was serving …; it will run the new
+   binary when it next starts"), the swap lands at the path, and the running
+   daemon's agents are untouched — never forced while agents run, never a silent
+   fallback. The Windows branch itself is the Windows leg's job (below).
+6. **metrics history** — the query runs against the live daemon and returns
+   recorded rows (T-0040), with a bounded retry so a marginal 10 s writer tick
+   cannot flake the stage.
+7. **alert ordering** — a budgeted pane (T-0019) sorts ahead of merely-working
+   panes in `panes` (T-0041) and the audit log orders `enforce.alert` before
+   `enforce.breach`. Where cgroup v2 delegation is unavailable the daemon answers
+   a **loud** `enforce failed` error and the stage reports a named skip quoting
+   it — the enforcement slice's environment-aware precedent; a skip is never
+   counted as a pass.
+
+**The gap the workflow half still carries.** Criteria 4–5 of T-0042 — the CI
+matrix and the PR/nightly split — are **not applied**: `.github/workflows/**` is
+the user's during T-0063 (CI never-green), so the wiring is recorded here as
+text until that settles. The matrix the slice needs:
+
+| Job | Runner | What it runs |
+| --- | --- | --- |
+| `release-slice` (PR) | ubuntu / macos / windows | `cargo xtask e2e --slice release` and `--slice update` |
+| `handoff-slice` (PR) | ubuntu / macos | `cargo xtask e2e --slice handoff` |
+| `deferred-case` (PR) | windows | `cargo xtask e2e --slice release --chain --case windows-deferred` |
+| `release-chain` (nightly) | ubuntu | `--slice release --chain` (plus `bench`) |
+| `release-publish` (tags) | the three targets | the same battery **before** publishing — a red slice blocks the release |
+
+The split: PRs run the fast cases (verify/refuse, the client swap, the deferred
+refusal — seconds each); nightly runs `--chain` (the handoffs under eight panes
+are seconds, so the full battery stays inside the < 5 min e2e budget) plus
+`bench`; the tag job runs the same battery before `gh release create`, so a red
+slice blocks the release. The Windows leg of `--case windows-deferred` is where
+T-0039's real `Handoff::Deferred` branch runs; on Unix that branch does not
+exist (compiled out), which the slice says out loud instead of substituting a
+pass it did not observe.
+
+**The honest gap that stays honest:** nothing here is Apple notarization or
+Windows Authenticode, and the slice proves nothing about installers — no paid
+identity exists yet (T-0036). The evidence index says so rather than letting a
+green chain imply a signed-installer claim.
 
 ### When the path belongs to a package manager
 

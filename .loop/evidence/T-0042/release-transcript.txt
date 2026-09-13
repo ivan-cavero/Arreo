@@ -1,0 +1,11 @@
+release: `cargo build --release -p arreo-server` ok in 48.2 s
+release: scratch and keypair live under /home/dev/dev/Arreo/target/test-scratch/T-0042-release-3381514 (build tree; removed when the slice exits)
+[PASS] release: the fixture and the release binary are signed
+[PASS] release: the fixture verifies against the generated key
+[PASS] release: the real release binary verifies against the generated key
+[PASS] release: a flipped byte is refused by the shared verifier, naming the artifact
+[PASS] release: the product binary refuses the tampered file with exit 1, naming it
+[PASS] release: the signed SHA256SUMS manifest verifies and matches the artifact's digest
+[PASS] release: a tampered manifest entry is refused, naming the artifact
+[PASS] release: the slice's scratch (keypair, channel, binary copies) was removed
+release: 8 passed, 0 skipped, 0 failed

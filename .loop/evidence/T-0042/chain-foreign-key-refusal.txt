@@ -1,0 +1,4 @@
+the channel's foreign-signed index, refused by the product (`update --check`):
+update: /home/dev/dev/Arreo/target/test-scratch/T-0042-chain-3383153/sbx/arreo-state/channel/arreo-index.json: signed by key D9BEC834EB76B96C, this build trusts 076F2F7CEBE0AF51
+update: the channel at file:///home/dev/dev/Arreo/target/test-scratch/T-0042-chain-3383153/channel/ served the file this refusal names; nothing was installed
+
