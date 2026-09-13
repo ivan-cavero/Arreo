@@ -5,40 +5,40 @@ spawns), SIGKILLed at this point by the trigger: immediately after spawn(2) — 
 machine: panes=8 tick=10ms watch=p0
 
 === kill point a: A — before the transfer ===
-[PASS] outgoing daemon serves (pid 3421073)
-[PASS] 8 panes tick before the cut (p0:tick-34/pid=3421089 p1:tick-35/pid=3421099 p2:tick-31/pid=3421116 p3:tick-28/pid=3421134 p4:tick-28/pid=3421153 p5:tick-25/pid=3421178 p6:tick-28/pid=3421200 p7:tick-25/pid=3421220)
-[PASS] a client is attached to p0 and streaming (48 ticks)
-note: killed 3.5ms after spawn (signal: 9 (SIGKILL))
+[PASS] outgoing daemon serves (pid 3897325)
+[PASS] 8 panes tick before the cut (p0:tick-33/pid=3897338 p1:tick-32/pid=3897348 p2:tick-32/pid=3897359 p3:tick-31/pid=3897372 p4:tick-30/pid=3897391 p5:tick-27/pid=3897418 p6:tick-25/pid=3897443 p7:tick-26/pid=3897466)
+[PASS] a client is attached to p0 and streaming (46 ticks)
+note: killed 0.9ms after spawn (signal: 9 (SIGKILL))
 [PASS] no cut was recorded (no `handoff` commit row) (0 rows)
-[PASS] the old daemon is still serving (a client's request is answered) (pid 3421073 alive: true; `arreo panes` lists all 8 panes: true)
-[PASS] every pane is alive and still producing (8 panes, pids [3421089, 3421099, 3421116, 3421134, 3421153, 3421178, 3421200, 3421220], ticking past their pre-abort marks)
+[PASS] the old daemon is still serving (a client's request is answered) (pid 3897325 alive: true; `arreo panes` lists all 8 panes: true)
+[PASS] every pane is alive and still producing (8 panes, pids [3897338, 3897348, 3897359, 3897372, 3897391, 3897418, 3897443, 3897466], ticking past their pre-abort marks)
 [PASS] every pane's marker stream is contiguous (no loss, no duplicate, no restart) (8 panes, one pid each, every tick +1)
-[PASS] the attached client saw nothing beyond the abort's own pause (76 lines, one pid (Some(3421089)), contiguous: true, reconnect notices: 0, client alive: true)
+[PASS] the attached client saw nothing beyond the abort's own pause (73 lines, one pid (Some(3897338)), contiguous: true, reconnect notices: 0, client alive: true)
 note: abort rows after A: none (A dies before it can ask, so the outgoing daemon has nothing to record)
-[PASS] the retry commits and the outgoing daemon exits 0 (retry took 0.48s after 1 attempt(s) (accepted first time); outgoing daemon exit: exit status: 0; the retry daemon (pid 3421852) is serving: true)
-[PASS] the retry carries the panes (same pids, still ticking) ([3421089, 3421099, 3421116, 3421134, 3421153, 3421178, 3421200, 3421220] -> [3421089, 3421099, 3421116, 3421134, 3421153, 3421178, 3421200, 3421220] (8 panes))
-[PASS] the client's transcript is one pane, one pid, contiguous across the abort and the retry (117 lines, 1 reconnect(s))
-[PASS] the retry daemon is the one serving (arreo-server: handoff complete (protocol 0 -> 0, panes 8, adopted 8, pid 3421852))
-[PASS] exactly one daemon serves the socket (a third is refused) (the killed incoming (pid 3421523) is gone, the outgoing (pid 3421073) exited, the retry (pid 3421852) serves; a third daemon exited exit status: 1 and the socket still accepts connects: true)
+[PASS] the retry commits and the outgoing daemon exits 0 (retry took 0.34s after 1 attempt(s) (accepted first time); outgoing daemon exit: exit status: 0; the retry daemon (pid 3898057) is serving: true)
+[PASS] the retry carries the panes (same pids, still ticking) ([3897338, 3897348, 3897359, 3897372, 3897391, 3897418, 3897443, 3897466] -> [3897338, 3897348, 3897359, 3897372, 3897391, 3897418, 3897443, 3897466] (8 panes))
+[PASS] the client's transcript is one pane, one pid, contiguous across the abort and the retry (111 lines, 1 reconnect(s))
+[PASS] the retry daemon is the one serving (arreo-server: handoff complete (protocol 0 -> 0, panes 8, adopted 8, pid 3898057))
+[PASS] exactly one daemon serves the socket (a third is refused) (the killed incoming (pid 3897763) is gone, the outgoing (pid 3897325) exited, the retry (pid 3898057) serves; a third daemon exited exit status: 1 and the socket still accepts connects: true)
 
 --- what was observed ---
-kill: killed 3.5ms after spawn (signal: 9 (SIGKILL))
-the client's own clock: the abort cost it 103.0ms between tick 48 and tick 49 (the pause, then the resume)
+kill: killed 0.9ms after spawn (signal: 9 (SIGKILL))
+the client's own clock: the abort cost it 100.8ms between tick 46 and tick 47 (the pause, then the resume)
 
 --- the run ---
---- the client's transcript (117 lines; the pane's own words) ---
-first: tick-1 pid=3421089
+--- the client's transcript (111 lines; the pane's own words) ---
+first: tick-1 pid=3897338
 …
-last: tick-117 pid=3421089
+last: tick-111 pid=3897338
 --- the abort's gap in the client's own clock ---
-tick 48 arrived 103.0ms before tick 49; that interval is the pause the abort caused (nothing else interrupted the stream: 117 ticks, 1 pid(s), contiguous: true)
+tick 46 arrived 100.8ms before tick 47; that interval is the pause the abort caused (nothing else interrupted the stream: 111 ticks, 1 pid(s), contiguous: true)
 --- the client's stderr (any notice here belongs to the *retry* below: the assertions above are taken before it runs, and the abort itself must not have broken the connection) ---
 attach: connection lost: server closed connection
-attach: reconnected after the daemon was replaced — resuming from line 81
+attach: reconnected after the daemon was replaced — resuming from line 78
 
 --- the outgoing daemon's log (tail) ---
-arreo-server: device authority ready (root dabb923f41ba3081…, 0 device(s))
-arreo-server: serving on /tmp/arreo-e2e-abort-a-3421062/a.sock
+arreo-server: device authority ready (root e5f958ef6cbb3a38…, 0 device(s))
+arreo-server: serving on /tmp/arreo-e2e-abort-a-3897314/a.sock
 --- the retry daemon's log (tail) ---
 daemon: adopted 8 pane(s) across the handoff
-arreo-server: handoff complete (protocol 0 -> 0, panes 8, adopted 8, pid 3421852)
+arreo-server: handoff complete (protocol 0 -> 0, panes 8, adopted 8, pid 3898057)
