@@ -1,39 +1,21 @@
 ## State snapshot          ← REWRITTEN (not appended) at every checkpoint
-Task: **T-0037 and T-0074 DONE** (`7f1dde3`, `792fa0c`) — the release channel and the
-TUI-manages-the-fleet both landed and pushed. The p2 queue is now: T-0072
-(harness-session-resume, schema migration + adapter resume strategies, live pi/opencode),
-T-0075 (harness survey — pure docs), and the release slice T-0042 (its sign/verify/refuse
-half is startable; its --chain half needs the T-0037 index on the GitHub channel, which the
-release job does not publish yet — the gap is written in docs/release.md).
-Where you are: **711 tests / 0 failed across 66 targets**; clippy clean on both toolchains;
-fmt clean; **13 slices green** (tui 59, mesh 21+1skip, update 27 incl. the new channel
-checks); bench 6/6; vet 337, deny 4/4, audit 0, check-targets PASS/SKIP.
-Next step: T-0072 (harness-session-resume) — delegate with the fence in its file; it needs
-xtask/src/main.rs (free now), live pi/opencode CLIs for its proof.
-Open workers: (none)
-Known broken: T-0063 (CI never-green — the user is working it) · Parked: T-0048 needs-human
-**T-0037 done — the release channel.** Re-scoped this turn (its criteria were re-written:
-six, startable, since the verifier T-0036 and the swap T-0070 already existed — the only new
-code was the fetch). `channel::check` / `channel::fetch` over a `Fetcher` trait: file:// and
-https:// share every line except the fetcher (proven by a test serving one channel's bytes
-under both). Index is a signed JSON with version + artifact names and NO digests (SHA256SUMS
-stays the only digest source). Fail-closed: an absent index is the only "no releases yet";
-a missing/foreign/bad signature is the verifier's own refusal, never "empty". Anonymous
-update fetches to <state>/channel/, verifies, and hands the verified artifact to the SAME
---from install path. rustls-native-certs added as a direct optional dep — already in the
-lockfile transitively (quinn) and already vetted; documented in Cargo.toml. The security
-review's one finding (--check didn't take the update lock) fixed and mutation-tested
-(removing the lock turns the new test red, exit 0 vs 3).
-**T-0074 done — the TUI manages the fleet.** s/i/x spawn/send/kill on the held connection
-(audited as the device), m/g machines/trust with the CLI's exact sentences and exit codes,
-pairing add flow, force key for online remove, fingerprint-confirmed grant, viewer-colored
-disabled controls with the daemon's own VerbDenial sentence BEFORE the keypress. One real
-divergence fixed: the CLI's remove-online sentence had a literal 14-space run; now one
-space, so the sentences are byte-identical. Evidence is interactive: tui slice 59 checks
-(spawn→dup-refusal→send→kill→dead-pane, frames), mesh 21 (machines-by-name over a real
-relay, trust-remote parity word-for-word vs the live CLI). Review: security-reviewer
-verified all claims; mutation-tested the two load-bearing gates (viewer denial, kill
-confirm) — both red when the gate is removed.
+Task: **T-0072** (harness-aware session resume) on worker `HarnessResume`; **T-0075**
+(harness survey, docs) on worker `HarnessSurvey`. Both p2, disjoint fences.
+Where you are: T-0037 + T-0074 landed and pushed (`7f1dde3`, `792fa0c`, ledger `a7abcd8`).
+711 tests / 0 failed / 66 targets; clippy clean both toolchains; fmt clean; 13 slices green;
+bench 6/6; vet 337, deny 4/4, audit 0, check-targets PASS/SKIP.
+Next step: integrate both workers (review → mutation-test the load-bearing checks → full
+battery → commit with a scoped `git add` → push → ledger).
+Open workers: HarnessResume (T-0072) · HarnessSurvey (T-0075)
+Known broken: T-0063 (CI never-green — the user's) · Parked: T-0048 needs-human
+**T-0072 design (planner, verified by direct probes before specifying).** pi 0.84.4 can be
+*told* its session id (`--session-id <uuid>` at spawn, `--session <path|id>` to resume; its
+`--mode json` first line is the session envelope). opencode 1.18.30 generates `ses_…` ids and
+its **interactive TUI never prints one** (25 s pty capture: zero occurrences) — but `-c/--continue`
+resumes without an id and `--format json` events carry `"sessionID"`. So the adapter data model
+is a **strategy** (`pin` | `continue` | none), not an argv template.
+**T-0075 scope reality:** only pi, opencode and omp are installed here — three live rows, the
+rest honestly `untried` (its criterion forbids filling a row from memory).
 ## Event log               ← append-only; newest last; never rewrite
 - 2026-09-10 [turn 1] ledger created; repo at e489fac (docs only); T-0001 + T-0022 (AGENTS.md gardened) done
 - 2026-09-10 [turn 2] T-0002 PTY manager done+pushed (342606c; 9 tests); PROMPT.md v2 synced + ADR 0001 (ef6c595)
@@ -185,3 +167,5 @@ confirm) — both red when the gate is removed.
 - 2026-09-13 [turn 72] T-0074 delegated to `TuiManages` (the user's p2: the TUI manages the fleet — agents from the sidebar, machines/trust verbs with the CLI's refusals, confirmations, key docs, interactive evidence). T-0037's channel criteria re-written (it had zero open after the T-0070 split; the fetch half is now startable: a URL + the T-0036 verifier, transport-agnostic, file:// tests, empty channel honest) and delegated to `ChannelFetch`. Both workers told: `xtask/src/main.rs` is mine for T-0037's registration (TuiManages owns it) — no collision.
 
 - 2026-09-13 [turn 73] T-0037 + T-0074 done and pushed. T-0037 (`7f1dde3`): the release channel — --check and the anonymous update; criteria re-written first (the task had zero open ones; the re-write is in the task file), then two workers (TuiManages for T-0074, ChannelFetch for T-0037) built the code; the security review (an independent security-reviewer) verified 13 channel invariants + all TUI invariants, one Low finding (--check bypassed the update lock) fixed by the planner and mutation-tested (red when the lock is removed: exit 0 vs 3). T-0074 (`792fa0c`): TUI spawn/send/kill + machines/trust panels with CLI-exact sentences; the evidence worker extended the slices (tui 59, mesh 21) with interactive frames under .loop/evidence/T-0074/; the worker's evidence run exposed a real bug (one-shot verb results clobbered by the pane poll; sidebar click mapping under a question line) — fixed in the same commit with regression tests; the CLI's 14-space sentence artifact fixed so both sides are byte-identical. Planner held the xtask/src/main.rs registration line (nothing needed registering — the slice ids already existed), wrote the missing docs (tour key table + machines TUI section), and closed the loop with full battery: 711 tests / 66 targets, 13 slices, bench 6/6, gates all green. Evidence commits: `bfb4d01` (T-0015/38/76/79 refreshes), `bf6d572` (fmt reflow).
+
+- 2026-09-13 [turn 74] Probed both harnesses live before specifying T-0072 (pi `--session-id` pins ids and its `--mode json` prints the session envelope; opencode's interactive TUI prints no id but `--continue` needs none and `--format json` carries `sessionID`) — the design decision (resume *strategy* in adapter data) is recorded in the task file. T-0072 delegated to `HarnessResume`, T-0075 (docs survey; only pi/opencode/omp installed, rest `untried`) to `HarnessSurvey`, both with the interference rule (both drive the real CLIs — isolate session stores) since they run concurrently.
