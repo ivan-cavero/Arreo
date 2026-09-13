@@ -1,29 +1,34 @@
 ## State snapshot          ← REWRITTEN (not appended) at every checkpoint
-Task: **T-0078 (daemon file permissions) IN FLIGHT** with worker `FileModes`. T-0079, T-0036,
-T-0038, T-0076, T-0071, T-0070 all done.
-Where you are: 647 tests / 63 targets, 13 slices, bench 6/6, all gates green at `d81a414`. The
-user's Astro `site/` is untracked and untouched.
-Next step: collect `FileModes`, verify its mode assertions independently (the leak proof must fail
-before the fix), run a security review (file permissions are a real boundary), then the battery on
-the merged tree and commit T-0078.
-Open workers: **FileModes** (0600/0700 policy applied at creation: store db/wal/shm in `open_once`,
-lock in `ExclusiveLock::acquire`, socket after bind, plus the SECURITY.md policy and a mode test)
+Task: **T-0078 DONE** (`c024ea2`) — the daemon's files are owner-only, at creation. The p1 queue is
+now clear. T-0079, T-0036, T-0038, T-0076, T-0071, T-0070 all done.
+Where you are: 652 workspace tests / 0 failed across 64 targets; clippy clean on **both**
+toolchains; fmt clean; **13 slices green**; bench 6/6; vet 337, deny 4/4, audit 0, check-targets
+PASS/SKIP. The user's Astro `site/` is untracked and untouched.
+Next step: the p2 queue — **T-0037** (the channel half; needs its criteria re-written — it has
+zero open ones after the T-0070 split and no channel exists to fetch yet), **T-0072/T-0074/T-0075**
+(the user's harness/TUI suite), and **T-0042** (the release slice; its sign/verify/refuse half is
+startable now, its chain half needs the channel). Also T-0039 (Windows deferred update, p4) and
+T-0063 (CI, user's).
+Open workers: (none)
 Known broken: T-0063 (CI never-green — the user is working it) · Parked: T-0048 needs-human
-Queue gardening this turn:
-- **T-0037 has zero open criteria** — all `[~]` were split to T-0070, and the channel half it
-  was supposed to keep (anonymous fetch + `--check` against a real index) has no channel to fetch:
-  no signed release has run in CI. Not startable; the file needs its channel criteria re-written
-  when a channel exists, or it should be marked needs-criteria. Recorded, not silently ignored.
-- **T-0042's `--chain` criterion has the same dependency** — a local file:// channel needs the
-  fetch half that T-0037 was supposed to keep. Its first criterion (sign → verify → refuse on
-  real artifacts, as a local slice) is startable now and exercises T-0036's verifier operably.
+**T-0078 — the daemon's files are owner-only, at creation.** Measured before: socket 0775, db
+0644 — every local user could read pane scrollback (agent output), proven by reading a pane's
+token out of a 0644 `-wal`. Now 0600 everywhere, at creation: socket (both the fresh bind and
+the inherited/handoff path, fail-closed), store db/wal/shm (after migrate, with the window
+proven empty of sensitive content by the review), lock (creation mode, no window), handoff
+(already done, now tested). The security review verified all six claims (policy enforced at the
+moment it matters on every path) and its findings were addressed: two stale comments corrected,
+the `.handoff` mode test added, the store-vs-socket chmod asymmetry documented in SECURITY.md.
 Findings:
-- **A task can be emptied by a split and left with no criteria** — T-0037's eight `[~]`s all
-  moved to T-0070 and the channel half never got re-written. Worth a scan of the queue for other
-  criteria-less files.
-- **The release slice's value is the local referee** — T-0036's release job already verifies its
-  own build in CI; a `--slice release` adds the repeatable local form (the T-0015/T-0016
-  precedent), which is the part startable now.
+- **A policy is a statement, not a scatter of chmods** — the mode test's failure mode reads
+  pane content out of the file, and the review's window proof shows the only pre-chmod bytes are
+  the schema version row.
+- **The test must force the conditions the measurement found.** The mode test drives the daemon
+  under umask 0002 (via a shell wrapper) because this box's ambient 077 would make pre-fix files
+  accidentally 0600 — a test that depends on the runner's umask is a test that passes for the
+  wrong reason.
+- **A security review of a mode change is worth it** — it found two stale comments that would
+  have led a future reader to fix the wrong thing, and a coverage gap (no `.handoff` mode test).
 ## Event log               ← append-only; newest last; never rewrite
 - 2026-09-10 [turn 1] ledger created; repo at e489fac (docs only); T-0001 + T-0022 (AGENTS.md gardened) done
 - 2026-09-10 [turn 2] T-0002 PTY manager done+pushed (342606c; 9 tests); PROMPT.md v2 synced + ADR 0001 (ef6c595)
@@ -169,3 +174,5 @@ Findings:
 - 2026-09-13 [turn 69] T-0079 + T-0036 both landed, two p1 slices in parallel on disjoint files. T-0079: the wall asks once — `PaneInfo` untouched, new `PanesDetail` variant (N-1 both directions, proven with a v0-mirror schema test), the daemon computing state/asking/RAM/history in one pass (entries cloned under the lock then released, 30 `/proc` walks concurrent, ONE store open), the TUI falling back to the old per-pane path on an old daemon. Baseline measured by the planner before the fix: 10,325 ms of serial state resolution vs a 300 ms budget (34x over); after: 76-259 ms across 10 slice runs, budget row flipped to enforced and read from perf-budget.toml. Criterion 5's answer written in the code: state is told, not asked; `Wait` stays for orchestration. T-0036: `arreo_core::update::verify` (TrustSet from the embedded pub file, typed errors, key id checked first, manifest the only digest source), `arreo update verify` (no bypass — `--force` is a usage error), the release job (signs with the env secret, verifies its own build, flips a byte and requires refusal, then publishes), docs (decision + rejections + rotation), 10 tamper tests with an in-process throwaway keypair, real-minisign agreement test. Human gate was cleared by the operator's key (076F2F7CEBE0AF51). One pre-existing test bug found by the full-workspace run: the adopt descriptor-identity check matched inode alone, and devpts inode 8 collides with /dev/urandom's devtmpfs inode 8 — now (device, inode). Verified: 647 tests / 63 targets, 13 slices, bench 6/6, vet 337 (minisign-verify exemption in the same change), deny 4/4, audit 0, check-targets PASS/SKIP. Commits: 22438b6, 7b691fa. README corrected (signing in place, signed release not yet); SECURITY.md verified still accurate.
 
 - 2026-09-13 [turn 70] T-0078 delegated (`FileModes`): the daemon's file modes. Policy: owner-only by default (0600 files / 0700 dirs) because the store holds pane scrollback (agent output), the audit log and device records; nothing group-reachable by default. Applied at creation: the store's db/wal/shm in `SessionStore::open_once` (SQLite creates them, so chmod-after-open with the honest window statement — a brand-new store's first empty pages, before any pane content), the lock in `ExclusiveLock::acquire` (options.mode(0o600), the identity pattern, plus re-chmod for existing files), the socket after bind (the handoff socket already does this). The task's fence was amended to include `lock.rs` (the lock file is created there) and pinned to the existing SECURITY.md. Queue gardening: T-0037 has zero open criteria (all split to T-0070; the channel half needs a channel that does not exist — no signed release has run in CI), and T-0042's `--chain` criterion shares that dependency, while its sign/verify/refuse slice is startable now. Both recorded for the queue, not silently ignored.
+
+- 2026-09-13 [turn 71] T-0078 done + pushed (`c024ea2`): the daemon's files are owner-only, at creation. Policy stated in SECURITY.md (0600/0700, nothing group-reachable by default; /tmp note; upgrade path; the store-vs-socket chmod asymmetry documented); applied at creation — socket in serve_on (fresh bind and inherited/handoff path, fail-closed), store db/wal/shm in open_once after migrate (window proven empty of sensitive content by the review: only meta(schema_version) pre-chmod), lock via options.mode(0o600) + existing-file re-chmod, handoff already 0600 now covered by a test. The security review verified all six claims sound on every path; its findings addressed (two stale handoff.rs comments describing the main socket as never-chmod'd, corrected; the missing .handoff mode test, added with a deterministic window). One residual risk recorded honestly: the fresh bind's create→chmod is two syscalls with no await, a sub-microsecond same-group race at boot, not reproduced, no compensating check on the client path. The mode test drives the daemon under umask 0002 via a shell wrapper — the failing-first property must not depend on the runner's ambient umask (077 here would mask the pre-fix modes). Mutation-checked: removing the socket chmod turns it red reading the pane's token out of the file. 652 tests / 64 targets, 13 slices, bench 6/6, vet 337, deny 4/4, audit 0, check-targets PASS/SKIP.

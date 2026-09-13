@@ -1,7 +1,7 @@
 ---
 id: T-0078
 title: The daemon's files are readable and connectable by other local users
-status: in-progress
+status: done
 priority: 1
 depends_on: []
 phase: 2
@@ -86,22 +86,22 @@ is not in this fence.
 
 ## Acceptance criteria
 
-- [ ] A **stated policy**, not a scatter of chmods: which of these files may be read by
+- [x] A **stated policy**, not a scatter of chmods: which of these files may be read by
       the owner only, and which may be reachable by a group (with the reason — e.g. an
       operator who deliberately shares a runtime directory).
-- [ ] Every file the daemon creates gets the policy at **creation**, not by a later
+- [x] Every file the daemon creates gets the policy at **creation**, not by a later
       chmod: `<socket>`, `<socket>.db`, its `-wal`/`-shm` sidecars, `<socket>.lock`, and
       `<socket>.handoff`.
-- [ ] An **existing** install is fixed too (a store created before this change is
+- [x] An **existing** install is fixed too (a store created before this change is
       re-chmodded when opened, or the policy is documented as apply-on-create with the
       upgrade path named).
-- [ ] The WAL/SHM sidecars are covered: SQLite creates them, so whatever the answer is
+- [x] The WAL/SHM sidecars are covered: SQLite creates them, so whatever the answer is
       (chmod after open, `PRAGMA` if one exists, or a containing directory at `0700`),
       it is *tested* — asserting the mode of the main DB while `-wal` stays `644` would
       be a half-fix that looks complete.
-- [ ] A test asserts the modes after a real daemon start, and fails if any of them is
+- [x] A test asserts the modes after a real daemon start, and fails if any of them is
       world-readable.
-- [ ] The runtime directory is part of the answer: with `XDG_RUNTIME_DIR` unset the
+- [x] The runtime directory is part of the answer: with `XDG_RUNTIME_DIR` unset the
       default socket lands in `/tmp` (world-writable), so the file mode is the only
       control there — and that is worth saying out loud in the policy.
 
