@@ -41,16 +41,40 @@ a PTY — T-0037 makes `arreo` and `arreo-tui` self-updating (server half T-0038
 
 ## Acceptance criteria
 
-- [~] **→ T-0070** (the invariant, and the machinery that must satisfy it).
-- [~] Split: the **stage → swap → re-exec → reattach** half is **T-0070**; the **read the
+**The channel half, re-written (2026-09-13).** The original eight criteria were split to
+T-0070 (the swap) and T-0036 (the verifier); what remained — "read the channel index → verify
+(fail closed) → fetch" — was never re-written as criteria. This is that re-write, and it is
+startable now: the verifier exists (T-0036), the swap exists (T-0070), and the only missing
+piece is the **fetch**, which is thin (a URL + the verifier). The channel is the repository's
+GitHub Releases: `https://github.com/<owner>/<repo>/releases/latest/download/` — the same
+artifacts the T-0036 release job publishes, so `--check` fetches what a real release would
+produce, and an empty channel is reported honestly rather than as an error.
+
+- [ ] **A channel URL is a configuration value**, not a constant in code: read from
+      `ARREO_CHANNEL_URL` (or a `--channel` flag), defaulting to the repo's GitHub Releases
+      `latest` URL. The fetch is transport-agnostic by construction — a URL is a URL, so
+      `file://` and `https://` share every line of code except the fetcher; prove it by
+      running `--check` against both.
+- [ ] **`arreo update --check`** fetches the channel index, **verifies its signature against
+      the pinned key (T-0036, fail closed — an unverifiable index is a refusal, never a
+      warning)**, and reports the newest version + the artifact name. An **empty** channel is
+      reported as "no releases yet" with exit 0 — the honest answer, not an error.
+- [ ] **`arreo update` (anonymous, no `--from`)** fetches the newest artifact, verifies it,
+      stages it, and **stops before the swap** — the swap is T-0070's `--from` machinery, and
+      this task wires the fetch into it, so a verified artifact becomes a `--from`-equivalent
+      without duplicating the install logic. A signature failure at any point refuses with the
+      typed error naming the file.
+- [ ] **The refusal is the same sentence the verifier uses** — `BadSignature`, `UnknownKeyId`,
+      `DigestMismatch` — so an operator who sees a refusal can act on it without translating.
+- [ ] **No network in tests**: the slice and tests use `file://` channels in a temp dir (the
+      transport-agnostic proof is the point; a test that dials the real internet is a test that
+      fails on a plane).
+- [ ] `--check` and the anonymous update are exercised end to end in `xtask/src/update_slice.rs`
+      (extend it — a second slice for one story is a defect), with frames/transcripts under
+      `.loop/evidence/T-0037/`.
+
       channel index → verify (T-0036, fail closed)** half stays here.
-- [~] **→ T-0070** (the slice, wired and proven there).
-- [~] **→ T-0070.**
-- [~] Split: the *staging* half (a failed write leaves the binary byte-identical) is **T-0070**;
       the *verification* half (a failed signature) stays here.
-- [~] **→ T-0070.**
-- [~] **→ T-0070.**
-- [~] Split: `--check` (needs the channel) stays here; the package-manager/read-only path is
       **T-0070**.
 
 ## Notes
