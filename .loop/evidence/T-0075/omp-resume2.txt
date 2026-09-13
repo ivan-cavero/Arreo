@@ -1,0 +1,15 @@
+$ omp --session-dir /home/dev/dev/Arreo/target/test-scratch/T-0075/omp/sessionsplain -r 01a099 --mode json -p 'second turn'  (timeout 60)
+{"type":"session","version":3,"id":"01a099e5-e66a-7568-9bd6-ac330e14b488","timestamp":"2026-09-13T08:32:55.914Z","cwd":"/home/dev/dev/Arreo/target/test-scratch/T-0075/omp/cwd"}
+{"type":"advisor_cost_changed"}
+{"type":"agent_start"}
+{"type":"turn_start"}
+rc=1
+
+$ omp --session-dir /home/dev/dev/Arreo/target/test-scratch/T-0075/omp/sessionsplain -c --mode json -p 'third turn'  (timeout 60)
+{"type":"session","version":3,"id":"01a099e5-e66a-7568-9bd6-ac330e14b488","timestamp":"2026-09-13T08:32:55.914Z","cwd":"/home/dev/dev/Arreo/target/test-scratch/T-0075/omp/cwd"}
+{"type":"advisor_cost_changed"}
+{"type":"agent_start"}
+rc=1
+
+--- session files present ---
+2026-09-13T08-32-55-914Z_01a099e5-e66a-7568-9bd6-ac330e14b488.jsonl

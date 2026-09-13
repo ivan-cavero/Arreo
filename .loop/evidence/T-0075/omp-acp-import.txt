@@ -1,0 +1,9 @@
+$ omp --help | grep -i 'from-claude\|from-codex'
+      --from-claude                   Import a Claude Code session into OMP
+      --from-codex                    Import a Codex session into OMP
+
+$ omp acp --help
+Run Oh My Pi as an ACP (Agent Client Protocol) server over stdio
+
+USAGE
+  $ omp acp

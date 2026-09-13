@@ -1,0 +1,45 @@
+--- control: WITHOUT VBK_TEST_KEY set (expect 401: proves {env:} substitution carried the key) ---
+{"type":"error","timestamp":1789289145113,"sessionID":"ses_f660e7473ffeSy4DtyAyfyc0hQ","error":{"name":"APIError","data":{"message":"Unauthorized: missing or invalid token","statusCode":401,"isRetryable":false,"responseHeaders":{"content-length":"37","content-type":"application/json","date":"Sun, 13 Sep 2026 08:45:44 GMT","x-request-id":"NvQaqMhfvZVjMGSfubCCPrwZCKaJjaTV","x-verboo-request-id":"21327c47-75c1-4f1b-8e43-55c76503d28b"},"responseBody":"{\"error\":\"missing or invalid token\"}\n","metadata":{"url":"https://code.verboo.ai/router/v1/chat/completions"}}}}
+exit=1
+
+--- opencode debug config (redaction check) ---
+{
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "verboo": {
+      "name": "Verboo Code",
+      "npm": "@ai-sdk/openai-compatible",
+      "options": {
+        "baseURL": "https://code.verboo.ai/router/v1",
+        "apiKey": "x"
+      },
+      "models": {
+        "deepseek-v4-flash": {
+          "id": "deepseek-v4-flash",
+          "name": "Verboo deepseek-v4-flash",
+          "tool_call": true,
+          "interleaved": "reasoning_content",
+          "modalities": {
+            "input": [
+              "text"
+            ],
+            "output": [
+              "text"
+            ]
+          },
+          "limit": {
+            "context": 1048576,
+            "output": 65536
+          }
+        },
+        "deepseek-v4-flash-0731": {
+          "id": "deepseek-v4-flash-0731",
+          "name": "Verboo deepseek-v4-flash-0731",
+          "tool_call": true,
+          "interleaved": "reasoning_content",
+          "modalities": {
+            "input": [
+              "text"
+            ],
+            "output": [
+              "text"

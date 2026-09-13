@@ -1,0 +1,111 @@
+=== pi auth --help ===
+Usage:
+  pi auth print-api-key [--provider <provider>] [--model <model>]
+  pi auth print-bearer-token [--provider <provider>] [--model <model>] [--min-expiry <duration>]
+  pi auth check [--provider <provider>] [--model <model>] [--json] [--credentials] [--no-refresh]
+
+Auth commands require at least one of --provider or --model. Checks refresh expired OAuth credentials by default; --no-refresh prevents this. --credentials emits the credential, or includes it in JSON output.
+=== pi config --help ===
+Usage:
+  pi config [-l] [--approve|--no-approve]
+
+Open the resource configuration TUI to enable or disable package resources.
+Without -l, starts in global settings (~/.pi/agent/settings.json).
+Press Tab in the TUI to switch between global and project-local modes.
+
+Options:
+  -l, --local       Edit project overrides (.pi/settings.json)
+  -a, --approve     Trust project-local files for this command with -l
+  -na, --no-approve Ignore project-local files for this command with -l
+
+=== omp config --help ===
+Manage configuration settings
+
+USAGE
+  $ omp config [ACTION] [KEY] [VALUE...] [FLAGS]
+
+ARGUMENTS
+  ACTION   Config action (list|get|set|reset|path|init-xdg)
+  KEY      Setting key
+  VALUE    Value (for set/reset)
+
+FLAGS
+      --json  Output JSON
+=== omp models --help ===
+List, search, and refresh available models
+
+USAGE
+  $ omp models [ACTION] [PATTERN] [FLAGS]
+
+ARGUMENTS
+  ACTION    ls (default) | find | refresh | <provider>
+  PATTERN   Filter/search substring, or provider name (required for find)
+
+FLAGS
+      --json               Output JSON
+  -e, --extension=<value>  Load an extension file before listing (repeatable)
+      --no-extensions      Disable extension discovery (explicit -e paths still work)
+      --config=<value>     Load an extra config.yml-style overlay for this run (repeatable)
+
+EXAMPLES
+  # List every available model, grouped by provider
+    omp models
+  # List one provider's models (any provider name works)
+    omp models openai-codex
+  # Find models by substring
+    omp models find minimax
+  # Force a fresh catalog fetch (replaces rm -rf ~/.omp/models.db)
+    omp models refresh
+  # Machine-readable output
+    omp models --json
+=== omp auth-broker --help ===
+Manage the omp auth-broker (credential vault)
+
+USAGE
+  $ omp auth-broker [ACTION] [SOURCE] [FLAGS]
+
+ARGUMENTS
+  ACTION   Sub-command (serve|token|login|logout|import|migrate|status|list)
+  SOURCE   OAuth provider id (login/logout) or path (import)
+
+FLAGS
+      --json              Output JSON
+  -b, --bind=<value>      Bind address for `serve` (host:port)
+      --regenerate        Regenerate the bearer token
+      --via=<value>       SSH user@host for remote login (login --via=user@host)
+      --provider=<value>  Override provider id for `import` (e.g. when JSON `type` is unrecognized)
+      --include-disabled  Import credentials whose JSON has `disabled: true` (import)
+      --from-local        migrate source: local SQLite + env vars (required for `migrate`)
+      --include-env       Capture env-var API keys for providers not yet on broker (migrate)
+      --include-oauth     Also upload OAuth from local SQLite during migrate (default skips them)
+      --dry-run           Print actions without executing (import / login --via / migrate)
+
+EXAMPLES
+  # Boot the broker against the local SQLite store
+    omp auth-broker serve
+  # Boot on a non-default port
+    omp auth-broker serve --bind=127.0.0.1:9000
+  # Print the bearer token
+    omp auth-broker token
+  # Rotate the bearer token
+    omp auth-broker token --regenerate
+  # List supported OAuth providers
+    omp auth-broker list
+  # Local login (run on the broker host)
+    omp auth-broker login anthropic
+  # Interactive provider selection
+    omp auth-broker login
+  # Remote login over SSH tunnel
+    omp auth-broker login anthropic --via=user@broker
+  # Log out of a provider (interactive without provider arg)
+    omp auth-broker logout anthropic
+  # Import a CLIProxyAPI auth dump
+    omp auth-broker import ~/.cliproxy/auth
+  # Import a single CLIProxyAPI JSON, overriding the provider mapping
+    omp auth-broker import ~/.cliproxy/auth/claude-foo.json --provider anthropic
+  # Preview a migration from local store + env vars to the configured broker
+    omp auth-broker migrate --from-local --include-env --dry-run
+  # Apply the migration
+    omp auth-broker migrate --from-local --include-env
+  # Health-check the configured remote broker
+    omp auth-broker status

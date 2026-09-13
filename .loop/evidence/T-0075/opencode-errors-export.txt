@@ -1,0 +1,43 @@
+$ opencode run --pure -m verboo/does-not-exist-xyz 'hi'   (bad model)
+[91m[1mError: [0m{
+  "name": "UnknownError",
+  "data": {
+    "message": "Unexpected server error. Check server logs for details.",
+    "ref": "err_4e3e5099"
+  }
+exit=0
+
+$ opencode export ses_f661e968dffeWZp8dXWhc6Bbbj (first 800 chars)
+Exporting session: ses_f661e968dffeWZp8dXWhc6Bbbj
+{
+  "info": {
+    "id": "ses_f661e968dffeWZp8dXWhc6Bbbj",
+    "slug": "nimble-engine",
+    "projectID": "49c6f64091f6050994abb55b2c961a8cd58da9a9",
+    "directory": "/home/dev/dev/Arreo/target/test-scratch/T-0075/oc/cwd",
+    "path": "target/test-scratch/T-0075/oc/cwd",
+    "title": "New session - 2026-09-13T08:28:01.779Z",
+    "agent": "build",
+    "model": {
+      "id": "deepseek-v4-flash-0731",
+      "providerID": "verboo",
+      "variant": "default"
+    },
+    "version": "1.18.30",
+    "summary": {
+      "additions": 0,
+      "deletions": 0,
+      "files": 0
+    },
+    "cost": 0,
+    "tokens": {
+      "input": 6848,
+      "output": 105,
+      "reasoning": 0,
+      "cache": {
+        "read": 17920,
+        "write": 0
+      }
+    },
+    "
+exit=0

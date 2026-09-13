@@ -1,0 +1,90 @@
+TUI escape-sequence analysis — what the two live harnesses actually emit on the
+wire, and why "BEL means attention" is wrong for both in TUI mode.
+
+Captures (verbatim, 10 s each, isolated HOME/XDG; stdin from /dev/null):
+
+  $ cd target/test-scratch/T-0075/cwd
+  $ PI_CODING_AGENT_DIR=.../pi-agent-dollar \
+      timeout -s KILL 10 script -qec "pi --session-dir .../sessions-pi --no-skills --no-context-files" \
+      /dev/null < /dev/null > pi-tui.raw 2>&1          # rc=137 (killed by timeout)
+  $ HOME=.../oc/home XDG_CONFIG_HOME=.../oc/cfg XDG_DATA_HOME=.../oc/data \
+      timeout -s KILL 10 script -qec "opencode --pure -m verboo/deepseek-v4-flash-0731" \
+      /dev/null < /dev/null > oc-tui.raw 2>&1         # rc=137 (killed by timeout)
+
+Raw captures kept beside this file: pi-0.84.4-tui-10s.raw (31130 B),
+opencode-1.18.30-tui-10s.raw (6979 B). Analysis command:
+
+  $ python3 - <<'EOF'
+  import re
+  for f in ['pi-0.84.4-tui-10s.raw', 'opencode-1.18.30-tui-10s.raw']:
+      d = open(f, 'rb').read()
+      osc = sorted(set(re.findall(rb'\x1b\][^\x07\x1b]*(?:\x07|\x1b\\\\)?', d)))
+      print(f, len(d), 'bytes |', len(osc), 'distinct OSC |', 'BEL:', d.count(b'\x07'))
+      for s in osc: print('   ', repr(s))
+      # byte context before each BEL, unique-ised
+      ctx = {}
+      for m in re.finditer(rb'\x07', d):
+          ctx[d[max(0,m.start()-24):m.start()]] = ctx.get(d[max(0,m.start()-24):m.start()], 0) + 1
+      for b, c in sorted(ctx.items(), key=lambda x: -x[1])[:8]:
+          print(f'    {c}x  ...{b[-24:]!r}')
+      print('    alt-screen', d.count(b'\x1b[?1049'), '| bracketed-paste',
+            d.count(b'\x1b[?2004'), '| kitty-kbd', d.count(b'\x1b[>'),
+            '| OSC9', d.count(b'\x1b]9;'), '| OSC777', d.count(b'\x1b]777'))
+  EOF
+
+pi 0.84.4 (31130 bytes):
+
+  --- pi-0.84.4-tui-10s.raw 31130 bytes | 3 distinct OSC | BEL: 60
+      b'\x1b]0;\xcf\x80 - cwd\x07'      <- window title "π - cwd", BEL-terminated
+      b'\x1b]11;?\x07'                  <- background-colour *query*, BEL-terminated
+      b'\x1b]8;;\x07'                   <- OSC 8 hyperlink CLOSE, BEL-terminated
+      19x  ...b'               \x1b[0m\x1b]8;;'
+      10x  ...b'62;190m\xe2\x94\x80\x1b[39m\x1b[0m\x1b]8;;'
+       7x  ...b'0m\x1b]8;;\x07\r\r\n\x1b[2K\x1b[0m\x1b]8;;'
+       6x  ...b'cwd (main)\x1b[39m\x1b[0m\x1b]8;;'
+       6x  ...b'\xe2\x80\xa2 medium\x1b[39m\x1b[0m\x1b]8;;'
+      alt-screen 0 | bracketed-paste 1 | kitty-kbd 1 | OSC9 0 | OSC777 0
+
+opencode 1.18.30 (6979 bytes):
+
+  --- opencode-1.18.30-tui-10s.raw 6979 bytes | 9 distinct OSC | BEL: 5
+      b'\x1b]0;OpenCode\x07'            <- window title
+      b'\x1b]10;?\x07'                  <- foreground-colour query
+      b'\x1b]11;?\x07'                  <- background-colour query
+      b'\x1b]12;#eeeeee\x07'            <- cursor-colour SET
+      b'\x1b]1337;Capabilities\x1b\\'   <- iTerm2 capabilities probe (ST-terminated)
+      b'\x1b]4;0;?\x07'                 <- palette query
+      b'\x1b]66;s=2; \x1b\\'            <- kitty text-sizing
+      b'\x1b]66;w=1; \x1b\\'
+      b'\x1b]99;i=opentui-notifications:p=?;\x1b\\'   <- opentui notification channel (probe)
+      alt-screen 1 | bracketed-paste 2 | kitty-kbd 2 | OSC9 0 | OSC777 0
+
+FINDING (actionable, adapter-suite v2):
+
+1. Every BEL in both captures terminates an OSC string. None is a "ring the
+   bell" attention chunk. pi: 60/60; opencode: 5/5.
+   The state engine flags BEL by scanning raw bytes for 0x07
+   (crates/arreo-core/src/state/engine.rs:191 `if bytes.contains(&0x07)`),
+   and with `bell_means_attention = true` (all three shipped adapters) a BEL
+   with no prompt-shaped tail transitions straight to `blocked`
+   (engine.rs:239). An idle pi TUI that renders one OSC 8 hyperlink therefore
+   arms a false `blocked`; opencode's title/cursor-colour OSC does the same.
+   The recorded T-0017 fixtures cannot catch this: they were captured in
+   `--print`/text mode (fixtures/pi-*.pty, opencode*.pty), which emits no OSC.
+   Fix belongs in adapter-suite v2 (parse-then-classify, or require a BEL that
+   is NOT preceded by ESC ]): see the T-0075 follow-up "adapter v2: ESC-aware
+   signal extraction".
+2. Neither harness emits an OSC 9 / OSC 777 desktop notification or an OSC 133
+   shell-integration mark from the TUI under probe. opencode exposes the
+   opentui notification channel OSC 99 (probe only, no notification sent);
+   pi has no notification channel visible in the capture — its attention
+   signal is the terminal BEL only via the OSC terminator above.
+3. opencode runs in the alternate screen (0x1b[?1049) from startup; pi does
+   not (its "regular" TUI mode paints inline and scrolls). A pane-state reader
+   that keys "am I in a full-screen app" off alt-screen will be right for
+   opencode and wrong for pi in default `--tui-mode regular`.
+4. Both enable bracketed paste; opencode asks for kitty keyboard protocol
+   (0x1b[>…) and/or a `\x1b[?2031h` mode; pi enables a modifier-key mode
+   (0x1b[>7u). Neither is a state signal on its own, but both break naive
+   "paste the question text into the pane" quick-reply paths if the answer is
+   sent without bracketed-paste framing.

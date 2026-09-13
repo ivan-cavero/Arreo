@@ -1,0 +1,14 @@
+$ pi -p --model verboo/deepseek-v4-flash-0731 'Remember the code word: BANANA'  (default session layout under PI_CODING_AGENT_DIR)
+"type":"session","version":3,"id":"01a099df-e283-7631-9b1b-ccd20343cc95","timestamp":"2026-09-13T08:26:21.699Z","cwd":"/home/dev/dev/Arreo/target/test-scratch/T-0075/cwd"}
+"text":"Remember the code word: BANANA"
+"text":"Remember the code word: BANANA"
+"text":"Got it — code word: **BANANA**."
+"text":"Got it — code word: **BANANA**."
+--- now: pi -c -p 'What is the code word?' ---
+"type":"session","version":3,"id":"01a099df-e283-7631-9b1b-ccd20343cc95"
+"text":"What is the code word?"
+"text":"What is the code word?"
+"text":"The code word is **BANANA**."
+"text":"The code word is **BANANA**."
+"text":"What is the code word?"
+exit=0

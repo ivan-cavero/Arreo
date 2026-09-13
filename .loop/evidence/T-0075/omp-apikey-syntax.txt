@@ -1,0 +1,12 @@
+--- apiKey syntax: brace ---
+"stopReason":"error"
+"errorStatus":401
+"stopReason":"error"
+"errorStatus":401
+exit=0
+--- apiKey syntax: plain ---
+"stopReason":"stop"
+"stopReason":"stop"
+"stopReason":"stop"
+"stopReason":"stop"
+exit=0

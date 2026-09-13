@@ -1,0 +1,8 @@
+$ opencode models verboo   # isolated XDG_CONFIG_HOME with one custom provider
+verboo/deepseek-v4-flash
+verboo/deepseek-v4-flash-0731
+verboo/deepseek-v4.1-flash
+verboo/glm-5.3-flash
+verboo/mimo-v2.5
+verboo/qwen3.8-27b
+exit=0

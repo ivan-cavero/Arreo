@@ -1,0 +1,21 @@
+$ opencode run --pure -m verboo/does-not-exist-xyz 'hi'; echo exit=$?
+[91m[1mError: [0m{
+  "name": "UnknownError",
+  "data": {
+    "message": "Unexpected server error. Check server logs for details.",
+    "ref": "err_93334cc0"
+  }
+}
+exit=1
+
+--- opencode data dir layout (isolated XDG_DATA_HOME) ---
+/home/dev/dev/Arreo/target/test-scratch/T-0075/oc/data
+/home/dev/dev/Arreo/target/test-scratch/T-0075/oc/data/opencode
+/home/dev/dev/Arreo/target/test-scratch/T-0075/oc/data/opencode/opencode.db
+/home/dev/dev/Arreo/target/test-scratch/T-0075/oc/data/opencode/log
+/home/dev/dev/Arreo/target/test-scratch/T-0075/oc/data/opencode/log/opencode.log
+/home/dev/dev/Arreo/target/test-scratch/T-0075/oc/data/opencode/opencode.db-wal
+/home/dev/dev/Arreo/target/test-scratch/T-0075/oc/data/opencode/opencode.db-shm
+/home/dev/dev/Arreo/target/test-scratch/T-0075/oc/data/opencode/snapshot
+/home/dev/dev/Arreo/target/test-scratch/T-0075/oc/data/opencode/snapshot/49c6f64091f6050994abb55b2c961a8cd58da9a9
+/home/dev/dev/Arreo/target/test-scratch/T-0075/oc/data/opencode/repos

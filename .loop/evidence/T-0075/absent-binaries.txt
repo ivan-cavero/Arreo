@@ -1,0 +1,15 @@
+claude: NOT FOUND
+codex: NOT FOUND
+gemini: NOT FOUND
+grok: NOT FOUND
+aider: NOT FOUND
+crush: NOT FOUND
+goose: NOT FOUND
+cline: NOT FOUND
+cursor-agent: NOT FOUND
+qwen: NOT FOUND
+droid: NOT FOUND
+kimi: NOT FOUND
+amp: NOT FOUND
+continue: continue
+openhands: NOT FOUND

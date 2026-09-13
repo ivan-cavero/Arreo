@@ -1,0 +1,15 @@
+$ cat /home/dev/dev/Arreo/target/test-scratch/T-0075/oc/cwd/opencode.json   (project-local custom provider 'projmarker')
+{
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "projmarker": {
+      "name": "Project-local marker",
+      "npm": "@ai-sdk/openai-compatible",
+      "options": { "baseURL": "https://example.invalid/v1", "apiKey": "{env:PROJ_KEY}" },
+      "models": { "m1": { "id": "m1", "name": "m1" } }
+    }
+  }
+}
+
+$ opencode debug config | python3 -c 'providers present?'
+providers: ['projmarker', 'verboo']

@@ -1,0 +1,6 @@
+--- session file layout in --session-dir ---
+/home/dev/dev/Arreo/target/test-scratch/T-0075/omp/sessionsplain/2026-09-13T08-32-55-914Z_01a099e5-e66a-7568-9bd6-ac330e14b488.jsonl
+--- resume by -r <id prefix> ---
+$ omp --session-dir /home/dev/dev/Arreo/target/test-scratch/T-0075/omp/sessionsplain -r 01a099 --mode json -p 'second turn'
+"type":"session","version":3,"id":"01a099e5-e66a-7568-9bd6-ac330e14b488","timestamp":"2026-09-13T08:32:55.914Z","cwd":"/home/dev/dev/Arreo/target/test-scratch/T-0075/omp/cwd"}
+exit=124

@@ -1,0 +1,11 @@
+$ opencode run --pure -s ses_f661e968dffeWZp8dXWhc6Bbbj --format json 'second turn'   # resume by session id
+      6 "sessionID":"ses_f661e968dffeWZp8dXWhc6Bbbj"
+exit=0
+
+$ opencode run --pure -c --format json 'third turn'   # continue last session
+      6 "sessionID":"ses_f661e968dffeWZp8dXWhc6Bbbj"
+exit=0
+
+--- session list --format json (ids) ---
+1 sessions
+ses_f661e968dffeWZp8dXWhc6Bbbj 'New session - 2026-09-13T08:28:01.779Z'

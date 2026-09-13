@@ -1,0 +1,150 @@
+$ cargo xtask adapters --check            # run 1, 2026-09-13T10:5xZ — sibling T-0072 mid-edit
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 3.59s
+     Running `target/debug/xtask adapters --check`
+[PASS] default: schema valid (11 question + 7 error patterns)
+[PASS] default/question-permission.pty: flow Working, end Question
+[PASS] default/working-stream.pty: flow Working, end Idle
+[PASS] default/idle-shell.pty: flow Working, end Idle
+[PASS] default/vim-edit.pty: flow Working, end Idle
+[FAIL] opencode: invalid TOML: adapter parse: TOML parse error at line 41, column 1
+   |
+41 | question_patterns = [
+   | ^^^^^^^^^^^^^^^^^
+unknown field `question_patterns`, expected one of `kind`, `argv`, `exact_argv`, `session_pattern`
+
+[FAIL] pi: invalid TOML: adapter parse: TOML parse error at line 37, column 1
+   |
+37 | question_patterns = [
+   | ^^^^^^^^^^^^^^^^^
+unknown field `question_patterns`, expected one of `kind`, `argv`, `exact_argv`, `session_pattern`
+
+adapters: 5 passed, 2 failed
+exit=1
+
+Cause: the in-flight T-0072 edit put the new `[resume]` table header (and
+`harness`/`programs`) ABOVE the top-level `question_patterns` array, so TOML made
+the arrays members of `[resume]`. Reported to the sibling via hub; T-0075 does not
+own adapters/ and changed nothing there.
+
+$ cargo xtask adapters --check            # run 2, 2026-09-13T11:0xZ — after the sibling's fix
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 2.51s
+     Running `target/debug/xtask adapters --check`
+[PASS] default: schema valid (11 question + 7 error patterns)
+[PASS] default/question-permission.pty: flow Working, end Question
+[PASS] default/working-stream.pty: flow Working, end Idle
+[PASS] default/idle-shell.pty: flow Working, end Idle
+[PASS] default/vim-edit.pty: flow Working, end Idle
+[PASS] opencode: schema valid (12 question + 9 error patterns)
+[PASS] opencode/opencode-question.pty: flow Working, end Question
+[PASS] opencode/opencode-working.pty: flow Working, end Idle
+[PASS] opencode/opencode-idle.pty: flow Working, end Idle
+[PASS] opencode/opencode-stress.pty: flow Working, end Idle
+[PASS] pi: schema valid (12 question + 9 error patterns)
+[PASS] pi/pi-question.pty: flow Working, end Question
+[PASS] pi/pi-working.pty: flow Working, end Idle
+[PASS] pi/pi-idle.pty: flow Working, end Idle
+[PASS] pi/pi-stress.pty: flow Working, end Question
+adapters: 15 passed, 0 failed
+exit=0
+
+$ cargo xtask adapters --check            # run 3, final pass by T-0075 at 09:15:50Z
+   Compiling xtask v0.1.0 (/home/dev/dev/Arreo/xtask)
+error: expected `,`, found `.`
+   --> xtask/src/persistence_slice.rs:562:53
+    |
+562 |         Err(_) => fail!("the daemon did not restart".to_string()),
+    |                                                     ^ expected `,`
+
+error: argument never used
+   --> xtask/src/persistence_slice.rs:562:54
+    |
+562 |         Err(_) => fail!("the daemon did not restart".to_string()),
+    |                         ---------------------------- ^^^^^^^^^^^ argument never used
+    |                         |
+    |                         formatting specifier missing
+    |
+help: format specifiers use curly braces, consider adding a format specifier
+    |
+562 |         Err(_) => fail!("the daemon did not restart{}".to_string()),
+    |                                                    ++
+
+error: in expressions, `_` can only be used on the left-hand side of an assignment
+   --> xtask/src/persistence_slice.rs:870:12
+    |
+870 |         if _ == n {
+    |            ^ `_` not allowed here
+
+error[E0277]: `?` couldn't convert the error to `String`
+   --> xtask/src/persistence_slice.rs:218:79
+    |
+183 | fn topology_slice() -> Result<usize, String> {
+    |                        --------------------- expected `String` because of this
+...
+218 |     let server = TestServer::spawn(&server_bin, &socket, "post-crash restart")?;
+    |                  -------------------------------------------------------------^ the trait `From<ExitCode>` is not implemented for `String`
+    |                  |
+    |                  this can't be annotated with `?` because it has type `Result<_, ExitCode>`
+    |
+    = note: the question mark operation (`?`) implicitly performs a conversion on the error value using the `From` trait
+    = help: `String` implements trait `From<T>`:
+              From<&String>
+              From<&mut str>
+              From<&str>
+              From<Box<str>>
+              From<Cow<'_, str>>
+              From<char>
+
+error[E0425]: cannot find function `new_matching` in this scope
+   --> xtask/src/persistence_slice.rs:576:20
+    |
+576 |         let pids = new_matching(&pi_session, &before);
+    |                    ^^^^^^^^^^^^ not found in this scope
+
+error[E0425]: cannot find function `new_matching` in this scope
+   --> xtask/src/persistence_slice.rs:596:20
+    |
+596 |         let pids = new_matching(&oc_session, &before);
+    |                    ^^^^^^^^^^^^ not found in this scope
+
+error[E0425]: cannot find function `new_matching` in this scope
+   --> xtask/src/persistence_slice.rs:612:20
+    |
+612 |         let pids = new_matching(&["plain-fallback-marker"], &before);
+    |                    ^^^^^^^^^^^^ not found in this scope
+
+error[E0425]: cannot find function `to_string` in this scope
+   --> xtask/src/persistence_slice.rs:562:54
+    |
+562 |         Err(_) => fail!("the daemon did not restart".to_string()),
+    |                                                      ^^^^^^^^^ not found in this scope
+
+Some errors have detailed explanations: E0277, E0425.
+For more information about an error, try `rustc --explain E0277`.
+error: could not compile `xtask` (bin "xtask") due to 8 previous errors
+exit=101
+
+$ cargo xtask adapters --check            # run 4, final pass by T-0075 at 09:16:59Z
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.58s
+     Running `target/debug/xtask adapters --check`
+[PASS] default: schema valid (11 question + 7 error patterns)
+[PASS] default/question-permission.pty: flow Working, end Question
+[PASS] default/working-stream.pty: flow Working, end Idle
+[PASS] default/idle-shell.pty: flow Working, end Idle
+[PASS] default/vim-edit.pty: flow Working, end Idle
+[PASS] opencode: schema valid (12 question + 9 error patterns)
+[PASS] opencode/opencode-question.pty: flow Working, end Question
+[PASS] opencode/opencode-working.pty: flow Working, end Idle
+[PASS] opencode/opencode-idle.pty: flow Working, end Idle
+[PASS] opencode/opencode-stress.pty: flow Working, end Idle
+[PASS] pi: schema valid (12 question + 9 error patterns)
+[PASS] pi/pi-question.pty: flow Working, end Question
+[PASS] pi/pi-working.pty: flow Working, end Idle
+[PASS] pi/pi-idle.pty: flow Working, end Idle
+[PASS] pi/pi-stress.pty: flow Working, end Question
+adapters: 15 passed, 0 failed
+exit=0
+
+Note on run 3 (above, elsewhere in this file): it failed at BUILD time (8 errors in
+xtask/src/persistence_slice.rs — E0277/E0425), i.e. another task's in-flight edit to a
+sibling xtask module blocked the whole xtask binary. T-0075 changed no Rust file; the
+next attempt, ~40 s later, was green again. Recorded rather than hidden.

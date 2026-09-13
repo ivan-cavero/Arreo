@@ -1,0 +1,14 @@
+$ pi --session-id 01a099ff-0000-7000-8000-000000000001 --mode json -p --model verboo/deepseek-v4-flash-0731 'pinned one'
+exit=0
+"type":"session","version":3,"id":"01a099ff-0000-7000-8000-000000000001","timestamp":"2026-09-13T08:43:38.898Z","cwd":"/home/dev/dev/Arreo/target/test-scratch/T-0075/cwd"
+0
+$ pi --session-id 01a099ff-0000-7000-8000-000000000001 --mode json -p --model verboo/deepseek-v4-flash-0731 'pinned two'
+exit=0
+"type":"session","version":3,"id":"01a099ff-0000-7000-8000-000000000001","timestamp":"2026-09-13T08:43:38.898Z","cwd":"/home/dev/dev/Arreo/target/test-scratch/T-0075/cwd"
+0
+--- files ---
+2026-09-13T08-43-38-898Z_01a099ff-0000-7000-8000-000000000001.jsonl
+2026-09-13T08-26-21-699Z_01a099df-e283-7631-9b1b-ccd20343cc95.jsonl
+--- pinned file content (user messages) ---
+"role":"user","content":[{"type":"text","text":"pinned one"
+"role":"user","content":[{"type":"text","text":"pinned two"

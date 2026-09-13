@@ -1,0 +1,12 @@
+--- apiKey syntax: dollar ---
+"text":"Reply with exactly: OK"
+"text":"Reply with exactly: OK"
+"text":"OK"
+"text":"OK"
+exit=0
+--- apiKey syntax: brace ---
+"text":"Reply with exactly: OK"
+"text":"Reply with exactly: OK"
+"text":"OK"
+"text":"OK"
+exit=0

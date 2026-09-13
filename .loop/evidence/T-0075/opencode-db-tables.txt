@@ -1,0 +1,2 @@
+$ sqlite3 /home/dev/dev/Arreo/target/test-scratch/T-0075/oc/data/opencode/opencode.db '.tables'
+(sqlite3 not installed)

@@ -1,0 +1,23 @@
+$ omp models verboo  # from scratch models.yml
+verboo (6)
+┌────────────────────────┬─────────┬─────────┬───────────────────────────────┬────────┐
+│ model                  │ context │ max-out │ thinking                      │ images │
+├────────────────────────┼─────────┼─────────┼───────────────────────────────┼────────┤
+│ deepseek-v4-flash      │      1M │     66K │ low,high,max                  │ no     │
+│ deepseek-v4-flash-0731 │      1M │     66K │ low,high,max                  │ no     │
+│ deepseek-v4.1-flash    │      1M │     66K │ -                             │ no     │
+│ glm-5.3-flash          │      1M │     66K │ low,high,max                  │ yes    │
+│ mimo-v2.5              │      1M │     66K │ -                             │ yes    │
+│ qwen3.8-27b            │    262K │     66K │ minimal,low,medium,high,xhigh │ yes    │
+exit=0
+
+$ omp --session-dir /home/dev/dev/Arreo/target/test-scratch/T-0075/omp/sessions --mode json -p --model verboo/deepseek-v4-flash-0731 'Reply with exactly: OK'
+"type":"session","version":3,"id":"01a099e4-e244-731a-807a-5d3529eac196","timestamp":"2026-09-13T08:31:49.316Z","cwd":"/home/dev/dev/Arreo/target/test-scratch/T-0075/omp/cwd"}
+"text":"Reply with exactly: OK"
+"text":"Reply with exactly: OK"
+"stopReason":"error"
+"stopReason":"error"
+"stopReason":"error"
+"text":"Reply with exactly: OK"
+"stopReason":"error"
+exit=0

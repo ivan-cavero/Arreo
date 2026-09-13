@@ -1,0 +1,37 @@
+=== Orca's shipped Codex hook wiring (host artifact, read-only) ===
+$ cat ~/.config/orca/codex-runtime-home/home/hooks.json | python3 -c 'hook event names'
+['SessionStart', 'UserPromptSubmit', 'PreToolUse', 'PermissionRequest', 'PostToolUse', 'SubagentStart', 'SubagentStop', 'Stop']
+command template: if [ -f '/home/dev/.orca/agent-hooks/codex-hook.sh' ] && [ -r '/home/dev/.orca/agent-hooks/codex-hook.sh' ] && [ -x '/ho ...
+
+$ cat ~/.config/orca/codex-runtime-home/home/config.toml | grep -o 'hooks.state."[^"]*"' | sed 's/.*://' | sort -u
+permission_request
+post_tool_use
+pre_tool_use
+session_start
+stop
+subagent_start
+subagent_stop
+user_prompt_submit
+
+=== Orca's OMP status extension hook events ===
+pi.on('agent_end'
+pi.on('agent_settled'
+pi.on('agent_start'
+pi.on('before_agent_start'
+pi.on('message_end'
+pi.on('tool_call'
+pi.on('tool_execution_end'
+pi.on('tool_execution_start'
+
+=== Orca's opencode status plugin event types ===
+event.type === "message.part.delta"
+event.type === "message.part.updated"
+event.type === "message.updated"
+event.type === "permission.asked"
+event.type === "permission.replied"
+event.type === "question.asked"
+event.type === "question.rejected"
+event.type === "question.replied"
+event.type === "session.error"
+event.type === "session.idle"
+event.type === "session.status"

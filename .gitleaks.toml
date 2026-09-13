@@ -37,4 +37,19 @@ regexes = [
     '''sk-abc123XYZ4567890abcdef''',
     # Dummy ghp_ literal: same triage (crates/arreo-core/tests/audit.rs).
     '''ghp_AAAABBBBCCCCDDDDEEEEFFFF''',
+    # The published PUBLIC account root key from a T-0067 transcript revision
+    # (commit ec4034a; the line was removed in the next commit, but gitleaks
+    # scans history). `--root-key` takes the public half by definition — see
+    # docs/machines.md, "the public key (64 hex characters)". Triage:
+    # .loop/evidence/T-0048/secrets-scan.txt, addendum 2026-09-13.
+    '''b7982e04edd07dc116f300e2c6cf248bb824a7570f841e7cd5b219f70374681a''',
+    # Dummy values written and executed by T-0075's secret-scanner probe
+    # (.loop/evidence/T-0075/existing-scan-secrets-e2e.txt): sequential filler in
+    # the shapes of four providers' keys plus the jwt.io example token, used as
+    # INPUT to `arreo record` to prove the shipped scanner's behaviour. Each is a
+    # literal that exists nowhere else; a real key in the same shape still fires.
+    '''xai-0123456789abcdefghijklmnopqrstuvwx''',
+    '''AIzaSyA0123456789abcdefghijklmnopqrstuv''',
+    '''sk-0123456789abcdefghijklmnop''',
+    '''eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U''',
 ]

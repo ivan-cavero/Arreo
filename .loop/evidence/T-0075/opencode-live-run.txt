@@ -1,0 +1,12 @@
+$ opencode run --pure --format json -m verboo/deepseek-v4-flash-0731 'Reply with exactly: OK'
+{"type":"step_start","timestamp":1789288098691,"sessionID":"ses_f661e968dffeWZp8dXWhc6Bbbj","part":{"id":"prt_099e1ab5d001uD2OPkRzgymX05","messageID":"msg_099e178fd001OOR16G1Pi1kUYq","sessionID":"ses_f661e968dffeWZp8dXWhc6Bbbj","snapshot":"613a1273d80235c83502e3e6ce5fa3baefe35e8e","type":"step-start"}}
+{"type":"text","timestamp":1789288098691,"sessionID":"ses_f661e968dffeWZp8dXWhc6Bbbj","part":{"id":"prt_099e1ab67001emhfcEgHojeX96","messageID":"msg_099e178fd001OOR16G1Pi1kUYq","sessionID":"ses_f661e968dffeWZp8dXWhc6Bbbj","type":"text","text":"OK","time":{"start":1789288098663,"end":1789288098676}}}
+{"type":"step_finish","timestamp":1789288098786,"sessionID":"ses_f661e968dffeWZp8dXWhc6Bbbj","part":{"id":"prt_099e1abd3001xFxevknzwdGSrf","reason":"stop","snapshot":"613a1273d80235c83502e3e6ce5fa3baefe35e8e","messageID":"msg_099e178fd001OOR16G1Pi1kUYq","sessionID":"ses_f661e968dffeWZp8dXWhc6Bbbj","type":"step-finish","tokens":{"total":8247,"input":6581,"output":2,"reasoning":0,"cache":{"write":0,"read":1664}},"cost":0}}
+exit=0
+
+--- opencode session list --format json ---
+[
+  {
+    "id": "ses_f661e968dffeWZp8dXWhc6Bbbj",
+    "title": "New session - 2026-09-13T08:28:01.779Z",
+    "updated": 1789288098994,

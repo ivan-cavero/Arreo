@@ -1,0 +1,28 @@
+=== opencode debug paths ===
+home       /home/dev/dev/Arreo/target/test-scratch/T-0075/home
+data       /home/dev/dev/Arreo/target/test-scratch/T-0075/data/opencode
+bin        /home/dev/dev/Arreo/target/test-scratch/T-0075/cache/opencode/bin
+log        /home/dev/dev/Arreo/target/test-scratch/T-0075/data/opencode/log
+repos      /home/dev/dev/Arreo/target/test-scratch/T-0075/data/opencode/repos
+cache      /home/dev/dev/Arreo/target/test-scratch/T-0075/cache/opencode
+config     /home/dev/dev/Arreo/target/test-scratch/T-0075/cfg/opencode
+state      /home/dev/dev/Arreo/target/test-scratch/T-0075/state/opencode
+tmp        /tmp/opencode
+=== opencode session list --help ===
+opencode session list
+
+list sessions
+
+Options:
+  -h, --help        show help                                                              [boolean]
+  -v, --version     show version number                                                    [boolean]
+      --print-logs  print logs to stderr                                                   [boolean]
+      --log-level   log level                   [string] [choices: "DEBUG", "INFO", "WARN", "ERROR"]
+      --pure        run without external plugins                                           [boolean]
+  -n, --max-count   limit to N most recent sessions                                         [number]
+      --format      output format             [string] [choices: "table", "json"] [default: "table"]=== opencode debug info ===
+opencode version: 1.18.30
+os: Linux 6.12.101+deb13-cloud-amd64 x64
+terminal: Orca 1.4.188 / dumb
+plugins:
+- file:///home/dev/.config/orca/opencode-hooks/shared/plugins/orca-opencode-status.js

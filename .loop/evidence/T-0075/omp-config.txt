@@ -1,0 +1,25 @@
+$ HOME=/home/dev/dev/Arreo/target/test-scratch/T-0075/omp/home omp config list
+Settings:
+
+[appearance]
+  theme.dark = titanium (string)
+  theme.light = light (string)
+  symbolPreset = unicode (unicode|nerd|ascii)
+  colorBlindMode = false (boolean)
+  composer.shape = band (string)
+  statusLine.preset = default (default|minimal|compact|full|nerd|ascii|custom)
+  statusLine.separator = powerline-thin (powerline|powerline-thin|slash|pipe|block|none|ascii)
+  statusLine.contextLine = embedded (off|percentage|annotated|embedded)
+  statusLine.sessionAccent = true (boolean)
+  statusLine.transparent = false (boolean)
+  statusLine.compactThinkingLevel = true (boolean)
+  statusLine.showHookStatus = true (boolean)
+  terminal.showImages = true (boolean)
+  images.autoResize = true (boolean)
+  images.blockImages = false (boolean)
+  tui.resizeScrollback = rebuild (append|rebuild|preserve)
+  terminal.showProgress = false (boolean)
+exit=0
+
+$ omp config path
+/home/dev/dev/Arreo/target/test-scratch/T-0075/omp/home/.omp/agent

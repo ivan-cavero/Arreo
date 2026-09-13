@@ -1,0 +1,20 @@
+$ herdr integration status
+pi: current (v8) (/home/dev/.pi/agent/extensions/herdr-agent-state.ts)
+omp: current (v9) (/home/dev/.omp/agent/extensions/herdr-omp-agent-state.ts)
+claude: not installed (/home/dev/.claude/hooks/herdr-agent-state.sh)
+codex: not installed (/home/dev/.config/orca/codex-runtime-home/home/herdr-agent-state.sh)
+copilot: not installed (/home/dev/.copilot/hooks/herdr-agent-state.sh)
+devin: not installed (/home/dev/.config/devin/herdr-agent-state.sh)
+droid: not installed (/home/dev/.factory/hooks/herdr-agent-state.sh)
+kimi: not installed (/home/dev/.kimi-code/hooks/herdr-agent-state.sh)
+opencode: current (v11) (/home/dev/.config/opencode/plugins/herdr-agent-state.js)
+kilo: not installed (/home/dev/.config/kilo/plugin/herdr-agent-state.js)
+hermes: not installed (/home/dev/.hermes/plugins/herdr-agent-state/__init__.py)
+qodercli: not installed (/home/dev/.qoder/hooks/herdr-agent-state.sh)
+qwen: not installed (/home/dev/.qwen/hooks/herdr-agent-session.sh)
+cursor: not installed (/home/dev/.cursor/herdr-agent-state.sh)
+mastracode: not installed (/home/dev/.mastracode/hooks/herdr-agent-state.sh)
+antigravity-cli: not installed (/home/dev/.gemini/config/hooks/herdr-agent-state.sh)
+grok: not installed (/home/dev/.grok/hooks/herdr-agent-state.sh)
+
+$ herdr integration status --outdated-only

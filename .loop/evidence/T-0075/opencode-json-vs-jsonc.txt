@@ -1,0 +1,3 @@
+$ (both $XDG_CONFIG_HOME/opencode/opencode.jsonc and .json present, different providers)
+$ opencode debug config | providers
+['fromjson', 'fromjsonc']

@@ -1,0 +1,34 @@
+$ omp config init-xdg   (isolated HOME/XDG)
+Created /home/dev/dev/Arreo/target/test-scratch/T-0075/omp/data/omp
+Created /home/dev/dev/Arreo/target/test-scratch/T-0075/omp/state/omp
+Created /home/dev/dev/Arreo/target/test-scratch/T-0075/omp/cache/omp
+
+XDG directories initialized.
+Ensure XDG_DATA_HOME, XDG_STATE_HOME, and XDG_CACHE_HOME
+are set in your shell profile for omp to use them.
+exit=0
+
+$ omp config path   (after)
+/home/dev/dev/Arreo/target/test-scratch/T-0075/omp/home/.omp/agent
+
+--- resulting dirs ---
+/home/dev/dev/Arreo/target/test-scratch/T-0075/omp/home/.omp
+/home/dev/dev/Arreo/target/test-scratch/T-0075/omp/home/.omp/agent
+/home/dev/dev/Arreo/target/test-scratch/T-0075/omp/home/.omp/agent/models.db
+/home/dev/dev/Arreo/target/test-scratch/T-0075/omp/home/.omp/agent/models-plain.yml
+/home/dev/dev/Arreo/target/test-scratch/T-0075/omp/home/.omp/agent/models.yml
+/home/dev/dev/Arreo/target/test-scratch/T-0075/omp/home/.omp/agent/models-brace.yml
+/home/dev/dev/Arreo/target/test-scratch/T-0075/omp/home/.omp/agent/agent.db
+/home/dev/dev/Arreo/target/test-scratch/T-0075/omp/home/.omp/agent/terminal-sessions
+/home/dev/dev/Arreo/target/test-scratch/T-0075/omp/home/.omp/run
+/home/dev/dev/Arreo/target/test-scratch/T-0075/omp/home/.omp/run/daemons
+/home/dev/dev/Arreo/target/test-scratch/T-0075/omp/home/.omp/logs
+/home/dev/dev/Arreo/target/test-scratch/T-0075/omp/home/.omp/logs/omp.2026-09-13.2805529.log
+/home/dev/dev/Arreo/target/test-scratch/T-0075/omp/home/.omp/logs/omp.2026-09-13.2805614.log
+/home/dev/dev/Arreo/target/test-scratch/T-0075/omp/home/.omp/logs/omp.2026-09-13.2805929.log
+/home/dev/dev/Arreo/target/test-scratch/T-0075/omp/home/.omp/logs/omp.2026-09-13.2793334.log
+/home/dev/dev/Arreo/target/test-scratch/T-0075/omp/home/.omp/logs/omp.2026-09-13.2821051.log
+/home/dev/dev/Arreo/target/test-scratch/T-0075/omp/home/.omp/logs/omp.2026-09-13.2794214.log
+/home/dev/dev/Arreo/target/test-scratch/T-0075/omp/home/.omp/logs/omp.2026-09-13.2794832.log
+/home/dev/dev/Arreo/target/test-scratch/T-0075/omp/home/.omp/logs/omp.2026-09-13.2793208.log
+/home/dev/dev/Arreo/target/test-scratch/T-0075/omp/home/.omp/logs/.omp.2821051-audit.json
