@@ -1,35 +1,40 @@
 ## State snapshot          ← REWRITTEN (not appended) at every checkpoint
-Task: **T-0038 stage 4 (abort leaves the old daemon whole + the SQLite criterion) IN FLIGHT** with
-worker `Stage4Abort`. Stages 1-3 done and pushed; T-0076 done; T-0079 filed p1.
-Where you are: 626 tests / 61 targets, 12 slices green, bench 6/6, all gates green at `a7b239b`.
-The user's T-0036/T-0063 edits remain dirty, theirs.
-Next step: collect `Stage4Abort`, verify its three-point chaos slice against the real binaries and
-the SQLite tests independently, then the battery on the merged tree and commit stage 4.
-Open workers: **Stage4Abort** (the chaos slice + the audit-during-cut test + the corrupt-wal
-quarantine in `arreo-core/src/store.rs`)
-Known broken: T-0063 (CI ubuntu leg — the user is actively working it; do not touch) · Parked:
-T-0048 + T-0036 needs-human (T-0036 now `todo` per the user)
-Stage 4's design, held by the planner:
-- **The three kill points are already proven piecemeal** (abort/resume/paused-window tests); stage
-  4's job is the coherent chaos run — kill -9 a real incoming daemon at three observably distinct
-  moments (before the transfer / at first pause / after the transfer before the commit), asserting
-  the full bundle each time: panes alive + producing, old daemon serving, an attached client
-  unaware, a retry succeeding, exactly one daemon (flock).
-- **The SQLite criterion was re-scoped** (recorded in the task file): the "checkpoints WAL and
-  closes" clause is obsolete (stage 1 corrected the ADR — no checkpoint exists or is needed), and
-  the "corrupt -wal heals per T-0018's rule" clause is **unproven**: no such rule is written and
-  no test exists. Measured: corrupting a live daemon's -wal does not crash it, but persistence
-  silently degrades (every store open fails, every `if let Ok(store)` swallows it) — a daemon that
-  looks healthy while its audit trail and scrollback quietly stop persisting. The fix: a corrupt
-  store is **quarantined on open** (renamed aside, loud log + audit), never deleted, so the next
-  open creates a fresh store and persistence resumes.
+Task: **T-0038 — DONE (all 6 criteria).** The zero-cut update is complete: five stages plus the
+SQLite criterion. Stages 1-3 shipped earlier; stage 4 (abort chaos + corrupt-store healing) landed
+in `e006fd1`. **The hardest thing in Phase 2 is finished.**
+Where you are: 629 workspace tests / 0 failed across 61 targets; clippy clean on **both**
+toolchains; fmt clean; **13 slices green** (incl. the new `handoff-abort` 41 checks and `reattach`
+11); bench 6/6; vet 336, deny 4/4, audit 0, check-targets PASS/SKIP. The user's own Astro site
+(`site/`, `.loop/evidence/landing/`) is untracked and deliberately untouched; their T-0036/T-0063
+work is committed (`220b9aa`) and **T-0036 is now `todo`** (a release key exists).
+Next step: the p1 queue, in this order of confidence — **T-0079** (the 30-pane wall poller: a
+nine-second first paint, a real product defect at the scale the product exists for) is the
+highest-value; **T-0078** (p1: the daemon's store is world-readable and its socket
+group-writable — proven, and until it lands the handoff's honest claim is "closed for same-user,
+open for same-group at the default mode"); **T-0036** is `todo` and human-held in part (the
+signing key exists now, so its automation half may be startable — read it first).
+Open workers: (none)
+Known broken: T-0063 (CI never-green — the user is working it; its file carries the runner logs
+and an ownership boundary) · Parked: T-0048 needs-human
 Findings:
-- **"Heals per T-0018's rule" was a claim with no rule behind it** — T-0018's file says "corrupt
-  DBs heal aside" with no mechanism and no test. The first probe showed the daemon survives a
-  corrupted -wal but degrades silently, which is exactly the failure mode this project refuses.
-  The criterion now defines the rule (quarantine) instead of referencing one.
-- **The three-point kill test is a timing problem** — the same lesson as stage 2: make each point
-  deterministically observable (immediately / ring-frozen / grace period) rather than racing it.
+- **A corrupt store used to degrade silently, and "heals per T-0018's rule" was a claim with no
+  rule behind it.** Probed: corrupting a live daemon's `-wal` does not crash it, but every store
+  open fails and every `if let Ok(store)` swallows it — a daemon that looks healthy while its
+  audit trail and scrollback quietly stop persisting. And on restart SQLite **silently discards**
+  an unparseable log, so the frames are gone with nothing said. The fix checks the log's header
+  before the open and quarantines loudly; the criterion now defines the rule instead of
+  referencing one.
+- **Two healers race, and the second quarantines the first's fresh store.** Found by a test
+  failing only under full-workspace load, and it is a real defect in a path meant to prevent data
+  loss: the daemon and a CLI both open the same store. Healing is now serialized with the
+  codebase's own `ExclusiveLock` and re-checked under it — one corruption, one heal, one row.
+- **A wait that equals the deadline it waits for has no margin.** A stage-3 test's cleanup waited
+  exactly 5 s for a daemon whose own graceful drain deadline is exactly 5 s; it failed
+  intermittently under load. Cleanup now escalates (SIGTERM 20 s, then SIGKILL), because "no
+  process left behind" is the property and the graceful path belongs to the lifecycle slice.
+- **A slice's own premise can be the flake.** Point B of the chaos slice required the `.handoff`
+  transfer socket to exist — a file that lives for milliseconds — so a healthy run could fail its
+  own precondition. The premise is now the *pause*, which is what "mid-handoff" actually means.
 ## Event log               ← append-only; newest last; never rewrite
 - 2026-09-10 [turn 1] ledger created; repo at e489fac (docs only); T-0001 + T-0022 (AGENTS.md gardened) done
 - 2026-09-10 [turn 2] T-0002 PTY manager done+pushed (342606c; 9 tests); PROMPT.md v2 synced + ADR 0001 (ef6c595)
@@ -167,3 +172,5 @@ Findings:
 - 2026-09-13 [turn 65] T-0038 stage 3 done + pushed (`25b8e0a`): clients reattach across the handoff. The CLI's `attach` was a one-shot that died at the cut; it now reconnects with the absolute line count as its cursor (the daemon's `from_line` clamp makes the resume exact — never a replay of the ring), the shared backoff policy, and script contract exit codes (0 pane exited / 1 attach failed / 2 usage / 130 Ctrl-C / 141 SIGPIPE). The TUI's reconnect had a real bug the measurement found: re-subscribed `Read`s sat until the next 1 s tick, worst case 2.04 s over the budget; a fresh connection now polls immediately (0.55-0.65 s after, 13+ runs under 1.55 s). New `xtask/src/reattach_slice.rs` (11 checks, registered) drives a real daemon + pane + CLI attach + TUI on a pty through a real `--handoff-from` cut, measures reattach against `server_handoff_reattach_s` read from perf-budget.toml, flips the row to enforced, asserts the pane id unchanged, and corroborates exactly-once input (33 accepted sends, every echo once). The slice, not bench, is the row's authority — the criterion's "assert it in xtask bench" was clarified into the task file, matching the `reattach_after_absence_s` precedent. Two input-during-cut tests in tests/handoff.rs: a paused-pane send survives exactly once; a racing send is acked once or refused-and-retried (with the canonical-mode newline lesson written into the test). Honest verification note: reverting the TUI fix did not turn the slice red on this box (base latency fits even the unfixed path in 2 s) — the fix is the margin, its pre-fix evidence is the 2.04 s measurement. 626 tests, 12 slices, bench 6/6, all gates green; the user's T-0036/T-0063 left dirty.
 
 - 2026-09-13 [turn 66] T-0038 stage 4 delegated (`Stage4Abort`). Reconnaissance: the three abort points are behaviorally proven piecemeal by stages 1-2's tests, so stage 4's deliverable is the coherent chaos run (kill -9 a real incoming daemon at three observably distinct moments, assert the whole bundle each time) plus the SQLite criterion. The SQLite criterion needed a re-scope, recorded in the task file: the "checkpoints WAL and closes" clause is obsolete (stage 1 corrected the ADR), and "corrupt -wal heals per T-0018's rule" turned out to be a claim with no rule behind it — probed empirically: a corrupted -wal does not crash the daemon but persistence silently degrades (every store open fails, every `if let Ok(store)` swallows it). The criterion now defines the rule: quarantine a corrupt store on open, loudly, never delete it. Also probed: `wal_checkpoint(FULL)` removes the -wal entirely, so a corrupt -wal is the crash-mid-transaction shape.
+
+- 2026-09-13 [turn 67] T-0038 DONE — all six criteria (five stages + SQLite). Stage 4 landed: `xtask/src/handoff_abort_slice.rs` (`--slice handoff-abort`, 41 checks) kills -9 a real incoming daemon at three observably distinct moments of a real cut with 8 panes and a live attached client, asserting the full bundle each time (panes alive + contiguous, old daemon serving, client unaware, abort row, retry commits and carries the panes, exactly one daemon); point C asserts the accepted §2c gap honestly (a kill after the commit leaves nobody serving, so it verifies the commit was withheld). The SQLite criterion: `SessionStore::open` now quarantines a corrupt store — files renamed aside (never deleted), stderr + a `store.corrupt` audit row, one call heals (the boot path's store is opened with `?` by a daemon that then exits), the heal is verified and undone if the fresh store will not open, and `SQLITE_IOERR` is excluded because a failing device means the store is not the problem. Two design-changing probes: a corrupt live `-wal` degrades persistence *silently* (every open fails, every `if let Ok` swallows it), and SQLite *silently discards* an unparseable log on restart — hence a header check before the open. Two load-sensitive tests found and both were real: the second healer was quarantining the first's fresh store (now serialized with the codebase's `ExclusiveLock` + re-check), and a cleanup waited exactly its subject's own 5 s drain deadline (now escalates TERM→KILL). Also fixed a slice premise that raced a millisecond-lived file. Verified: 629 tests / 61 targets, 13 slices, bench 6/6, vet/deny/audit/targets green; the quarantine is mutation-checked. The user's `site/` (Astro) is untouched; their T-0036/T-0063 landed in `220b9aa` and T-0036 is now `todo`.

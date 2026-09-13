@@ -3,7 +3,7 @@ id: T-0038
 title: Server live handoff on Unix — PTY masters over SCM_RIGHTS, zero-cut update
 phase: 2
 priority: 2
-status: in-progress
+status: done
 depends_on: [T-0002, T-0012, T-0013, T-0018]
 scope:
   - crates/arreo-server/src/handoff/**
@@ -272,11 +272,45 @@ PTY masters over SCM_RIGHTS, re-opens SQLite and serves — a failed step kills 
       criterion's "assert it in `xtask bench`" was clarified (recorded above): the slice is the
       authority, matching the precedent set by `reattach_after_absence_s`.
 
-- [ ] **Stage 4 — abort leaves the old daemon whole.** Kill -9 the new daemon at three points
+- [x] **Stage 4 — abort leaves the old daemon whole.** Kill -9 the new daemon at three points
       (before fd transfer, mid-transfer, after ack before commit): every pane alive, old daemon
       serving, clients unaware, a retry succeeding — `flock` keeps exactly one serving daemon.
-- [ ] SQLite: an audit write during the cut loses nothing and raises no `database is locked`; a
+
+      **Outcome.** `cargo xtask e2e --slice handoff-abort` — 41 checks, three kill points, all
+      passing. Real binaries throughout: a daemon hosting **eight** panes, a live `arreo attach`
+      client, a real `--handoff-from` cut, and `kill -9` at each moment (immediately / at the first
+      pause / after the transfer but before the commit). Each point asserts the same bundle:
+      every pane alive and still producing with a **contiguous** marker stream, the old daemon
+      still serving, the attached client seeing nothing beyond the pause, a `handoff.abort` row,
+      a retry that commits and carries the panes, and exactly one daemon serving (a third is
+      refused). Point C also asserts the *accepted* gap honestly: a kill **after** the commit
+      would leave nobody serving (ADR 0021 §2c), so the slice verifies the commit was withheld
+      rather than claiming it was survived.
+
+      Two load-sensitive tests were found by the full-workspace run and both were real rather
+      than test artifacts — the first became a fix in `store.rs` (below): the daemon and a CLI
+      can both find a corrupt store at once, and **the second healer was quarantining the fresh
+      store the first had just created**, destroying the rows the heal exists to protect. Healing
+      is now serialized by the codebase's own `ExclusiveLock`, with a re-check under it.
+- [x] SQLite: an audit write during the cut loses nothing and raises no `database is locked`; a
       corrupt `-wal` heals. Windows routes to T-0039 rather than half-implementing this.
+
+      **Outcome.** Both halves proven. `an_audit_write_during_the_cut_is_not_locked_out` writes
+      through the store while a handoff is in flight; `a_corrupt_wal_heals_on_restart` and
+      `a_corrupt_wal_does_not_lock_a_second_writer_out` cover the two orders corruption arrives
+      in (restart, and a second writer while the log is still live). Healing is real, not
+      declared: the store's files are renamed aside (`<name>.corrupt-<timestamp>`, **never
+      deleted** — SQLite cannot recover those bytes, and a renamed file is evidence), the event is
+      shouted on stderr and recorded as a `store.corrupt` row in the replacement store, and the
+      open returns that fresh store so **one call heals** — the boot path's store is opened with
+      `?` by a daemon that then exits, so a machine with a corrupt log must not refuse to come
+      back up. The heal is verified and an unverified one is undone (the fresh store must open,
+      or the files are renamed back), and `SQLITE_IOERR` is excluded from the corruption test
+      because a failing device means the store is not what needs replacing.
+
+      One find the probe produced that changed the design: SQLite **silently discards** a
+      `-wal` it cannot parse, so a corrupt log is caught by its own header check **before** the
+      open — there is no error to read afterwards, and the frames are simply gone.
 
       **Re-scope, recorded rather than silently narrowed:** the clause once read "old daemon
       checkpoints the WAL and closes, new one re-opens the same file". Stage 1 corrected the ADR on
