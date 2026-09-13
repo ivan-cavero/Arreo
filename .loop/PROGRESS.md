@@ -1,17 +1,26 @@
 ## State snapshot          ← REWRITTEN (not appended) at every checkpoint
-Task: **T-0083 in progress** — the scanner half landed (`e5f355f`, the reference-aware scan
-with both negative controls measured through `arreo record` and both halves mutation-checked);
-the local half (presets, version vectors, history, revert, keychain bridge, `xtask sync
---check`) is on worker `ConfigSync`. **T-0086 filed** for the transport half (deltas between
-real machines over the mesh + the merge hazards), split out because it needs a protocol
-decision and the relay fabric.
-Where you are: 735+ tests green in core/cli; the scan change is verified at the product
-surface; full battery (workspace tests, both clippys, 14 slices, bench, gates) runs at
-integration.
-Next step: integrate `ConfigSync` (review + mutation-test the LOCAL deny-list and the
-conflict rule), then the full battery, commit, push, ledger.
-Open workers: ConfigSync (T-0083 local half)
-Known broken: T-0063 (CI never-green — the user's) · Parked: T-0048 needs-human
+Task: **T-0083 DONE** (`e5f355f` + `42d3c5b` + `fa13ca9` hardening) — harness config sync's
+local half; **T-0073 DONE** (`d5f1c64`) — the TUI's opt-in exit that also drain-stops the
+local daemon; **T-0087 filed** (the keychain bridge's daemon wiring); **T-0086** carries the
+transport half.
+Where you are: **810 tests / 0 failed / 66 targets**; clippy clean on both toolchains; fmt
+clean; **13/14 slices green** — `handoff-abort` is the parked T-0084 racer (pre-existing,
+reproduced at `a7abcd8`); sync slice 14/14; tui 80, update 27, mesh 21+1, persistence 16,
+theme 33, relay 20, chaos 8; bench 6/6; vet 337, deny 4/4, audit 0, check-targets PASS/SKIP.
+Next step: **T-0084** (the handoff-abort racing gate — the only red slice) or **T-0087** (the
+keychain wiring); then T-0086 (sync over the mesh), T-0039 (windows deferred), T-0081/T-0082
+(adapter batches, gated on live CLIs), T-0085 (CI, blocked on T-0063).
+Open workers: (none)
+Known broken: `--slice handoff-abort` intermittent (T-0084, mechanism + evidence filed)
+ · T-0063 (CI never-green — the user's) · Parked: T-0048 needs-human
+**The security review earned its keep this turn.** The sync engine's own slice exchanged only
+payloads the engine itself produced, so all three HIGH findings lived in the hostile-payload
+path: a reference could splice `mcp` command syntax into the receiver's config (F1), a forged
+version vector turned keep-both into a silent overwrite and could pin a third machine's counter
+for ever (F2), and an unquoted `${ARREO_ENV:NAME}` bypassed the by-name refusal while
+false-positively refusing omp's own dialect (F3). All eight findings fixed, each with a test the
+planner mutation-checked by removing the fix. The lesson for T-0086: exchanging real payloads
+between machines is exactly what makes those paths live.
 ## Event log               ← append-only; newest last; never rewrite
 - 2026-09-10 [turn 1] ledger created; repo at e489fac (docs only); T-0001 + T-0022 (AGENTS.md gardened) done
 - 2026-09-10 [turn 2] T-0002 PTY manager done+pushed (342606c; 9 tests); PROMPT.md v2 synced + ADR 0001 (ef6c595)
@@ -175,3 +184,5 @@ Known broken: T-0063 (CI never-green — the user's) · Parked: T-0048 needs-hum
 - 2026-09-13 [turn 75] Closed the turn: evidence refreshes committed (`chore(evidence)`), and two task frontmatter statuses corrected — a `re.sub` without MULTILINE silently matched nothing, so T-0072 and T-0080 kept `proposed` while their bodies said done; the queue scan caught it and all eight recently-completed tasks were audited (`done`/`in-progress` now truthful). T-0042 stays `in-progress` with its two CI criteria pointing at T-0085, which is the honest state: the hermetic half landed, the workflow half is the user's file during T-0063.
 
 - 2026-09-13 [turn 76] T-0083 started. The scanner half done by the planner (security-critical, held): `is_env_reference` + the measured prefixes + per-prefix minimum runs + the masker sharing the predicate. Verified at the product surface — the two negative controls from T-0075's own probe re-run through `arreo record`: `{env:VAR}` now records (was refused), `token: vbk_pro_…` now refused (was missed), a literal in the apiKey field still refused. Mutation-checked both ways. The residual (an all-uppercase literal with no provider prefix reads as a reference) is documented in the code and closed by the sync path refusing an unresolved name by name — the worker's criterion. T-0083 re-scoped to its local half; T-0086 filed for the transport half. `ConfigSync` delegated the local half.
+
+- 2026-09-13 [turn 76] T-0083 (local half) + T-0073 done. Planner held the security-critical work (the secret-scan reference rule) and the integration: the sync engine's security review returned NOT MERGEABLE with 3 HIGH findings reachable through `arreo sync apply` (F1 reference→syntax injection enabling an `mcp` command block; F2 forged vector → silent overwrite + permanent counter pinning; F3 unquoted `${ARREO_ENV:NAME}` bypassing the by-name refusal AND false-positively refusing omp's dialect); F4–F8 medium/low (Codex hook-trust shape that never occurs, no content-validity parse, 0644 store not repaired, deny-list gaps, empty HOME → relative roots). All eight fixed with mutation-checked tests (`fa13ca9`). T-0073 landed with two pty-level mutations proven (default-on, and the live-pane confirmation removed → six slice checks red). Sibling worker `ConfigSync` was frozen mid-review (told to stop editing, hand back its test diff) — the file-hostile case the brief warned about, handled by messaging rather than racing. Filed T-0087 (daemon-side keychain injection) and updated T-0083 with what it deliberately did not do. Battery: 810/66, both clippys, fmt, 13/14 slices (handoff-abort = parked T-0084), sync 14/14, bench 6/6, gates green.
