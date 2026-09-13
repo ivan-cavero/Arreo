@@ -44,22 +44,22 @@ it fails.
 
 ## Acceptance criteria
 
-- [ ] **A BEL that terminates an OSC string is not a bell.** Detection parses the escape
+- [x] **A BEL that terminates an OSC string is not a bell.** Detection parses the escape
       stream rather than scanning for the byte; the reproduction above must report a
       non-attention state, with a regression test whose fixture is built from the recorded TUI
       captures (replaying them must not produce `Blocked`).
-- [ ] A **bare** BEL — the real bell, not an OSC terminator — still means attention exactly as
+- [x] A **bare** BEL — the real bell, not an OSC terminator — still means attention exactly as
       today, proven by a test that asserts both halves. The change must not trade a false
       positive for a false negative.
-- [ ] `adapters/omp.toml`: omp 18.1.16 as a first-class adapter (`harness`, program match,
+- [x] `adapters/omp.toml`: omp 18.1.16 as a first-class adapter (`harness`, program match,
       resume strategy, patterns) instead of falling through to `default.toml`, with its resume
       argv verified live (`-r {session}` by id prefix and `-c` both re-open the same file — the
       survey's transcript) and ≥4 recorded fixtures (question/working/idle/stress).
-- [ ] **TUI-mode fixtures for pi and opencode** — today's fixtures are `--print`/text mode and
+- [x] **TUI-mode fixtures for pi and opencode** — today's fixtures are `--print`/text mode and
       contain no escape sequences, which is why this bug survived T-0017. The new fixtures
       carry OSC strings (opencode in alt-screen, pi not — the survey measured both) and the
       adapter check runs the existing latency assertion (≤ 200 ms) against them.
-- [ ] No new dependency; no `#[allow]`; `cargo xtask adapters --check` green with the new
+- [x] No new dependency; no `#[allow]`; `cargo xtask adapters --check` green with the new
       fixture count stated, and `--slice state` green.
 
 ## Why this is one task

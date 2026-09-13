@@ -25,31 +25,31 @@ Windows — making §3.11's "a release is not a release if any OS is red" mechan
 
 ## Acceptance criteria
 
-- [ ] `cargo xtask e2e --slice release`: generates a throwaway minisign keypair in a temp dir
+- [x] `cargo xtask e2e --slice release`: generates a throwaway minisign keypair in a temp dir
       (never committed, never reused), signs both a fixture and a real
       `cargo build --release` daemon binary, verifies both against the generated public key,
       then flips one byte → asserts a refusal naming the artifact and a non-zero exit.
-- [ ] `--slice release --chain` runs the whole story in one command against a `file://` channel
+- [x] `--slice release --chain` runs the whole story in one command against a `file://` channel
       in a temp dir: index → verify → client atomic swap → server handoff (0 panes, then 8 panes
       with output in flight) → deferred path (forced on Unix by flag to exercise T-0039's rule)
       → metrics history query → alert ordering. One transcript, one pass/fail line per stage.
-- [ ] The channel is transport-agnostic by construction, and the slice proves it: index parsing,
+- [x] The channel is transport-agnostic by construction, and the slice proves it: index parsing,
       artifact naming and verification share the single code path an `https` base URL uses (only
       the fetcher differs), so a green slice exercises the real path and not a lookalike.
-- [ ] CI matrix: `--slice release` + `--slice update` on ubuntu/macos/windows,
+- [ ] **→ T-0085 (deferred with T-0063)** CI matrix: `--slice release` + `--slice update` on ubuntu/macos/windows,
       `--slice handoff` on ubuntu/macos, `--case windows-deferred` on windows, with the
       tag-triggered release workflow running the same battery *before* publishing artifacts —
       a red slice blocks the release.
-- [ ] PR vs nightly split recorded in the workflow comments and `docs/release.md`: PRs run the
+- [ ] **→ T-0085 (deferred with T-0063)** PR vs nightly split recorded in the workflow comments and `docs/release.md`: PRs run the
       fast cases (verify/refuse, client swap, deferred refusal), nightly runs `--chain` plus
       `bench`. Handoff under 8 panes is seconds, so the full battery stays inside the < 5 min
       e2e budget.
-- [ ] Evidence under `.loop/evidence/T-0042/`: one transcript per OS, the tampered-artifact
+- [x] Evidence under `.loop/evidence/T-0042/` (Linux transcript; the per-OS ones belong to the deferred workflow half): one transcript per OS, the tampered-artifact
       refusal output, the chain transcript with the handoff marker-continuity proof, and an
       index naming which artifact backs each claim.
-- [ ] Nothing in the slice needs network, a published GitHub release or a real signing secret
+- [x] Nothing in the slice needs network, a published GitHub release or a real signing secret
       — hermetic, deterministic, re-runnable on the dev box.
-- [ ] Partial landing is honest: if T-0039 has not landed, the windows-deferred case reports a
+- [x] Partial landing is honest: if T-0039 has not landed, the windows-deferred case reports a
       loud skip with the owning task named (T-0019's no-delegation precedent) and the Unix
       chain still runs; a skip is never counted as a pass in the CI summary.
 
