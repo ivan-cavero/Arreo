@@ -1,16 +1,16 @@
 ## State snapshot          ← REWRITTEN (not appended) at every checkpoint
-Task: **T-0080 DONE** (`a2d3f56`) — an OSC BEL is not a bell; **T-0042's hermetic half DONE**
-(`c398b4c`) — the release slice. **T-0085 filed** (the CI matrix half, blocked on T-0063).
-Where you are: **735 tests / 0 failed / 66 targets**; clippy clean on both toolchains; fmt
-clean; **14 slices green** (adapters 24, release 8, release --chain 13+1 loud skip, update 27,
-persistence 16, tui 59, mesh 21+1, handoff-abort 41/41 this run); bench 6/6; vet 337, deny 4/4,
-audit 0, check-targets PASS/SKIP; gitleaks clean on the new fixtures/evidence.
-Next step: **T-0083** (harness config sync — its first deliverable is the reference-aware
-secret scan the survey measured: `"apiKey": "{env:VAR}"` is refused today while
-`token: vbk_pro_…` passes) is the highest-value remaining. Then T-0084 (the racing gate),
-T-0085 (CI, blocked on T-0063), T-0081/T-0082 (adapter batches, gated on live CLIs),
-T-0039 (windows deferred), T-0073 (TUI exit-shutdown).
-Open workers: (none)
+Task: **T-0083 in progress** — the scanner half landed (`e5f355f`, the reference-aware scan
+with both negative controls measured through `arreo record` and both halves mutation-checked);
+the local half (presets, version vectors, history, revert, keychain bridge, `xtask sync
+--check`) is on worker `ConfigSync`. **T-0086 filed** for the transport half (deltas between
+real machines over the mesh + the merge hazards), split out because it needs a protocol
+decision and the relay fabric.
+Where you are: 735+ tests green in core/cli; the scan change is verified at the product
+surface; full battery (workspace tests, both clippys, 14 slices, bench, gates) runs at
+integration.
+Next step: integrate `ConfigSync` (review + mutation-test the LOCAL deny-list and the
+conflict rule), then the full battery, commit, push, ledger.
+Open workers: ConfigSync (T-0083 local half)
 Known broken: T-0063 (CI never-green — the user's) · Parked: T-0048 needs-human
 ## Event log               ← append-only; newest last; never rewrite
 - 2026-09-10 [turn 1] ledger created; repo at e489fac (docs only); T-0001 + T-0022 (AGENTS.md gardened) done
@@ -173,3 +173,5 @@ Known broken: T-0063 (CI never-green — the user's) · Parked: T-0048 needs-hum
 - 2026-09-13 [turn 75] T-0080 + T-0042 (hermetic half) done and pushed. Two workers: `EscapeSignals` (escape-aware bell parse, 8 fixtures incl. the recorded TUI captures, omp adapter + registry guard) and `ReleaseSlice` (the release slice + chain, reusing update_slice helpers). Planner verification: both mutations of the ESC parse reproduced red/red (6 OSC tests vs 5 bare-BEL tests), the product-level repro re-run against real binaries (hyperlink Idle, real bell Blocked), the chain re-run (13+1 skip), `--slice update` still 27/0. Corrected the survey's omp apiKey prose in specs/harness-matrix.md (the bare name works; sigils 401) after reading both transcripts — the survey's transcript was right, its label was not. Filed T-0085 for the deferred CI matrix (blocked on the user's T-0063). Battery: 735/66, both clippys, fmt, 14 slices, bench 6/6, gates green, gitleaks clean on the new fixtures/evidence.
 
 - 2026-09-13 [turn 75] Closed the turn: evidence refreshes committed (`chore(evidence)`), and two task frontmatter statuses corrected — a `re.sub` without MULTILINE silently matched nothing, so T-0072 and T-0080 kept `proposed` while their bodies said done; the queue scan caught it and all eight recently-completed tasks were audited (`done`/`in-progress` now truthful). T-0042 stays `in-progress` with its two CI criteria pointing at T-0085, which is the honest state: the hermetic half landed, the workflow half is the user's file during T-0063.
+
+- 2026-09-13 [turn 76] T-0083 started. The scanner half done by the planner (security-critical, held): `is_env_reference` + the measured prefixes + per-prefix minimum runs + the masker sharing the predicate. Verified at the product surface — the two negative controls from T-0075's own probe re-run through `arreo record`: `{env:VAR}` now records (was refused), `token: vbk_pro_…` now refused (was missed), a literal in the apiKey field still refused. Mutation-checked both ways. The residual (an all-uppercase literal with no provider prefix reads as a reference) is documented in the code and closed by the sync path refusing an unresolved name by name — the worker's criterion. T-0083 re-scoped to its local half; T-0086 filed for the transport half. `ConfigSync` delegated the local half.

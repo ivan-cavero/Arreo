@@ -35,7 +35,18 @@ Fixing the scanner is the first deliverable, not a follow-up.
 
 ## Acceptance criteria
 
-- [ ] **Reference-aware scanning.** In a portable field, an env reference is not a secret —
+- [x] **Reference-aware scanning** — landed (`e5f355f`): `is_env_reference` (opencode `{env:NAME}`, pi `$VAR`/`${VAR}`, omp the bare name), the measured prefixes (`vbk_`, `xai-`, `glpat-`, `hf_`, `AIza`, JWT) with per-prefix minimum runs, and the masker sharing the predicate. Both negative controls measured through `arreo record` before/after, and both halves mutation-checked (`.loop/evidence/T-0083/scan-negative-controls.txt`). Residual stated there: an all-uppercase literal with no provider prefix is called a reference — closed by the sync path refusing an unresolved name, not by more scanning.
+
+**Re-scope (2026-09-13).** The task was one worker-session for four deliverables; the
+scanner (above) landed here, and the **transport half is split out to T-0086**: exchanging
+deltas with a *real* peer over the mesh, conflict copies across two live machines, and the
+JSONC/array-merge hazards, which need the relay fabric and a protocol decision rather than a
+local mechanism. What stays here is the local half — presets, the LOCAL deny-list, version
+vectors and history, `arreo sync revert`, the keychain bridge, and `xtask sync --check`
+driving the §3.8 worked case on two **isolated roots** standing in for two machines (which is
+what criterion 5 asks for, and needs no network).
+
+- [ ] **Per-file presets.** In a portable field, an env reference is not a secret —
       `{env:NAME}` (opencode), `$NAME` and `${NAME}` (pi), `$NAME` (omp) per the dialects T-0075
       verified — while a literal in the same field is. `TOKEN_PREFIXES` gains the measured
       shapes (`vbk_`, `xai-`, `glpat-`, `hf_`, `AIza`, plus a JWT shape). Both negative controls
