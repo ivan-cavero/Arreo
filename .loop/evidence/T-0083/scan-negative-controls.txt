@@ -57,3 +57,49 @@ the sync path, not more scanning: T-0083 refuses a file whose reference does not
 resolve to a variable on the receiving machine, by name. Every provider-prefixed
 literal is caught by the token rule, which reads the value's shape and never
 consults the reference predicate.
+
+
+REVIEW HARDENING (turn 76, after the security review of the sync engine)
+=======================================================================
+
+The review found eight issues in the sync engine's hostile-payload path; all
+eight are fixed, and each fix has a test that goes red when the fix is removed
+(mutations run by the planner, one per finding):
+
+F1 HIGH  denormalize spliced an unvalidated variable name into the destination
+         file's *syntax*: a payload carrying ${ARREO_ENV:X", "mcp": {...}, "z":"}
+         wrote an executable `mcp` block into the receiver's opencode config.
+         Fix: is_name() before substitution. Mutation: validation removed ->
+         denormalize_never_splices_a_name_that_is_not_one FAILS.
+F2 HIGH  payload.vector was trusted for every machine it named: one forged field
+         turned keep-both into a silent overwrite (no conflict copy), and a second
+         pinned a real machine's counter so its genuine payloads were refused as
+         "already up to date" forever. Fix: a claim about *this* machine's counter
+         above what the store says is refused (ForgedVector), and only the
+         sender's own entry is absorbed. Mutations: check off -> the overwrite
+         test FAILS; hearsay recorded again -> the pin test FAILS.
+F3 HIGH  an unquoted ${ARREO_ENV:NAME} was never recognised (the bare-token rule
+         ended the span at `}`), so an unresolved reference landed verbatim and
+         omp's own bare-name dialect was false-positively refused on arrival.
+         Fix: the neutral form is scanned as one value. Mutation: brace branch
+         off -> an_unquoted_neutral_reference_is_a_value FAILS.
+F4 MED   the Codex hook-trust rule matched a table shape that does not exist
+         ([hooks.state.abc.trusted_hash]); the real one is
+         [hooks.state."<abs hooks.json>:<event>:0:0"] with trusted_hash inside.
+         Fix: track the hooks.state header. Mutation -> the test FAILS.
+F5 MED   content that is not a document was applied when its digest matched.
+         Fix: validate_format() refuses truncated JSON / YAML with no mapping.
+         Mutation -> the test FAILS.
+F6 MED   `secret set` left a pre-existing 0644 store at 0644 while its warning
+         said otherwise (OpenOptions::mode is creation-only). Fix: chmod the open
+         file. Mutation -> setting_a_secret_repairs_a_readable_store FAILS.
+F7 LOW   deny-list gaps (sqlite -wal/-shm/-journal, .db3, `log` singular,
+         authorized_keys, known_hosts, .env). Fix: is_database_name() + names.
+         Mutation -> the test FAILS.
+F8 LOW   an unset/empty HOME made every XDG fallback relative, so a receive could
+         write into the process's working directory. Fix: empty HOME joins the
+         refusal path. Mutation -> the test FAILS.
+
+Gate counts after the fixes: `cargo test --workspace` 810 passed / 0 failed
+across 66 targets; clippy clean on both toolchains; fmt clean; `xtask sync
+--check` 14/14.

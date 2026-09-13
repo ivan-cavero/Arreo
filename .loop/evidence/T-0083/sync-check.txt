@@ -1,0 +1,180 @@
+T-0083 — cargo xtask sync --check, the §3.8 worked case on two isolated roots
+========================================================================
+
+Structure of this evidence:
+  - the stage lines below are printed by the slice itself, one pass/fail per stage;
+  - then raw CLI traces (verbatim commands, verbatim output) so each PASS can be
+    read back to the command that produced it;
+  - the slice drives the shipped binary (target/debug/arreo) in a per-root
+    environment — HOME/XDG_*/PI_CODING_AGENT_DIR inside target/test-scratch/T-0083/
+    and VBK_PROD_KEY removed from the child environment — so the machine's own
+    store is the only source of the value.
+
+
+=== cargo xtask sync --check — roots under /home/dev/dev/Arreo/target/test-scratch/T-0083/check, run at unix 1789322792s ===
+PASS edit: wrote /home/dev/dev/Arreo/target/test-scratch/T-0083/check/a/cfg/opencode/opencode.jsonc on alpha-machine; beta-machine has no such file
+PASS presets: list --json: opencode.jsonc/models.json/config.yml are SYNC and auth.json/opencode.db/opencode.json are not (exit=true)
+PASS push: opencode.jsonc: alpha-machine revision 1 -> /home/dev/dev/Arreo/target/test-scratch/T-0083/check/a/cfg/opencode/opencode.jsonc
+PASS payload-neutral: /home/dev/dev/Arreo/target/test-scratch/T-0083/check/a/payload-1.json carries ${ARREO_ENV:VBK_PROD_KEY} and no value
+PASS refused-by-name: beta-machine: sync: refused opencode.jsonc: VBK_PROD_KEY is not set on beta-machine, and the file references it — the harness would answer the provider's 401 instead of a config error; set it with `arreo sync secret set VBK_PROD_KEY…
+PASS converged: both roots hold byte-identical files (653 bytes), one revision each; opencode.jsonc: applied alpha-machine's revision 1 -> /home/dev/dev/Arreo/target/test-scratch/T-0083/check/b/cfg/opencode/opencode.jsonc
+PASS injected: pty child under alpha-machine sees alpha-machine's key, under beta-machine sees beta-machine's; with no injection it sees UNSET
+PASS local-refused: auth.json: sync: auth.json is not syncable (local): credentials, session state, caches and logs are this machine's; the sync engine never reads it | credentials.json: sync: /home/dev/dev/Arreo/target/test-scratch/T-0083/check/a/cfg/arreo/credentials.json is not syncable: it is a credential store (LOCAL — refused by class, before the scan)
+PASS conflict-keep-both: beta-machine kept opencode.conflict-alpha-machine-20260913T180633.jsonc; the live file still holds this machine's edit; opencode.jsonc: alpha-machine edited this too — both kept; the live file is unchanged at /home/dev/dev/Arreo/target/test-scratch/T-0083/check/b/cfg/opencode/opencode.jsonc and alpha-machine's copy is /home/dev/dev/Arre…
+PASS merge-union: provider objects and the plugin array both unioned (opencode.jsonc: merged 1 source(s) -> /home/dev/dev/Arreo/target/test-scratch/T-0083/check/b/cfg/opencode/opencode.jsonc (beta-machine revision 2) / from /home/dev/dev/Arreo/target/test-scratch/T-0083/check/b/cfg/opencod…)
+PASS sibling-reconcile: write refused while the sibling existed (sync: refused opencode.jsonc: /home/dev/dev/Arreo/target/test-scratch/T-0083/check/b/cfg/opencode/opencode.json exists beside it and this harness merges both, so writing would put two configs live at once; reconcile with…); merge folded it in and renamed it aside (opencode.jsonc: merged 1 source(s) -> /home/dev/dev/Arreo/target/test-scratch/T-0083/check/b/cfg/opencode/opencode.jsonc (beta-machine revision 3) / from /home/dev/dev/Arreo/target/test-scratch/T-0083/check/b/cfg/opencod… )
+PASS comments-refuse: conflict kept both (opencode.jsonc: alpha-machine edited this too — both kept; the live file is unchanged at /home/dev/dev/Arreo/target/test-scratch/T-0083/check/b/cfg/opencode/opencode.jsonc and alpha-machine's copy is /home/dev/dev/Arre…); merge refused, naming the comments (sync: merge refused: this machine's copy carries JSONC comments, and this merge re-emits the document it parsed — it would silently drop them; merge by hand, or revert); the note is still in the file
+PASS revert: revert restored the first revision on alpha-machine and it propagated to beta-machine (tui.jsonc: restored the previous revision -> /home/dev/dev/Arreo/target/test-scratch/T-0083/check/a/cfg/opencode/tui.jsonc (alpha-machine revision 3)); the next push reports: tui.jsonc: unchanged (alpha-machine already holds these bytes)
+PASS push-idempotent: a second push of the same bytes: tui.jsonc: unchanged (alpha-machine already holds these bytes)
+RAW CLI TRACES — the same story by hand, on a fresh pair of roots
+------------------------------------------------------------------
+root A = target/test-scratch/T-0083/trace-a, root B = …/trace-b; each has
+its own XDG_*/PI_CODING_AGENT_DIR and its own store. Binary: target/debug/arreo.
+
+--- 0. the edit, on A only (the §4 step-1 file, verbatim) ---
+{
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "verboo": {
+      "name": "Verboo Code",
+      "npm": "@ai-sdk/openai-compatible",
+      "options": {
+        "baseURL": "https://code.verboo.ai/router/v1",
+        "apiKey": "{env:VBK_PROD_KEY}"
+      },
+      "models": {
+        "deepseek-v4-flash-0731": {
+          "id": "deepseek-v4-flash-0731",
+          "name": "Verboo deepseek-v4-flash-0731",
+          "tool_call": true,
+          "interleaved": "reasoning_content",
+          "modalities": { "input": ["text"], "output": ["text"] },
+          "limit": { "context": 1048576, "output": 65536 }
+        }
+      }
+    }
+  }
+}
+
+--- 1. what A would sync, and where each file lives here ---
+$ arreo sync list --machine alpha-machine
+alpha-machine — 6 syncable file(s), presets for opencode/pi/omp only
+  opencode.jsonc   opencode  present /home/dev/dev/Arreo/target/test-scratch/T-0083/trace-a/cfg/opencode/opencode.jsonc  vector=-
+      needs VBK_PROD_KEY (not set on this machine)
+  tui.jsonc        opencode  absent  /home/dev/dev/Arreo/target/test-scratch/T-0083/trace-a/cfg/opencode/tui.jsonc  vector=-
+  models.json      pi        absent  /home/dev/dev/Arreo/target/test-scratch/T-0083/trace-a/agent/models.json  vector=-
+  settings.json    pi        absent  /home/dev/dev/Arreo/target/test-scratch/T-0083/trace-a/agent/settings.json  vector=-
+  models.yml       omp       absent  /home/dev/dev/Arreo/target/test-scratch/T-0083/trace-a/agent/models.yml  vector=-
+  config.yml       omp       absent  /home/dev/dev/Arreo/target/test-scratch/T-0083/trace-a/agent/config.yml  vector=-
+  exit=0
+
+--- 2. A stores its own key and pushes ---
+$ arreo sync secret set VBK_PROD_KEY --machine alpha-machine
+  (stdin: the value; never echoed, stored mode 0600)
+set VBK_PROD_KEY on alpha-machine (/home/dev/dev/Arreo/target/test-scratch/T-0083/trace-a/cfg/arreo/secrets.json)
+  exit=0
+
+$ arreo sync secret list --machine alpha-machine
+VBK_PROD_KEY
+  exit=0
+
+$ arreo sync push opencode.jsonc --machine alpha-machine
+opencode.jsonc: alpha-machine revision 1 -> /home/dev/dev/Arreo/target/test-scratch/T-0083/trace-a/cfg/opencode/opencode.jsonc
+  exit=0
+
+--- 3. the payload B receives: neutral references, no value ---
+$ arreo sync payload opencode.jsonc --out /home/dev/dev/Arreo/target/test-scratch/T-0083/trace-a/p.json --machine alpha-machine
+(no output)
+  exit=0
+
+$ cat <A>/p.json
+{
+  "file": "opencode.jsonc",
+  "harness": "opencode",
+  "machine": "alpha-machine",
+  "vector": {
+    "alpha-machine": 1
+  },
+  "content": "{\n  \"$schema\": \"https://opencode.ai/config.json\",\n  \"provider\": {\n    \"verboo\": {\n      \"name\": \"Verboo Code\",\n      \"npm\": \"@ai-sdk/openai-compatible\",\n      \"options\": {\n        \"baseURL\": \"https://code.verboo.ai/router/v1\",\n        \"apiKey\": \"${ARREO_ENV:VBK_PROD_KEY}\"\n      },\n      \"models\": {\n        \"deepseek-v4-flash-0731\": {\n          \"id\": \"deepseek-v4-flash-0731\",\n          \"name\": \"Verboo deepseek-v4-flash-0731\",\n          \"tool_call\": true,\n          \"interleaved\": \"reasoning_content\",\n          \"modalities\": { \"input\": [\"text\"], \"output\": [\"text\"] },\n          \"limit\": { \"context\": 1048576, \"output\": 65536 }\n        }\n      }\n    }\n  }\n}\n",
+  "digest": "1757c2b4dcbcdeb42db5250be2ef1f34055c3b6c5a67940b23cbda41077b64a6"
+}
+
+--- 4. B has the file's reference but not the variable ---
+$ arreo sync apply /home/dev/dev/Arreo/target/test-scratch/T-0083/trace-a/p.json --machine beta-machine
+sync: refused opencode.jsonc: VBK_PROD_KEY is not set on beta-machine, and the file references it — the harness would answer the provider's 401 instead of a config error; set it with `arreo sync secret set VBK_PROD_KEY`
+  exit=1
+
+--- 5. B sets its own value; the same payload applies ---
+$ arreo sync secret set VBK_PROD_KEY --machine beta-machine
+  (stdin: the value; never echoed, stored mode 0600)
+set VBK_PROD_KEY on beta-machine (/home/dev/dev/Arreo/target/test-scratch/T-0083/trace-b/cfg/arreo/secrets.json)
+  exit=0
+
+$ arreo sync apply /home/dev/dev/Arreo/target/test-scratch/T-0083/trace-a/p.json --machine beta-machine
+opencode.jsonc: applied alpha-machine's revision 1 -> /home/dev/dev/Arreo/target/test-scratch/T-0083/trace-b/cfg/opencode/opencode.jsonc
+  exit=0
+
+$ diff <A>/cfg/opencode/opencode.jsonc <B>/cfg/opencode/opencode.jsonc
+(no output — byte-identical)
+
+--- 6. each root resolves the reference from its own store ---
+$ arreo sync env opencode.jsonc --machine alpha-machine
+opencode.jsonc needs 1 variable(s) on alpha-machine:
+  VBK_PROD_KEY: set
+  the value is injected when Arreo spawns the harness; nothing is exported here
+  exit=0
+
+$ arreo sync env opencode.jsonc --machine beta-machine
+opencode.jsonc needs 1 variable(s) on beta-machine:
+  VBK_PROD_KEY: set
+  the value is injected when Arreo spawns the harness; nothing is exported here
+  exit=0
+
+--- 7. the edit propagates a second time, then the undo ---
+$ arreo sync push opencode.jsonc --machine alpha-machine
+opencode.jsonc: alpha-machine revision 2 -> /home/dev/dev/Arreo/target/test-scratch/T-0083/trace-a/cfg/opencode/opencode.jsonc
+  exit=0
+
+$ arreo sync payload opencode.jsonc --out /home/dev/dev/Arreo/target/test-scratch/T-0083/trace-a/p2.json --machine alpha-machine
+(no output)
+  exit=0
+
+$ arreo sync apply /home/dev/dev/Arreo/target/test-scratch/T-0083/trace-a/p2.json --machine beta-machine
+opencode.jsonc: applied alpha-machine's revision 2 -> /home/dev/dev/Arreo/target/test-scratch/T-0083/trace-b/cfg/opencode/opencode.jsonc
+  exit=0
+
+$ arreo sync revert opencode.jsonc --machine alpha-machine
+opencode.jsonc: restored the previous revision -> /home/dev/dev/Arreo/target/test-scratch/T-0083/trace-a/cfg/opencode/opencode.jsonc (alpha-machine revision 3)
+  exit=0
+
+$ arreo sync history opencode.jsonc --machine alpha-machine
+3     revert   alpha-machine rev 3  2026-09-13T18:06:35.068Z
+  2     push     alpha-machine rev 2  2026-09-13T18:06:34.966Z
+  1     push     alpha-machine rev 1  2026-09-13T18:06:34.695Z
+  exit=0
+
+$ arreo sync push opencode.jsonc --machine alpha-machine
+opencode.jsonc: unchanged (alpha-machine already holds these bytes)
+  exit=0
+
+$ arreo sync payload opencode.jsonc --out /home/dev/dev/Arreo/target/test-scratch/T-0083/trace-a/p3.json --machine alpha-machine
+(no output)
+  exit=0
+
+$ arreo sync apply /home/dev/dev/Arreo/target/test-scratch/T-0083/trace-a/p3.json --machine beta-machine
+opencode.jsonc: applied alpha-machine's revision 3 -> /home/dev/dev/Arreo/target/test-scratch/T-0083/trace-b/cfg/opencode/opencode.jsonc
+  exit=0
+
+$ grep -c 'Broken At 3am' <B>/cfg/opencode/opencode.jsonc
+0
+  exit=1 (non-zero: the broken revision is gone on B too)
+
+--- 8. a credential store beside the config, offered by hand ---
+$ arreo sync push /home/dev/dev/Arreo/target/test-scratch/T-0083/trace-a/cfg/arreo/credentials.json --machine alpha-machine
+sync: /home/dev/dev/Arreo/target/test-scratch/T-0083/trace-a/cfg/arreo/credentials.json is not syncable: it is a credential store (LOCAL — refused by class, before the scan)
+  exit=1
+
+$ arreo sync push auth.json --machine alpha-machine   # credentials, never syncable
+sync: auth.json is not syncable (local): credentials, session state, caches and logs are this machine's; the sync engine never reads it
+  exit=1
+

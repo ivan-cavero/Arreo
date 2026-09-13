@@ -1,0 +1,46 @@
+T-0083 — mutation proof for the load-bearing rules
+========================================================================
+
+Each mutation below is applied to the shipped source, one test is run, and the
+source is restored (verified byte-identical against a backup refreshed after
+every intentional change). A mutation that leaves every test green would mean
+the rule was not pinned; all six are red, so each rule is.
+
+command: python3 target/test-scratch/T-0083/mutate.py <name>
+
+$ python3 mutate.py deny-list   # LOCAL deny-list call removed from resolve()
+  $ cargo test -p arreo-core --lib sync::engine::tests::a_credential_store_no_preset_knows_is_refused_by_the_deny_list
+  test sync::engine::tests::a_credential_store_no_preset_knows_is_refused_by_the_deny_list ... FAILED
+  test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 275 filtered out; finished in 0.01s
+  exit=101 (non-zero = the test caught the mutation)
+
+$ python3 mutate.py keep-both   # concurrent payload overwrites the live file (last-writer-wins)
+  $ cargo test -p arreo-core --lib sync::engine::tests::concurrent_edits_keep_both_copies_and_the_live_file_is_untouched
+  test sync::engine::tests::concurrent_edits_keep_both_copies_and_the_live_file_is_untouched ... FAILED
+  test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 275 filtered out; finished in 0.02s
+  exit=101 (non-zero = the test caught the mutation)
+
+$ python3 mutate.py by-name   # the unresolved-variable refusal removed from receive()
+  $ cargo test -p arreo-core --lib sync::engine::tests::the_owner_case_converges_across_two_roots_that_each_resolve_the_reference_itself
+  test sync::engine::tests::the_owner_case_converges_across_two_roots_that_each_resolve_the_reference_itself ... FAILED
+  test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 275 filtered out; finished in 0.02s
+  exit=101 (non-zero = the test caught the mutation)
+
+$ python3 mutate.py local-fields   # the machine-local field rule removed from validate()
+  $ cargo test -p arreo-core --lib sync::engine::tests::a_machine_local_field_with_a_literal_is_refused_by_name
+  test sync::engine::tests::a_machine_local_field_with_a_literal_is_refused_by_name ... FAILED
+  test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 275 filtered out; finished in 0.01s
+  exit=101 (non-zero = the test caught the mutation)
+
+$ python3 mutate.py sibling-gate   # the sibling-extension gate removed from receive()
+  $ cargo test -p arreo-core --lib sync::engine::tests::the_sibling_extension_refuses_a_write_and_the_merge_reconciles_it
+  test sync::engine::tests::the_sibling_extension_refuses_a_write_and_the_merge_reconciles_it ... FAILED
+  test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 275 filtered out; finished in 0.03s
+  exit=101 (non-zero = the test caught the mutation)
+
+$ python3 mutate.py class-check   # the SYNC/LOCAL class check removed for preset files
+  $ cargo test -p arreo-core --lib sync::engine::tests::a_local_file_is_refused_by_class_before_it_is_read_or_scanned
+  test sync::engine::tests::a_local_file_is_refused_by_class_before_it_is_read_or_scanned ... FAILED
+  test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 275 filtered out; finished in 0.01s
+  exit=101 (non-zero = the test caught the mutation)
+
