@@ -52,6 +52,10 @@
 
 pub mod resume;
 
+/// Release signature verification (T-0036): the one door every artifact passes
+/// through before it is trusted, shared by the CLI, the daemon and the TUI.
+pub mod verify;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 

@@ -1,0 +1,25 @@
+## T-0036 evidence (2026-09-13, linux x86_64, rustc 1.98.0)
+
+### tamper-refusal and verifier suite
+     Running tests/update_verify.rs (target/debug/deps/update_verify-1b069bcab4ef452b)
+
+running 10 tests
+test a_missing_signature_is_refused_and_names_what_it_looked_for ... ok
+test a_legacy_signature_is_refused ... ok
+test an_artifact_the_manifest_does_not_describe_is_refused ... ok
+test an_unreadable_artifact_is_an_io_refusal ... ok
+test a_signed_fixture_verifies_and_reports_its_key_id_and_digest ... ok
+test a_signature_from_another_key_is_refused_by_key_id ... ok
+test a_two_key_trust_set_accepts_either_key_and_refuses_a_stranger ... ok
+test a_valid_signature_over_a_different_file_is_refused ... ok
+test one_flipped_byte_is_refused_as_a_bad_signature_naming_the_file ... ok
+test real_minisign_agrees_with_this_files_fixtures ... ok
+
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.29s
+
+
+### supply chain
+Vetting Succeeded (337 exempted)
+    Scanning Cargo.lock for vulnerabilities (344 crate dependencies)
+advisories ok, bans ok, licenses ok, sources ok
+cargo audit: clean — exits 0 after scanning 344 crate dependencies (no advisory matched)

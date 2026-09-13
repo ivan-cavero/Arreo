@@ -1,0 +1,215 @@
+# The signed release (T-0036, ROADMAP §3.13 channels-and-trust).
+#
+# A tag builds the three targets, writes `SHA256SUMS`, signs **every artifact and
+# the manifest** with the key whose public half is committed at
+# `supply-chain/arreo.pub`, and then verifies what it just signed with the binary
+# it just built. Nothing is published unless every one of those checks passes —
+# and the last check is a *refusal* test: one byte of a copy is flipped and the
+# verifier must reject it, so a job that would ship an unverifiable artifact
+# cannot finish green.
+#
+# ## Where the key lives
+#
+# `MINISIGN_SECRET_KEY` is a repository secret, supplied to the signing step
+# through the environment and never written into this file. The workflow cannot
+# verify *which* key it holds — and it does not need to: `arreo update verify`
+# refuses a signature whose key id is not the pinned one, so a secret belonging to
+# another key fails the job at the verification step with "signed by key X, this
+# build trusts Y". That is also what makes rotation a procedure rather than an
+# emergency: see `docs/release.md`.
+#
+# ## What this job does *not* do
+#
+# It publishes the binaries and their signatures; the cargo-dist archives and the
+# installers the skeleton declares are not built here, and the job has not yet run
+# against a real key — `docs/release.md` says so in the same words. Apple
+# notarization and Windows Authenticode are a separate paid-identity line item;
+# a minisign signature proves *our* authorship of exactly these bytes and nothing
+# more.
+
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+# The release job creates the GitHub release, which needs write access to
+# contents; every other permission is left at the default of none.
+permissions:
+  contents: write
+
+jobs:
+  # One target per native runner: `x86_64-pc-windows-msvc` cannot be built on
+  # Linux without the MSVC toolchain, and cross-compiling `aarch64-apple-darwin`
+  # needs an SDK. Native builds are also the ones the artifacts will actually run
+  # as, which is the point of shipping them.
+  build:
+    name: build ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+          - os: macos-latest
+            target: aarch64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.98.0"
+      - name: build the client and the daemon
+        run: cargo build --release --locked --target ${{ matrix.target }} -p arreo-cli -p arreo-server
+      - name: stage the artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          suffix=""
+          if [ "${{ runner.os }}" = "Windows" ]; then suffix=".exe"; fi
+          cp "target/${{ matrix.target }}/release/arreo$suffix" \
+             "dist/arreo-${{ matrix.target }}$suffix"
+          cp "target/${{ matrix.target }}/release/arreo-server$suffix" \
+             "dist/arreo-server-${{ matrix.target }}$suffix"
+          ls -l dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: binaries-${{ matrix.target }}
+          path: dist/*
+          # A target that built nothing must fail here rather than become a
+          # release with a missing platform.
+          if-no-files-found: error
+
+  sign-and-publish:
+    name: sign, verify, publish
+    needs: build
+    runs-on: ubuntu-latest
+    env:
+      MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: the key must be present, and the verifier must be runnable
+        run: |
+          set -euo pipefail
+          if [ -z "${MINISIGN_SECRET_KEY:-}" ]; then
+            echo "::error::MINISIGN_SECRET_KEY is not set — refusing to publish unsigned artifacts"
+            exit 1
+          fi
+          # The Linux artifact is native here, and it is the verifier: the binary
+          # that was just built from this commit, checking against the key
+          # compiled into it. A verifier that cannot run is a release that cannot
+          # be verified, so this fails before anything is signed.
+          chmod +x dist/arreo-x86_64-unknown-linux-gnu
+          dist/arreo-x86_64-unknown-linux-gnu --version
+          ls -l dist
+
+      - name: install minisign
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq minisign
+          minisign -v
+
+      - name: no signature may arrive from anywhere but this job
+        run: |
+          set -euo pipefail
+          if find dist -name '*.minisig' | grep -q .; then
+            echo "::error::a .minisig was uploaded with the artifacts; every signature must be made here"
+            find dist -name '*.minisig'
+            exit 1
+          fi
+
+      - name: write SHA256SUMS
+        run: |
+          set -euo pipefail
+          cd dist
+          # Every artifact, and not the manifest itself: `sha256sum` reads the
+          # names it is given, so the manifest lists exactly the files that ship.
+          find . -maxdepth 1 -type f ! -name '*.minisig' ! -name 'SHA256SUMS' \
+            -printf '%P\n' | sort > /tmp/artifacts.txt
+          sha256sum $(cat /tmp/artifacts.txt) > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: sign every artifact and the manifest
+        run: |
+          set -euo pipefail
+          umask 077
+          key="$RUNNER_TEMP/arreo.key"
+          printf '%s\n' "$MINISIGN_SECRET_KEY" > "$key"
+          # An empty line covers both key shapes: minisign does not read stdin for
+          # an unencrypted key (`minisign -G -W`, the shape a CI key is made in)
+          # and needs one empty password otherwise.
+          for artifact in $(cat /tmp/artifacts.txt) SHA256SUMS; do
+            printf '\n' | minisign -S -s "$key" -m "dist/$artifact" -x "dist/$artifact.minisig"
+          done
+          rm -f "$key"
+          ls -l dist
+
+      - name: fail hard if any artifact lacks its .minisig
+        run: |
+          set -euo pipefail
+          missing=0
+          for artifact in $(cat /tmp/artifacts.txt); do
+            if [ ! -s "dist/$artifact.minisig" ]; then
+              echo "::error::dist/$artifact has no signature"
+              missing=1
+            fi
+          done
+          if [ ! -s dist/SHA256SUMS.minisig ]; then
+            echo "::error::the manifest has no signature"
+            missing=1
+          fi
+          [ "$missing" = 0 ] || exit 1
+
+      - name: verify every artifact against the committed key
+        run: |
+          set -euo pipefail
+          verifier=dist/arreo-x86_64-unknown-linux-gnu
+          # The manifest first: its own signature must hold before any digest in
+          # it is consulted (the order the install scripts use).
+          "$verifier" update verify dist/SHA256SUMS
+          for artifact in $(cat /tmp/artifacts.txt); do
+            # Each artifact is checked twice over: its signature against the key
+            # pinned in supply-chain/arreo.pub, and its digest against the signed
+            # manifest. Either failure is exit 1 and fails this step.
+            "$verifier" update verify "dist/$artifact" --manifest dist/SHA256SUMS
+          done
+
+      - name: the tamper check — one flipped byte must be refused
+        run: |
+          set -euo pipefail
+          verifier=dist/arreo-x86_64-unknown-linux-gnu
+          original=dist/arreo-x86_64-unknown-linux-gnu
+          tampered="$RUNNER_TEMP/arreo-tampered"
+          python3 - "$original" "$tampered" <<'PY'
+          import sys
+          data = bytearray(open(sys.argv[1], "rb").read())
+          data[len(data) // 2] ^= 0x01
+          open(sys.argv[2], "wb").write(data)
+          PY
+          # The signature is the *valid* one, carried over to a file whose bytes
+          # changed: exactly the attack the verifier exists to stop.
+          cp "$original.minisig" "$tampered.minisig"
+          if "$verifier" update verify "$tampered"; then
+            echo "::error::the verifier accepted a tampered artifact — refusing to publish"
+            exit 1
+          fi
+          echo "tampered copy refused, as it must be"
+
+      - name: publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --verify-tag \
+            --title "$GITHUB_REF_NAME" \
+            --notes "Signed release. Verify with \`arreo update verify <artifact>\`; the key id is pinned in supply-chain/arreo.pub, and SHA256SUMS is the only trusted digest source."

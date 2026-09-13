@@ -44,7 +44,15 @@ const NOT_WRITABLE: u8 = 4;
 
 /// `arreo update [--from PATH] [--rollback] [--check] [--json] [--reattach-pane ID]
 /// [--no-reexec] [--socket PATH]`
+///
+/// `arreo update verify <path> [--sig PATH] [--manifest PATH]` is the other half
+/// of the verb — it checks a release artifact instead of installing one — and is
+/// read off before the install flags are parsed, because it takes a positional
+/// argument and an install never does.
 pub fn run(rest: &[String]) -> ExitCode {
+    if rest.first().map(String::as_str) == Some("verify") {
+        return verify(&rest[1..]);
+    }
     let args = match parse(rest) {
         Ok(args) => args,
         Err(message) => {
@@ -135,6 +143,163 @@ pub fn run(rest: &[String]) -> ExitCode {
             ExitCode::from(exit_code(&e))
         }
     }
+}
+
+/// What `arreo update verify` was asked to check.
+#[derive(Debug)]
+struct VerifyArgs {
+    artifact: String,
+    sig: Option<String>,
+    manifest: Option<String>,
+    json: bool,
+}
+
+/// `arreo update verify <path> [--sig <path>] [--manifest <path>] [--json]` — the
+/// user door onto [`arreo_core::update::verify`] (T-0036).
+///
+/// ## What it prints, and why those three things
+///
+/// The artifact, the key id that signed it, and the SHA-256 digest. The key id is
+/// compared against the key **compiled into this binary**, never against anything
+/// in the environment, the working directory or the release page — which is what
+/// makes the three lines auditable: an operator can write them down and check
+/// them later, and a release announcement can be compared against them. `ok` on
+/// its own is a claim nobody can audit.
+///
+/// ## Why there is no bypass
+///
+/// A `--force` here would make every other line of the signed-release story
+/// decorative: the whole claim is that nothing downstream can be talked into
+/// trusting an artifact. So a refusal is exit 1 — missing signature, unknown key
+/// id, bad signature, digest mismatch or an unreadable file, each naming what
+/// failed — and a usage error is exit 2. The only recourse a script has is to
+/// fetch the artifact again, which is the correct answer to every one of those.
+///
+/// ## `--manifest`
+///
+/// With `--manifest SHA256SUMS`, the manifest's **own** signature is verified
+/// first and the artifact's digest is then checked against its entry: the order
+/// the install scripts use, and the only way a digest means anything. The
+/// manifest is the trusted digest source — never a web page, never a file name.
+fn verify(rest: &[String]) -> ExitCode {
+    let args = match parse_verify(rest) {
+        Ok(args) => args,
+        Err(message) => {
+            eprintln!("update: {message}");
+            verify_usage();
+            return ExitCode::from(USAGE);
+        }
+    };
+    let artifact = std::path::Path::new(&args.artifact);
+
+    // The manifest first: an unverified manifest is a list of digests from
+    // nowhere, so nothing in it is consulted until its own signature holds.
+    if let Some(manifest) = args.manifest.as_deref() {
+        let manifest = std::path::Path::new(manifest);
+        if let Err(e) = arreo_core::update::verify::verify(manifest, None) {
+            eprintln!("update: {e}");
+            return ExitCode::from(FAILED);
+        }
+    }
+
+    let signature = args.sig.as_deref().map(std::path::Path::new);
+    let verified = match arreo_core::update::verify::verify(artifact, signature) {
+        Ok(verified) => verified,
+        Err(e) => {
+            eprintln!("update: {e}");
+            return ExitCode::from(FAILED);
+        }
+    };
+
+    if let Some(manifest) = args.manifest.as_deref() {
+        if let Err(e) = arreo_core::update::verify::check_manifest_digest(
+            artifact,
+            std::path::Path::new(manifest),
+        ) {
+            eprintln!("update: {e}");
+            return ExitCode::from(FAILED);
+        }
+    }
+
+    let name = verified
+        .artifact
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| args.artifact.clone());
+    if args.json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "verified": true,
+                "artifact": name,
+                "path": verified.artifact.display().to_string(),
+                "key_id": verified.key_id,
+                "digest": verified.digest,
+            })
+        );
+    } else {
+        println!("verified {name}");
+        println!(
+            "  key    {} (pinned in supply-chain/arreo.pub, compiled into this binary)",
+            verified.key_id
+        );
+        println!("  sha256 {}", verified.digest);
+    }
+    OK.into()
+}
+
+fn parse_verify(rest: &[String]) -> Result<VerifyArgs, String> {
+    let mut artifact: Option<String> = None;
+    let mut sig = None;
+    let mut manifest = None;
+    let mut json = false;
+    let mut i = 0;
+    while i < rest.len() {
+        let flag = rest[i].as_str();
+        let value = || -> Result<String, String> {
+            rest.get(i + 1)
+                .cloned()
+                .ok_or_else(|| format!("{flag} needs a value"))
+        };
+        match flag {
+            "--sig" => {
+                sig = Some(value()?);
+                i += 2;
+            }
+            "--manifest" => {
+                manifest = Some(value()?);
+                i += 2;
+            }
+            "--json" => {
+                json = true;
+                i += 1;
+            }
+            other if other.starts_with('-') => return Err(format!("unknown flag {other}")),
+            other => {
+                if artifact.replace(other.to_string()).is_some() {
+                    return Err(format!(
+                        "verify checks one artifact; {other} is a second one"
+                    ));
+                }
+                i += 1;
+            }
+        }
+    }
+    Ok(VerifyArgs {
+        artifact: artifact
+            .ok_or_else(|| "verify needs the path of the artifact to check".to_string())?,
+        sig,
+        manifest,
+        json,
+    })
+}
+
+fn verify_usage() {
+    eprintln!("usage: arreo update verify <path> [--sig <path>] [--manifest <path>] [--json]");
+    eprintln!("  <path>      the artifact to check; its signature is <path>.minisig");
+    eprintln!("  --sig       the signature to use instead of the sibling <path>.minisig");
+    eprintln!("  --manifest  a signed SHA256SUMS; verified first, then used to check the digest");
+    eprintln!("  exit codes: 0 verified · 1 refused · 2 usage — there is no bypass flag");
 }
 
 /// `arreo update --server --from <path>` — the daemon half of the update (T-0038).
@@ -629,12 +794,17 @@ fn usage() {
     );
     eprintln!("       arreo update --rollback [--json]");
     eprintln!("       arreo update --check");
+    eprintln!("       arreo update verify <path> [--sig <path>] [--manifest <path>] [--json]");
     eprintln!(
         "       arreo update --server --from <path> [--json] [--socket PATH] [--timeout-secs N]"
     );
     eprintln!("  --from      a binary to install in place of this one (already on disk)");
     eprintln!("  --rollback  put the previous binary back");
     eprintln!("  --check     report the available version from the release channel (needs T-0037)");
+    eprintln!(
+        "  verify      check an artifact's minisign signature against the key compiled into this \
+         binary; prints the key id and digest, and refuses (exit 1) with no bypass"
+    );
     eprintln!(
         "  --server    with --from: replace the `arreo-server` beside this binary and hand the \
          running daemon over to it, without killing an agent"
@@ -1093,5 +1263,37 @@ mod tests {
         // `--rollback` and `--from` are different intentions; obeying both would
         // mean installing and uninstalling in one command.
         assert!(parse(&args(&["--rollback", "--from", "/tmp/x"])).is_err());
+    }
+
+    /// `arreo update verify` takes one positional artifact and nothing that could
+    /// be mistaken for a way past the check.
+    ///
+    /// The last two assertions are the "no bypass flag" claim as a test: a
+    /// `--force` or `--insecure` gets the usage error, because a verifier that
+    /// can be argued out of refusing is a verifier that will be.
+    #[test]
+    fn verify_takes_one_artifact_and_offers_no_bypass() {
+        let parsed = parse_verify(&args(&[
+            "/tmp/arreo-0.1.0",
+            "--sig",
+            "/tmp/arreo-0.1.0.minisig",
+            "--manifest",
+            "/tmp/SHA256SUMS",
+        ]))
+        .expect("parses");
+        assert_eq!(parsed.artifact, "/tmp/arreo-0.1.0");
+        assert_eq!(parsed.sig.as_deref(), Some("/tmp/arreo-0.1.0.minisig"));
+        assert_eq!(parsed.manifest.as_deref(), Some("/tmp/SHA256SUMS"));
+        assert!(!parsed.json);
+
+        // No artifact at all is a usage error, not a check of something else.
+        assert!(parse_verify(&args(&[])).is_err());
+        // Two artifacts: the second would otherwise be silently ignored.
+        assert!(parse_verify(&args(&["/tmp/a", "/tmp/b"])).is_err());
+        // A flag that needs a value and does not get one.
+        assert!(parse_verify(&args(&["/tmp/a", "--sig"])).is_err());
+        // And there is no flag that skips the check.
+        assert!(parse_verify(&args(&["/tmp/a", "--force"])).is_err());
+        assert!(parse_verify(&args(&["/tmp/a", "--insecure"])).is_err());
     }
 }

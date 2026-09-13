@@ -209,8 +209,10 @@ AGPL code.
   for it; the only removal path is an explicit, bounded `arreo audit prune`. It is
   *not* tamper-evident — anyone who can write the SQLite file can edit it, and
   [docs/audit.md](docs/audit.md) says so rather than implying a hash chain exists.
-- **Nothing is signed yet.** [docs/release.md](docs/release.md) states that release
-  artifacts are unsigned until signing lands, and forbids presenting them otherwise.
+- **Signing is in place; a signed release is not.** The verifier, the pinned key and the
+  release job landed (T-0036), but no tag has gone through the job with the operator's key, so
+  [docs/release.md](docs/release.md) still forbids presenting artifacts as trusted until one
+  has.
 - **No external security review has happened**, and [SECURITY.md](SECURITY.md) says
   so itself: it records that the private reporting channel is not enabled on this
   repository yet and that the report path is the fallback it describes. The threat

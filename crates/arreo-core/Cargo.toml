@@ -43,6 +43,13 @@ portable-pty = "0.9"
 # entry and no hand-rolled `unsafe libc::sendmsg`.
 rustix = { version = "0.38", features = ["alloc", "event", "net", "process", "pty", "termios"] }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "time", "io-util", "net"] }
+# Release verification (T-0036): minisign signatures, checked in-process against
+# the key committed at `supply-chain/arreo.pub`. `minisign-verify` is the
+# *verification* half only — pure Rust, zero dependencies, no build script, no
+# network — which is the whole point: signing lives in the release job (with the
+# key supplied by the environment), and no code in this workspace can produce a
+# signature. See `docs/release.md` for the decision and what was rejected.
+minisign-verify = "0.2"
 anyhow = "1"
 thiserror = "2"
 serde = { version = "1", features = ["derive"] }
@@ -65,6 +72,14 @@ polling = "=3.7.0"
 curve25519-dalek = "4"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "time", "io-util"] }
 proptest = "1"
+# The refusals in `tests/update_verify.rs` are only meaningful if something
+# *valid* signed first, and the real key must never be used by a test (never
+# sign with it, never commit a secret). So the test writes the minisign format
+# itself from `ed25519-dalek` (a shipped dep, used for device identity) and
+# `blake2` (already in the graph via spake2) — the supply chain does not grow —
+# and the *signing path* is test-only: it lives in the test file, not the
+# library, so nothing that ships can produce a signature.
+blake2 = "0.10"
 
 [features]
 default = ["sqlite", "transport"]

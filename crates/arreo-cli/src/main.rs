@@ -90,6 +90,9 @@ fn usage() -> ExitCode {
     eprintln!(
         "      `--rollback` puts it back. Never touches a running agent (see docs/release.md)"
     );
+    eprintln!("  arreo update verify <path> [--sig <path>] [--manifest <path>] [--json]");
+    eprintln!("      check an artifact against the key pinned in this repo: prints the key id and");
+    eprintln!("      digest, refuses (exit 1) otherwise, and has no flag that skips the check");
     eprintln!("  arreo machines list [--json] [--all] [--offline] [--config PATH]");
     eprintln!("  arreo machines status [<name>] [--json] [--offline]   (0 ok, 2 usage, 3 unknown machine, 4 relay unreachable, 5 conflict)");
     eprintln!(

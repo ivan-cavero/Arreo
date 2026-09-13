@@ -1,0 +1,31 @@
+## arreo update verify — the user door, through the real binary (T-0036)
+
+### 1. an artifact with no signature: exit 1, names what is missing
+
+update: arreo-0.1.0-x86_64: no signature at arreo-0.1.0-x86_64.minisig — refusing an unverified artifact
+exit=1
+
+### 2. missing artifact argument: usage, exit 2
+
+update: verify needs the path of the artifact to check
+usage: arreo update verify <path> [--sig <path>] [--manifest <path>] [--json]
+  <path>      the artifact to check; its signature is <path>.minisig
+  --sig       the signature to use instead of the sibling <path>.minisig
+  --manifest  a signed SHA256SUMS; verified first, then used to check the digest
+  exit codes: 0 verified · 1 refused · 2 usage — there is no bypass flag
+exit=2
+
+### 3. --force: refused as an unknown flag (no bypass exists)
+
+update: unknown flag --force
+usage: arreo update verify <path> [--sig <path>] [--manifest <path>] [--json]
+  <path>      the artifact to check; its signature is <path>.minisig
+  --sig       the signature to use instead of the sibling <path>.minisig
+  --manifest  a signed SHA256SUMS; verified first, then used to check the digest
+  exit codes: 0 verified · 1 refused · 2 usage — there is no bypass flag
+exit=2
+
+### 4. a signature made by another key (fresh real minisign keypair): UnknownKeyId, exit 1
+
+update: arreo-0.1.0-x86_64: signed by key AEC6DF2C25AFE72A, this build trusts 076F2F7CEBE0AF51
+exit=1

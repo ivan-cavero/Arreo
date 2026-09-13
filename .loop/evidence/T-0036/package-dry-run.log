@@ -1,0 +1,17 @@
+[PASS] package: target x86_64-unknown-linux-gnu declared
+[PASS] package: target x86_64-pc-windows-msvc declared
+[PASS] package: target aarch64-apple-darwin declared
+[PASS] package: installer shell declared
+[PASS] package: installer powershell declared
+[PASS] package: binary arreo-server present
+[PASS] package: binary arreo present
+[PASS] package: pinned trust set 076F2F7CEBE0AF51 (every comment names its key)
+[PASS] package: release job — the release job runs on tags
+[PASS] package: release job — signing takes the key from the environment secret
+[PASS] package: release job — the workflow reads the key from the secret store, not from a file
+[PASS] package: release job — the manifest is written and signed
+[PASS] package: release job — signatures ship beside the artifacts
+[PASS] package: release job — verification goes through the shipped verifier, not a second path
+[PASS] package: release job — a tampered copy is refused before publishing
+[PASS] package: release.yml carries no key material
+package: skeleton valid (real builds on tags; see docs/release.md)

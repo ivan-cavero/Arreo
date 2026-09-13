@@ -1,0 +1,44 @@
+## The release job, simulated end to end (T-0036)
+
+A copy of the workspace was built in /tmp/pubcheck with a **throwaway pinned key**
+(minisign -G; key id D88DB7DB9A6D7AE0) swapped into supply-chain/arreo.pub. The
+operator's real key was never involved and its secret never existed on this machine.
+This exercises the CLI's *success* path with the real code — the crate-level tests
+must use a throwaway key via verify_with, while the product binary only ever trusts
+the key compiled into it.
+
+### sign every artifact and the manifest (the workflow's own commands, throwaway key)
+SHA256SUMS:
+a420ea24f045fec5eff0e0ae0963215f1d0de2e7016d147fc18f45b06079318a  arreo-server-x86_64-unknown-linux-gnu
+107246ceaee9b13260affffe42e1ce8091da7ee3a6be9dd7d3660e9e40ae3014  arreo-x86_64-pc-windows-msvc.exe
+a420ea24f045fec5eff0e0ae0963215f1d0de2e7016d147fc18f45b06079318a  arreo-x86_64-unknown-linux-gnu
+
+### verify — exit 0, naming artifact, key id and digest
+verified SHA256SUMS
+  key    D88DB7DB9A6D7AE0 (pinned in supply-chain/arreo.pub, compiled into this binary)
+  sha256 4a89003da91885b30f6a20f3008564adbcac2e26af9e0c1c58e6b4ea255aa21a
+exit=0
+verified arreo-x86_64-unknown-linux-gnu
+  key    D88DB7DB9A6D7AE0 (pinned in supply-chain/arreo.pub, compiled into this binary)
+  sha256 a420ea24f045fec5eff0e0ae0963215f1d0de2e7016d147fc18f45b06079318a
+exit=0
+verified arreo-server-x86_64-unknown-linux-gnu
+  key    D88DB7DB9A6D7AE0 (pinned in supply-chain/arreo.pub, compiled into this binary)
+  sha256 a420ea24f045fec5eff0e0ae0963215f1d0de2e7016d147fc18f45b06079318a
+exit=0
+verified arreo-x86_64-pc-windows-msvc.exe
+  key    D88DB7DB9A6D7AE0 (pinned in supply-chain/arreo.pub, compiled into this binary)
+  sha256 107246ceaee9b13260affffe42e1ce8091da7ee3a6be9dd7d3660e9e40ae3014
+exit=0
+
+### the tamper check — one flipped byte of a copy, valid signature carried over
+update: /tmp/relsim2/tampered: signature does not authenticate this file (The signature verification failed)
+refused, exit=1 — the job fails, as it must
+
+### a MINISIGN_SECRET_KEY belonging to another key (the misconfiguration gate)
+update: SHA256SUMS: signed by key 8D6501077D3EE876, this build trusts D88DB7DB9A6D7AE0
+refused, exit=1 — the job refuses to publish under an unpinned key
+
+### a missing .minisig (the fail-hard check)
+update: arreo-x86_64-pc-windows-msvc.exe: no signature at arreo-x86_64-pc-windows-msvc.exe.minisig — refusing an unverified artifact
+refused, exit=1 — the 'fail if any artifact lacks its .minisig' step fails

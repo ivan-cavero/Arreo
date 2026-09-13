@@ -37,7 +37,7 @@ jobs:
           cargo vet --locked
           cargo audit
           cargo deny check
-      - name: package skeleton (T-0020 — dist plan mode)
+      - name: package + signed-release structure (T-0020/T-0036 — dist plan mode, tag job, pinned key)
         run: cargo run -p xtask -- package --dry-run
       - name: binary size (T-0020 — release daemon ≤ budget)
         run: cargo run -p xtask -- bench --probe size

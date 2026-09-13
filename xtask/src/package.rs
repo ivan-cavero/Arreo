@@ -74,11 +74,116 @@ pub fn package(rest: &[String]) -> ExitCode {
             failed = true;
         }
     }
+    signed_release(&mut failed);
     if failed {
         ExitCode::FAILURE
     } else {
         println!("package: skeleton valid (real builds on tags; see docs/release.md)");
         ExitCode::SUCCESS
+    }
+}
+
+/// T-0036: the signed-release structure, checked on every PR rather than on the
+/// first tag.
+///
+/// Two claims are machine-checkable here and both have failed silently before in
+/// other projects:
+///
+/// * **The pinned key is a real key.** A placeholder public key is worse than
+///   none — the release job would verify against a key nobody holds and refuse
+///   every artifact, a gate that looks green and can never pass. So the key is
+///   parsed, its key id is read, and the file's own comment must agree with it.
+/// * **The tag job exists and is the one that ships.** A workflow that builds but
+///   does not sign, or signs but never verifies, or verifies with something other
+///   than the shipped verifier, is a release pipeline that produces untrusted
+///   artifacts while looking complete. The assertions below are the acceptance
+///   criteria written where CI can see them; `docs/release.md` records what they
+///   cannot prove (the job has never run against a real key).
+fn signed_release(failed: &mut bool) {
+    let root = workspace_root();
+
+    let key_text = std::fs::read_to_string(root.join("supply-chain/arreo.pub")).unwrap_or_default();
+    match arreo_core::update::verify::TrustSet::parse(&key_text) {
+        Some(keys) => {
+            let ids = keys.ids();
+            // Every comment in the file must name the key it introduces: a
+            // rotation that edits the blob and forgets the comment is a file
+            // whose reader cannot tell which key is which.
+            let comments: Vec<&str> = key_text
+                .lines()
+                .filter(|line| line.starts_with("untrusted comment:"))
+                .collect();
+            let named = ids
+                .split(", ")
+                .all(|id| comments.iter().any(|line| line.contains(id)));
+            let placeholder = ids
+                .split(", ")
+                .any(|id| matches!(id, "0000000000000000" | "FFFFFFFFFFFFFFFF"));
+            if placeholder {
+                println!(
+                    "[FAIL] package: supply-chain/arreo.pub holds a placeholder key ({ids}) — \
+                     every release would fail closed against a key nobody holds"
+                );
+                *failed = true;
+            } else if named {
+                println!("[PASS] package: pinned trust set {ids} (every comment names its key)");
+            } else {
+                println!(
+                    "[FAIL] package: a key in supply-chain/arreo.pub has no comment naming it \
+                     ({ids})"
+                );
+                *failed = true;
+            }
+        }
+        None => {
+            println!(
+                "[FAIL] package: supply-chain/arreo.pub is not a minisign public key — this \
+                 build would have no trust anchor"
+            );
+            *failed = true;
+        }
+    }
+
+    let workflow =
+        std::fs::read_to_string(root.join(".github/workflows/release.yml")).unwrap_or_default();
+    let requirements: &[(&str, &str)] = &[
+        ("tags:", "the release job runs on tags"),
+        (
+            "MINISIGN_SECRET_KEY",
+            "signing takes the key from the environment secret",
+        ),
+        (
+            "secrets.MINISIGN_SECRET_KEY",
+            "the workflow reads the key from the secret store, not from a file",
+        ),
+        ("SHA256SUMS", "the manifest is written and signed"),
+        (".minisig", "signatures ship beside the artifacts"),
+        (
+            "arreo update verify",
+            "verification goes through the shipped verifier, not a second path",
+        ),
+        ("tampered", "a tampered copy is refused before publishing"),
+    ];
+    for (needle, why) in requirements {
+        if workflow.contains(needle) {
+            println!("[PASS] package: release job — {why}");
+        } else {
+            println!("[FAIL] package: release.yml is missing {needle:?} ({why})");
+            *failed = true;
+        }
+    }
+
+    // No key material in the workflow. A minisign secret key blob is a long
+    // base64 run; anything that long in a workflow is either a leaked key or a
+    // mistake, and neither belongs in a file that ships to a public repository.
+    let long_base64 = workflow
+        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '+' || c == '/' || c == '='))
+        .any(|run| run.len() >= 80 && !run.chars().all(|c| c.is_ascii_digit()));
+    if long_base64 {
+        println!("[FAIL] package: release.yml contains what looks like embedded key material");
+        *failed = true;
+    } else {
+        println!("[PASS] package: release.yml carries no key material");
     }
 }
 
