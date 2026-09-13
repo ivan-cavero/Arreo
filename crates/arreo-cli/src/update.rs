@@ -777,6 +777,15 @@ fn wait_for_takeover(
     {
         use std::os::unix::process::CommandExt;
         command.arg0(current);
+        // **Its own process group** (T-0077). The candidate is a daemon: it may
+        // adopt PTY masters, and it may fork. When it has to be abandoned, the
+        // signal has to reach everything it started — `Child::kill` reaches one
+        // pid, and a descendant that outlives its parent would keep a live
+        // agent's terminal open with no daemon serving it. Making the candidate
+        // its own group *leader* is what makes the group addressable at all
+        // (`pgid == pid`), and it costs the candidate nothing: it is a daemon,
+        // so being in the terminal's foreground group is not something it wants.
+        command.process_group(0);
     }
     // See the fn docs: a TTY is safe to inherit and worth inheriting; anything
     // else is a stream that can close under the daemon and kill it via a panicking
@@ -844,15 +853,26 @@ fn wait_for_takeover(
         }
         std::thread::sleep(POLL_INTERVAL);
     }
-    // **This kills the direct child, not its descendants.** `Child::kill` signals
-    // one pid, and a candidate that spawned children before hanging would leave
-    // them behind (observed while testing a deliberately hanging fake server: the
-    // `sh` wrapper died and its `sleep` did not). Reaping the whole tree needs a
-    // process group plus a group-kill syscall, which this crate has no dependency
-    // for; the practical exposure today is nil because an `arreo-server` waiting
-    // on a handoff has adopted nothing and spawned nothing. It stops being nil
-    // when the handoff carries panes, so it is filed rather than noted and
-    // forgotten — see T-0077.
+    // **The whole group, not just the direct child** (T-0077). `Child::kill`
+    // signals one pid, and a candidate that forked before hanging would leave its
+    // descendants behind — observed while testing a deliberately hanging fake
+    // server, where the `sh` wrapper died and its `sleep` did not. That stopped
+    // being theoretical when the handoff started carrying panes (T-0038 stage 2):
+    // a candidate that adopted PTY masters before hanging is a process holding
+    // live agents' terminals with nothing serving them, which is the state ADR
+    // 0021 exists to make unreachable.
+    //
+    // The child was spawned into its own group, so `pgid == pid` and the group is
+    // addressable by that number. Signal the group first, then reap the leader;
+    // a group that is already gone returns ESRCH, which is not an error here —
+    // the point of the call is the state afterwards, not the return code.
+    #[cfg(unix)]
+    {
+        let pgid = rustix::process::Pid::from_raw(child.id() as i32);
+        if let Some(pgid) = pgid {
+            let _ = rustix::process::kill_process_group(pgid, rustix::process::Signal::Kill);
+        }
+    }
     let _ = child.kill();
     let _ = child.wait();
     Err(HandoffError {

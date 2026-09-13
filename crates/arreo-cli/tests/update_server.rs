@@ -592,6 +592,82 @@ fn a_candidate_that_hangs_is_abandoned_without_an_install() {
     assert!(!scratch.path().join("arreo-server.prev").exists());
 }
 
+/// **A timed-out candidate is abandoned with its whole process tree** (T-0077).
+///
+/// `Child::kill` signals one pid. A candidate that forked before hanging — which
+/// an `arreo-server` waiting on a handoff can, and which a candidate that has
+/// already adopted PTY masters will — would otherwise leave its descendants
+/// running with nothing serving them: agents' terminals held by a process whose
+/// daemon was abandoned. The fix spawns the candidate into its own process group
+/// and signals the group, so the timeout path takes the tree with it.
+///
+/// The fixture forks a descendant that outlives its parent, records its pid, and
+/// then hangs. The assertion is on that pid: gone, not merely orphaned.
+///
+/// The pid path is **quoted** inside the script: the scratch directory is named
+/// after the test thread (`…ThreadId(2)`), and `dash` rejects an unquoted `(` in a
+/// redirection word with a syntax error — which reads as "the candidate refused
+/// the handoff" rather than "the fixture never ran".
+#[test]
+fn a_timed_out_handoff_kills_the_candidates_descendants() {
+    let scratch = Scratch::new("tree");
+    let client = install_pair(&scratch);
+    let server = scratch.path().join("arreo-server");
+    let socket = scratch.path().join("arreo.sock");
+    let daemon = start_daemon(&server, &socket, &scratch);
+
+    let descendant_pid = scratch.path().join("descendant.pid");
+    let hang = scratch.path().join("hang-with-child");
+    write_script(
+        &hang,
+        &format!(
+            "case \"$1\" in\n  --version) echo 'arreo-server 9.9.9 (hangs with a child)'; exit 0 ;;\nesac\n\
+             sleep 300 &\necho $! > '{}'\nwait",
+            descendant_pid.display()
+        ),
+    );
+
+    let failed = run(
+        &client,
+        &scratch,
+        &[
+            "update",
+            "--server",
+            "--from",
+            hang.to_str().unwrap(),
+            "--timeout-secs",
+            "1",
+        ],
+    );
+    assert_eq!(failed.code, 1, "{}", failed.out);
+    assert!(
+        failed.out.contains("did not complete within 1s"),
+        "the timeout is reported as a timeout: {}",
+        failed.out
+    );
+
+    let pid: u32 = std::fs::read_to_string(&descendant_pid)
+        .expect("the candidate recorded its descendant before hanging")
+        .trim()
+        .parse()
+        .expect("a pid");
+    // A signal is asynchronous: give the kernel a moment to take the group down
+    // rather than asserting on the instant the command returned.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while running(pid) && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(
+        !running(pid),
+        "the candidate's descendant (pid {pid}) survived the timeout — the group was not signalled"
+    );
+
+    assert!(
+        running(daemon.pid),
+        "and the daemon it did not take over is fine"
+    );
+}
+
 /// A second updater is refused while one holds the lock, and the refusal does
 /// not disturb the daemon (T-0070's lock, doing the same job on the server path).
 #[test]
