@@ -699,25 +699,36 @@ fn a_running_daemon_is_handed_over_to_the_new_binary() {
     // nothing reaps it for us: without this, every run of this test leaves a live
     // daemon behind, and a leaked process is indistinguishable from a product
     // defect — the trap this project has already paid a session for.
-    kill_daemon(new_pid);
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    while running(new_pid) && std::time::Instant::now() < deadline {
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    }
+    // SIGTERM, then **escalate**. The daemon's own graceful drain is bounded by
+    // `SHUTDOWN_DEADLINE` (5 s) and this wait used to be exactly 5 s — so it raced
+    // the daemon's own deadline with no margin, and failed intermittently under
+    // the load of a full-workspace run (observed twice). Waiting past it and then
+    // SIGKILLing is the right shape because **this is cleanup, not a shutdown
+    // test**: the property worth asserting is "no process left behind", which
+    // SIGKILL guarantees regardless of how slow the machine is, and the graceful
+    // path is the lifecycle slice's business (its comment below says so).
+    kill_daemon(new_pid, "-TERM", std::time::Duration::from_secs(20));
+    kill_daemon(new_pid, "-KILL", std::time::Duration::from_secs(5));
     assert!(
         !running(new_pid),
         "the handed-over daemon must be gone before the test ends (pid {new_pid})"
     );
 }
 
-/// SIGTERM a daemon and do not wait: the daemon's own shutdown path is what makes
-/// this clean, and this test is not the place to assert on it (the lifecycle slice
-/// owns that).
-fn kill_daemon(pid: u32) {
+/// Signal a daemon and wait up to `grace` for it to go.
+///
+/// Returns whether it is gone, so the caller decides what a failure means: this
+/// test escalates rather than failing on the graceful path, because a shutdown
+/// that is merely slow under load is not a defect in *this* subject.
+fn kill_daemon(pid: u32, signal: &str, grace: std::time::Duration) {
     let _ = std::process::Command::new("kill")
-        .arg("-TERM")
+        .arg(signal)
         .arg(pid.to_string())
         .status();
+    let deadline = std::time::Instant::now() + grace;
+    while running(pid) && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
 }
 
 /// Find the daemon serving `socket` the way the verb does: a process whose argv

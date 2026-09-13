@@ -3963,3 +3963,507 @@ fn a_send_racing_the_cut_is_acked_once_or_refused_as_retryable() {
     }
     cleanup(&socket);
 }
+
+// ---------------------------------------------------------------------------
+// T-0038 stage 4 — the SQLite criterion.
+//
+// "An audit write during the cut loses nothing and raises no `database is
+// locked`; a corrupt `-wal` heals." The store is opened the way the product
+// opens it — per operation, WAL with a 5 s busy timeout — so "two writers on
+// one file" is an existing, supported situation (the CLI already does it while
+// the daemon runs), not a hope. What these tests add is the behaviour *during*
+// a cut, and after the one failure mode that used to be silent: a corrupt
+// store left every `if let Ok(store)` failing for ever while the daemon looked
+// healthy.
+// ---------------------------------------------------------------------------
+
+/// The store path for a socket — the same rule the daemon and the CLI use.
+fn store_path(socket: &Path) -> PathBuf {
+    arreo_server::persist::db_path_for(socket)
+}
+
+/// Milliseconds since the epoch, for a test-written audit row.
+fn audit_now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Every `*.corrupt-*` file in `dir` whose name starts with the store file's
+/// full name — the quarantine's naming rule (`<db>.corrupt-<ms>` and
+/// `<db>-wal.corrupt-<ms>`), narrowed so another test's quarantine in the
+/// shared `temp_dir` cannot satisfy the assertion.
+fn quarantined_files(db: &Path) -> Vec<PathBuf> {
+    let name = db
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let dir = db.parent().expect("the store has a directory");
+    let mut out: Vec<PathBuf> = std::fs::read_dir(dir)
+        .expect("read the store's directory")
+        .filter_map(|entry| entry.ok().map(|e| e.path()))
+        .filter(|path| {
+            let file = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            file.starts_with(&name) && file.contains(".corrupt-")
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+/// Stage-4 SQLite criterion 1 — **an audit write during the cut is neither
+/// locked out nor lost.**
+///
+/// The cut is held at the point the design calls atomic (the [`HeldTransfer`]
+/// harness: every pane paused, the outgoing daemon waiting for the commit), the
+/// outgoing daemon holds the store exactly as it does all day (its device
+/// authority's long-lived connection), and **three concurrent writers** hammer
+/// audit rows through the store while the cut is in flight — each row through
+/// its own `SessionStore::open`, which is the product's own per-operation
+/// pattern (`arreo audit`, the relay, the daemon's background sweeps).
+///
+/// The concurrency is the point, not decoration: WAL plus the 5 s busy timeout
+/// (`prepare`) is what makes two writers safe, and without the timeout a
+/// second writer fails the instant it overlaps the first with `SQLITE_BUSY` —
+/// "database is locked", the failure the criterion names. Three writers over
+/// a hundred operations in a few tens of milliseconds is what makes that
+/// overlap certain rather than likely.
+///
+/// Two properties, and what each defends:
+///
+/// - **No `database is locked`.** Every write must be accepted.
+/// - **Nothing lost.** Every row written during the cut is readable afterwards,
+///   on the daemon's own file, and the daemon goes on serving (the cut was
+///   abandoned, so the old daemon is still the one serving).
+///
+/// What removal turns red: dropping the busy timeout from `prepare` (the
+/// overlapping writers observe `SQLITE_BUSY` and the test names the row);
+/// taking a long-lived exclusive handle on the store across a cut (the daemon's
+/// own writes and the writers here would serialize into a refusal).
+#[test]
+fn an_audit_write_during_the_cut_is_not_locked_out() {
+    use arreo_core::store::{AuditEvent, AuditKind, AuditOutcome, SessionStore};
+
+    /// The action this test writes: a name of its own, so the read-back is
+    /// exactly these rows and not the daemon's.
+    const ACTION: &str = "test.audit-during-cut";
+    /// Writers, and rows each: enough concurrent operations that the busy
+    /// timeout is exercised rather than hoped for.
+    const WRITERS: usize = 3;
+    const ROWS: usize = 40;
+
+    let socket = temp_socket("stage4-audit-cut");
+    cleanup(&socket);
+    let mut old = spawn_daemon(&socket, &[], std::process::Stdio::null());
+    wait_serving(&mut old, &socket, Duration::from_secs(10));
+
+    // A pane, so the cut holds a pane paused while the writes happen.
+    let reply = spawn_pane(&socket, "p0", "sh", &["-c", "echo pid=$$; sleep 120"]);
+    assert!(matches!(reply, Message::Ok { .. }), "spawn: {reply:?}");
+    let db = store_path(&socket);
+
+    // Held at the transfer point: the pane's pump is paused, the cut has not
+    // committed, and the outgoing daemon is still serving.
+    let held = HeldTransfer::receive(&socket, 1);
+    assert_eq!(held.id(0), "p0");
+
+    let tag = format!("during-cut-{}", std::process::id());
+    let failures: std::sync::Arc<std::sync::Mutex<Vec<String>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut writers = Vec::new();
+    for writer in 0..WRITERS {
+        let db = db.clone();
+        let tag = tag.clone();
+        let failures = std::sync::Arc::clone(&failures);
+        writers.push(std::thread::spawn(move || {
+            for n in 0..ROWS {
+                let detail = format!("{tag}#{writer}.{n}");
+                let opened = SessionStore::open(&db);
+                let written = opened.and_then(|store| {
+                    let mut event = AuditEvent::new(
+                        ACTION,
+                        AuditKind::Unknown,
+                        AuditOutcome::Ok,
+                        audit_now_ms(),
+                    );
+                    event.detail = Some(detail.clone());
+                    store.record(&event)
+                });
+                if let Err(e) = written {
+                    if let Ok(mut failures) = failures.lock() {
+                        failures.push(format!("{detail}: {e}"));
+                    }
+                }
+            }
+        }));
+    }
+    for writer in writers {
+        writer.join().expect("a writer thread finished");
+    }
+    let failures = failures.lock().map(|f| f.clone()).unwrap_or_default();
+    assert!(
+        failures.is_empty(),
+        "a store write during the cut must not be locked out (want: no \
+         `database is locked`): {failures:?}"
+    );
+
+    // Abandon the cut: EOF on the transfer connection is what a killed incoming
+    // daemon produces, and the outgoing daemon keeps serving.
+    drop(held);
+
+    // Every row written during the cut is still there, on the daemon's file.
+    let store = SessionStore::open(&db).expect("the store reopens after the cut");
+    let rows = store
+        .audit_query(&arreo_core::store::AuditQuery {
+            action: Some(ACTION.to_string()),
+            ..arreo_core::store::AuditQuery::all(WRITERS * ROWS * 2)
+        })
+        .expect("query the rows");
+    assert_eq!(
+        rows.len(),
+        WRITERS * ROWS,
+        "every audit row written during the cut survived it ({} expected, {} found)",
+        WRITERS * ROWS,
+        rows.len()
+    );
+    assert!(
+        rows.iter()
+            .all(|r| r.detail.as_deref().unwrap_or("").starts_with(&tag)),
+        "and they are the rows this test wrote: {:?}",
+        rows.iter().map(|r| r.detail.clone()).collect::<Vec<_>>()
+    );
+    assert!(
+        old.try_wait().expect("try_wait").is_none(),
+        "the outgoing daemon still serves after the abandoned cut"
+    );
+    cleanup(&socket);
+}
+
+/// Stage-4 SQLite criterion 2 — **a corrupt `-wal` heals on restart.**
+///
+/// The scenario the criterion names, made real and in the order that actually
+/// produces the fault: a **live** daemon's write-ahead log is overwritten with
+/// bytes that are not a WAL while the daemon holds its connection (the test
+/// chooses them; nothing here guesses at a corrupt file's contents), the daemon
+/// is then **SIGKILLed** (the crash shape — no destructor runs, so the corrupted
+/// log and its stale wal-index are exactly what the next boot meets; the
+/// graceful path would only be easier, because its final snapshot would
+/// quarantine first), and a fresh daemon is started on the same socket.
+///
+/// **Why the daemon has to be live and the `-shm` has to stay.** The order is
+/// the fault's own shape, not a stronger test: overwriting a closed daemon's
+/// `-wal` is *ignored* by SQLite (the log's header does not parse, so it is
+/// discarded and the store opens — measured), while a live daemon leaves a
+/// `-shm` whose wal-index still describes the frames that used to be in the log,
+/// so the next open trusts the index and reads past the end of the truncated log
+/// — **`disk I/O error`**, the failure the task calls "persistence silently
+/// degrades". That is the state a restart has to heal, and
+/// [`arreo_core::store::SessionStore::open`] is where the healing happens (the
+/// seam also covers the CLI, the relay and the device authority without each of
+/// them growing its own copy).
+///
+/// The heal has to be visible in five ways, because "it came up" is not the
+/// claim:
+///
+/// - it **serves** (a restart that cannot open its store used to exit 1 in the
+///   device authority's open, before serving at all);
+/// - the corrupt files are **renamed aside, not deleted** — `<db>` and
+///   `<db>-wal` both under `.corrupt-<ms>`, and non-empty;
+/// - the quarantine is **loud** — on the daemon's stderr;
+/// - it is **on the audit trail** — one `store.corrupt` row in the replacement
+///   store, naming where the corrupt files went;
+/// - **persistence resumed** — through the store (a fresh row round-trips) and
+///   through the daemon's own path (a pane spawned after the heal is snapshotted
+///   into the store's topology).
+///
+/// **What removal turns red (observed, not predicted).** With no quarantine
+/// this test fails at the `.corrupt-` assertion: the daemon *does* come back up,
+/// because SQLite silently discards a log it cannot parse — the store opens, the
+/// log's frames are gone, and nothing is said. That silence is the failure the
+/// criterion refuses ("persistence silently degrades"), so the red observed
+/// here is "nothing was renamed, nothing was logged, no row exists", and the
+/// [`a_corrupt_wal_does_not_lock_a_second_writer_out`] test next to it is the
+/// half that goes red on the *error* (the live daemon's opens fail with a
+/// `disk I/O error`).
+#[test]
+fn a_corrupt_wal_heals_on_restart() {
+    use arreo_core::store::{actions, AuditEvent, AuditKind, AuditOutcome, SessionStore};
+
+    let socket = temp_socket("stage4-corrupt-wal");
+    cleanup(&socket);
+    let db = store_path(&socket);
+    let wal = PathBuf::from(format!("{}-wal", db.display()));
+    let shm = PathBuf::from(format!("{}-shm", db.display()));
+
+    let mut daemon = spawn_daemon(&socket, &[], std::process::Stdio::null());
+    wait_serving(&mut daemon, &socket, Duration::from_secs(10));
+
+    // A write, so the WAL exists and has bytes in it: the daemon's boot opened
+    // and migrated the store, but a WAL is written by writing.
+    {
+        let store = SessionStore::open(&db).expect("the store opens");
+        let mut event = AuditEvent::new(
+            "test.before-corrupt",
+            AuditKind::Unknown,
+            AuditOutcome::Ok,
+            audit_now_ms(),
+        );
+        event.detail = Some("written before the corruption".to_string());
+        store
+            .record(&event)
+            .expect("the pre-corruption row is written");
+    }
+    // Generous, because this is a readiness poll and not a deadline: it returns
+    // the moment the log appears, but the suite runs 39 tests in parallel and a
+    // tight bound here failed once under an unrelated `cargo` load (the file is
+    // created by the row written just above, so the wait is only ever for the
+    // filesystem's visibility, never for the daemon to do something).
+    assert!(
+        until(Duration::from_secs(20), || wal.exists()),
+        "the WAL exists — it is the file this test corrupts ({})",
+        wal.display()
+    );
+    assert!(
+        until(Duration::from_secs(5), || shm.exists()),
+        "the wal-index exists — it is what makes the corruption a disk I/O error \
+         ({})",
+        shm.display()
+    );
+
+    // Corrupt the WAL **while the daemon is live**: bytes that cannot be a
+    // write-ahead log. This is the *test's* chosen garbage; the product never
+    // guesses at a corrupt file's contents (it renames them aside whole).
+    std::fs::write(&wal, b"not a write-ahead log: no header, no frames").expect("corrupt the wal");
+
+    // SIGKILL — the crash shape. Nothing runs on the way down, so the corrupt
+    // WAL and the stale wal-index are untouched when the next daemon boots.
+    daemon.0.kill().expect("kill the daemon");
+    daemon.0.wait().expect("reap it");
+
+    // Restart on the same socket, capturing stderr to a file so the loud line is
+    // readable while the daemon is still serving (a piped stderr would never
+    // reach EOF).
+    let log_path = socket.with_extension("stderr.log");
+    let log = std::fs::File::create(&log_path).expect("the stderr log");
+    let mut restarted = spawn_daemon(&socket, &[], std::process::Stdio::from(log));
+    wait_serving(&mut restarted, &socket, Duration::from_secs(15));
+    assert!(
+        restarted.try_wait().expect("try_wait").is_none(),
+        "the restarted daemon serves (a corrupt store must not stop the machine)"
+    );
+
+    // Quarantined: the corrupt DB *and* its WAL are renamed aside, never
+    // deleted. The suffix check is on the file name, so the shared temp_dir's
+    // other tests cannot satisfy it.
+    let moved = quarantined_files(&db);
+    let db_name = db
+        .file_name()
+        .expect("db file name")
+        .to_string_lossy()
+        .into_owned();
+    assert!(
+        moved.iter().any(|p| p
+            .file_name()
+            .map(|n| n
+                .to_string_lossy()
+                .starts_with(&format!("{db_name}-wal.corrupt-")))
+            .unwrap_or(false)),
+        "the corrupt WAL was renamed aside (not deleted): {moved:?}"
+    );
+    assert!(
+        moved.iter().any(|p| p
+            .file_name()
+            .map(|n| n
+                .to_string_lossy()
+                .starts_with(&format!("{db_name}.corrupt-")))
+            .unwrap_or(false)),
+        "and so was the store file itself: {moved:?}"
+    );
+    for path in &moved {
+        let body = std::fs::read(path).expect("a quarantined file is still readable");
+        assert!(
+            !body.is_empty(),
+            "the quarantine keeps the bytes for a human: {}",
+            path.display()
+        );
+    }
+
+    // Loud: the daemon's own stderr names the quarantine.
+    let log_text = std::fs::read_to_string(&log_path).unwrap_or_default();
+    assert!(
+        log_text.contains("quarantined"),
+        "the quarantine is shouted on stderr: {log_text:?}"
+    );
+
+    // Durable: the quarantine is an audit row in the replacement store, and it
+    // names where the corrupt files went.
+    let store = SessionStore::open(&db).expect("the store opens after the heal");
+    let rows = store
+        .audit_by_action(actions::STORE_CORRUPT, 10)
+        .expect("query the quarantine row");
+    assert_eq!(
+        rows.len(),
+        1,
+        "the quarantine is recorded once on the audit trail: {rows:?}"
+    );
+    let detail = rows[0].detail.clone().unwrap_or_default();
+    assert!(
+        detail.contains("quarantined"),
+        "and the row names the quarantine: {detail:?}"
+    );
+    assert!(
+        detail.contains(&db_name),
+        "the row names the store it healed: {detail:?}"
+    );
+
+    // Persistence resumed — through the store...
+    let mut event = AuditEvent::new(
+        "test.after-heal",
+        AuditKind::Unknown,
+        AuditOutcome::Ok,
+        audit_now_ms(),
+    );
+    event.detail = Some("written after the heal".to_string());
+    store
+        .record(&event)
+        .expect("a row is written after the heal");
+    assert_eq!(
+        store
+            .audit_by_action("test.after-heal", 5)
+            .expect("query it back")
+            .len(),
+        1,
+        "the row written after the heal is readable from the same file"
+    );
+    // ...and through the daemon's own path: a pane spawned now is snapshotted
+    // into the store the daemon is serving from.
+    let reply = spawn_pane(
+        &socket,
+        "after-heal",
+        "sh",
+        &["-c", "echo pid=$$; sleep 120"],
+    );
+    assert!(matches!(reply, Message::Ok { .. }), "spawn: {reply:?}");
+    assert!(
+        until(Duration::from_secs(10), || {
+            SessionStore::open(&db)
+                .and_then(|s| s.load_topology())
+                .map(|panes| panes.iter().any(|p| p.id == "after-heal"))
+                .unwrap_or(false)
+        }),
+        "the daemon's own persistence resumed: the pane it spawned is in the store's topology"
+    );
+
+    cleanup(&socket);
+}
+
+/// Stage-4 SQLite criterion 2, the half the criterion measured: **a corrupt
+/// `-wal` does not lock a second writer out.**
+///
+/// "Measured: corrupting a live daemon's `-wal` does not crash it and it keeps
+/// serving, but persistence then silently degrades (every store open fails,
+/// every `if let Ok(store)` swallows it) — a daemon that looks healthy while its
+/// audit trail and scrollback quietly stop persisting."
+///
+/// That is this test, minus the silence: the daemon is live, its log is
+/// corrupted under it, and a **second process** (the shape the CLI, the relay
+/// and the daemon's own background sweeps all use — `SessionStore::open` per
+/// operation, never a shared handle) opens the store. It must succeed, and the
+/// store it gets must be the healed one: the quarantine is recorded, and the row
+/// it writes afterwards is readable.
+///
+/// **Why the daemon is not restarted here.** The quarantine is an *open* path:
+/// the daemon's already-open connection is not something this change can repair
+/// (the device authority holds a long-lived handle by design, and the criterion
+/// is restart-healing — that case is `a_corrupt_wal_heals_on_restart` above).
+/// What this test adds is the failure mode the criterion names in its own words:
+/// without the heal the open fails with `disk I/O error` (measured: the live
+/// daemon's wal-index still describes the frames the corrupted log no longer
+/// has, so the reader walks off the end), which is exactly "every store open
+/// fails, every `if let Ok(store)` swallows it".
+///
+/// What removal turns red: the second writer's open returns `disk I/O error`
+/// instead of a store (asserted directly, with that message), and no
+/// `store.corrupt` row exists.
+#[test]
+fn a_corrupt_wal_does_not_lock_a_second_writer_out() {
+    use arreo_core::store::{actions, AuditEvent, AuditKind, AuditOutcome, SessionStore};
+
+    let socket = temp_socket("stage4-corrupt-wal-live");
+    cleanup(&socket);
+    let db = store_path(&socket);
+    let wal = PathBuf::from(format!("{}-wal", db.display()));
+
+    let mut daemon = spawn_daemon(&socket, &[], std::process::Stdio::null());
+    wait_serving(&mut daemon, &socket, Duration::from_secs(10));
+    {
+        let store = SessionStore::open(&db).expect("the store opens");
+        let mut event = AuditEvent::new(
+            "test.before-corrupt",
+            AuditKind::Unknown,
+            AuditOutcome::Ok,
+            audit_now_ms(),
+        );
+        event.detail = Some("written before the corruption".to_string());
+        store
+            .record(&event)
+            .expect("the pre-corruption row is written");
+    }
+    assert!(
+        until(Duration::from_secs(5), || wal.exists()),
+        "the WAL exists — it is the file this test corrupts ({})",
+        wal.display()
+    );
+    assert!(
+        daemon.try_wait().expect("try_wait").is_none(),
+        "the daemon is live while its log is corrupted"
+    );
+
+    // Corrupt the log under the live daemon, exactly as
+    // `a_corrupt_wal_heals_on_restart` does — but here the daemon keeps running,
+    // so its wal-index (the `-shm`) still describes the frames that are gone.
+    std::fs::write(&wal, b"not a write-ahead log: no header, no frames").expect("corrupt the wal");
+
+    let store = match SessionStore::open(&db) {
+        Ok(store) => store,
+        Err(e) => panic!(
+            "a corrupt store must not lock a second writer out: {e} (this is the \
+             `every store open fails` degradation the criterion names)"
+        ),
+    };
+    // The store this writer got is the healed one, on the same path.
+    let rows = store
+        .audit_by_action(actions::STORE_CORRUPT, 10)
+        .expect("query the quarantine row");
+    assert_eq!(
+        rows.len(),
+        1,
+        "the open that healed the store recorded it: {rows:?}"
+    );
+    let mut event = AuditEvent::new(
+        "test.after-heal",
+        AuditKind::Unknown,
+        AuditOutcome::Ok,
+        audit_now_ms(),
+    );
+    event.detail = Some("written by the second writer".to_string());
+    store
+        .record(&event)
+        .expect("the second writer persists into the healed store");
+    assert_eq!(
+        store
+            .audit_by_action("test.after-heal", 5)
+            .expect("query it back")
+            .len(),
+        1,
+        "and its audit trail is readable"
+    );
+
+    let _ = daemon.0.kill();
+    let _ = daemon.0.wait();
+    cleanup(&socket);
+}

@@ -25,6 +25,7 @@
 //! never touches disk.
 
 use rusqlite::{params, Connection, OptionalExtension};
+use std::path::PathBuf;
 use thiserror::Error;
 
 use crate::fixtures::scan_secrets;
@@ -35,6 +36,26 @@ pub enum SessionError {
     Sqlite(#[from] rusqlite::Error),
     #[error("session json: {0}")]
     Json(#[from] serde_json::Error),
+    /// The store at `path` was **corrupt** (`SQLITE_CORRUPT` / `SQLITE_NOTADB`)
+    /// and the healing open could not complete: the corrupt files are at
+    /// `quarantine` (renamed aside, never deleted) and re-opening the fresh
+    /// store failed with `reason`.
+    ///
+    /// This is the *typed, loud* half of the quarantine rule (see
+    /// [`SessionStore::open`]): an ordinary corrupt store heals inside `open`,
+    /// and this error means the heal itself could not finish — the quarantine
+    /// rename was refused, or the replacement store is immediately unusable.
+    /// Either way the operator has a path to look at and a reason, rather than
+    /// a daemon that silently stopped persisting.
+    #[error(
+        "session store corrupt at {path}: {reason}; the corrupt files were quarantined to \
+         {quarantine} (never deleted) and the fresh store could not be opened"
+    )]
+    CorruptStore {
+        path: std::path::PathBuf,
+        quarantine: String,
+        reason: String,
+    },
 }
 
 pub const SCHEMA_VERSION: u32 = 7;
@@ -152,6 +173,13 @@ pub mod actions {
     /// side knows the reason — `outgoing: …` or `incoming: …` in `detail` — so
     /// a cut that did not happen is never recorded as `ok`, and never silently.
     pub const HANDOFF_ABORT: &str = "handoff.abort";
+    /// The store was corrupt and was **quarantined** (T-0038 stage 4, the
+    /// SQLite criterion): the corrupt `<socket>.db` and its `-wal`/`-shm`
+    /// sidecars were renamed aside to `<db>.corrupt-<timestamp>` and a fresh
+    /// store replaced them, so persistence resumes. Written by the very open
+    /// that healed the store, into the fresh one — the one row that proves a
+    /// machine healed rather than quietly stopped persisting.
+    pub const STORE_CORRUPT: &str = "store.corrupt";
 }
 
 /// One audit row (prompt already redacted on write).
@@ -314,6 +342,202 @@ fn has_column(conn: &Connection, table: &str, column: &str) -> Result<bool, Sess
 
 pub struct SessionStore {
     conn: std::sync::Mutex<Connection>,
+}
+
+/// Whether a failed store open is SQLite saying the *store* is not usable.
+///
+/// Two codes, and they are the two SQLite uses for "this file is not the
+/// database it says it is": `SQLITE_NOTADB` (26 — a non-database file where the
+/// store should be) and `SQLITE_CORRUPT` (11 — a malformed page inside a file
+/// whose header is fine).
+///
+/// **What is deliberately *not* here: `SQLITE_IOERR`.** Corrupting a live
+/// daemon's `-wal` does produce a `disk I/O error` — the stale wal-index
+/// describes frames that are no longer in the log, so a reader walks off the end
+/// (measured) — and that was this function's first shape. It is not one now,
+/// because the corrupt log is caught by its own header **before** the open
+/// ([`wal_problem`]), which makes the I/O error unreachable *for corruption*
+/// while leaving it reachable for its other meaning: a failing device or a
+/// network filesystem that dropped. Quarantining a store because the disk is
+/// broken would rename a healthy file aside and report a corruption that does
+/// not exist, and the store is not what needs replacing then.
+fn is_store_corruption(err: &SessionError) -> bool {
+    let SessionError::Sqlite(rusqlite::Error::SqliteFailure(ffi, _)) = err else {
+        return false;
+    };
+    matches!(
+        ffi.code,
+        rusqlite::ErrorCode::NotADatabase | rusqlite::ErrorCode::DatabaseCorrupt
+    )
+}
+
+/// `<db>.heal.lock` — the lock that serializes store healers (see
+/// [`SessionStore::heal`]).
+///
+/// Deliberately **not** one of [`store_files`]: the quarantine must not rename
+/// it aside, or the second healer's lock would vanish mid-heal.
+fn heal_lock_path(path: &std::path::Path) -> PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push(".heal.lock");
+    PathBuf::from(name)
+}
+
+/// Try to take the heal lock, giving a concurrent healer a moment to finish.
+///
+/// Best-effort by design: `None` means "somebody else is healing", and the
+/// caller then simply attempts an ordinary open, which succeeds once their fresh
+/// store is in place. Returning `None` must never be an error — refusing to open
+/// a store because another process is *repairing* it would turn a heal into an
+/// outage, which is the failure this whole path exists to prevent.
+fn acquire_heal_lock(path: &std::path::Path) -> Option<crate::lock::ExclusiveLock> {
+    for _ in 0..HEAL_LOCK_ATTEMPTS {
+        match crate::lock::ExclusiveLock::acquire(path) {
+            Ok(lock) => return Some(lock),
+            Err(crate::lock::LockError::WouldBlock(_)) => {
+                std::thread::sleep(HEAL_LOCK_WAIT);
+            }
+            // A lock file that cannot be opened at all is not a reason to refuse
+            // the open: proceed unlocked rather than fail the caller.
+            Err(_) => return None,
+        }
+    }
+    None
+}
+
+/// How many times a healer waits for the lock before proceeding unlocked.
+const HEAL_LOCK_ATTEMPTS: u32 = 50;
+
+/// How long each of those waits is (50 × 20 ms = up to a second, comfortably
+/// longer than the few renames a heal performs).
+const HEAL_LOCK_WAIT: std::time::Duration = std::time::Duration::from_millis(20);
+
+/// The write-ahead log files that belong to a store: `<db>-wal`, `<db>-shm`.
+fn sidecars_of(path: &std::path::Path) -> [PathBuf; 2] {
+    let mut wal = path.as_os_str().to_owned();
+    wal.push("-wal");
+    let mut shm = path.as_os_str().to_owned();
+    shm.push("-shm");
+    [PathBuf::from(wal), PathBuf::from(shm)]
+}
+
+/// Every file a store consists of, in the order they are quarantined: the
+/// database first, then its log and index.
+fn store_files(path: &std::path::Path) -> [PathBuf; 3] {
+    let [wal, shm] = sidecars_of(path);
+    [path.to_path_buf(), wal, shm]
+}
+
+/// Move a corrupt store's files aside — **renamed, never deleted**.
+///
+/// Each of `<db>`, `<db>-wal` and `<db>-shm` becomes `<itself>.corrupt-<ms>`: the
+/// suffix appends so all three keep their relationship (and a later `-wal`/`-shm`
+/// glob still finds them), and the millisecond stamp keeps repeated quarantines
+/// apart while naming when the fault was found.
+///
+/// A missing sidecar is not an error — a corrupt DB often has no `-wal`, and a
+/// corrupt WAL may have no `-shm` — but a rename that fails *is* one: the caller
+/// must not report a heal it could not perform, because the fresh open would
+/// then land on the same corrupt bytes. On a failure partway through, the files
+/// already moved are put back, so a refused quarantine does not leave the store
+/// half-named.
+///
+/// Returns the paths moved, for the stderr line and the audit row.
+fn quarantine_corrupt_store(path: &std::path::Path) -> Result<Vec<(PathBuf, PathBuf)>, String> {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let mut moved: Vec<(PathBuf, PathBuf)> = Vec::new();
+    for from in store_files(path) {
+        if !from.exists() {
+            continue;
+        }
+        let to = PathBuf::from(format!("{}.corrupt-{stamp}", from.display()));
+        if let Err(e) = std::fs::rename(&from, &to) {
+            for (moved_from, moved_to) in moved.iter().rev() {
+                let _ = std::fs::rename(moved_to, moved_from);
+            }
+            return Err(format!("cannot quarantine {}: {e}", from.display()));
+        }
+        moved.push((from, to));
+    }
+    Ok(moved)
+}
+
+/// Put a quarantine back, for a heal that turned out to be the wrong diagnosis.
+fn restore_quarantine(moved: &[(PathBuf, PathBuf)]) {
+    for (from, to) in moved.iter().rev() {
+        let _ = std::fs::rename(to, from);
+    }
+}
+
+/// The paths a quarantine moved, for a message that names them.
+fn quarantine_paths(moved: &[(PathBuf, PathBuf)]) -> String {
+    moved
+        .iter()
+        .map(|(_, to)| to.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// A `<db>-wal` that cannot be a write-ahead log, named as the reason.
+///
+/// **SQLite does not report this one, which is why the check exists here.**
+/// Measured: with a log whose header is not a WAL header, opening the store
+/// *succeeds* — SQLite discards the log silently, the frames it held are gone,
+/// and nothing is said. The store then looks healthy while the history it was
+/// holding has evaporated, which is exactly the "persistence silently degrades"
+/// shape this project refuses to ship. Checking the log's own identity *before*
+/// the open turns that silence into the same loud quarantine every other
+/// corruption gets, and it covers the order the criterion names (corrupt a live
+/// daemon's log, stop it, restart) as well as the order that made SQLite speak
+/// (a second process opening while the corrupted log is still live — there
+/// SQLite reports a `disk I/O error`, see [`is_store_corruption`]).
+///
+/// **What is checked is a file-format invariant, not the file's contents.** A
+/// write-ahead log begins with the 32-byte header whose first four bytes are the
+/// WAL magic (`0x377f0682`/`0x377f0683`); a zero-length log is legitimate (a
+/// checkpoint truncates the log before the next write recreates the header), and
+/// a log that is present, non-empty and has no valid header is a log no reader
+/// can use. Nothing here parses or repairs what it finds — the file is renamed
+/// aside whole, and a human can still read it.
+fn wal_problem(path: &std::path::Path) -> Option<String> {
+    let [wal, _shm] = sidecars_of(path);
+    let metadata = std::fs::metadata(&wal).ok()?;
+    if metadata.len() == 0 {
+        return None;
+    }
+    let mut header = [0u8; 4];
+    match std::fs::File::open(&wal).and_then(|mut f| {
+        use std::io::Read;
+        f.read_exact(&mut header)
+    }) {
+        Ok(()) => {}
+        Err(e) => {
+            return Some(format!(
+                "the write-ahead log {} cannot be read ({e})",
+                wal.display()
+            ))
+        }
+    }
+    let magic = u32::from_be_bytes(header);
+    if magic == 0x377f_0682 || magic == 0x377f_0683 {
+        return None;
+    }
+    Some(format!(
+        "the write-ahead log {} ({} bytes) does not begin with a WAL header (found {magic:#010x}; \
+         SQLite would discard it silently and the frames it held with it)",
+        wal.display(),
+        metadata.len(),
+    ))
+}
+
+/// Milliseconds since the epoch, for the audit row a quarantine writes.
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 impl SessionStore {
@@ -733,7 +957,157 @@ impl SessionStore {
     }
 
     /// Open (or create + migrate) a file store.
+    ///
+    /// **A corrupt store is quarantined, never deleted and never silently
+    /// degraded** (T-0038 stage 4, the SQLite criterion). Two ways in, one heal:
+    ///
+    /// - the write-ahead log is checked **before** the open
+    ///   ([`wal_problem`]), because SQLite silently discards a log it cannot
+    ///   parse — the store opens, the log's frames are gone, and nobody is told;
+    /// - and if the open still fails, SQLite's own verdict is read
+    ///   ([`is_store_corruption`]: `SQLITE_NOTADB` and `SQLITE_CORRUPT` only —
+    ///   `SQLITE_IOERR` is deliberately excluded, because the `disk I/O error`
+    ///   a corrupted log produces behind a stale wal-index is caught by its own
+    ///   header check *before* the open, while a genuine I/O error means the
+    ///   device is failing and the store is not what needs replacing).
+    ///
+    /// Either way the store's files (`<db>`, `<db>-wal`, `<db>-shm`) are
+    /// **renamed aside** to `<name>.corrupt-<timestamp>`, the event is shouted on
+    /// stderr and recorded as an [`actions::STORE_CORRUPT`] audit row in the
+    /// replacement store, and this call returns that fresh store.
+    ///
+    /// Four properties, each of which is why the code is shaped this way:
+    ///
+    /// - **Deleted: never.** SQLite cannot recover a corrupt store's bytes
+    ///   (that is what the error means), so quarantine loses nothing
+    ///   recoverable — but a renamed file is evidence a human can still
+    ///   inspect, and the alternative (delete and start over) would destroy
+    ///   the only record of what went wrong.
+    /// - **One call heals, because "restart heals" has to mean one restart.**
+    ///   The boot path is the device authority's long-lived connection, opened
+    ///   once by `arreo-server` with `?` — a typed error returned there exits the
+    ///   daemon, so a SIGKILLed machine with a corrupt WAL would refuse to come
+    ///   back up. The quarantine and the fresh open therefore happen in the same
+    ///   call, and [`SessionError::CorruptStore`] is returned only when the heal
+    ///   itself cannot finish.
+    /// - **The heal is verified, and an unverified one is undone.** The fresh
+    ///   store must actually open: if it does not, the quarantined files are
+    ///   renamed *back* and the failure is reported. A misdiagnosis (a failing
+    ///   device reported as an I/O error) therefore costs a rename that is
+    ///   undone, never a store moved out from under a machine that was working.
+    /// - **Loud, and durable.** The stderr line names the quarantine (it exists
+    ///   even where the fresh store cannot be written), and the audit row in the
+    ///   fresh store survives on disk — a store that healed is a fact an
+    ///   operator can query, not a message that scrolled past.
     pub fn open(path: &std::path::Path) -> Result<Self, SessionError> {
+        let reason = match wal_problem(path) {
+            Some(reason) => reason,
+            None => match Self::open_once(path) {
+                Ok(store) => return Ok(store),
+                Err(e) if is_store_corruption(&e) => e.to_string(),
+                Err(e) => return Err(e),
+            },
+        };
+        Self::heal(path, &reason)
+    }
+
+    /// Quarantine `path`'s store and open a fresh one, for a `reason` that says
+    /// why the old one could not be used (see [`SessionStore::open`]).
+    ///
+    /// The order is load-bearing: quarantine, open, verify, and only then
+    /// record — with every failure path leaving the machine exactly as it was
+    /// found (the files renamed back) and returning the reason.
+    fn heal(path: &std::path::Path, reason: &str) -> Result<Self, SessionError> {
+        // **One healer at a time** (T-0038 stage 4). The daemon holds a
+        // long-lived store connection and its background tasks open the store
+        // too, so a corrupt store is routinely found by two processes at once —
+        // and without this, the *second* healer quarantines the **fresh** store
+        // the first one just created, destroying the very rows the heal exists
+        // to preserve (measured: two `store.corrupt` rows, or one, or none,
+        // depending on which process won).
+        //
+        // The lock is the codebase's own `ExclusiveLock` — an OS lock the kernel
+        // releases when the holder ends, so a killed healer cannot leave it
+        // stuck. Taking it is best-effort: if another healer holds it, waiting
+        // briefly for them is almost always enough (a heal is a few renames),
+        // and failing that we simply try to open — by then their fresh store is
+        // in place and this open succeeds without healing anything.
+        let lock_path = heal_lock_path(path);
+        let _heal_lock = acquire_heal_lock(&lock_path);
+        // Re-check **under** the lock: the healer we were waiting for may have
+        // fixed the store already, in which case this open is an ordinary one
+        // and there is nothing to quarantine.
+        if wal_problem(path).is_none() {
+            if let Ok(store) = Self::open_once(path) {
+                return Ok(store);
+            }
+        }
+        let moved = match quarantine_corrupt_store(path) {
+            Ok(moved) => moved,
+            Err(why) => {
+                eprintln!(
+                    "arreo-core: store at {} cannot be used ({reason}) and could not be \
+                     quarantined: {why}",
+                    path.display()
+                );
+                return Err(SessionError::CorruptStore {
+                    path: path.to_path_buf(),
+                    quarantine: format!("(quarantine failed: {why})"),
+                    reason: reason.to_string(),
+                });
+            }
+        };
+        let quarantine = quarantine_paths(&moved);
+        eprintln!(
+            "arreo-core: store at {} cannot be used ({reason}) — quarantined to {quarantine}; \
+             opening a fresh store",
+            path.display()
+        );
+        let fresh = match Self::open_once(path) {
+            Ok(store) => store,
+            Err(second) => {
+                // The heal did not take, so the diagnosis was wrong: the machine
+                // is broken rather than the store. Put the evidence back where it
+                // was and report what actually happened.
+                restore_quarantine(&moved);
+                eprintln!(
+                    "arreo-core: store at {} still cannot be opened after quarantining ({second}) \
+                     — the quarantined files were restored",
+                    path.display()
+                );
+                return Err(SessionError::CorruptStore {
+                    path: path.to_path_buf(),
+                    quarantine: format!("(restored: {quarantine})"),
+                    reason: second.to_string(),
+                });
+            }
+        };
+        // The row goes into the fresh store, which is the only store there is to
+        // write to; a failure here is reported and does not undo the heal (the
+        // stderr line above already named the quarantine).
+        let mut event = AuditEvent::new(
+            actions::STORE_CORRUPT,
+            AuditKind::Unknown,
+            AuditOutcome::Refused,
+            now_ms(),
+        );
+        event.detail = Some(format!(
+            "quarantined {quarantine} ({reason}; a corrupt store never stops the machine, and the \
+             files are kept for inspection)"
+        ));
+        if let Err(e) = fresh.record(&event) {
+            eprintln!("arreo-core: could not record the store quarantine in the fresh store: {e}");
+        }
+        Ok(fresh)
+    }
+
+    /// [`SessionStore::open`] without the quarantine: settings, then migration.
+    ///
+    /// Split out because the corrupt-open check has to wrap *all* of it —
+    /// `rusqlite` opens lazily, so the corruption surfaces from the first
+    /// statement the migration runs, not from `Connection::open` — and because
+    /// the healer needs to run exactly this again on the quarantined path.
+    fn open_once(path: &std::path::Path) -> Result<Self, SessionError> {
         let conn = Connection::open(path)?;
         Self::prepare(&conn)?;
         Self::migrate(&conn)?;
