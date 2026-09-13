@@ -1,7 +1,7 @@
 ---
 id: T-0078
 title: The daemon's files are readable and connectable by other local users
-status: proposed
+status: in-progress
 priority: 1
 depends_on: []
 phase: 2
@@ -78,8 +78,11 @@ implicit, and the code comment in the handoff now says the same thing.
 
 `crates/arreo-server/src/daemon.rs`, `crates/arreo-server/src/persist.rs`,
 `crates/arreo-server/src/handoff.rs`, `crates/arreo-core/src/store.rs`,
-`crates/arreo-core/src/identity/authority.rs` (the sidecar path helper only if the policy
-is applied there), plus one doc (`docs/security.md` or `SECURITY.md`) stating the policy.
+`crates/arreo-core/src/lock.rs` (added: the `<socket>.lock` file is created there, and the
+policy must apply at creation — the single door, not a chmod at each of the two callers),
+plus `SECURITY.md` (the existing policy doc — no new file) stating the policy. The device
+authority's files are already correct (`identity/keys.rs`: 0600/0700, measured) and its code
+is not in this fence.
 
 ## Acceptance criteria
 
