@@ -6,14 +6,14 @@
 //! produces the object a peer receives, `receive` applies it (or keeps both, or
 //! refuses by name), and `revert` puts a previous revision back.
 //!
-//! ## What this is not
+//! ## Where the network is
 //!
-//! There is no network here. T-0086 owns the transport — the mesh, the relay,
-//! the two live machines — and this module deliberately stops at the shape it
-//! will carry: [`SyncPayload`] is a serialisable object and [`SyncEngine::receive`]
-//! takes one. The `xtask sync --check` slice calls the pair twice inside one
-//! scratch directory on two isolated roots, which is exactly the wiring T-0086
-//! replaces with sockets.
+//! Not here. T-0086 owns the transport — the mesh, the relay, the two live
+//! machines — and this module deliberately stops at the shape it carries:
+//! [`SyncPayload`] is a serialisable object and [`SyncEngine::receive`] takes
+//! one. The daemon's `Message::Sync` arm decodes the payload and calls
+//! `receive`; the `xtask sync --check` slice calls the same pair twice inside
+//! one scratch directory on two isolated roots. One implementation, two ways in.
 //!
 //! ## The order of the refusals, which is itself a decision
 //!
@@ -402,20 +402,50 @@ pub struct SyncEngine<'a> {
     store: &'a SessionStore,
     env: &'a MachineEnv,
     secrets: &'a SecretStore,
+    /// **The identity this machine counts its revisions under** (T-0086): its
+    /// authenticated device id (`dev_…`), which is what a version vector is
+    /// keyed by and what names a conflict copy's loser.
+    ///
+    /// Not `env.name()`, and that is the decision this field carries. The
+    /// machine's *name* is a display label the operator can change
+    /// (`arreo machines rename`, T-0043), so keying a counter by it would fork
+    /// "old name" from "new name" and make every peer see a concurrent edit from
+    /// a machine that did nothing. The device id is stable, unique, `dev_<hex>`
+    /// (filesystem-safe, which matters because it lands in a file name), and —
+    /// over the mesh — the identity the session *authenticated*, never a string
+    /// the peer chose.
+    identity: &'a str,
 }
 
 impl<'a> SyncEngine<'a> {
+    /// `identity` is this machine's device id; see [`SyncEngine::identity`] for
+    /// why it is passed rather than read from `env`.
     #[must_use]
-    pub fn new(store: &'a SessionStore, env: &'a MachineEnv, secrets: &'a SecretStore) -> Self {
+    pub fn new(
+        store: &'a SessionStore,
+        env: &'a MachineEnv,
+        secrets: &'a SecretStore,
+        identity: &'a str,
+    ) -> Self {
         Self {
             store,
             env,
             secrets,
+            identity,
         }
     }
 
+    /// The counter key: the identity every vector entry and conflict copy for
+    /// this machine is written under.
     #[must_use]
     pub fn machine(&self) -> &str {
+        self.identity
+    }
+
+    /// The machine's human name, for the sentences an operator reads ("`NAME`
+    /// is not set on `workbox`"). Never a counter key.
+    #[must_use]
+    pub fn display_name(&self) -> &str {
         self.env.name()
     }
 
@@ -577,19 +607,19 @@ impl<'a> SyncEngine<'a> {
             return Ok(PushOutcome {
                 file: resolved.file,
                 path: resolved.path,
-                counter: vector.get(self.env.name()),
+                counter: vector.get(self.identity),
                 revision,
                 changed: false,
                 references,
                 missing: plan.missing().to_vec(),
             });
         }
-        let counter = vector.bump(self.env.name());
+        let counter = vector.bump(self.identity);
         self.store
-            .sync_set_counter(&resolved.file, self.env.name(), counter)?;
+            .sync_set_counter(&resolved.file, self.identity, counter)?;
         let revision = self.store.sync_record_revision(
             &resolved.file,
-            self.env.name(),
+            self.identity,
             counter,
             "push",
             content.as_bytes(),
@@ -620,19 +650,25 @@ impl<'a> SyncEngine<'a> {
                 .map(Harness::id)
                 .unwrap_or("custom")
                 .to_string(),
-            machine: self.env.name().to_string(),
+            machine: self.identity.to_string(),
             vector: self.store.sync_vector(&resolved.file)?,
             digest: digest_of(neutral.as_bytes()),
             content: neutral,
         })
     }
 
-    /// Apply a peer's payload: the local half of the exchange T-0086 will carry
-    /// over the mesh.
+    /// Apply a peer's payload: the one door a payload may come through, whether
+    /// it arrived as a file (`arreo sync apply`) or over the mesh (T-0086's
+    /// `Message::Sync`, which calls this function rather than re-implementing
+    /// any part of it).
+    ///
+    /// `payload.machine` is the **sender's authenticated identity** — the daemon
+    /// sets it from the Noise handshake before calling here, and refuses a
+    /// payload whose own claim disagrees — so everything below that treats it as
+    /// the counter's authority is treating an authenticated fact as one.
     pub fn receive(&self, payload: &SyncPayload) -> Result<ReceiveOutcome, SyncError> {
-        // The transport (T-0086) will authenticate the sender; this check is
-        // about the bytes in hand, and it is the last place they exist before
-        // they are written.
+        // The caller authenticated the sender; this check is about the bytes in
+        // hand, and it is the last place they exist before they are written.
         if digest_of(payload.content.as_bytes()) != payload.digest {
             return Err(SyncError::Digest {
                 name: payload.file.clone(),
@@ -703,7 +739,7 @@ impl<'a> SyncEngine<'a> {
         // silent overwrite (a payload claiming this machine was at counter N made
         // the live file look stale) and a second pinned a real machine's counter
         // so its genuine payloads were refused as "already up to date" for ever.
-        let ours = self.env.name().to_string();
+        let ours = self.identity.to_string();
         // `get` is 0 for a machine the vector does not mention, and a counter is
         // bumped from 0, so "absent" can never exceed what this machine issued.
         //
@@ -922,12 +958,12 @@ impl<'a> SyncEngine<'a> {
         // config (a receive), not for putting back what was there.
         write_atomic(&resolved.path, &bytes)?;
         let mut vector = self.store.sync_vector(&resolved.file)?;
-        let counter = vector.bump(self.env.name());
+        let counter = vector.bump(self.identity);
         self.store
-            .sync_set_counter(&resolved.file, self.env.name(), counter)?;
+            .sync_set_counter(&resolved.file, self.identity, counter)?;
         let revision = self.store.sync_record_revision(
             &resolved.file,
-            self.env.name(),
+            self.identity,
             counter,
             "revert",
             &bytes,
@@ -1024,12 +1060,12 @@ impl<'a> SyncEngine<'a> {
         }
         write_atomic(&resolved.path, merged.as_bytes())?;
         let mut vector = self.store.sync_vector(&resolved.file)?;
-        let counter = vector.bump(self.env.name());
+        let counter = vector.bump(self.identity);
         self.store
-            .sync_set_counter(&resolved.file, self.env.name(), counter)?;
+            .sync_set_counter(&resolved.file, self.identity, counter)?;
         let revision = self.store.sync_record_revision(
             &resolved.file,
-            self.env.name(),
+            self.identity,
             counter,
             "merge",
             merged.as_bytes(),
@@ -1282,16 +1318,21 @@ mod tests {
     /// the wrong reason.
     const KEY: &str = "ARREO_T83_KEY";
 
-    /// One machine: its own roots, its own store, its own secrets.
+    /// One machine: its own roots, its own store, its own secrets, its own
+    /// **device identity**.
     ///
     /// Two of these in one process is the whole point — a two-machine exchange
-    /// with no network — which is why [`SyncEngine`] borrows all three rather
-    /// than owning a global.
+    /// with no network — which is why [`SyncEngine`] borrows all of them rather
+    /// than owning a global. The identity is a key derived from a fixed seed
+    /// (T-0086): the counter key is a device id, so a test that hardcoded one
+    /// would be asserting against a number it could not predict, and a test that
+    /// reused one machine's id for both roots would be testing one machine.
     struct Root {
         dir: PathBuf,
         env: MachineEnv,
         store: SessionStore,
         secrets: SecretStore,
+        identity: String,
     }
 
     fn scratch(tag: &str) -> PathBuf {
@@ -1312,16 +1353,35 @@ mod tests {
                 .with_pi_agent_dir(dir.join("agent"));
             let secrets = SecretStore::open(dir.join("secrets.json")).expect("secrets");
             let store = SessionStore::open_memory().expect("store");
+            // The device identity, derived from the fixture's own tag so the id
+            // is stable across a run and different between two roots. **The
+            // derivation is the fixture's, not the product's**: a real machine
+            // reads its id from `identity/device.key` (T-0086) and never from a
+            // name — deriving an identity from a renameable label is the exact
+            // mistake the counter-key decision exists to prevent.
+            let seed = tag
+                .bytes()
+                .fold(0u8, |acc, byte| acc.wrapping_mul(31).wrapping_add(byte))
+                | 1;
+            let key = crate::identity::DeviceKey::from_seed([seed; 32]);
+            let identity = crate::identity::DeviceId::from_key(&key.public()).display_id();
             Self {
                 dir,
                 env,
                 store,
                 secrets,
+                identity,
             }
         }
 
         fn engine(&self) -> SyncEngine<'_> {
-            SyncEngine::new(&self.store, &self.env, &self.secrets)
+            SyncEngine::new(&self.store, &self.env, &self.secrets, &self.identity)
+        }
+
+        /// The id this machine's revisions are counted under — the device id,
+        /// never the display name (T-0086).
+        fn id(&self) -> &str {
+            &self.identity
         }
 
         /// The resolved destination of a preset file, on this machine.
@@ -1354,6 +1414,19 @@ mod tests {
         }
     }
 
+    /// A device id for a machine this fixture never builds: the sender of a
+    /// hand-built payload.
+    ///
+    /// **Even-seeded, so it can never collide with a [`Root`]'s** (those fold a
+    /// tag into an odd seed). That matters: a payload whose `machine` is the
+    /// *receiver's* own id is the replay case, which legitimately skips the
+    /// vector check — a test that meant to exercise the forgery path would
+    /// silently stop exercising it.
+    fn other_id() -> String {
+        let key = crate::identity::DeviceKey::from_seed([0xE6; 32]);
+        crate::identity::DeviceId::from_key(&key.public()).display_id()
+    }
+
     fn worked_case() -> String {
         // The owner's file, with a test-only variable name so a shell that
         // happens to export the real one cannot make a test pass.
@@ -1381,7 +1454,7 @@ mod tests {
         let payload = alpha.engine().payload("opencode.jsonc").expect("payload");
         assert!(payload.content.contains("${ARREO_ENV:ARREO_T83_KEY}"));
         assert!(!payload.content.contains("alpha-value"));
-        assert_eq!(payload.machine, "alpha-machine");
+        assert_eq!(payload.machine, alpha.id());
 
         // Step 3: beta has the file's *reference* but not the variable, and says
         // so by name instead of letting opencode answer the provider's 401.
@@ -1447,11 +1520,11 @@ mod tests {
         beta.engine().receive(&payload).expect("applies");
         // The return trip: beta's vector now includes alpha's counter, and alpha
         // absorbs nothing new — the exchange is a function that can be called
-        // twice, which is what T-0086 replaces with two sockets.
+        // twice, which is what the mesh's `Message::Sync` pair wraps in sockets.
         let back = beta.engine().payload("opencode.jsonc").expect("payload");
-        assert_eq!(back.vector.get("alpha-machine"), 1);
+        assert_eq!(back.vector.get(alpha.id()), 1);
         assert_eq!(
-            back.vector.get("beta-machine"),
+            back.vector.get(beta.id()),
             0,
             "beta has edited nothing, so it has no revision of its own"
         );
@@ -1685,7 +1758,7 @@ mod tests {
         else {
             panic!("expected a conflict, got {outcome:?}");
         };
-        assert_eq!(from, "alpha-machine");
+        assert_eq!(from, alpha.id());
         assert_eq!(live, beta.path("opencode.jsonc"));
         assert_eq!(
             beta.read("opencode.jsonc"),
@@ -1693,8 +1766,13 @@ mod tests {
             "the live file is never overwritten by a concurrent payload"
         );
         let name = copy.file_name().expect("name").to_str().expect("utf8");
+        // The loser is named by its **device id**, not by its display name: the
+        // id is stable across a rename and filesystem-safe (`dev_<hex>`), and a
+        // conflict copy named after a machine that has since been renamed would
+        // point at a machine nobody can find.
         assert!(
-            name.starts_with("opencode.conflict-alpha-machine-") && name.ends_with(".jsonc"),
+            name.starts_with(&format!("opencode.conflict-{}-", alpha.id()))
+                && name.ends_with(".jsonc"),
             "{name}"
         );
         let copy_text = std::fs::read_to_string(&copy).expect("copy");
@@ -1778,7 +1856,7 @@ mod tests {
         // next payload resolves by comparison instead of by protection.
         beta.engine().push("opencode.jsonc").expect("push");
         let third = beta.engine().payload("opencode.jsonc").expect("payload");
-        assert_eq!(third.vector.get("beta-machine"), 1);
+        assert_eq!(third.vector.get(beta.id()), 1);
         assert!(matches!(
             alpha.engine().receive(&third).expect("conflict"),
             ReceiveOutcome::Conflict { .. }
@@ -1953,7 +2031,7 @@ mod tests {
 
         // The revert is a revision like any other, so it travels.
         let payload = alpha.engine().payload("opencode.jsonc").expect("payload");
-        assert_eq!(payload.vector.get("alpha-machine"), 3);
+        assert_eq!(payload.vector.get(alpha.id()), 3);
         beta.engine().receive(&payload).expect("applies");
         assert_eq!(beta.read("opencode.jsonc"), first);
 
@@ -1997,8 +2075,8 @@ mod tests {
         let payload = SyncPayload {
             file: "opencode.jsonc".to_string(),
             harness: "opencode".to_string(),
-            machine: "alpha-machine".to_string(),
-            vector: Vector::from_pairs([("alpha-machine".to_string(), 1)]),
+            machine: other_id(),
+            vector: Vector::from_pairs([(other_id(), 1)]),
             digest: String::new(),
             content: "{\n  \"provider\": { \"p\": { \"options\": { \"apiKey\": \"{env:ARREO_T83_KEY}\" } } },\n  \"extra\": \"sk-0123456789abcdef\"\n}\n".to_string(),
         };
@@ -2047,8 +2125,8 @@ mod tests {
         let payload = SyncPayload {
             file: "opencode.jsonc".to_string(),
             harness: "opencode".to_string(),
-            machine: "alpha-machine".to_string(),
-            vector: Vector::from_pairs([("alpha-machine".to_string(), 2)]),
+            machine: other_id(),
+            vector: Vector::from_pairs([(other_id(), 2)]),
             digest: digest_of(truncated.as_bytes()),
             content: truncated.to_string(),
         };
@@ -2071,8 +2149,8 @@ mod tests {
         let yaml = SyncPayload {
             file: "models.json".to_string(),
             harness: "pi".to_string(),
-            machine: "alpha-machine".to_string(),
-            vector: Vector::from_pairs([("alpha-machine".to_string(), 2)]),
+            machine: other_id(),
+            vector: Vector::from_pairs([(other_id(), 2)]),
             digest: digest_of(b"not: [a mapping\n"),
             content: "not: [a mapping\n".to_string(),
         };
@@ -2120,7 +2198,7 @@ mod tests {
         // A hostile payload: alpha's bytes, but a vector claiming *beta* (the
         // receiver) is at 9 — which beta never issued.
         let mut forged = alpha.engine().payload("opencode.jsonc").expect("payload");
-        forged.vector.set("beta-machine", 9);
+        forged.vector.set(beta.id(), 9);
         let refusal = beta.engine().receive(&forged).expect_err("refused");
         assert!(
             matches!(
@@ -2129,7 +2207,7 @@ mod tests {
                     ref machine,
                     claimed: 9,
                     ..
-                } if machine == "beta-machine"
+                } if machine.as_str() == beta.id()
             ),
             "{refusal:?}"
         );
@@ -2186,12 +2264,12 @@ mod tests {
         );
         alpha.engine().push("opencode.jsonc").expect("alpha pushes");
         let mut forged = alpha.engine().payload("opencode.jsonc").expect("payload");
-        forged.vector.set("gamma-machine", 99);
+        forged.vector.set(gamma.id(), 99);
         beta.engine()
             .receive(&forged)
             .expect("beta takes alpha's revision");
         assert!(
-            gamma_payload.vector.get("gamma-machine") >= 1,
+            gamma_payload.vector.get(gamma.id()) >= 1,
             "gamma's own revision is in its payload: {:?}",
             gamma_payload.vector.summary()
         );
@@ -2222,8 +2300,8 @@ mod tests {
         let payload = SyncPayload {
             file: "models.json".to_string(),
             harness: "pi".to_string(),
-            machine: "workbox".to_string(),
-            vector: Vector::from_pairs([("workbox".to_string(), 1)]),
+            machine: other_id(),
+            vector: Vector::from_pairs([(other_id(), 1)]),
             digest: digest_of(content.as_bytes()),
             content,
         };
@@ -2262,7 +2340,7 @@ mod tests {
             .find(|s| s.file == "opencode.jsonc")
             .expect("present");
         assert!(opencode.present);
-        assert_eq!(opencode.vector, "alpha-machine:1");
+        assert_eq!(opencode.vector, format!("{}:1", root.id()));
         assert!(opencode.missing.is_empty());
         assert_eq!(opencode.harness, "opencode");
         assert_eq!(opencode.class, Class::Sync);
@@ -2279,7 +2357,7 @@ mod tests {
         let bare = MachineEnv::new("bare", Os::Linux, root.dir.join("nohome"));
         let bare_store = SessionStore::open_memory().expect("store");
         let bare_secrets = SecretStore::open(root.dir.join("none.json")).expect("secrets");
-        let bare_status = SyncEngine::new(&bare_store, &bare, &bare_secrets)
+        let bare_status = SyncEngine::new(&bare_store, &bare, &bare_secrets, root.id())
             .status()
             .expect("status");
         let models = bare_status

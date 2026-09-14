@@ -546,6 +546,20 @@ pub fn identity_root() -> PathBuf {
     identity_dir().join("identity")
 }
 
+/// **This machine's own device id** — `dev_<hex>`, from `identity/device.key`.
+///
+/// One spelling of "which machine am I", for the callers that must count or be
+/// counted: the sync engine keys a version vector by the *authenticated* device
+/// id rather than by a self-declared name (T-0086), and both the CLI and the
+/// daemon have to agree about what that id is. A machine that has never paired
+/// has no such file, and the refusal names the path — never a fallback to the
+/// hostname, which is a display label the operator can change and would fork one
+/// machine's counter into two.
+pub fn own_device_id() -> Result<super::cert::DeviceId, KeyError> {
+    let key = DeviceKey::load(&identity_root().join("device.key"))?;
+    Ok(super::cert::DeviceId::from_key(&key.public()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

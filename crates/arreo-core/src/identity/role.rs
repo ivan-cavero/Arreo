@@ -112,6 +112,12 @@ pub enum Verb {
     Split,
     Kill,
     Admin,
+    /// Writing this machine's harness configuration from a peer (T-0086). Its
+    /// own name rather than `Admin`'s: `Admin` is where server→client messages
+    /// land when one arrives as a request, and a real verb that shares that name
+    /// would make both of them unreadable in a refusal ("refusing Admin for
+    /// dev_…" says nothing about what was attempted).
+    Sync,
 }
 
 /// The capability a verb requires.
@@ -125,8 +131,12 @@ pub fn required(verb: Verb) -> Capability {
         Verb::Hello | Verb::Panes | Verb::Read | Verb::Attach | Verb::Wait | Verb::Metrics => {
             Capability::Observe
         }
-        // Changing it.
-        Verb::Send | Verb::Spawn | Verb::Split | Verb::Kill | Verb::Admin => Capability::Control,
+        // Changing it. `Sync` is here rather than with the readers because it
+        // writes this machine's configuration: an administrative change to the
+        // machine, not a look at it (T-0086).
+        Verb::Send | Verb::Spawn | Verb::Split | Verb::Kill | Verb::Admin | Verb::Sync => {
+            Capability::Control
+        }
     }
 }
 
@@ -172,6 +182,7 @@ mod tests {
         Verb::Split,
         Verb::Kill,
         Verb::Admin,
+        Verb::Sync,
     ];
 
     #[test]
@@ -192,6 +203,7 @@ mod tests {
             Verb::Split,
             Verb::Kill,
             Verb::Admin,
+            Verb::Sync,
         ] {
             assert!(
                 matches!(check(Role::Viewer, verb), Err(RoleError::Denied { .. })),

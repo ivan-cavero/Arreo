@@ -16,9 +16,12 @@ use arreo_core::identity::role::Verb;
 use arreo_core::identity::{DeviceId, VerifyingKey};
 use arreo_core::metrics::Sampler;
 use arreo_core::proto::codec::{self, CodecError};
-use arreo_core::proto::{AgentState, Message, PaneDetail, PaneInfo, VERSION};
+use arreo_core::proto::{
+    AgentState, Message, PaneDetail, PaneInfo, SyncExchange, SyncOutcome, SyncStatus, VERSION,
+};
 use arreo_core::pty::{ExitState, Pane};
 use arreo_core::state::{Adapter, AdapterRegistry, Confidence, Engine, State};
+use arreo_core::sync::engine::{ReceiveOutcome, SyncEngine, SyncPayload};
 use std::collections::HashMap;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -1985,6 +1988,34 @@ where
                 .await?;
                 continue;
             }
+            // The sync exchange (T-0086). It is answered here rather than in
+            // `dispatch` because it needs two things `dispatch` is not given:
+            // the *authenticated* identity (`auth.device`, bound to the Noise
+            // handshake) and this machine's own keychain — the payload carries
+            // references, and resolving them is the receiving machine's job.
+            Message::Sync { v, exchange } => {
+                let v = *v;
+                if let Err(reply) = check_version(v) {
+                    write_message(writer, &reply).await?;
+                    continue;
+                }
+                let reply = serve_sync(exchange, auth.as_ref(), &db, &audit);
+                write_message(writer, &reply).await?;
+                continue;
+            }
+            // A reply is never a request: a peer that sends one is confused (or
+            // probing), and the answer is a typed refusal, never an action.
+            Message::SyncReply { .. } => {
+                write_message(
+                    writer,
+                    &Message::Error {
+                        v: VERSION,
+                        message: "unexpected sync_reply here".to_string(),
+                    },
+                )
+                .await?;
+                continue;
+            }
             _ => {}
         }
         let reply = dispatch(&message, &registry, &db).await;
@@ -2087,6 +2118,223 @@ fn audited(message: &Message) -> Option<Audited> {
     }
 }
 
+/// This machine's sync environment: its display name and its paths.
+///
+/// One function, because the daemon reads it from two places (the spawn
+/// keychain bridge, T-0087, and the sync exchange, T-0086) and two spellings of
+/// "which machine am I" is the defect the identity decision exists to prevent —
+/// this is the *display* half, and the counter half is the authenticated device
+/// id the session supplies.
+fn sync_machine_env() -> arreo_core::sync::paths::MachineEnv {
+    arreo_core::sync::paths::MachineEnv::from_process(&arreo_core::mesh::default_machine_name())
+}
+
+/// The `Message::Sync` arm (T-0086): authenticate, then run the **same**
+/// [`SyncEngine::receive`] the local path runs.
+///
+/// ## Why the identity is the session's and never the payload's
+///
+/// A version vector is keyed by *the machine that is the authority on that
+/// counter*. `payload.machine` is a string the peer chose; `auth.device` is the
+/// id the Noise handshake proved. Without the check below, any paired peer could
+/// send `machine: "<someone else>"` and pin that machine's counter — the same
+/// forgery the engine already refuses *within* one machine (review F2), moved to
+/// the wire.
+///
+/// A disagreement is **refused, not corrected**: a peer that lies about who it
+/// is is a finding for the operator, and silently rewriting the claim would
+/// discard the only evidence of it. The assignment that follows the check is
+/// what makes the trust boundary explicit — the field the engine reads is the
+/// authenticated one, by construction, not by the peer's good behaviour.
+///
+/// ## What it deliberately does not do
+///
+/// No part of the write path is re-implemented here: the digest, the forged
+/// vector, the unresolved reference, the format check, the LOCAL deny-list, the
+/// sibling gate and keep-both are all `receive`'s, which is the point of
+/// carrying the local form's payload rather than a second one.
+fn serve_sync(
+    exchange: &SyncExchange,
+    auth: Option<&SessionAuth>,
+    db: &Path,
+    audit: &crate::audit::SessionAudit,
+) -> Message {
+    let refused = |file: &str, reason: String| {
+        audit.record_with_prompt(
+            arreo_core::store::actions::SYNC,
+            arreo_core::store::AuditOutcome::Refused,
+            file,
+            "",
+            Some(&reason),
+        );
+        Message::SyncReply {
+            v: VERSION,
+            outcome: Box::new(SyncOutcome {
+                file: file.to_string(),
+                status: SyncStatus::Refused,
+                from: String::new(),
+                counter: 0,
+                revision: 0,
+                copy: String::new(),
+                reason,
+            }),
+        }
+    };
+    // **The local socket cannot carry this verb.** There is no authenticated
+    // peer on it, so the only identity available would be *this* machine's — and
+    // a payload counted under the receiver's own id is the shape `receive` reads
+    // as "my own bytes coming back" (the replay case, which legitimately skips
+    // the vector check). A local push is `arreo sync push <file>`; the exchange
+    // is for a peer.
+    let Some(auth) = auth else {
+        return refused(
+            "",
+            "sync needs a paired peer: this session is the local socket, which authenticates no \
+             device to count the revision under (a local edit is `arreo sync push <file>`; a peer's \
+             is `arreo sync push <file> --machine <name>`)"
+                .to_string(),
+        );
+    };
+    let device = auth.device_id().display_id();
+    let payload: SyncPayload = match serde_json::from_slice(&exchange.payload) {
+        Ok(payload) => payload,
+        Err(e) => return refused("", format!("the payload is not a sync payload: {e}")),
+    };
+    if payload.machine != device {
+        return refused(
+            &payload.file,
+            format!(
+                "refused {}: the payload counts its revision under {}, but this session is \
+                 authenticated as {device} — a machine is the authority on its own counter, and \
+                 only on its own",
+                payload.file,
+                excerpt(&payload.machine, 64)
+            ),
+        );
+    }
+    // From here on the identity is the one the handshake proved, whatever the
+    // payload said (it said the same thing, or we returned above).
+    let payload = SyncPayload {
+        machine: device.clone(),
+        ..payload
+    };
+    let env = sync_machine_env();
+    let store = match arreo_core::store::SessionStore::open(db) {
+        Ok(store) => store,
+        Err(e) => {
+            return refused(
+                &payload.file,
+                format!("this machine's store is unreadable: {e}"),
+            )
+        }
+    };
+    let secrets = match arreo_core::sync::keychain::SecretStore::default_path(&env)
+        .and_then(arreo_core::sync::keychain::SecretStore::open)
+    {
+        Ok(secrets) => secrets,
+        Err(e) => {
+            return refused(
+                &payload.file,
+                format!("this machine's keychain is unreadable: {e}"),
+            )
+        }
+    };
+    let engine = SyncEngine::new(&store, &env, &secrets, &device);
+    let outcome = match engine.receive(&payload) {
+        Ok(outcome) => outcome,
+        Err(e) => return refused(&payload.file, e.to_string()),
+    };
+    let reply = sync_outcome(outcome);
+    audit.record_with_prompt(
+        arreo_core::store::actions::SYNC,
+        arreo_core::store::AuditOutcome::Ok,
+        &reply.file,
+        "",
+        Some(&format!(
+            "{} from {} (revision {})",
+            status_word(reply.status),
+            reply.from,
+            reply.revision
+        )),
+    );
+    Message::SyncReply {
+        v: VERSION,
+        outcome: Box::new(reply),
+    }
+}
+
+/// One engine outcome as the wire's reply. The engine's own paths stay here:
+/// what crosses back is the conflict copy's **file name**, which is what the
+/// sending operator needs to say which copy landed (see [`SyncOutcome`]).
+fn sync_outcome(outcome: ReceiveOutcome) -> SyncOutcome {
+    let mut reply = SyncOutcome {
+        file: String::new(),
+        status: SyncStatus::UpToDate,
+        from: String::new(),
+        counter: 0,
+        revision: 0,
+        copy: String::new(),
+        reason: String::new(),
+    };
+    match outcome {
+        ReceiveOutcome::Applied {
+            file,
+            from,
+            counter,
+            revision,
+            ..
+        } => {
+            reply.file = file;
+            reply.status = SyncStatus::Applied;
+            reply.from = from;
+            reply.counter = counter;
+            reply.revision = revision;
+        }
+        ReceiveOutcome::UpToDate { file } => {
+            reply.file = file;
+            reply.status = SyncStatus::UpToDate;
+        }
+        ReceiveOutcome::Conflict {
+            file,
+            copy,
+            from,
+            revision,
+            ..
+        } => {
+            reply.file = file;
+            reply.status = SyncStatus::Conflict;
+            reply.from = from;
+            reply.revision = revision;
+            reply.copy = copy
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default();
+        }
+    }
+    reply
+}
+
+/// The wire word for a status, for the audit row's detail.
+fn status_word(status: SyncStatus) -> &'static str {
+    match status {
+        SyncStatus::Applied => "applied",
+        SyncStatus::UpToDate => "up-to-date",
+        SyncStatus::Conflict => "conflict (both kept)",
+        SyncStatus::Refused => "refused",
+    }
+}
+
+/// At most `max` characters of peer-supplied text, for a message an operator
+/// reads: a hostile peer can put a megabyte in a field, and a refusal that
+/// quotes all of it is a denial of service against the log it lands in.
+fn excerpt(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text.to_string();
+    }
+    let head: String = text.chars().take(max).collect();
+    format!("{head}…")
+}
+
 /// The policy verb a wire message maps to.
 ///
 /// Exhaustive on purpose, like `role::required`: a `Message` added without a
@@ -2119,6 +2367,12 @@ fn verb_of(message: &Message) -> Verb {
         // it needs the control capability; the readiness notice is news.
         Message::Handoff { .. } => Verb::Admin,
         Message::HandoffReady { .. } => Verb::Admin,
+        // The sync exchange writes this machine's harness configuration, which
+        // is an administrative change to the machine and needs the control
+        // capability (T-0086). A reply is not a request, and gets the same
+        // treatment as the other server→client shapes below.
+        Message::Sync { .. } => Verb::Sync,
+        Message::SyncReply { .. } => Verb::Admin,
         Message::Welcome { .. }
         | Message::Error { .. }
         | Message::Ok { .. }
@@ -2159,6 +2413,8 @@ fn op_name(message: &Message) -> &'static str {
         Message::Wait { .. } => "wait",
         Message::Handoff { .. } => "handoff",
         Message::HandoffReady { .. } => "handoff_ready",
+        Message::Sync { .. } => "sync",
+        Message::SyncReply { .. } => "sync_reply",
         Message::Split { .. } => "split",
         Message::MetricsReq { .. } => "metrics-req",
     }
@@ -2739,6 +2995,8 @@ async fn dispatch(message: &Message, registry: &Registry, db: &std::path::Path) 
         | Message::MetricsSeries { .. }
         | Message::Handoff { .. }
         | Message::HandoffReady { .. }
+        | Message::Sync { .. }
+        | Message::SyncReply { .. }
         | Message::Ok { .. }
         | Message::Exited { .. } => Some(Message::Error {
             v: VERSION,

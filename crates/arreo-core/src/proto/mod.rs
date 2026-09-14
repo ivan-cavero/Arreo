@@ -26,4 +26,7 @@ pub use codec::{
     classify_op, client_versions, client_versions_from, decode_op_for_error, frame_body_len,
     negotiate, CodecError, Direction, MAX_FRAME_BYTES, MIN_VERSION,
 };
-pub use message::{AgentState, Message, MetricsPoint, PaneDetail, PaneInfo, VERSION};
+pub use message::{
+    AgentState, Message, MetricsPoint, PaneDetail, PaneInfo, SyncExchange, SyncOutcome, SyncStatus,
+    VERSION,
+};

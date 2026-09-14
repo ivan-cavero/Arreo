@@ -341,6 +341,111 @@ pub enum Message {
         #[serde(default)]
         manifest: bool,
     },
+    /// Client → server: one synced file's payload (T-0086).
+    ///
+    /// The bytes are the *same* `SyncPayload` JSON the local exchange already
+    /// produces (`arreo_core::sync::engine`), and the receiving daemon runs the
+    /// *same* `SyncEngine::receive` on them — which is the point of the shape:
+    /// every refusal the local path was hardened with (digest, forged vector,
+    /// unresolved reference, format validation, the LOCAL deny-list, the sibling
+    /// gate, keep-both) is the one code path, not a second implementation that
+    /// could drift from the tested one.
+    ///
+    /// **What the wire does not carry.** No secret value: the payload holds
+    /// `${ARREO_ENV:NAME}` references, and the receiver resolves them from its
+    /// own keychain. No path: the payload names the *logical* file, and the
+    /// receiver resolves the destination from its own preset registry.
+    ///
+    /// The reply is [`Message::SyncReply`], and the exchange is refused before
+    /// anything is written when the payload disagrees with the identity the
+    /// session authenticated as (see [`SyncExchange`]).
+    Sync { v: u32, exchange: SyncExchange },
+    /// Server → client: what the receiver did with a [`Message::Sync`].
+    ///
+    /// A new variant rather than a field on an existing reply, because a reply
+    /// that carries an outcome is a *new shape* (ADR 0017; T-0079 measured that
+    /// `rmp-serde`'s positional structs make an extended shape fatal to an older
+    /// reader).
+    SyncReply {
+        v: u32,
+        /// **Boxed** because `SyncOutcome` is six strings wide (120 bytes) and
+        /// this enum is the `Err` variant of every `Result<(), Message>` on the
+        /// session's gate path: a `Result` is as large as its largest variant, so
+        /// an inline outcome would make *every* refusal carry it. A reply is a
+        /// rare message (one per config push), and the wire shape does not change
+        /// — `serde` delegates through a `Box` transparently, which the compat
+        /// corpus test pins.
+        outcome: Box<SyncOutcome>,
+    },
+}
+
+/// One file's payload, as the exchange carries it (T-0086).
+///
+/// The bytes are the `SyncPayload` JSON — kept as bytes rather than as a decoded
+/// struct so this crate's protocol layer does not have to own the sync engine's
+/// shape (the engine lives behind the `sqlite` feature; the wire type must not),
+/// and so a payload travels as a MessagePack byte string instead of an array of
+/// integers.
+///
+/// **It carries the payload and nothing else.** The file's logical name, the
+/// harness and the sender's vector are all inside the JSON, and repeating any of
+/// them here would be a second spelling of a fact that could then disagree with
+/// the first — the same defect the identity rule exists to prevent.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SyncExchange {
+    /// The `SyncPayload` JSON (`serde_json`), exactly as the local form builds
+    /// it. Bounded by [`crate::proto::codec::MAX_FRAME_BYTES`], which is checked
+    /// against the frame's length prefix before the body is allocated.
+    pub payload: Vec<u8>,
+}
+
+/// What the receiving machine did with a payload.
+///
+/// The names are the operator's, not the engine's internal ones: an `applied`
+/// revision, an `up_to_date` no-op, a `conflict` that kept both copies, and a
+/// `refused` payload with the receiver's own reason (which is the interesting
+/// half — "refused" alone is a support ticket).
+///
+/// **No path crosses the wire.** `copy` is the conflict copy's *file name*
+/// beside the receiver's own file, which is what the sending operator needs to
+/// say ("beta kept alpha's copy as `opencode.conflict-…jsonc`"); the directory
+/// it lives in is the receiver's layout and stays there.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SyncOutcome {
+    /// The logical file name, echoed so one reply line is self-describing.
+    pub file: String,
+    pub status: SyncStatus,
+    /// The machine whose revision this was: the **authenticated device id** of
+    /// the sender (`dev_…`), which is also the counter key.
+    #[serde(default)]
+    pub from: String,
+    /// The sender's counter for this revision, as the receiver recorded it.
+    #[serde(default)]
+    pub counter: u64,
+    /// The receiver's revision row id, when it recorded one.
+    #[serde(default)]
+    pub revision: i64,
+    /// The conflict copy's file name, for a `conflict` outcome.
+    #[serde(default)]
+    pub copy: String,
+    /// The receiver's own words, for a `refused` outcome.
+    #[serde(default)]
+    pub reason: String,
+}
+
+/// The outcome of one sync exchange, as one word.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SyncStatus {
+    /// The payload was newer and the receiver's file now holds it.
+    Applied,
+    /// Nothing to do: the receiver already had these bytes (or newer ones).
+    UpToDate,
+    /// Both machines edited without seeing each other: nothing was overwritten,
+    /// and the incoming copy was kept beside the file.
+    Conflict,
+    /// Nothing was written, and the reason says why.
+    Refused,
 }
 
 /// One pane in the handoff manifest (T-0038 stage 2).

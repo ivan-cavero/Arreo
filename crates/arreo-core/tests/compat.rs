@@ -15,7 +15,8 @@
 
 use arreo_core::proto::{
     classify_op, client_versions, client_versions_from, frame_body_len, negotiate, CodecError,
-    Direction, Message, PaneDetail, PaneInfo, MAX_FRAME_BYTES, MIN_VERSION, VERSION,
+    Direction, Message, PaneDetail, PaneInfo, SyncExchange, SyncOutcome, SyncStatus,
+    MAX_FRAME_BYTES, MIN_VERSION, VERSION,
 };
 use arreo_core::proto::{codec, AgentState};
 
@@ -378,6 +379,52 @@ fn a_verb_added_after_v0_classifies_as_a_request() {
         classify_op(&body),
         Some(Direction::Request),
         "a new client→server verb is a request, classified without a full decode"
+    );
+}
+
+/// **The sync pair classifies by the same rule** (T-0086). `Sync` is a
+/// client→server request (it writes this machine's configuration) and
+/// `SyncReply` is an event (it answers one), both learned by the map-head read
+/// rather than by a version bump — so a v0 peer that receives either does not
+/// decode it and answers a typed refusal, which is exactly what the sender's
+/// error path is written to report.
+#[test]
+fn the_sync_pair_classifies_by_the_same_rule() {
+    let request = body_of(&Message::Sync {
+        v: VERSION,
+        exchange: SyncExchange {
+            payload: br#"{"file":"opencode.jsonc"}"#.to_vec(),
+        },
+    });
+    assert_eq!(
+        classify_op(&request),
+        Some(Direction::Request),
+        "a sync exchange is a request: it asks the peer to write"
+    );
+    let reply = body_of(&Message::SyncReply {
+        v: VERSION,
+        outcome: Box::new(SyncOutcome {
+            file: "opencode.jsonc".to_string(),
+            status: SyncStatus::Applied,
+            from: "dev_0123456789abcdef0123456789abcdef".to_string(),
+            counter: 1,
+            revision: 1,
+            copy: String::new(),
+            reason: String::new(),
+        }),
+    });
+    assert_eq!(
+        classify_op(&reply),
+        Some(Direction::Event),
+        "a sync reply is an event: it answers one"
+    );
+    // The payload travels as a byte string, not as an array of integers: the
+    // difference is one MessagePack type byte, and it is the difference between
+    // a frame that grows with the config and one that does not.
+    assert!(
+        request.len() < 128,
+        "a one-line payload stays a small frame ({} bytes)",
+        request.len()
     );
 }
 

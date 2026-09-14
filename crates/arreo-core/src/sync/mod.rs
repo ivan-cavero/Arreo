@@ -32,10 +32,12 @@
 //!
 //! ## What is deliberately absent
 //!
-//! No transport: T-0086 owns the mesh, and [`engine::SyncPayload`] is the shape
-//! it will carry. No folder mode: §3.8 rejects it, because a surprise overwrite
-//! of a whole tree is not an opt-in per file. No secret in a synced file, ever,
-//! encrypted or otherwise — the key would travel with the ciphertext.
+//! No transport code: T-0086's `Message::Sync` carries [`engine::SyncPayload`]
+//! to the peer's daemon, which runs [`engine::SyncEngine::receive`] — the same
+//! door a payload file goes through. No folder mode: §3.8 rejects it, because a
+//! surprise overwrite of a whole tree is not an opt-in per file. No secret in a
+//! synced file, ever, encrypted or otherwise — the key would travel with the
+//! ciphertext.
 
 pub mod keychain;
 pub mod merge;

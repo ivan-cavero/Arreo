@@ -210,6 +210,13 @@ pub mod actions {
     /// that healed the store, into the fresh one — the one row that proves a
     /// machine healed rather than quietly stopped persisting.
     pub const STORE_CORRUPT: &str = "store.corrupt";
+    /// A peer's synced file was applied to this machine's configuration
+    /// (T-0086), or refused. The row names the logical file and the sending
+    /// device, and carries the outcome in `detail`; the *content* never lands
+    /// in the row (the `agent` column holds a preset name, and `prompt` is
+    /// empty), because a synced file is configuration and the trail is not the
+    /// place for a copy of it.
+    pub const SYNC: &str = "sync.apply";
 }
 
 /// One audit row (prompt already redacted on write).
