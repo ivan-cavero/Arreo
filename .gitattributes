@@ -1,2 +1,9 @@
 # Auto detect text files and perform LF normalization
 * text=auto
+# **Recorded bytes stay byte-exact.** `include_str!` fixtures and the captures
+# beside them are *evidence*: a test asserts the exact bytes git printed, CRLF
+# content included, so `text=auto` normalizing them would silently change what
+# the test checks — and the failure would appear only on a fresh clone, which is
+# the worst place to find it (T-0092's parser caught it: the committed blob had
+# 0 carriage returns where the working file had 4).
+.loop/evidence/**/*.raw -text

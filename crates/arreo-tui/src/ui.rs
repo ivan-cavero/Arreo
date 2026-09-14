@@ -4,7 +4,8 @@
 //! region. The right region is either the focused pane (scrollback text) or the
 //! pane wall (every pane tiled, focused one highlighted).
 //! Keys: j/k or arrows (move), Enter (attach/focus), / (search), q (quit),
-//! w (wall ↔ focus), t (theme picker), ? (key list), [ / ] (sidebar
+//! w (wall ↔ focus), d (diff of the attached pane's worktree, T-0092),
+//! t (theme picker), ? (key list), [ / ] (sidebar
 //! narrower/wider), Tab (cycle panes), PgUp/PgDn/Home/End (scrollback).
 //! **The fleet keys (T-0074)**: s (spawn), i (send), x (kill), m (machines),
 //! g (trust grants) — every one of them a keyboard equivalent of what the
@@ -43,6 +44,7 @@
 //! leaves the dot shape and the label, which is what makes the state readable
 //! in the first place.
 
+use crate::diff_view::{DiffView, GUTTER};
 use crate::fleet::{Grant, Machine, Outcome};
 use crate::model::{Focus, Model};
 use crate::settings::Settings;
@@ -65,6 +67,8 @@ pub enum ViewMode {
     Focus,
     /// Every pane tiled — the "what is everyone doing" view.
     Wall,
+    /// The attached pane's worktree changes (T-0092) — the review view.
+    Diff,
 }
 
 /// Sidebar split bounds (columns, borders included).
@@ -92,6 +96,8 @@ const KEY_LIST: &[(&str, &str, Option<Verb>)] = &[
     ("Enter", "attach the pane (or open the wall tile)", None),
     ("Tab", "next pane", None),
     ("w", "wall ↔ focus", None),
+    ("d", "diff: the attached pane's worktree changes", None),
+    ("n/p · h/l", "in the diff: next/prev file · sideways", None),
     ("t", "theme picker", None),
     ("/", "search the transcript", None),
     ("[ ]", "sidebar narrower / wider", None),
@@ -161,6 +167,21 @@ pub fn key_hints(columns: u16) -> &'static str {
     }
 }
 
+/// The diff view's legend (T-0092), in the same ladder shape as [`key_hints`]
+/// and for the same reason: its keys are not the sidebar's, and a legend that
+/// named `Enter attach` under a diff would be teaching keys that do nothing
+/// there. `q` and `? keys` are in every tier, because they always work.
+#[must_use]
+pub fn diff_hints(columns: u16) -> &'static str {
+    if columns >= 120 {
+        "j/k scroll · n/p file · h/l pan · PgUp/PgDn page · d close · ? keys · q quit"
+    } else if columns >= 90 {
+        "j/k · n/p file · h/l pan · d close · ? keys · q quit"
+    } else {
+        "d close · ? keys · q quit"
+    }
+}
+
 /// One thing the UI asked for that cannot happen on the key path (T-0074):
 /// a verb to the daemon, or a fleet verb.
 ///
@@ -174,6 +195,13 @@ pub enum Action {
         id: String,
         program: String,
         args: Vec<String>,
+    },
+    /// Read a pane's worktree diff (T-0092). The read runs `git` on this
+    /// machine's disk and finishes on a blocking task in the main loop, which
+    /// pushes the answer back as [`crate::diff_view::State`]; a key handler that
+    /// shelled out would freeze the frame it was pressed on.
+    Diff {
+        pane: String,
     },
     Kill {
         id: String,
@@ -492,6 +520,10 @@ pub struct App {
     /// results live here and hold the line until the next keypress.
     pub result: Option<String>,
     pub view: ViewMode,
+    /// The diff view's own state (T-0092): which pane it is about, what the last
+    /// read answered, and where in the document the operator is. Separate from
+    /// `Model`, which is pane and focus state and knows nothing about worktrees.
+    pub diff: DiffView,
     /// The key list is up (`?`). It consumes input until dismissed.
     pub help: bool,
     /// Sidebar width in columns, drag- or key-resizable.
@@ -589,6 +621,7 @@ impl App {
             status: "connecting…".to_string(),
             result: None,
             view: ViewMode::Focus,
+            diff: DiffView::default(),
             help: false,
             sidebar_width: SIDEBAR_DEFAULT,
             dragging: false,
@@ -631,6 +664,7 @@ impl App {
         match self.view {
             ViewMode::Focus => self.render_pane(frame, chunks[1]),
             ViewMode::Wall => self.render_wall(frame, chunks[1]),
+            ViewMode::Diff => self.render_diff(frame, chunks[1]),
         }
         if let Some(picker) = self.picker.clone() {
             self.render_picker(frame, area, &picker);
@@ -1133,6 +1167,40 @@ impl App {
         frame.render_widget(list, area);
     }
 
+    /// The border of the region the keyboard is in (T-0076): `primary` is
+    /// BRAND §2's "active", and the two facts — which region has the keys, which
+    /// region is merely drawn — must never look alike.
+    fn active_border(&self) -> Style {
+        Style::default()
+            .fg(self.theme.color("primary"))
+            .add_modifier(Modifier::BOLD)
+    }
+
+    /// The diff view (T-0092): the attached pane's worktree changes, colored
+    /// from the theme's diff tokens.
+    ///
+    /// Its border is the active one unconditionally — unlike the pane view,
+    /// where the keyboard can be in the sidebar, the diff view *always* has the
+    /// keys while it is up, so a hairline border here would be the lie T-0076
+    /// warns about in the other direction. The title carries the pane and the
+    /// worktree, and the status line the summary and `file N/M` — which is the
+    /// whole point of the view: what changed, how much, and where in it.
+    fn render_diff(&self, frame: &mut Frame, area: Rect) {
+        let lines = self.diff.lines(
+            &self.theme,
+            area.width.saturating_sub(2),
+            area.height.saturating_sub(2),
+        );
+        let paragraph = Paragraph::new(lines).style(self.theme.text_style()).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(self.active_border())
+                .title(self.diff.title())
+                .title_style(self.theme.text_style()),
+        );
+        frame.render_widget(paragraph, area);
+    }
+
     fn render_pane(&self, frame: &mut Frame, area: Rect) {
         let (title, lines) = match self.model.focused_id() {
             Some(id) => match self.model.panes().iter().find(|p| p.id == id) {
@@ -1195,9 +1263,7 @@ impl App {
         // region; while the cursor is in the sidebar the border is the plain
         // hairline, so the two facts never look alike.
         let border = if self.model.focus_is_pane() {
-            Style::default()
-                .fg(self.theme.color("primary"))
-                .add_modifier(Modifier::BOLD)
+            self.active_border()
         } else {
             self.theme.border_style()
         };
@@ -1229,6 +1295,14 @@ impl App {
                 self.search,
                 hits.len()
             )
+        } else if self.view == ViewMode::Diff {
+            // The diff view (T-0092) puts *its* half first: what changed and
+            // which file of how many is on screen. The legend is the diff's own
+            // — under a diff, `Enter attach` would be teaching a key that does
+            // nothing here — and when there is no document the daemon's status
+            // keeps the line, because the sentence is in the body.
+            let status = self.diff.status().unwrap_or_else(|| self.status.clone());
+            format!("{status} · {}", diff_hints(area.width))
         } else {
             // Connection/daemon status *and* the key legend: the keys are the
             // part that must not be clipped away, so they come last and the
@@ -1345,6 +1419,14 @@ impl App {
             }
             return true;
         }
+        // The diff view's own keys (T-0092), ahead of the shared ones: `j`/`k`
+        // scroll the diff rather than the sidebar cursor. Everything it does not
+        // claim — `?`, `t`, `w`, `q`, the fleet keys — falls through to the
+        // bindings below, because the diff is another thing to look at, not a
+        // modal: a modal would have to re-implement every key it wanted to keep.
+        if self.view == ViewMode::Diff && self.on_key_diff(code) {
+            return true;
+        }
         match code {
             K::Char('q') => false,
             K::Esc => {
@@ -1371,7 +1453,20 @@ impl App {
                 self.view = match self.view {
                     ViewMode::Focus => ViewMode::Wall,
                     ViewMode::Wall => ViewMode::Focus,
+                    // From the diff, `w` is the wall: the views are
+                    // alternatives, and `w` is the key that means "the other
+                    // way of looking at the same panes".
+                    ViewMode::Diff => ViewMode::Wall,
                 };
+                true
+            }
+            K::Char('d') => {
+                // One key, two directions (T-0092): `d` reads the attached
+                // pane's worktree changes, and `d` again puts them away.
+                match self.view {
+                    ViewMode::Diff => self.view = ViewMode::Focus,
+                    ViewMode::Focus | ViewMode::Wall => self.open_diff(),
+                }
                 true
             }
             K::PageUp => {
@@ -1427,6 +1522,9 @@ impl App {
                             }
                         }
                     }
+                    // Nothing to attach: the diff view is already about the
+                    // attached pane, and the sidebar cursor is not its subject.
+                    ViewMode::Diff => {}
                 }
                 true
             }
@@ -1556,6 +1654,11 @@ impl App {
                     self.queue(Action::TrustList);
                 }
             }
+            // The diff view's own answer arrives as `Poll::Diff` (T-0092), so
+            // there is nothing for this handler to do with it — listed rather
+            // than swept into the group above, so the next variant added to
+            // `Action` has to say which of the two it is.
+            Action::Diff { .. } => {}
             // A preview that failed its checks: the status line already carries
             // the CLI's sentence. A preview that passed never reaches here — it
             // becomes a confirmation instead.
@@ -1903,6 +2006,78 @@ impl App {
         self.scroll = 0;
     }
 
+    /// Enter the diff view for the attached pane (T-0092), asking the main loop
+    /// for a read; with nothing attached there is no worktree to name, and the
+    /// view says that instead of asking for anything.
+    ///
+    /// Coming back to a diff re-reads it: the worktree a reviewer is looking at
+    /// is one `git` is still being used on, and a frame kept from ten minutes
+    /// ago would be a picture of a checkout that has moved on.
+    pub fn open_diff(&mut self) {
+        self.view = ViewMode::Diff;
+        match self.model.focused_id() {
+            Some(id) => {
+                let pane = id.to_string();
+                self.diff.reading(&pane);
+                self.queue(Action::Diff { pane });
+            }
+            None => self.diff.no_pane(),
+        }
+    }
+
+    /// A key that attaches a *different* pane while the diff is up re-reads it:
+    /// leaving the old diff on screen under a new selection would be a picture
+    /// of one pane with another one's name on it.
+    fn refocus_diff(&mut self) {
+        if self.view == ViewMode::Diff {
+            self.open_diff();
+        }
+    }
+
+    /// Rows the diff's body has inside its box at the size the frame was last
+    /// drawn at: the body keeps every row but the status line, and the box
+    /// spends two of them on borders.
+    fn diff_rows(&self) -> u16 {
+        self.screen_rows.saturating_sub(3)
+    }
+
+    /// Columns of diff *text* on screen: the pane region's inner width less the
+    /// gutter, which stays put under a sideways scroll. The same arithmetic,
+    /// from the same helper, that `render` lays the frame out with.
+    fn diff_cols(&self) -> u16 {
+        let sidebar = sidebar_extent(self.screen_cols, self.sidebar_width);
+        self.screen_cols
+            .saturating_sub(sidebar)
+            .saturating_sub(2 + GUTTER as u16)
+    }
+
+    /// The diff view's own keys (T-0092). Returns whether the key was one of
+    /// them; everything else falls through to the bindings `on_key` shares with
+    /// the other views.
+    fn on_key_diff(&mut self, code: crossterm::event::KeyCode) -> bool {
+        use crossterm::event::KeyCode as K;
+        let rows = self.diff_rows();
+        let cols = self.diff_cols();
+        match code {
+            // One more step of the progressive dismissal (T-0076): under a
+            // diff, Esc puts the diff away — the applied search and the quit
+            // are still behind it, so the hint never lies about the key.
+            K::Esc => self.view = ViewMode::Focus,
+            K::Char('j') | K::Down => self.diff.scroll(1, rows),
+            K::Char('k') | K::Up => self.diff.scroll(-1, rows),
+            K::Char('n') => self.diff.next_file(rows),
+            K::Char('p') => self.diff.prev_file(rows),
+            K::Char('h') | K::Left => self.diff.pan(-1, cols),
+            K::Char('l') | K::Right => self.diff.pan(1, cols),
+            K::PageDown => self.diff.scroll(10, rows),
+            K::PageUp => self.diff.scroll(-10, rows),
+            K::Home => self.diff.home(),
+            K::End => self.diff.end(rows),
+            _ => return false,
+        }
+        true
+    }
+
     /// Open the theme picker over every theme the catalog found.
     pub fn open_picker(&mut self) {
         let names = self.theme.names();
@@ -1948,7 +2123,15 @@ impl App {
 
     /// Wheel/keyboard scrollback: positive `delta` moves back in history.
     /// Clamped to the focused pane's length, and a focus change resets it.
+    ///
+    /// Under the diff view the wheel walks the *diff* (T-0092): the transcript
+    /// is not what is on screen, and a wheel that scrolled something invisible
+    /// would look broken.
     pub fn on_scroll(&mut self, delta: i32) {
+        if self.view == ViewMode::Diff {
+            self.diff.scroll(-delta, self.diff_rows());
+            return;
+        }
         let len = self
             .model
             .focused_id()
@@ -1991,6 +2174,10 @@ impl App {
                 if current_row == row {
                     self.model.focus_pane(&id);
                     self.scroll = 0;
+                    // A click that attaches another pane re-reads the diff
+                    // (T-0092): the view is about the attached pane, and a click
+                    // is a way of changing which one that is.
+                    self.refocus_diff();
                     return;
                 }
                 current_row += 1;
@@ -2075,7 +2262,7 @@ fn ask_width(sidebar_width: u16) -> usize {
 /// is no second wrap implementation to drift from. Wide glyphs count as one
 /// cell, which under-counts, so a box may be one column wider than planned —
 /// a clipped-cell corner, not a wrong layout.
-fn wrap(text: &str, width: usize) -> Vec<String> {
+pub(crate) fn wrap(text: &str, width: usize) -> Vec<String> {
     if width == 0 {
         return vec![text.to_string()];
     }

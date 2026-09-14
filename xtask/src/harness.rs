@@ -54,13 +54,29 @@ pub struct TestServer {
 
 impl TestServer {
     pub fn spawn(server_bin: &Path, socket: &Path, what: &str) -> Result<Self, ExitCode> {
-        match std::process::Command::new(server_bin)
+        Self::spawn_with_env(server_bin, socket, what, &[])
+    }
+
+    /// The same, with environment the daemon needs (T-0092: `ARREO_CONFIG`, so a
+    /// slice can drive a daemon whose `[worktree]` root it chose). Split out
+    /// rather than added as a parameter so every existing caller — and the
+    /// meaning of "spawn a server" — stays unchanged.
+    pub fn spawn_with_env(
+        server_bin: &Path,
+        socket: &Path,
+        what: &str,
+        env: &[(&str, &str)],
+    ) -> Result<Self, ExitCode> {
+        let mut command = std::process::Command::new(server_bin);
+        command
             .arg("--socket")
             .arg(socket)
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-        {
+            .stderr(std::process::Stdio::null());
+        for (name, value) in env {
+            command.env(name, value);
+        }
+        match command.spawn() {
             Ok(child) => Ok(Self { child }),
             Err(e) => {
                 println!("[FAIL] tui: {what}: {e}");

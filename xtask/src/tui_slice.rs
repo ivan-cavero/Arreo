@@ -1516,6 +1516,165 @@ pub fn run(rest: &[String]) -> ExitCode {
     let _ = std::fs::write(evidence_dir_73.join("20-refusals.txt"), &refusal_text);
     let _ = std::fs::remove_file(&config_73);
 
+    // ---- T-0092: the diff view, on a real repository -----------------------
+    //
+    // Its own daemon on its own socket, with a real `git` repository and a
+    // `[worktree]` config: the pane must genuinely be in a worktree for the view
+    // to have anything to show, and the configured root is deliberately **not**
+    // the default so a TUI that ignored the config could not pass. The frames go
+    // to `.loop/evidence/T-0092/` — a view this task exists to make *readable*, so
+    // the proof is the screen, not a substring.
+    let evidence_dir_92 = workspace().join(".loop").join("evidence").join("T-0092");
+    let _ = std::fs::create_dir_all(&evidence_dir_92);
+    {
+        let scratch = workspace()
+            .join("target")
+            .join("test-scratch")
+            .join("T-0092");
+        let _ = std::fs::remove_dir_all(&scratch);
+        let repo = scratch.join("repo");
+        let root = scratch.join("worktrees");
+        if std::fs::create_dir_all(&repo).is_ok() {
+            let git = |args: &[&str]| {
+                std::process::Command::new("git")
+                    .arg("-C")
+                    .arg(&repo)
+                    .args(args)
+                    .output()
+                    .map(|out| out.status.success())
+                    .unwrap_or(false)
+            };
+            git(&["init", "-q", "-b", "main"]);
+            git(&["config", "user.name", "arreo slice"]);
+            git(&["config", "user.email", "slice@arreo.invalid"]);
+            let _ = std::fs::write(repo.join("notes.md"), "one\ntwo\nthree\n");
+            git(&["add", "."]);
+            git(&["commit", "-q", "-m", "base"]);
+
+            let config = scratch.join("arreo.toml");
+            let _ = std::fs::write(
+                &config,
+                format!(
+                    "[worktree]\nroot = \"{}\"\nrepo = \"{}\"\n",
+                    root.display(),
+                    repo.display()
+                ),
+            );
+            let config = config.display().to_string();
+
+            let diff_socket =
+                std::env::temp_dir().join(format!("arreo-e2e-tui92-{}.sock", std::process::id()));
+            let _ = std::fs::remove_file(&diff_socket);
+            let env: &[(&str, &str)] = &[("ARREO_CONFIG", &config)];
+            match TestServer::spawn_with_env(&server_bin, &diff_socket, "T-0092 server", env) {
+                Ok(server) => {
+                    wait_bound(&diff_socket);
+                    // A pane in its own worktree, which writes one file and
+                    // edits another: a modification and an untracked addition,
+                    // the two shapes a reviewer most needs to see.
+                    let body = "printf 'one\\nTWO CHANGED\\nthree\\n' > notes.md; \
+                                echo 'fresh file' > added.txt; sleep 120";
+                    let (spawned, out) = cli(
+                        &cli_bin,
+                        &diff_socket,
+                        &["spawn", "review", "/bin/sh", "-c", body, "--worktree"],
+                    );
+                    check(
+                        "T-0092: a pane runs in its own worktree",
+                        spawned,
+                        &format!("spawn --worktree: {out}"),
+                    );
+
+                    if let Some(mut tui) = TuiSession::start_with(&tui_bin, &diff_socket, &[], env)
+                    {
+                        // Let the child write its files before the view reads.
+                        std::thread::sleep(Duration::from_secs(2));
+                        tui.send("\r"); // attach the focused pane
+                        std::thread::sleep(Duration::from_secs(2));
+                        let before = tui.screen();
+                        let _ = std::fs::write(evidence_dir_92.join("01-before-d.txt"), &before);
+
+                        tui.send("d");
+                        // The read runs git off the event loop; poll rather than
+                        // guess a duration.
+                        let deadline = Instant::now() + Duration::from_secs(15);
+                        let mut screen = String::new();
+                        while Instant::now() < deadline {
+                            screen = tui.screen();
+                            if screen.contains("notes.md") && screen.contains("TWO CHANGED") {
+                                break;
+                            }
+                            std::thread::sleep(Duration::from_millis(250));
+                        }
+                        let _ = std::fs::write(evidence_dir_92.join("02-diff-view.txt"), &screen);
+
+                        check(
+                            "T-0092: d opens the diff of the pane's worktree",
+                            screen.contains("diff") && screen.contains("notes.md"),
+                            "the diff view did not open on the pane's worktree",
+                        );
+                        // The modification, with both sides of the hunk.
+                        check(
+                            "T-0092: the modified hunk is on screen, both sides",
+                            screen.contains("TWO CHANGED") && screen.contains("two"),
+                            "the hunk body is missing one of its sides",
+                        );
+                        // The untracked file: the shape `git diff HEAD` alone
+                        // cannot show, and the one an agent's work usually is.
+                        check(
+                            "T-0092: an untracked file appears too",
+                            screen.contains("added.txt") && screen.contains("fresh file"),
+                            "the untracked file is not in the view",
+                        );
+                        // The summary and the file position, so a reviewer knows
+                        // how much they are looking at.
+                        check(
+                            "T-0092: the status line carries the summary and the position",
+                            screen.contains("files changed") && screen.contains("file 1/"),
+                            "the status line lacks the summary or the file position",
+                        );
+                        // Horizontal scroll has to have a key that changes what
+                        // is drawn; asserted on the *transcript*, because a frame
+                        // of a wide line is clipped either way.
+                        let before_scroll = tui.transcript().len();
+                        tui.send("l");
+                        std::thread::sleep(Duration::from_millis(800));
+                        check(
+                            "T-0092: horizontal scroll redraws",
+                            tui.transcript().len() > before_scroll,
+                            "l produced no redraw",
+                        );
+
+                        // And the view closes back to the pane: one key, two
+                        // directions — `d` again.
+                        tui.send("d");
+                        std::thread::sleep(Duration::from_secs(1));
+                        let closed = tui.screen();
+                        let _ = std::fs::write(evidence_dir_92.join("03-after-d.txt"), &closed);
+                        check(
+                            "T-0092: d closes the view again",
+                            !closed.contains("files changed"),
+                            "the diff view stayed open",
+                        );
+                        tui.send("q");
+                        let _ = wait_exit(&mut tui, Duration::from_secs(5));
+                    } else {
+                        check(
+                            "T-0092: the TUI starts on a pty",
+                            false,
+                            "TuiSession::start_with returned None",
+                        );
+                    }
+                    drop(server);
+                    for path in sidecars(&diff_socket) {
+                        let _ = std::fs::remove_file(path);
+                    }
+                }
+                Err(code) => return code,
+            }
+        }
+    }
+
     if failures == 0 {
         println!("tui: {passes} passed, 0 failed");
         ExitCode::SUCCESS
@@ -1771,6 +1930,16 @@ fn sidecars(socket: &std::path::Path) -> Vec<PathBuf> {
             PathBuf::from(path)
         })
         .collect()
+}
+
+/// The workspace root: `xtask` lives one level below it, and every scratch path
+/// and evidence directory in this slice is resolved from here rather than from
+/// the process's working directory (which a caller may have set to anything).
+fn workspace() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("workspace root")
+        .to_path_buf()
 }
 
 /// The pid of the daemon serving `socket`, by the same /proc scan `arreo server

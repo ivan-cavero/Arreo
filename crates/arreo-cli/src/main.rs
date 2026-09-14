@@ -51,6 +51,12 @@ fn usage() -> ExitCode {
     eprintln!("  arreo worktrees remove <pane> [--force] [--repo PATH] [--config PATH]");
     eprintln!("      the git worktrees `spawn --worktree` makes; `list` needs no daemon");
     eprintln!("      (docs/worktrees.md)");
+    eprintln!("  arreo diff <pane> [--json] [--repo PATH] [--config PATH]");
+    eprintln!("      what the pane's worktree has changed (staged, unstaged, untracked);");
+    eprintln!(
+        "      no daemon, never writes. --json is the script contract (schema {DIFF_SCHEMA})."
+    );
+    eprintln!("      exit 0 diff (or no changes) · 1 the pane has no worktree · 2 usage");
     eprintln!("  arreo send <id> <text...> [--socket PATH]");
     eprintln!("  arreo read <id> [--from N] [--socket PATH]   (one-shot snapshot)");
     eprintln!("  arreo wait <id> --state <state> [--timeout 5m] [--socket PATH]");
@@ -168,6 +174,7 @@ fn main() -> ExitCode {
         Some("panes") => rt::block_on(cmd_panes(&args[2..])),
         Some("spawn") => rt::block_on(cmd_spawn(&args[2..])),
         Some("worktrees") => rt::block_on(cmd_worktrees(&args[2..])),
+        Some("diff") => cmd_diff(&args[2..]),
         Some("attach") => rt::block_on(cmd_attach(&args[2..])),
         Some("send") => rt::block_on(cmd_send(&args[2..])),
         Some("service") => cmd_service(&args[2..]),
@@ -882,9 +889,34 @@ fn parse_worktrees_options(sub: &str, args: &[String]) -> Result<WorktreesOption
 /// through `git rev-parse --show-toplevel` — so a subdirectory of a checkout
 /// works, and a path that is not a repository is refused by name (exit 2)
 /// instead of surfacing as an empty listing.
+///
+/// Shared by `arreo worktrees` and `arreo diff` (T-0092): both ask the same
+/// question about the same flag, and a second implementation would let the two
+/// disagree about what `--repo` means.
+/// The repository a worktree verb works on: `--repo`, else `[worktree] repo` from
+/// the configuration, else this directory.
+///
+/// **The config's `repo` is in the chain because the daemon honours it.** A pane
+/// spawned with `--worktree` under a configured repository has its checkout
+/// registered *there*, so a consumer that fell straight from `--repo` to the
+/// process's working directory would look in the wrong repository and report "no
+/// worktree" about a pane that plainly has one. The failure is silent and reads
+/// as a fact about the pane, which is why it is fixed here rather than left to
+/// whoever notices.
+fn worktree_repo(from: Option<&PathBuf>, config: Option<&PathBuf>) -> Result<PathBuf, String> {
+    let chosen = match from {
+        Some(path) => path.clone(),
+        None => config_worktree_settings(config)?
+            .repo
+            .map(PathBuf::from)
+            // Nothing configured: the operator's shell is the only answer left.
+            .unwrap_or_else(|| PathBuf::from(".")),
+    };
+    arreo_core::worktree::repo_root(&chosen).map_err(|e| e.to_string())
+}
+
 fn worktrees_repo(sub: &str, options: &WorktreesOptions) -> Result<PathBuf, ExitCode> {
-    let from = options.repo.clone().unwrap_or_else(|| PathBuf::from("."));
-    arreo_core::worktree::repo_root(&from).map_err(|e| {
+    worktree_repo(options.repo.as_ref(), options.config.as_ref()).map_err(|e| {
         eprintln!("worktrees {sub}: {e}");
         ExitCode::from(2)
     })
@@ -893,32 +925,52 @@ fn worktrees_repo(sub: &str, options: &WorktreesOptions) -> Result<PathBuf, Exit
 /// The worktree root: the `[worktree] root` of `--config`/`$ARREO_CONFIG` when
 /// one names a file, else the state-directory default.
 ///
-/// Read by both subcommands on purpose — see [`WorktreesOptions`]. A named file
-/// that cannot be read is refused (exit 2) rather than falling back to the
-/// default: the operator named the file, and listing the wrong root is a worse
-/// answer than saying the configuration is broken.
-fn worktrees_root(sub: &str, options: &WorktreesOptions) -> Result<PathBuf, ExitCode> {
+/// Read by both worktree subcommands on purpose — see [`WorktreesOptions`] —
+/// and by `arreo diff`, which has to look for the pane's checkout under exactly
+/// the root the listing would have shown. A named file that cannot be read is
+/// refused rather than falling back to the default: the operator named the file,
+/// and using the wrong root is a worse answer than saying the configuration is
+/// broken. The refusal comes back as a message rather than being printed here so
+/// each verb can name itself under it.
+fn config_worktree_root(config: Option<&PathBuf>) -> Result<PathBuf, String> {
+    Ok(config_worktree_settings(config)?
+        .root
+        .map(PathBuf::from)
+        .unwrap_or_else(arreo_core::worktree::default_root))
+}
+
+/// The `[worktree]` settings of `--config`/`$ARREO_CONFIG`, or the defaults.
+///
+/// One loader for the section, because three surfaces now read it: this file's
+/// worktree verbs and `arreo diff`, the TUI's diff view, and the daemon. The
+/// **repo** matters as much as the root — the daemon resolves a pane's worktree
+/// against `[worktree] repo`, so a consumer that defaulted to the process's
+/// working directory would look for the pane's checkout in a *different
+/// repository* and report "no worktree", which reads as "this pane never had
+/// one". Found by the T-0092 slice, whose TUI ran with the cwd elsewhere.
+fn config_worktree_settings(
+    config: Option<&PathBuf>,
+) -> Result<arreo_core::relay::config::WorktreeSettings, String> {
     use arreo_core::relay::config::WorktreeSettings;
-    let path = options
-        .config
-        .clone()
+    let path = config
+        .cloned()
         .or_else(|| std::env::var_os("ARREO_CONFIG").map(PathBuf::from));
     let Some(path) = path else {
-        return Ok(arreo_core::worktree::default_root());
+        return Ok(WorktreeSettings::default());
     };
-    match WorktreeSettings::load(&path) {
-        Ok(settings) => Ok(settings
-            .root
-            .map(PathBuf::from)
-            .unwrap_or_else(arreo_core::worktree::default_root)),
-        Err(e) => {
-            eprintln!(
-                "worktrees {sub}: the configuration at {} cannot be read: {e}",
-                path.display()
-            );
-            Err(ExitCode::from(2))
-        }
-    }
+    WorktreeSettings::load(&path).map_err(|e| {
+        format!(
+            "the configuration at {} cannot be read: {e}",
+            path.display()
+        )
+    })
+}
+
+fn worktrees_root(sub: &str, options: &WorktreesOptions) -> Result<PathBuf, ExitCode> {
+    config_worktree_root(options.config.as_ref()).map_err(|message| {
+        eprintln!("worktrees {sub}: {message}");
+        ExitCode::from(2)
+    })
 }
 
 /// Every pane's liveness from the daemon, or `None` when no daemon answers.
@@ -1223,6 +1275,304 @@ async fn worktrees_remove(rest: &[String]) -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// The schema of `arreo diff --json` — the script contract (T-0092). The human
+/// view below it is not one and may change. Additive-only: a renamed or removed
+/// key is a wire break for a script that parses this.
+const DIFF_SCHEMA: u32 = 1;
+
+fn diff_usage() {
+    eprintln!("usage: arreo diff <pane> [--json] [--repo PATH] [--config PATH]");
+    eprintln!("       what the pane's worktree has changed: staged, unstaged and untracked.");
+    eprintln!("       --repo is the repository the worktree belongs to (default: this directory);");
+    eprintln!("       --config names the file with the [worktree] root (default: $ARREO_CONFIG,");
+    eprintln!("       else the state directory). Needs no daemon, and never writes.");
+    eprintln!(
+        "exit codes: 0 the diff (or no changes) · 1 the pane has no worktree, or git failed · \
+         2 usage, not a repository, unreadable --config"
+    );
+}
+
+/// `arreo diff <pane>` (T-0092): what the pane's worktree changed.
+///
+/// `git` is the source and is run directly — no daemon, no socket verb — for the
+/// same reason `arreo worktrees list` runs it: the worktree is a directory on
+/// this machine, and reading what an agent did is most useful exactly when no
+/// daemon is up. The verb is read-only; `arreo_core::diff` records why it does not
+/// reach for `git add -N` to make untracked files appear.
+///
+/// Two facts that are easy to collide are kept apart here from end to end.
+/// **No worktree** — the pane has no checkout under the configured root at all —
+/// is a refusal (exit 1) naming the pane and the root it looked under, on stderr
+/// because it is not an answer to the question. **No changes** — the checkout is
+/// there and clean — is the answer (exit 0) on stdout. Neither may ever print the
+/// other's sentence, and a caller can tell them apart without reading either.
+fn cmd_diff(rest: &[String]) -> ExitCode {
+    use arreo_core::{diff, worktree};
+    let mut pane: Option<String> = None;
+    let mut repo_arg: Option<PathBuf> = None;
+    let mut config: Option<PathBuf> = None;
+    let mut json = false;
+    let mut i = 0;
+    while i < rest.len() {
+        let flag = rest[i].as_str();
+        match flag {
+            "--json" => json = true,
+            "--repo" | "--config" => {
+                let Some(value) = rest.get(i + 1) else {
+                    eprintln!("diff: {flag} needs a path");
+                    diff_usage();
+                    return ExitCode::from(2);
+                };
+                if flag == "--repo" {
+                    repo_arg = Some(PathBuf::from(value));
+                } else {
+                    config = Some(PathBuf::from(value));
+                }
+                i += 2;
+                continue;
+            }
+            other if other.starts_with('-') => {
+                eprintln!("diff: unknown argument {other:?}");
+                diff_usage();
+                return ExitCode::from(2);
+            }
+            other if pane.is_none() => pane = Some(other.to_string()),
+            other => {
+                eprintln!("diff: unexpected argument {other:?}");
+                diff_usage();
+                return ExitCode::from(2);
+            }
+        }
+        i += 1;
+    }
+    let Some(pane) = pane else {
+        diff_usage();
+        return ExitCode::from(2);
+    };
+    let repo = match worktree_repo(repo_arg.as_ref(), config.as_ref()) {
+        Ok(repo) => repo,
+        Err(e) => {
+            // `WorktreeError::NotARepo`'s own Display names the path and git's
+            // reason for refusing it.
+            eprintln!("diff: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    let root = match config_worktree_root(config.as_ref()) {
+        Ok(root) => root,
+        Err(message) => {
+            eprintln!("diff: {message}");
+            return ExitCode::from(2);
+        }
+    };
+    let path = worktree::path_for(&root, &pane);
+    let entry = match worktree::find(&repo, &path) {
+        Ok(entry) => entry,
+        Err(e) => {
+            eprintln!("diff: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let Some(entry) = entry else {
+        // The pane's worktree is not where panes' worktrees live. Not "no
+        // changes": there is no checkout here to be clean, and saying "no
+        // changes" would report a pane that was never spawned as a reviewed one.
+        eprintln!(
+            "diff: pane {pane:?} has no worktree under {} (nothing registered at {})",
+            root.display(),
+            path.display()
+        );
+        return ExitCode::FAILURE;
+    };
+    let changed = match diff::worktree_diff(&entry.path) {
+        Ok(changed) => changed,
+        Err(e) => {
+            // `DiffError` names the git command and the directory it failed in.
+            eprintln!("diff: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if changed.is_empty() {
+        // The answer, not a refusal: the checkout is there and nothing changed in
+        // it. `--json` still has to be a document a script can parse, so the
+        // contract is emitted for this case too — its `summary` says "no changes"
+        // in the half of the sentence that is machine-readable.
+        if json {
+            println!("{}", diff_json(&changed));
+        } else {
+            println!("no changes in {}", entry.path.display());
+        }
+        return ExitCode::SUCCESS;
+    }
+    if json {
+        println!("{}", diff_json(&changed));
+    } else {
+        print!("{}", diff_text(&changed));
+    }
+    ExitCode::SUCCESS
+}
+
+/// The human view: one header per file, its hunks, then the summary.
+///
+/// **No colour at all.** `NO_COLOR` is therefore respected by construction — there
+/// is no escape sequence to suppress — and a CLI consumer's terminal is not the
+/// TUI's business (the brand palette in `arreo_core::theme` is the TUI's). A
+/// gutter, git's own `+`/`-` prefix and the words carry every fact here.
+fn diff_text(diff: &arreo_core::diff::Diff) -> String {
+    let mut out = String::new();
+    for file in &diff.files {
+        out.push_str(&diff_file_header(file));
+        for hunk in &file.hunks {
+            // `Hunk::header` already carries the section git printed after the
+            // second `@@`.
+            out.push_str(&format!("  {}\n", hunk.header()));
+            for line in &hunk.lines {
+                out.push_str(&diff_text_line(line));
+            }
+        }
+    }
+    out.push_str(&diff.summary());
+    out.push('\n');
+    out
+}
+
+/// One file's header: the change, the path (or `from -> to`), and the counts.
+fn diff_file_header(file: &arreo_core::diff::FileDiff) -> String {
+    use arreo_core::diff::Change;
+    let mut out = format!("{}  ", file.change.word());
+    match &file.change {
+        Change::Renamed { from, to, .. } | Change::Copied { from, to, .. } => {
+            out.push_str(&format!("{from} -> {to}"));
+        }
+        Change::ModeChanged { old, new } => {
+            out.push_str(&format!("{}  {old} -> {new}", file.path()));
+        }
+        _ => out.push_str(file.path()),
+    }
+    out.push_str(&format!("  +{} -{}", file.added(), file.removed()));
+    if file.binary {
+        // A binary file has no hunks, so without this the header would describe a
+        // file that changed nothing. Git could not show it as text; that is a
+        // fact about the review rather than about the file's contents.
+        out.push_str("  (binary: git could not show this file as text)");
+    }
+    out.push('\n');
+    out
+}
+
+/// One line: the old and new line numbers in a gutter, then the prefix the diff
+/// itself uses, then the text — and git's own no-newline marker on the line it
+/// belongs to.
+fn diff_text_line(line: &arreo_core::diff::Line) -> String {
+    use arreo_core::diff::Kind;
+    let prefix = match line.kind {
+        Kind::Added => '+',
+        Kind::Removed => '-',
+        Kind::Context => ' ',
+    };
+    let old = line.old_line.map(|n| n.to_string()).unwrap_or_default();
+    let new = line.new_line.map(|n| n.to_string()).unwrap_or_default();
+    let mut out = format!("{old:>6} {new:>6} {prefix}{}\n", line.text);
+    if line.no_newline {
+        out.push_str(&format!(
+            "{:>6} {:>6} \\ No newline at end of file\n",
+            "", ""
+        ));
+    }
+    out
+}
+
+/// This verb's `--json`, and nothing else on stdout with it (the callers print
+/// exactly this one line), so `arreo diff … --json | jq` is a script that works
+/// whether or not a daemon happens to be running.
+fn diff_json(diff: &arreo_core::diff::Diff) -> serde_json::Value {
+    let mut root = serde_json::Map::new();
+    root.insert("schema".into(), serde_json::json!(DIFF_SCHEMA));
+    root.insert("summary".into(), serde_json::json!(diff.summary()));
+    root.insert(
+        "files".into(),
+        serde_json::json!(diff.files.iter().map(diff_file_json).collect::<Vec<_>>()),
+    );
+    if diff.hidden_untracked > 0 {
+        // Absent, not zero, when nothing was hidden: a field a consumer has to
+        // interpret ("is 0 none, or did it not say?") is worse than no field.
+        root.insert(
+            "hidden_untracked".into(),
+            serde_json::json!(diff.hidden_untracked),
+        );
+    }
+    serde_json::Value::Object(root)
+}
+
+fn diff_file_json(file: &arreo_core::diff::FileDiff) -> serde_json::Value {
+    use arreo_core::diff::Change;
+    let mut map = serde_json::Map::new();
+    map.insert("path".into(), serde_json::json!(file.path()));
+    map.insert("old_path".into(), serde_json::json!(file.old_path));
+    map.insert("new_path".into(), serde_json::json!(file.new_path));
+    map.insert("change".into(), serde_json::json!(file.change.word()));
+    map.insert("binary".into(), serde_json::json!(file.binary));
+    map.insert("added".into(), serde_json::json!(file.added()));
+    map.insert("removed".into(), serde_json::json!(file.removed()));
+    match &file.change {
+        Change::Renamed {
+            from,
+            to,
+            similarity,
+        }
+        | Change::Copied {
+            from,
+            to,
+            similarity,
+        } => {
+            map.insert("from".into(), serde_json::json!(from));
+            map.insert("to".into(), serde_json::json!(to));
+            if let Some(similarity) = similarity {
+                // git prints a similarity for some renames and not others; an
+                // absent key says "git did not say", which is the truth.
+                map.insert("similarity".into(), serde_json::json!(similarity));
+            }
+        }
+        Change::ModeChanged { old, new } => {
+            map.insert("old_mode".into(), serde_json::json!(old));
+            map.insert("new_mode".into(), serde_json::json!(new));
+        }
+        Change::Added | Change::Deleted | Change::Modified => {}
+    }
+    map.insert(
+        "hunks".into(),
+        serde_json::json!(file.hunks.iter().map(diff_hunk_json).collect::<Vec<_>>()),
+    );
+    serde_json::Value::Object(map)
+}
+
+fn diff_hunk_json(hunk: &arreo_core::diff::Hunk) -> serde_json::Value {
+    serde_json::json!({
+        "old_start": hunk.old_start,
+        "old_count": hunk.old_count,
+        "new_start": hunk.new_start,
+        "new_count": hunk.new_count,
+        "section": hunk.section,
+        "lines": hunk.lines.iter().map(diff_line_json).collect::<Vec<_>>(),
+    })
+}
+
+fn diff_line_json(line: &arreo_core::diff::Line) -> serde_json::Value {
+    use arreo_core::diff::Kind;
+    let kind = match line.kind {
+        Kind::Context => "context",
+        Kind::Added => "added",
+        Kind::Removed => "removed",
+    };
+    serde_json::json!({
+        "kind": kind,
+        "text": line.text,
+        "old_line": line.old_line,
+        "new_line": line.new_line,
+        "no_newline": line.no_newline,
+    })
 }
 
 async fn cmd_send(rest: &[String]) -> ExitCode {

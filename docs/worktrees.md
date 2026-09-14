@@ -142,9 +142,13 @@ root /srv/arreo/worktrees
   (no daemon: liveness unknown)
   ```
 
-  `--repo` defaults to the current directory (resolved with `git rev-parse
-  --show-toplevel`, so a subdirectory works). A path that is not a repository is
-  refused, exit 2, naming the path.
+  `--repo` defaults to the `[worktree] repo` of `--config`/`$ARREO_CONFIG`, and
+  to the current directory when neither says (resolved with `git rev-parse
+  --show-toplevel`, so a subdirectory works). The configuration is consulted
+  because the **daemon** resolves a pane's worktree against it: a consumer that
+  went straight to its own working directory would look in a different repository
+  and report "no worktree" about a pane that has one. A path that is not a
+  repository is refused, exit 2, naming the path.
 
 `--json` is the script contract; the table above is not one and may change.
 

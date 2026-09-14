@@ -1,0 +1,150 @@
+T-0092 — diff review: the parser, the verb, and the view
+========================================================
+
+One sentence: a pane's worktree changes are readable *where the review happens* —
+`arreo diff <pane>` for a script or a terminal, a diff view in the TUI for an
+operator — and both read the same `arreo_core::diff` structure.
+
+Written against real bytes, not the format's documentation
+----------------------------------------------------------
+Every parsing rule was measured on this box (git 2.47.3). The capture is kept and
+is the test's own fixture, so "parses what git prints" is checked against what git
+printed:
+
+- `.loop/evidence/T-0092/git-diff.raw` — the raw diff the unit test `include_str!`s.
+- `.loop/evidence/T-0092/git-diff-bytes.txt` — the same bytes through `cat -A`
+  (^I = TAB, ^M = CR, $ = end of line), for a human reading the traps.
+
+The repository it came from had one commit and then these changes, covering every
+shape the format has: `A` added.txt, `M` blob.bin (binary), `M` both.txt (add +
+context), `M` crlf.txt (CRLF content), `D` doomed.txt, `M` modify.txt,
+`M` nonewline.txt (no trailing newline on both sides), `R` rename-me.txt ->
+renamed.txt (100%), plus three path shapes: `my file.txt` (a space), `quote"name.txt`
+(a quote) and `täb çhär.txt` (non-ASCII).
+
+Four rules a careful reader gets wrong from a spec, all measured:
+
+1. **Paths are C-quoted when they need to be** — `diff --git
+   "a/quote\"name.txt" "b/quote\"name.txt"` and `"a/t\303\244b \303\247h\303\244r.txt"`.
+   The octal escapes are **bytes** (UTF-8 in practice), so unquoting builds a
+   `Vec<u8>` and decodes afterwards rather than mapping characters one to one.
+2. **A `---`/`+++` path with a space ends in a TAB** (`+++ b/my file.txt\t`) and
+   the `diff --git` line does not — so the tab is stripped where it appears.
+3. **The `diff --git` header is not a reliable source of names**: for a space it
+   is `diff --git a/my file.txt b/my file.txt`, i.e. ambiguous. It is parsed as a
+   **fallback** (a mode-only change has no other source) and `---`/`+++` or the
+   rename pair overrides it.
+4. **A pure rename has no `---`/`+++` and no hunks at all** — the paths live in
+   `rename from`/`rename to`, so a parser reading only the `---`/`+++` pair loses
+   both names. A mode-only change is the same shape.
+
+Two defects found by testing rather than by reading — both real, both fixed
+----------------------------------------------------------------------------
+1. **`str::lines()` strips `\r`.** It splits CRLF as well as LF, so the CR of a
+   CRLF source line vanished from the parsed text — the parser silently
+   disagreeing with the file it describes, which is the one thing a reviewer
+   cannot check by looking at the screen. `split_lines()` splits on `\n` only
+   (the doc comment says why). Mutation: swapping it back reddens the CRLF
+   assertion with `["CRLF line", "second", …]` instead of `["CRLF line\r", …]`.
+2. **`run_git`'s "exit 1 means differences" rule swallowed `rev-parse --verify`'s
+   "no HEAD".** The unborn-repository check therefore never fired and the failure
+   surfaced later as a confusing `git diff` error. A separate `git_succeeds()`
+   now answers the commands whose exit code *is* the answer.
+
+`worktree_diff` — the one entry point, and the untracked half
+-------------------------------------------------------------
+`git diff HEAD` covers staged **and** unstaged changes against the last commit.
+It cannot show a file git does not track — and for this product that is the
+*common* case, not a corner: an agent that wrote a new file and did not `git add`
+it would be invisible to a review. Each untracked file gets git's own answer
+(`git diff --no-index -- /dev/null <file>`), capped at `UNTRACKED_LIMIT = 100`
+with the remainder reported in `Diff::hidden_untracked` and named in
+`summary()`.
+
+**Not `git add --intent-to-add`**, the other way to fold untracked files into one
+`git diff`: it *writes the repository's index*, and a read-only review verb must
+not mutate the tree it is reviewing — an agent mid-task would see its index change
+under it.
+
+PROOF 1 — the library (`cargo test -p arreo-core --lib diff::` → 13 passed)
+--------------------------------------------------------------------------
+Parses the captured real git output (all 12 files, with the new-file, binary,
+deletion, rename, CRLF and no-newline shapes asserted by value); unquotes all
+three path shapes; puts `\ No newline at end of file` on the line it describes on
+both sides; reads a range without a count as one line; round-trips a hunk section
+heading; keeps a mode-only change's paths; treats empty input as an empty diff;
+refuses an unrecognized line **with its number**; counts the summary; includes an
+**untracked** file; covers staged + unstaged + untracked together; reports the
+untracked cap; and names an unborn repository and a missing directory.
+
+PROOF 2 — the JSON contract (`cargo test -p arreo-cli --test diff` → 4 passed)
+-----------------------------------------------------------------------------
+`crates/arreo-cli/tests/diff.rs` pins the schema key by key and shape by shape
+(`schema: 1`, `summary`, `files[].{path,old_path,new_path,change,binary,added,
+removed,hunks[].{old_start,old_count,new_start,new_count,section,lines[].{kind,
+text,old_line,new_line,no_newline}}}`, `hidden_untracked` absent when zero), and
+asserts the asymmetry a consumer draws its gutter from: a context line has both
+numbers, a removed line only the old, an added line only the new.
+Mutation: renaming `old_line` to `oldLine` in the JSON reddens
+`the_json_schema_is_pinned` — the pin is load-bearing, not decorative.
+
+The same file proves **the two facts are not collapsed**: a clean worktree is exit
+0 with "no changes" and never the no-worktree sentence; a pane with no worktree is
+a non-zero exit naming the pane, and never "no changes".
+
+PROOF 3 — the view, on a real pty (`cargo xtask e2e --slice tui` → 87 passed, 0 failed)
+--------------------------------------------------------------------------------------
+Six new checks in the TUI slice (was 80): a pane spawned with `--worktree` into a
+**configured** root that is not the default; `d` opensthe view on its worktree; the
+modified hunk with both sides; the untracked file; the status line with the summary
+and `file 1/N`; `d` closing again.
+
+The frame is the evidence, captured to `.loop/evidence/T-0092/02-diff-view.txt`:
+
+```
+┌this machine · socket─────┐┌diff review · …/test-scratch/T-0092/worktrees/review─────────────┐
+│  ? unknown               ││modified  notes.md  +1 -1                                        │
+│ ▸ review      3M █░░░░░░░││              @@ -1,3 +1,3 @@                                    │
+│                          ││     1      1  one                                               │
+│                          ││     2        -two                                               │
+│                          ││            2 +TWO CHANGED                                       │
+│                          ││     3      3  three                                             │
+│                          ││added  added.txt  +1 -0                                          │
+│                          ││              @@ -0,0 +1,1 @@                                    │
+│                          ││            1 +fresh file                                        │
+└──────────────────────────┘└─────────────────────────────────────────────────────────────────┘
+2 files changed, +2 -1 · file 1/2 · j/k scroll · n/p file · h/l pan · PgUp/PgDn page · d close
+```
+
+Line-number gutters, `+`/`-` prefixes, hunk headers, per-file headers with
+`+added -removed`, the summary and the file position. Colours come from the 12
+`diff*` theme tokens T-0016 already defines — no new token names, no hardcoded
+hex — and the read runs git off the event loop (`spawn_blocking`, answer dropped
+if the operator moved on to another pane).
+
+A defect the slice caught — the third, and the best argument for the slice
+----------------------------------------------------------------------------
+The first TUI run rendered, instead of the diff:
+
+```
+/home/dev is not inside a git repository (no `git rev-parse --show-toplevel`):
+fatal: not a git repository (or any of the parent directories): .git
+```
+
+The **daemon** resolves a pane's worktree against `[worktree] repo`; both
+consumers defaulted `repo` to the process's working directory and honoured only
+`[worktree] root`. So a consumer running anywhere but the repository looked in a
+different repository and reported "no worktree" about a pane that plainly had one
+— a wrong answer that reads like a fact about the pane, which is why it is worth
+fixing rather than documenting. `arreo diff`, `arreo worktrees list|remove` and
+the TUI now share one chain: `--repo` → `[worktree] repo` → the current directory
+(`config_worktree_settings` in the CLI, `worktree_settings` in the TUI). A
+regression test pins it: `the_configured_repository_is_used_when_no_repo_flag_is_given`
+runs `arreo diff` with `current_dir("/")`.
+
+VERIFIED
+--------
+- `cargo test -p arreo-core --lib diff::` → 13 passed.
+- `cargo test -p arreo-cli --test diff` → 4 passed.
+- `cargo xtask e2e --slice tui` → 87 passed, 0 failed.
+- Frames: `.loop/evidence/T-0092/{01-before-d,02-diff-view,03-after-d}.txt`.

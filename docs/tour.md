@@ -202,6 +202,89 @@ If you want the daemon managed for you instead of started by hand, `arreo servic
 install` writes the unit for this OS and, on Linux with a systemd user session,
 enables and starts it.
 
+## What a pane changed: `arreo diff`
+
+An agent's work is a diff, and `arreo diff <pane>` is that diff: staged,
+unstaged **and** untracked, which is what `git diff HEAD` plus one
+`git diff --no-index` per untracked file adds up to (a new file an agent has not
+`git add`ed is the common case, not a corner). It reads `git` directly, so it
+needs **no daemon** — the worktree is a directory on this machine — and it never
+writes: no `git add`, no `git add -N`, nothing that would move an agent's index
+under it while it works.
+
+```console
+$ arreo diff fix --repo /srv/src/project --config /etc/arreo/arreo.toml
+modified  src/lib.rs  +3 -2
+  @@ -1,4 +1,5 @@
+     1      1  fn main() {
+     2        -    let x = 1;
+     3        -    println!("{x}");
+            2 +    let x = 2;
+            3 +    let y = x + 1;
+            4 +    println!("{y}");
+     4      5  }
+added  NOTES.md  +1 -0
+  @@ -0,0 +1,1 @@
+            1 +scratch notes
+2 files changed, +4 -2
+```
+
+One header per file — the change, the path, `+added -removed` — then each hunk
+with git's own header and section, then its lines with the old and new line
+numbers in a gutter and git's `+`/`-`/space prefix. A rename or copy shows
+`from -> to`, a mode change shows the two modes, a binary file says so instead of
+printing nothing (`(binary: git could not show this file as text)`), a line
+without a trailing newline is followed by `\ No newline at end of file`, and the
+last line is the summary — which also mentions any untracked files that were past
+the cap. There is no colour at all, so `NO_COLOR` is honoured by construction and
+nothing here depends on the TUI's theme.
+
+`--repo` is the repository the worktree belongs to (default: the `[worktree] repo`
+of the configuration, else this directory) and
+`--config` names the file whose `[worktree] root` says where the pane's checkout
+lives (default `$ARREO_CONFIG`, else the state directory) — the same two flags,
+resolved by the same code, as `arreo worktrees list`, so the two never disagree
+about which checkout belongs to a pane. **Both come from the configuration when
+the flags are absent**, which is the rule the daemon itself applies when it
+*creates* a worktree: a consumer that fell straight to its own working directory
+would look for the checkout in a different repository and report "no worktree"
+about a pane that has one.
+
+**"The pane has no worktree" and "the worktree has no changes" are different
+answers**, and they never share a sentence. A clean checkout is the answer to the
+question, on stdout with exit 0. A pane with no worktree at all is a refusal: exit
+1, on stderr, naming the pane and the root it looked under — reporting it as "no
+changes" would describe a pane that was never spawned as a reviewed one.
+
+```console
+$ arreo diff fix --repo /srv/src/project
+no changes in /srv/arreo/worktrees/fix
+$ echo $?
+0
+$ arreo diff never-spawned --repo /srv/src/project
+diff: pane "never-spawned" has no worktree under /srv/arreo/worktrees (nothing registered at /srv/arreo/worktrees/never-spawned)
+$ echo $?
+1
+```
+
+For a script, `--json` is the contract — **schema 1**, the same kind of versioned
+document `arreo machines list --json` and `arreo worktrees list --json` print, and
+the only thing on stdout:
+
+```console
+$ arreo diff fix --repo /srv/src/project --json | jq -r '.summary, (.files[].path)'
+2 files changed, +4 -2
+src/lib.rs
+NOTES.md
+```
+
+It carries `schema`, `summary` and `files` (`path`, `old_path`, `new_path`,
+`change`, `binary`, `added`, `removed`, and the hunks with their lines), plus
+`from`/`to`/`similarity` on a rename or copy, `old_mode`/`new_mode` on a mode
+change, and `hidden_untracked` when — and only when — untracked files were left
+out. Exit codes: 0 the diff (or no changes), 1 no worktree or `git` failed, 2
+usage, not a repository, unreadable `--config`.
+
 ## What each `cargo xtask` command does
 
 `cargo xtask` is a cargo alias for `cargo run -p xtask --` (`.cargo/config.toml`),

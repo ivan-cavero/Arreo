@@ -145,19 +145,27 @@ impl Client {
     }
 }
 
-/// Wait for `path` to exist, bounded. Returns whether it arrived.
+/// Wait for `path` to exist **with the expected contents**, bounded.
 ///
-/// A bounded wait rather than a sleep: the child is a separate process and the
-/// time it takes to write a file is the machine's business, not the test's.
-fn wait_for_file(path: &Path, within: Duration) -> bool {
+/// Waiting for existence alone is not enough, and the difference is a flake
+/// rather than a nicety: the child's shell creates the file when it applies the
+/// redirection and fills it a moment later, so a poll that returns on `is_file()`
+/// can read an empty file and compare it against the worktree path. That is a
+/// check sampling a fact that is still moving — the same class as T-0088 — and it
+/// showed up as one failure in ~6 full workspace runs before this was fixed.
+fn wait_for_contents(path: &Path, expected: &str, within: Duration) -> bool {
     let deadline = Instant::now() + within;
-    while Instant::now() < deadline {
-        if path.is_file() {
-            return true;
+    loop {
+        if let Ok(text) = std::fs::read_to_string(path) {
+            if text.trim() == expected {
+                return true;
+            }
+        }
+        if Instant::now() >= deadline {
+            return false;
         }
         std::thread::sleep(Duration::from_millis(25));
     }
-    false
 }
 
 /// Wait for a path to be **gone**, bounded (the kill path's cleanup is a git
@@ -206,31 +214,35 @@ async fn two_panes_in_worktrees_cannot_see_each_others_files() {
     // The child's own answer to "where am I", written by the child.
     for id in ["one", "two"] {
         let where_file = root.join(id).join("where.txt");
+        let expected = std::fs::canonicalize(root.join(id))
+            .expect("canonical")
+            .display()
+            .to_string();
         assert!(
-            wait_for_file(&where_file, Duration::from_secs(10)),
-            "pane {id} never wrote where.txt in {}",
-            root.join(id).display()
-        );
-        let printed = std::fs::read_to_string(&where_file).expect("read");
-        assert_eq!(
-            printed.trim(),
-            std::fs::canonicalize(root.join(id))
-                .expect("canonical")
-                .display()
-                .to_string(),
-            "pane {id} ran in its own worktree"
+            wait_for_contents(&where_file, &expected, Duration::from_secs(10)),
+            "pane {id} never wrote {expected} into {}",
+            where_file.display()
         );
     }
 
     // The same filename in both checkouts, with different contents — the
-    // collision a shared working directory loses.
-    assert_eq!(
-        std::fs::read_to_string(root.join("one").join("task.txt")).expect("read"),
-        "first\n"
+    // collision a shared working directory loses. Also content-waited: the child
+    // writes these after the `pwd` above.
+    assert!(
+        wait_for_contents(
+            &root.join("one").join("task.txt"),
+            "first",
+            Duration::from_secs(10)
+        ),
+        "pane one never finished writing task.txt"
     );
-    assert_eq!(
-        std::fs::read_to_string(root.join("two").join("task.txt")).expect("read"),
-        "second\n"
+    assert!(
+        wait_for_contents(
+            &root.join("two").join("task.txt"),
+            "second",
+            Duration::from_secs(10)
+        ),
+        "pane two never finished writing task.txt"
     );
     assert!(
         !repo.join("task.txt").exists(),
@@ -308,8 +320,15 @@ async fn a_killed_pane_leaves_a_dirty_worktree_and_removes_a_clean_one() {
         .await;
     assert!(matches!(reply, Message::Ok { .. }), "{reply:?}");
     let dirty_path = root.join("dirty");
+    // Content, not mere existence: the shell creates the file when it applies
+    // the redirection and writes a moment later, and "the work is still there"
+    // is the claim this test makes — an empty file would not support it.
     assert!(
-        wait_for_file(&dirty_path.join("uncommitted.txt"), Duration::from_secs(10)),
+        wait_for_contents(
+            &dirty_path.join("uncommitted.txt"),
+            "wip",
+            Duration::from_secs(10)
+        ),
         "the child wrote its file"
     );
 
@@ -333,8 +352,11 @@ async fn a_killed_pane_leaves_a_dirty_worktree_and_removes_a_clean_one() {
         wait_for_absent(&clean_path, Duration::from_secs(10)),
         "a clean worktree goes with its pane"
     );
-    assert!(
-        dirty_path.join("uncommitted.txt").is_file(),
+    assert_eq!(
+        std::fs::read_to_string(dirty_path.join("uncommitted.txt"))
+            .expect("the dirty worktree was kept")
+            .trim(),
+        "wip",
         "the dirty worktree was kept, with the work in it"
     );
     // The branch survives in both cases: it holds the commits, and deleting it

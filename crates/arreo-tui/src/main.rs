@@ -18,6 +18,7 @@ use arreo_core::identity::{DeviceId, Role};
 use arreo_core::proto::{AgentState, Message, VERSION};
 use arreo_core::theme::{Depth, Variant};
 use arreo_tui::client::{default_socket, Client, PaneSummary, Target};
+use arreo_tui::diff_view::{self, State};
 use arreo_tui::exit;
 use arreo_tui::fleet::{Code, Fleet, GrantPreview, Outcome};
 use arreo_tui::model::PaneView;
@@ -123,6 +124,10 @@ async fn main() -> anyhow::Result<()> {
                 println!("keys (mouse works too; ? lists them on screen):");
                 println!("  j/k ↑/↓     move the cursor          Enter  attach the pane");
                 println!("  Tab         next pane                w      wall ↔ focus");
+                println!(
+                    "  d           diff the attached pane's worktree changes (d again closes)"
+                );
+                println!("  n/p · h/l   in the diff: next/previous file · scroll sideways");
                 println!("  /           search the transcript    t      theme picker");
                 println!("  [ ]         sidebar narrower/wider   PgUp/PgDn, Home/End  scroll");
                 println!("  s           spawn an agent: <id> <program> [args…]");
@@ -347,6 +352,10 @@ enum Poll {
         from_line: usize,
         lines: Vec<String>,
     },
+    /// The answer to a diff read (T-0092): the pane it was for — so an answer
+    /// that arrives after the operator moved on is dropped rather than painted —
+    /// and what was read.
+    Diff { pane: String, state: State },
     /// The answer to a fleet verb the UI asked for (T-0074): the CLI's code,
     /// the CLI's sentence, and the rows a panel renders. The action travels with
     /// it, so the UI knows which surface the answer belongs to without guessing
@@ -482,6 +491,21 @@ async fn run(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
 ) -> anyhow::Result<Exit> {
     let mut app = App::new();
+    // Where a diff comes from, resolved once (T-0092): this process's own
+    // working directory — the CLI's `--repo`, which the TUI has no flag for, is
+    // the directory the operator started it in — and the config file this run
+    // reads, through the same precedence the settings below use.
+    let dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let diff_config = settings::config_path(fleet.config.as_deref());
+    // A pane on another machine is a worktree on another machine, and the diff
+    // view says so instead of reading this machine's disk. `Target` carries no
+    // name (it is a socket or an address), so the name is the one `main`
+    // resolved for the sidebar: the `--machine` name, or that device's id when
+    // the target was an address.
+    let remote = match &target {
+        Target::Local(_) => None,
+        Target::Remote(_) => Some(session.clone()),
+    };
     // Which machine, and over what (T-0061): shown in the sidebar once, not
     // repeated on every row — one sidebar is one machine's panes today.
     app.session = session;
@@ -627,6 +651,9 @@ async fn run(
                 }
                 Poll::Fleet { action, outcome } => app.apply_fleet(&action, outcome),
                 Poll::ConfirmGrant(preview) => app.show_grant_confirm(*preview),
+                // The answer belongs to a pane (T-0092): the view keeps it only
+                // if that is still the pane it is showing.
+                Poll::Diff { pane, state } => app.diff.apply(&pane, state),
                 Poll::Delta {
                     id,
                     from_line,
@@ -677,6 +704,27 @@ async fn run(
                 // the stop armed. Nothing is sent to the daemon from here —
                 // the drain-stop runs after the terminal is handed back.
                 Action::QuitDaemon => break 'ui true,
+                // The diff is read here and off the event loop (T-0092): `git`
+                // spawns processes (the worktree's diff, its `ls-files`, one
+                // more per untracked file) and the disk they read is *this*
+                // machine's, which is why no daemon verb is involved. The
+                // answer travels back on the same channel as everything else.
+                Action::Diff { pane } => {
+                    let request = diff_view::Request {
+                        pane: pane.clone(),
+                        dir: dir.clone(),
+                        config: diff_config.clone(),
+                        remote: remote.clone(),
+                    };
+                    let tx = tx.clone();
+                    tokio::task::spawn_blocking(move || {
+                        let state = diff_view::read(&request);
+                        let _ = tx.blocking_send(Poll::Diff {
+                            pane: request.pane,
+                            state,
+                        });
+                    });
+                }
                 _ => {
                     let fleet = fleet.clone();
                     let tx = tx.clone();
@@ -834,7 +882,12 @@ async fn run_fleet_action(fleet: Fleet, action: Action, tx: tokio::sync::mpsc::S
                 Err(e) => Some(blocking_failed("machines trust", &e)),
             }
         }
-        Action::Spawn { .. } | Action::Kill { .. } | Action::Send { .. } => None,
+        // Verbs with no fleet answer: a spawn/kill/send rides the daemon
+        // connection the poller holds, and a diff (T-0092) is read from this
+        // machine's disk with its answer delivered as `Poll::Diff`.
+        Action::Spawn { .. } | Action::Kill { .. } | Action::Send { .. } | Action::Diff { .. } => {
+            None
+        }
         // Answered by the event loop before it ever gets here (T-0073): a quit
         // is not a fleet verb.
         Action::QuitDaemon => None,
