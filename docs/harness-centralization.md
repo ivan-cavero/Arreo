@@ -407,13 +407,37 @@ given the rule.
 PTY spawn from the machine's own store (a 0600 `$XDG_CONFIG_HOME/arreo/
 secrets.json`, written by `arreo sync secret set NAME` with the value on stdin,
 never argv and never echoed). The injection itself is the environment a spawn
-applies — `keychain::plan(...).environment()` — and the slice proves it by
-spawning a real pty child per root and observing each root's own value. The
-daemon's spawn site (`arreo-server`) is T-0086's to wire; the mechanism is here
-and `arreo sync env <file>` reports, by name, which variables this machine has
-and which it lacks.
+applies — `keychain::spawn_environment(harness, env)`, which reads only that
+harness's `SYNC` files and resolves those names — and it is applied by the daemon
+at both spawn sites *and* by `persist::restore`, because a resumed harness session
+whose child did not get the key dies on the provider's 401 (T-0087). A name the
+daemon's own environment already carries is left alone: the injection is
+additive, so it can supply what is missing and never override the operator.
+`arreo sync env <file>` reports, by name, which variables this machine has and
+which it lacks.
 
-**What is T-0086's.** The transport: carrying `SyncPayload` over the mesh, the
-outbox, watching files, and conflict copies across two live machines. The
-exchange itself is a local function (`payload`/`receive`), so the slice already
-runs the whole §4 story on two isolated roots with no network.
+**The transport (T-0086).** One appended variant pair — `Message::Sync` carrying
+the same `SyncPayload` JSON the local form produces, and `Message::SyncReply`
+carrying the outcome — so the receiving daemon runs the **same**
+`SyncEngine::receive` the local path runs, with every refusal it was hardened
+with. `arreo sync push <file> --machine <peer>` does the round trip over the mesh.
+Two facts are worth knowing before reading the code:
+
+- **The counter key is the authenticated device id** (`dev_<hex>`), not the
+  machine's name. A name is a display label the operator can change, so keying a
+  version vector by it would fork the counter on a rename; and it is
+  self-declared, which over a socket would let any paired peer pin another
+  machine's counter. The daemon **refuses** a payload whose `machine` disagrees
+  with the identity the handshake proved, rather than silently correcting it.
+  `--name` names this machine; `--machine` names a peer.
+- **No secret value and no path cross the wire.** The payload holds
+  `${ARREO_ENV:NAME}` references (resolved by the receiver's own keychain) and a
+  logical file name (resolved by the receiver's own preset registry).
+
+The decision and the alternatives it rejected are in
+[ADR 0022](../specs/adr/0022-sync-transport.md).
+
+**What is still not built.** A pull or a full reconciliation: the flow is
+push-based (the editing machine propagates), and a machine that was offline
+catches up when its peer pushes. Watching files for edits is likewise not built —
+`push` is explicit, which is what makes "opt-in per file" true in practice.
