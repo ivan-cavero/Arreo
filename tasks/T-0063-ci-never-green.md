@@ -79,6 +79,26 @@ Three legs, three different failures — not one cause:
   stage 2. Owned by HandoffStage2. Follow-up for this task's author: check why
   `check-targets` did not catch a macOS breakage, and record the answer.
 
+## Batch 3 (2026-09-14 — full three-OS failure set, pasted runner logs)
+
+The T-0038 sprint's Unix-only code broke the other two legs at compile time:
+
+- **Windows (`build`): ~35 errors, all owned by T-0090.** `std::os::unix::*` across
+  `daemon.rs`/`handoff.rs`, ungated tokio Unix sockets, uses of `#[cfg(unix)]` `pty::adopt`,
+  `from_mode`/`master_fd`/`ExclusiveLock::fd` — plus Windows-dead warnings that are fatal
+  under `-D warnings`. This task never touches those files (collision).
+- **macOS (`build`): 4 errors, all owned by T-0091** (`NOSIGNAL`, `Pidfd` use-site,
+  `SocketFlags::NONBLOCK|CLOEXEC`, `unused_mut`).
+- **Ubuntu (`test`): the same 2 `update_server` failures, now with new evidence
+  (deferred-update "applies at next restart" output), all owned by T-0092.**
+- **`public-readiness`: 4 passed / 6 failed, unchanged shape** — test (now T-0092's),
+  vet/audit/deny still uninstalled (this task's criterion stands), REUSE still red
+  (this task), **secrets: now 2 leaks over 228 commits** (was 1 over 133 — identify both).
+  Links pass (80 links / 16 docs).
+- This task's remaining own work: tool installs, REUSE, gitleaks verdict (×2), and the
+  final green run — which now waits for **T-0090 + T-0091 + T-0092**, in that order of
+  unblocking (nothing passes until it compiles).
+
 ## Acceptance criteria
 
 - [ ] The ubuntu `test` failure is identified (from a runner with log access, or by
