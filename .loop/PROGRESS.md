@@ -1,42 +1,37 @@
 ## State snapshot          ← REWRITTEN (not appended) at every checkpoint
-Task: **T-0092 DONE** (`0b6ada5`) — diff review: `arreo_core::diff`, `arreo diff <pane>`, the
-TUI view. **T-0106 DONE** (`989980d`) — the live handoff carries the worktree binding.
-Where you are: **861 tests / 0 failed / 70 targets**; clippy clean on both toolchains; fmt
+Task: **T-0107 DONE** (`c4dccb4`) and **T-0108 DONE** (`07ad5db`) — both findings from the
+T-0091 security review, now closed.
+Where you are: **868 tests / 0 failed / 70 targets**; clippy clean on both toolchains; fmt
 clean; **14/14 slices** (tui 87, worktree 9, mesh 36+1, update 27, handoff-abort 41);
 `xtask sync --check` 14/14; bench 6/6; vet 337, deny 4/4, audit 0, check-targets PASS/SKIP.
-Next step: **T-0107** (restore must validate a recorded path against the configured root — a
-reproduced defect, medium) or **T-0108** (the kill path decides "dirty" from a read taken while
-the child may be alive); then T-0093 (notification rules), T-0095 (approval gates), T-0105
-(the deferred update's start path), T-0109 (store downgrade guard).
+Next step: **T-0109** (the store's downgrade guard — the last open finding from that review);
+then T-0093 (notification rules), T-0095 (approval gates), T-0105 (the deferred update's start
+path), T-0096 (adapter SDK linter), T-0098 (plugin host v0).
 Open workers: (none)
 Known broken: T-0063 (CI never-green — the user's) · Parked: T-0048 needs-human
-**T-0106 — the security review earned its keep.** A `security-reviewer` pass over T-0091 found
-the live handoff **silently un-isolating every pane**: `HandoffPane` carried no worktree,
-`PaneEntry::adopted` never set one, and `run_handoff` built its daemon with `Daemon::new` (main
-resolved `[worktree]` *after* the handoff branch, which never returns). So an `arreo update
---server` — the normal update route — left the adopted pane claiming the daemon's own
-directory, nulled the stored column on the next snapshot, leaked the checkout on kill, and put
-the agent back in the shared tree after a restart. Fixed: a trailing `#[serde(default)]`
-manifest field (old→new, so a sender that predates it still decodes), the setter in `adopted`,
-the config resolved before the handoff branch, and `arreo update --server --config` forwarded to
-the child. Regression test with a deliberately non-default root; three mutations red, one per
-half of the fix. The review's other three findings are filed, not folded: T-0107 (restore trusts
-a recorded path — reproduced), T-0108 (kill-path TOCTOU, hypothesis), T-0109 (no store
-downgrade guard).
-**T-0092 — the parser, and three defects testing found.** `arreo_core::diff` turns git's bytes
-into typed data, written against a capture of git 2.47.3's real output that is also the test's
-fixture. Measured traps: paths are **C-quoted** with octal *bytes*; a `---`/`+++` path with a
-space ends in a **TAB** the header lacks; the `diff --git` header is ambiguous for such a path
-and is therefore a fallback; a **pure rename has no hunks and no `---`/`+++`**. `worktree_diff`
-adds one `git diff --no-index` per **untracked** file — the common case for an agent's work, and
-invisible to `git diff HEAD` — never `git add -N` (a read-only verb must not write the index).
-The three defects: `str::lines()` **strips `\r`**, so a CRLF file's CR vanished; `run_git`'s
-"exit 1 means differences" **swallowed `rev-parse`'s "no HEAD"**; and both consumers resolved
-the repository from their own cwd, ignoring `[worktree] repo` — which the daemon honours, so a
-consumer elsewhere reported "no worktree" about a pane that had one (the TUI slice caught it).
-A fourth defect was in the *fixture itself*: `* text=auto` stripped the CRs from the committed
-blob, so the CRLF test would have failed on a fresh clone — fixed with a `-text` rule for
-`.loop/evidence/**/*.raw`, a regeneration script, and a `git clone` check that the bytes survive.
+**T-0107 — a record may be used to *find* something, never to *create* something.** The restore
+path took the worktree **root** out of the recorded path and handed it to `ensure`, which does
+`create_dir_all(root)` + `git worktree add` — so a store row made the daemon create a directory
+anywhere (reproduced: `<abs>/outside/nested/x`), or start the agent in the repository's main
+checkout with the isolation silently off. `pane_of_recorded` now requires the record to be the
+`<root>/<pane>` the **configured** root implies and hands `ensure` only the *name* (with the
+configured root), making containment structural. Two pieces of path math carry it: `normalize`
+resolves `.`/`..` lexically — a text comparison would accept `/root/../escape`, which *starts
+with* `/root` — and `resolved` canonicalizes first so a root behind a symlink is not refused
+with every pane. A record from a different root is refused, never repaired (re-creating it
+under the new root would move the agent to different files while its old checkout sat with the
+uncommitted work). `check-targets` caught a regression of mine en route: the new symlink test
+used `std::os::unix` ungated and broke the windows-msvc type-check.
+**T-0108 — measuring reframed the finding.** The kill path discarded its 5 s wait and decided
+"dirty" from a status read taken while the child might still be writing. Two measurements
+settled it: `git worktree remove` (no `--force`) **re-checks and refuses** a dirty checkout, so
+the predicted file-loss does not happen — git is the guard and our pre-check is only the message
+layer (now documented, with the rule that nothing may pass `force = true` where a live process
+could write); and `kill_shared` sends **SIGKILL**, so a `trap '' TERM` child dies anyway, which
+is why the reviewer could not reproduce it and why the criterion's test cannot be written. The
+fix uses the wait result (keep + report when the child had not exited); the decision is a
+function, unit-tested and mutation-proven. **One criterion is left unticked with its reason
+recorded** rather than faked.
 ## Event log               ← append-only; newest last; never rewrite
 - 2026-09-10 [turn 1] ledger created; repo at e489fac (docs only); T-0001 + T-0022 (AGENTS.md gardened) done
 - 2026-09-10 [turn 2] T-0002 PTY manager done+pushed (342606c; 9 tests); PROMPT.md v2 synced + ADR 0001 (ef6c595)
@@ -215,3 +210,4 @@ blob, so the CRLF test would have failed on a fresh clone — fixed with a `-tex
 - 2026-09-14 [turn 82] T-0039 done + pushed (15aa539). The deferred update: `arreo_core::update::deferred` (one window rule `live_panes == 0`, `stage_next`/`promote`/`clear_after_confirm`, every marker fn in an `_in(state_dir)` form), `arreo update --status`/`--apply-now`, the deferral on a failed cut (the verified artifact used to be `remove_file`d), and `xtask e2e --slice update --case deferred` (7 checks, new `--case` flag whose default is the whole slice). Re-scoped: the Windows half is T-0090, because `cargo check --target x86_64-pc-windows-msvc -p arreo-server` dies in cc-rs (lib.exe missing), there is no clang/wine here, and check-targets SKIPs Windows for that reason; T-0042 now depends on T-0090. Three mutations red: `window_is_open` always true → 3 slice checks + 2 unit tests; `clear_after_confirm` ignoring the version → the confirm test; `promote` not discarding → the no-retry-loop test. Battery: 825 tests / 0 failed, clippy clean on both toolchains, fmt clean, vet 337, deny 4/4, audit 0, check-targets PASS/SKIP, 13/13 slices, sync --check 14/14, bench 6/6.
 - 2026-09-14 [turn 83] T-0091 done + pushed (e3c8a11). Worktree-per-task: `arreo_core::worktree` (pane-id gate, `ensure`/`remove`/`prune_clean`, porcelain parser), `Message::SpawnWorktree` (a variant, not a field on `Spawn` — rmp-serde positional arrays would break N−1), `Pane::spawn_in_dir`, store schema v10 carrying the worktree path, `[worktree] root`/`repo` in the one config parser, daemon spawn/kill/restore wiring, CLI `spawn --worktree` + `worktrees list|remove`, docs/worktrees.md, and `xtask e2e --slice worktree` (9 checks). Two real defects found by a worker while wiring, both in core, both fixed with tests: `git worktree list` keeps reporting a DELETED worktree (prunable) so `ensure` returned a path that was not there; and `portable-pty` drops a `cwd` that is not a directory and falls back to `$HOME`, so a pane whose worktree vanished would have run in the wrong place silently — `Pane::spawn_in_dir` now refuses it. Five mutations red (one at the slice: the daemon ignoring the worktree path reddens 4 checks). `Message` was 136 bytes after the first cut and is back to 112 with `the_message_enum_stays_at_its_budget` pinning it. Battery: 842 tests / 0 failed / 68 targets, clippy clean on both toolchains, fmt clean, vet 337, deny 4/4, audit 0, check-targets PASS/SKIP, 14/14 slices, sync --check 14/14, bench 6/6.
 - 2026-09-14 [turn 84] T-0106 done + pushed (989980d) and T-0092 done + pushed (0b6ada5). T-0106: a security-reviewer pass over T-0091 found the live handoff silently un-isolating every pane (HandoffPane carried no worktree, adopted() never set one, run_handoff built its daemon without the settings because main resolved [worktree] after a branch that never returns) — so an arreo update --server left the adopted pane in the daemon own directory, nulled the stored column, leaked the checkout on kill and put the agent back in the shared tree after a restart. Fixed with a trailing serde(default) manifest field, the setter, the config resolved before the handoff dispatch, and arreo update --server --config forwarded to the child; regression test with three mutations red. Review findings T-0107 (reproduced) and T-0108/T-0109 filed. T-0092: arreo_core::diff (parser written against a capture of real git output that is also the tests fixture), arreo diff <pane> [--json] with a key-by-key schema contract test, the TUI diff view (d) coloured from the existing diff* theme tokens, and six new tui-slice assertions (87 passed). Four defects found by testing: str::lines() strips \r (a CRLF files CR vanished), run_git exit-1 rule swallowed rev-parse no-HEAD, both consumers ignored [worktree] repo (so they reported no worktree about panes that had one), and * text=auto stripped the CRs from the committed fixture blob (a fresh clone would have failed) — fixed with a -text rule, a regeneration script, and a git clone check. Also fixed a flake in the T-0091 worktree test: it waited for its file to exist and could read it empty, now waits for the content. Battery: 861 tests / 0 failed / 70 targets, clippy clean both toolchains, fmt clean, vet 337, deny 4/4, audit 0, check-targets PASS/SKIP, 14/14 slices, sync --check 14/14, bench 6/6.
+- 2026-09-14 [turn 85] T-0107 done + pushed (c4dccb4) and T-0108 done + pushed (07ad5db) — both from the T-0091 security review. T-0107: the restore path took the worktree ROOT out of the recorded path (`file_name()` + `parent()`) and handed it to `ensure`, which does create_dir_all + git worktree add — so a store row made the daemon create a directory anywhere it could write (reproduced) or start the agent in the main checkout with the isolation off (reproduced). Fixed with `worktree::pane_of_recorded`: the record must be the `<root>/<pane>` the configured root implies, only the name survives, and the configured root reaches `ensure` — containment structural. Two pieces of path math carry it: `normalize` (lexical `..`, because a text comparison accepts `/root/../escape`) and `resolved` (canonicalize first, so a symlinked root is not refused). A record from a different root is refused, never repaired. 15 unit tests + 6 integration tests (real arreo-server child with --config); mutation restores the pre-fix body and reddens both with the reviewer own symptoms. check-targets caught a regression of mine: the new symlink test used std::os::unix ungated and broke the windows-msvc type-check. T-0108: the kill path discarded its wait and decided dirty from a status read taken while the child might be writing. Measuring reframed it — `git worktree remove` without --force RE-CHECKS and refuses a dirty checkout (so the predicted file-loss does not happen; git is the guard and our pre-check is the message layer, now documented with the rule that nothing may pass force=true where a live process could write), and kill_shared sends SIGKILL (probed: a trap-TERM child dies anyway), which is why the reviewer could not reproduce it and why the criterion test cannot be written. The fix uses the wait result (keep + report when the child had not exited); the decision is a unit-tested, mutation-proven function. One criterion left unticked with its reason recorded rather than faked. Battery: 868 tests / 0 failed / 70 targets, clippy clean both toolchains, fmt clean, vet 337, deny 4/4, audit 0, check-targets PASS/SKIP, 14/14 slices, sync --check 14/14, bench 6/6.
