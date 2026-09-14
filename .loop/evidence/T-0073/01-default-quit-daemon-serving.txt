@@ -1,8 +1,8 @@
 T-0073(a) — `q` with no opt-in: the TUI is gone, the daemon is not.
 
-socket /tmp/arreo-e2e-tui-785964.sock exists (a serving daemon holds it)
-daemon pid (by /proc argv scan): Some(785975)
-`arreo panes --socket /tmp/arreo-e2e-tui-785964.sock` -> exit_ok=true:
+socket /tmp/arreo-e2e-tui-1183557.sock exists (a serving daemon holds it)
+daemon pid (by /proc argv scan): Some(1183617)
+`arreo panes --socket /tmp/arreo-e2e-tui-1183557.sock` -> exit_ok=true:
               ID  STATE    ALERT
            alpha  alive    
             beta  alive    
