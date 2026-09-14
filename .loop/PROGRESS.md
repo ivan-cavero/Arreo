@@ -1,61 +1,43 @@
 ## State snapshot          ← REWRITTEN (not appended) at every checkpoint
 
-Task: **T-0093 done** — the notification rules engine (one config, every transition, no noise).
-Where you are: committed and pushed. The pure rule (`arreo_core::notify`, 27 tests with quiet
-hours), the daemon's 1 s classification tick, `arreo notify --why|--policy`, an 8-test socket
-suite in the api slice, and `docs/notifications.md`. An independent review produced seven findings
-*after* integration; four are fixed here (each mutation-proven), three filed as T-0110 / T-0111.
-Battery on the integrated tree: **899 tests, 0 failed; 14/14 slices; sync 14/14; vet 337; deny
-4/4; audit 0; check-targets PASS/SKIP; bench 6/6; clippy 0 findings on both toolchains; fmt clean.**
-Next step: pick the next unblocked unit — **T-0095** (approval gates) or **T-0105** (the deferred
-update's start path) are the highest-priority Phase-4/2 items; **T-0110** is the regression this
-task's review found and is the one an operator would feel (it fires with notifications *off*).
+Task: **T-0110 done** — `wait` answers with how the state was derived, whoever observed it.
+T-0093 and T-0112 are also done and pushed this session; the rustls advisory is bumped.
+Where you are: committed and pushed. `Engine` keeps the last transition's `Provenance`
+(confidence + matched pattern) beside its state, set at every state assignment through one
+`record`, so the two cannot drift; `Wait`'s "already" branch reads it instead of synthesising
+`direct:already`, which now survives only for a state no transition derived (the fresh engine's
+`Unknown`). Three tests, each mutation-proven. Battery on the integrated tree: **902 tests, 0
+failed; 14/14 slices; sync 14/14; vet 337; deny 4/4; audit 0; check-targets PASS/SKIP; bench 6/6;
+clippy 0 findings on both toolchains; fmt clean.**
+Next step: the next unblocked unit — **T-0094** (quick-action notifications, the direct sequel to
+T-0093 and p2) or **T-0105** (the deferred update's start path, p2). **T-0111** (p3) is the other
+follow-up T-0093 filed; **T-0104** (uniffi bindings, p2) is larger and unblocked.
 Open workers: none.
 Known broken: T-0063 (CI never-green — the user's, untouched) · Parked: T-0048 needs-human
-**T-0093 — the rule, and the three design decisions that shaped it.** The pure half is
-`arreo_core::notify`: `Policy::decide(transition, history) -> Decision`, with quiet hours, a
-coalescing window, the once-per-episode rule, pane globs and machine scoping — no clock, no I/O,
-no interior mutability, so every boundary is a test. Both edges of a quiet window, both edges of
-the coalesce window, the episode rule's two halves, the documented order of the four questions,
-the one-wildcard glob including the backtracking case, and the config loader's every refusal.
-Three decisions were made before writing a line, and two changed the task's shape:
-1. **No background loop pumped the state engine** — `PaneEntry::pump` was called only from
-   client-driven paths, so a pane that becomes blocked **with nobody attached is never classified
-   at all** — precisely the case a notification exists for. The tick pumps as well as judges, and
-   the pump is deliberately **not** gated on the policy. The review then showed the pump is not
-   observationally neutral: it consumed transitions that clients' own pumps used to see, which is
-   T-0110.
-2. **The audit log is the memory.** Episode and coalescing state are reconstructed from the
-   `notify.sent` rows rather than a new table: durable across a restart by construction, queryable
-   (which the "why was I not told?" criterion needs anyway), and no second source of truth.
-3. **Quiet hours are local wall-clock plus an explicit `utc_offset_minutes`**, not a time zone:
-   `std` has no local time, and the `time` crate's `local_offset` returns an error in a
-   multithreaded process unless an unsound feature is enabled — a trap, not a solution. The DST
-   caveat is documented rather than hidden.
-**The decision order is the design**: no-rule → quiet → coalesce → same-episode, because each
-position answers "which reason does the operator see, and what does the count mean?" — quiet
-before coalesce so the quiet count means "the noise I asked you to hold".
-**What the review found, and what it cost to learn.** The rule was right; the *reads around it*
-were not. (F1) the history used the store's oldest-first read, whose limit keeps the *oldest* rows,
-so a pane's first-ever notification was its history for ever and past 200 rows every transition
-re-notified. One new store read (`audit_recent_by_action`, newest-first) and both consumers share
-it. (F2) a transition consumed by a client's pump reached **no decision at all** — the common case,
-since the TUI asks for the whole wall once a pass and races the tick for every transition. The
-tick now tracks the state it last saw per pane; a pane the engine moved *is* a transition,
-whoever pumped it. (F5) the same map removed a racy `from`. (F6) the coalesced detail printed a
-Unix time as a duration. All four mutation-proven; the two mutations are recorded in the evidence.
-**A criterion met in part, on purpose**: `once_per_episode`'s "a flap within one episode notifies
-once" is tested at the rule level and is **unreachable in the daemon** — the engine cannot emit a
-same-state transition (probed; a daemon-level test for it would be a test that cannot fail). The
-cycle half is met end to end. Recorded in the task file with the probe, not worked around.
+**T-0110 — what the regression was, and why the pump could not be neutral.** T-0093's tick pumps
+every pane once a second so an unattached pane is classified at all, and it is deliberately not
+gated on a `[notify]` section. The engine fires each state change exactly once, so the transition
+a *client's* own pump used to produce is normally already consumed by the time a client asks;
+`Wait` then took its "already in the wanted state" branch, which synthesised `direct:already` and
+dropped the matched pattern. The state value was right, the provenance was gone — and for a
+`question` the pattern is the only field that says *what the pane is asking*. It fired with no
+`[notify]` section, i.e. for every existing user. The fix keeps the provenance with the state
+(one `record` call per transition, so they cannot drift) and reads it in the branch; the reply's
+wire shape is unchanged. Mutation-proven both ways: remove the read → the regression test reddens
+with `left: "direct:already", right: "inferred:silence+prompt-shape"`; lie in the `None` branch →
+the "already is still true" test reddens. The engine is on every pane's hot path, so the bench is
+part of the verification, not a formality — 6/6, no regression.
+**This session's three units, so far.** (1) T-0093, the notification rules engine, integrated and
+then corrected by an independent review: four findings fixed (the history read the store's oldest
+row; a client-consumed transition reached no decision; a racy `from`; an epoch printed as a
+duration), two filed as T-0110 and T-0111. (2) T-0112, a slice defect found while verifying it
+(the persistence slice's plain pane is a fixed 60 s marker outlived by its own 300 s harness
+waits — one token, 16/16). (3) T-0110, the regression above. Plus **RUSTSEC-2026-0285** tripped
+`audit`/`deny` on `rustls 0.23.44`; bumped to 0.23.45 with the vet exemption moved.
 **Two slice failures during verification, both attributed and neither a product defect.**
-`persistence` failed deterministically: its plain pane is a fixed 60 s marker and the check that
-looks for it sits after harness waits bounded by 300 s. One token (`sleep 60` → `sleep 600`) and
-it is 16/16 — filed and closed as **T-0112**. `handoff-abort` failed 2 of 41 in the batch and is
-41/41 alone: it SIGKILLs daemons at sub-second deadlines and does not tolerate a neighbour slice.
-**A supply-chain gate went red on a new advisory, not on this work**: RUSTSEC-2026-0285 (published
-today, TLS 1.3 message-acceptance across encryption levels, `rustls 0.23.44`). Bumped to 0.23.45,
-exemption extended, audit/deny/vet green — its own commit.
+`persistence` failed deterministically pre-fix (T-0112, above) and is 16/16 now.
+`handoff-abort` failed 2 of 41 in a batch run and is 41/41 alone: it SIGKILLs daemons at
+sub-second deadlines and does not tolerate a neighbour slice. Run it alone.
 ## Event log               ← append-only; newest last; never rewrite
 - 2026-09-10 [turn 1] ledger created; repo at e489fac (docs only); T-0001 + T-0022 (AGENTS.md gardened) done
 - 2026-09-10 [turn 2] T-0002 PTY manager done+pushed (342606c; 9 tests); PROMPT.md v2 synced + ADR 0001 (ef6c595)
@@ -274,3 +256,4 @@ exemption extended, audit/deny/vet green — its own commit.
   on both toolchains; fmt clean; 14/14 slices (api = 2 suites; tui 87, worktree 9, mesh 36+1,
   update 27, handoff-abort 41, persistence 16); sync 14/14; vet 337; deny 4/4; audit 0;
   check-targets PASS/SKIP; bench 6/6 (19 MB RSS, 211 KB/pane, 0 ms detect, 61 ms sweep).
+- 2026-09-14 [turn 26] **T-0110 done** — `wait` answers with how the state was derived, whoever observed it. T-0093's tick pumps every pane once a second (deliberately not gated on a `[notify]` section), so the transition a client's own pump used to produce is normally already consumed by the time the client asks — and `Wait`'s "already" branch synthesised `direct:already` and dropped the matched pattern, with notifications *off* (every user). `Engine` now keeps the last transition's `Provenance { confidence, matched_pattern }` beside its state, set at every state assignment through one private `record` so the two cannot drift; the constructor's initial `Unknown` is the only state with no derivation. `Wait`'s branch fills the same two fields the event path fills; `direct:already` survives only where it is true. No wire change. Three tests (the regression through a real daemon+socket+config with no `[notify]`; the `direct:already`-still-true half; the accessor boundary in core), each mutation-proven: removing the fix reddens the first with `left: "direct:already", right: "inferred:silence+prompt-shape"`, a lying `None` branch reddens the second. Engine is a hot path, so the bench is verification: 6/6, no regression. Battery: 902 tests / 0 failed, 14/14 slices, sync 14/14, vet 337, deny 4/4, audit 0, check-targets PASS/SKIP, clippy 0/0, fmt clean. Commits: 436c000 + this ledger.
