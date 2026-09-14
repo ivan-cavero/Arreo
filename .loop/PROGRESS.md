@@ -1,28 +1,29 @@
 ## State snapshot          ← REWRITTEN (not appended) at every checkpoint
-Task: **T-0081 + T-0082 DONE** — both adapter batches closed with the scope note their own
-criteria allow; **T-0089 filed** as the single retry, gated on a credential. The blocker is
-proven, not assumed: the CLIs install and run, and none can drive a turn.
-Where you are: **818 tests / 0 failed / 67 targets**; clippy clean on both toolchains; fmt
-clean; **13/13 slices**; `xtask sync --check` 14/14; bench 6/6; vet 337, deny 4/4, audit 0,
-check-targets PASS/SKIP; `xtask adapters --check` 24/24.
-Next step: **T-0039** (Windows deferred update) — the last unblocked task that is not the
-user's; it unblocks T-0042, which unblocks T-0085. Then T-0089 (gated on a credential).
+Task: **T-0039 DONE** (`arreo_core::update::deferred` + the CLI surfaces + the `--case
+deferred` slice case + the release-doc evidence). **T-0090 filed** for the half that needs a
+Windows runner; **T-0042 now depends on it**.
+Where you are: battery running on the final tree (818/0 before this change); the deferred
+module's 7 unit tests and `xtask e2e --slice update --case deferred` (7 checks) are green.
+Next step: T-0090 is gated on the Windows runner, T-0089 on a credential, T-0085 on the
+user's CI — so the next unit is **queue gardening**: draft the next phase's tasks from
+`ROADMAP.md` (the loop's rule when nothing unblocked is left), not another work-unit.
 Open workers: (none)
 Known broken: T-0063 (CI never-green — the user's) · Parked: T-0048 needs-human
-**T-0081/T-0082 — the queue's phantoms cleared honestly.** Both asked for adapter TOMLs
-behind live recordings and both allow a scope note instead. Codex, [CC], Copilot, Qwen Code,
-Kimi Code and Kilo all install from npm into scratch and all run here — and every one refuses
-a turn for want of a credential (`codex doctor`: "no Codex credentials were found"; `claude
--p`: "Not logged in"; `kilo run`: "You need to sign in"). No provider key is in the
-environment and `~/.codex`/`~/.claude` are empty. So N = 0, stated, with twelve per-harness
-lines naming the cause and the exact refusal text. `xtask adapters --check` is green at 24/24
-— unchanged, which is the evidence nothing was fabricated. Two npm names that look right are
-different tools (`grok-cli`, `cursor-agent`). The criterion-4 finding is confirmed against
-the real `config.toml` Orca writes: `hooks.state.*.trusted_hash` digests the *local*
-hooks.json, keyed by an absolute path, so it is never syncable — syncing it would re-prompt
-hook trust on every machine. The live facts (codex `resume [SESSION_ID] [PROMPT]`/`--last`;
-[CC] `--resume`/`--continue`/`--fork-session`; four verified versions) are recorded so T-0089
-starts warm, and its first step is a one-command re-probe rather than a rediscovery.
+**T-0039 — the deferral, and the honest split.** The task as filed could not be finished on
+this box, and that is measured: `cargo check --target x86_64-pc-windows-msvc -p arreo-server`
+dies in cc-rs (`lib.exe` missing), there is no clang/wine here, and `check-targets` SKIPs
+Windows for exactly that reason. So the task was **re-scoped by what this machine can prove**,
+with the reason written into the file: T-0039 keeps the deferred update itself —
+`window_is_open` as the *one* rule (`live_panes == 0`), `panes_block` naming each pane,
+`stage_next`/`promote`/`clear_after_confirm`, every marker function in an `_in(state_dir)`
+form so tests never touch the real state directory — plus `arreo update --status` and
+`--apply-now` (exit 3, panes named), the deferral on a failed cut (the verified artifact used
+to be `remove_file`d, so a refused cut threw away the download), and the new slice case.
+T-0090 takes the Windows application point: service control codes, promotion before the socket
+is bound, the automatic promotion at start, `.prev` cleanup, and the Windows case.
+Three mutations, each red where it should be: `window_is_open` always true → 3 slice checks
+and 2 unit tests red; `clear_after_confirm` ignoring the version → the confirm test red;
+`promote` not discarding an unpromotable stage → the no-retry-loop test red.
 ## Event log               ← append-only; newest last; never rewrite
 - 2026-09-10 [turn 1] ledger created; repo at e489fac (docs only); T-0001 + T-0022 (AGENTS.md gardened) done
 - 2026-09-10 [turn 2] T-0002 PTY manager done+pushed (342606c; 9 tests); PROMPT.md v2 synced + ADR 0001 (ef6c595)
@@ -198,3 +199,4 @@ starts warm, and its first step is a one-command re-probe rather than a rediscov
 - 2026-09-14 [turn 79] T-0086 done. The delegated worker died mid-edit (HTTP 400 from the harness) after landing the protocol, identity, engine, daemon and CLI changes; the planner took the unit over (per §7), finished the integration (proto re-exports, the CLI's `block_on` return shape, the sync slice's per-root device identities, `--name` vs `--machine`), then froze the code and delegated the two-machine proof. Verified independently: forged-identity mutation (accepted without the check — 2 checks red) and last-writer-wins mutation (3 checks red). A real clippy finding from the change: `SyncOutcome` is 120 bytes, which took `Message` to 128 and tripped `result_large_err` on two pre-existing functions — boxed, back to 112. ADR 0022 written. One flake observed and filed (T-0088, handoff pty-buffer test under parallel load: 1 failure in 3 full runs, 3/3 clean alone, 816/0 on the next full run). Battery: 816/67, both clippys, fmt, 14/14 slices, sync 14/14, bench 6/6, gates green.
 - 2026-09-14 [turn 80] T-0088 done + pushed (8ea5de2). Filed as a load-sensitive flake; it was a real defect. `Pane::drain()` called `RingBuffer::flush_partial()`, which took the unterminated trailing line into the ring, so a poll landing between two writes of one line split that line permanently for every reader (`arreo read`, `attach`, the TUI, the handoff manifest, the persisted snapshot). Fix: `RingBuffer::lines_with_partial()` (the reader view, non-mutating), `Pane::ring_len()` (the terminated-line count), `flush_partial()` deleted, and `stream_attach` advancing its cursor only past terminated lines so the completion is re-fetched at its own index. Reproduced with the parallel test-binary shape (3x `--test handoff` + `relay_daemon`, 8 rounds): 1 failure in 24 pre-fix, 0 in 24 post-fix; synthetic CPU load alone never reproduced it. Three mutations red. The test that pinned the materialisation asserted the defect and was replaced by two tests that assert what a reader sees and that the ring stays one-line-per-written-line. Battery on the fixed tree: 818 tests / 0 failed / 67 targets, clippy clean on both toolchains, fmt clean, vet 337, deny 4/4, audit 0, check-targets PASS/SKIP, 13/13 slices, `xtask sync --check` 14/14, bench 6/6.
 - 2026-09-14 [turn 81] T-0081 + T-0082 closed with the scope note each task allows; T-0089 filed as the single retry (gated on a credential, first step a one-command re-probe). The blocker is proven: Codex 0.154.0, [CC] 2.1.270, Copilot 1.0.83, Qwen Code 0.23.3, Kimi Code 0.42.0 and Kilo 7.6.2 all install from npm into scratch and all run, and every one refuses a turn for want of a credential; no provider key in the environment and `~/.codex`/`~/.claude` empty here. N = 0, stated; twelve per-harness lines with the exact refusal text; `xtask adapters --check` 24/24 unchanged (nothing fabricated). Two npm names that look right are different tools (`grok-cli`, `cursor-agent`). Criterion-4 finding confirmed against the real config.toml Orca writes: `hooks.state.*.trusted_hash` digests the local hooks.json, so it is never syncable.
+- 2026-09-14 [turn 82] T-0039 done + pushed (15aa539). The deferred update: `arreo_core::update::deferred` (one window rule `live_panes == 0`, `stage_next`/`promote`/`clear_after_confirm`, every marker fn in an `_in(state_dir)` form), `arreo update --status`/`--apply-now`, the deferral on a failed cut (the verified artifact used to be `remove_file`d), and `xtask e2e --slice update --case deferred` (7 checks, new `--case` flag whose default is the whole slice). Re-scoped: the Windows half is T-0090, because `cargo check --target x86_64-pc-windows-msvc -p arreo-server` dies in cc-rs (lib.exe missing), there is no clang/wine here, and check-targets SKIPs Windows for that reason; T-0042 now depends on T-0090. Three mutations red: `window_is_open` always true → 3 slice checks + 2 unit tests; `clear_after_confirm` ignoring the version → the confirm test; `promote` not discarding → the no-retry-loop test. Battery: 825 tests / 0 failed, clippy clean on both toolchains, fmt clean, vet 337, deny 4/4, audit 0, check-targets PASS/SKIP, 13/13 slices, sync --check 14/14, bench 6/6.
