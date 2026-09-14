@@ -1,31 +1,32 @@
 ## State snapshot          ← REWRITTEN (not appended) at every checkpoint
-Task: **T-0086 DONE** (`58f60e1`, `c7d778e`) — the sync transport: a peer's config over the
-mesh, counted under the **authenticated device id**; **T-0088 filed** (the handoff
-pty-buffer test is load-sensitive).
-Where you are: **816 tests / 0 failed / 67 targets**; clippy clean on both toolchains; fmt
-clean; **14/14 slices** (mesh 36+1, compat, handoff-abort 41, tui 80, update 27, persistence
+Task: **T-0088 DONE** (`8ea5de2`) — the handoff pty-buffer "flake" was a real defect: a
+poll landing mid-line split one written line into two, permanently, for every reader. The
+partial is now visible but never materialised.
+Where you are: **818 tests / 0 failed / 67 targets**; clippy clean on both toolchains; fmt
+clean; **13/13 slices** (mesh 36+1, compat, handoff-abort 41, tui 80, update 27, persistence
 16); `xtask sync --check` 14/14; bench 6/6; vet 337, deny 4/4, audit 0, check-targets
 PASS/SKIP.
-Next step: **T-0088** (reproduce and fix the load-sensitive handoff test) or **T-0039**
-(windows deferred update); then T-0081/T-0082 (adapter batches, gated on live CLIs), T-0085
-(CI, blocked on the user's T-0063), T-0042's remaining CI half, T-0073's follow-ups.
+Next step: **T-0039** (Windows deferred update) — the highest-priority unblocked task; then
+T-0081/T-0082 (adapter batches, gated on live CLIs), T-0085 (CI, blocked on the user's
+T-0063), T-0042's remaining CI half.
 Open workers: (none)
-Known broken: T-0088 (one flake, filed with its reproduction as criterion 1)
- · T-0063 (CI never-green — the user's) · Parked: T-0048 needs-human
-**T-0086 — the transport, and the identity decision that mattered.** The payload the local
-path produces travels unchanged (`SyncEngine::receive` is the one hardened door), but the
-counter key moved from a self-declared machine name to the **authenticated device id**: over
-a socket a paired peer could otherwise claim another machine's identity and pin its counter —
-the F2 attack class reopened one layer up. The daemon refuses a disagreement instead of
-correcting it. `Message` grew to 128 bytes (the reply's outcome is 120) and tripped
-`result_large_err` on two existing functions; boxing the outcome restored 112. Two mutations
-verified by the planner: identity check off → the forgery is accepted (2 checks red);
-conflict arm made last-writer-wins → 3 checks red. ADR 0022 records the decision and the four
-rejected alternatives.
-**The worker that built it died mid-edit** (harness 400, not a code failure) after landing
-core+server+CLI; the planner finished the integration (the missing proto re-exports, the
-CLI's `block_on` shape, the sync slice's identities and the `--name`/`--machine` split), then
-delegated the two-machine proof to a fresh worker with the code frozen.
+Known broken: T-0063 (CI never-green — the user's) · Parked: T-0048 needs-human
+**T-0088 — the flake was the product.** `Pane::drain()` called `RingBuffer::flush_partial()`,
+which *took* the unterminated trailing line into the lines ring. Any poll landing between two
+writes of one line therefore gave that line two ring entries — permanently, and every reader
+saw it: `arreo read`, `attach` (the ring is the source of its deltas), the TUI's pane view,
+the handoff manifest, the persisted snapshot. Measured through the product, not inferred:
+`arreo read` mid-line printed `burst-2|aaaa…`, and the completion came back as its own line
+`bbbb…`. The fix keeps the partial *visible* (a harness's question without a trailing newline
+is the product's flagship signal) but never *materialised*: `lines_with_partial()` is the
+reader's view, `ring_len()` is the terminated-line count a line-indexed cursor may trust,
+`flush_partial()` is deleted (with `drain` no longer mutating it had no production user, and
+the two must not disagree about what a line is), and `stream_attach` advances its cursor only
+past terminated lines so the completion is re-fetched at its own index instead of being
+skipped as already delivered. Three mutations verified: `ring_len` counting the partial and
+`drain` materialising it each redden the new daemon test; the full pre-fix behaviour restored
+reddens the handoff test with "479 of 480" again. Reproduction needed the *parallel
+test-binary* shape of a workspace run, not CPU load (6 busy loops × 6 runs, all green).
 ## Event log               ← append-only; newest last; never rewrite
 - 2026-09-10 [turn 1] ledger created; repo at e489fac (docs only); T-0001 + T-0022 (AGENTS.md gardened) done
 - 2026-09-10 [turn 2] T-0002 PTY manager done+pushed (342606c; 9 tests); PROMPT.md v2 synced + ADR 0001 (ef6c595)
@@ -199,3 +200,4 @@ delegated the two-machine proof to a fresh worker with the code frozen.
 - 2026-09-14 [turn 78] T-0087 done + pushed; T-0086 started with the design decided by the planner (the task file's Design section): one appended variant pair reusing the local payload, `Verb::Admin` gate, and the counter key moving to the **authenticated device id** — the F2 attack class reopened by the network, since `payload.machine` is self-declared and a paired peer could claim another machine's identity. Worker `SyncTransport` delegated with the decision as its contract; `--slice compat` is the acceptance test for the protocol change.
 
 - 2026-09-14 [turn 79] T-0086 done. The delegated worker died mid-edit (HTTP 400 from the harness) after landing the protocol, identity, engine, daemon and CLI changes; the planner took the unit over (per §7), finished the integration (proto re-exports, the CLI's `block_on` return shape, the sync slice's per-root device identities, `--name` vs `--machine`), then froze the code and delegated the two-machine proof. Verified independently: forged-identity mutation (accepted without the check — 2 checks red) and last-writer-wins mutation (3 checks red). A real clippy finding from the change: `SyncOutcome` is 120 bytes, which took `Message` to 128 and tripped `result_large_err` on two pre-existing functions — boxed, back to 112. ADR 0022 written. One flake observed and filed (T-0088, handoff pty-buffer test under parallel load: 1 failure in 3 full runs, 3/3 clean alone, 816/0 on the next full run). Battery: 816/67, both clippys, fmt, 14/14 slices, sync 14/14, bench 6/6, gates green.
+- 2026-09-14 [turn 80] T-0088 done + pushed (8ea5de2). Filed as a load-sensitive flake; it was a real defect. `Pane::drain()` called `RingBuffer::flush_partial()`, which took the unterminated trailing line into the ring, so a poll landing between two writes of one line split that line permanently for every reader (`arreo read`, `attach`, the TUI, the handoff manifest, the persisted snapshot). Fix: `RingBuffer::lines_with_partial()` (the reader view, non-mutating), `Pane::ring_len()` (the terminated-line count), `flush_partial()` deleted, and `stream_attach` advancing its cursor only past terminated lines so the completion is re-fetched at its own index. Reproduced with the parallel test-binary shape (3x `--test handoff` + `relay_daemon`, 8 rounds): 1 failure in 24 pre-fix, 0 in 24 post-fix; synthetic CPU load alone never reproduced it. Three mutations red. The test that pinned the materialisation asserted the defect and was replaced by two tests that assert what a reader sees and that the ring stays one-line-per-written-line. Battery on the fixed tree: 818 tests / 0 failed / 67 targets, clippy clean on both toolchains, fmt clean, vet 337, deny 4/4, audit 0, check-targets PASS/SKIP, 13/13 slices, `xtask sync --check` 14/14, bench 6/6.

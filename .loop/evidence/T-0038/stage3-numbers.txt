@@ -1,11 +1,11 @@
 T-0038 stage 3 — client reattach across a daemon handoff
 budget: server_handoff_reattach_s = 2s (perf-budget.toml, phase0=true)
 
-cli: last pre-cut tick 21 at 0.018s; first post-cut tick 22 at 0.588s (replay burst through tick 35; t=0 is cut start)
-cli: reattach 0.569s | cut→resume 0.588s | transcript clock ≈ 0.864s (14 missed ticks × 61 ms)
+cli: last pre-cut tick 22 at 0.120s; first post-cut tick 23 at 0.562s (replay burst through tick 35; t=0 is cut start)
+cli: reattach 0.442s | cut→resume 0.562s | transcript clock ≈ 0.737s (13 missed ticks × 56 ms)
 
-tui: last pre-cut tick 18 shown at 0.004s; first post-cut tick 23 at 0.918s
-tui: reattach 0.914s | cut→resume 0.918s | transcript clock ≈ 0.308s (5 missed ticks × 61 ms)
+tui: last pre-cut tick 20 shown at 0.018s; first post-cut tick 23 at 0.947s
+tui: reattach 0.929s | cut→resume 0.947s | transcript clock ≈ 0.170s (3 missed ticks × 56 ms)
 
-pane id: "tick" unchanged — `panes` lists it before and after the cut; the CLI transcript carries one pid (Some(442004)) throughout; CLI ticks contiguous: true
-input during cut: 21 accepted sends, 1 refused (of which 1 retried ok); every accepted send reflected exactly once: true
+pane id: "tick" unchanged — `panes` lists it before and after the cut; the CLI transcript carries one pid (Some(656732)) throughout; CLI ticks contiguous: true
+input during cut: 29 accepted sends, 1 refused (of which 1 retried ok); every accepted send reflected exactly once: true

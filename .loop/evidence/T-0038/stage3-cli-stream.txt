@@ -1,73 +1,84 @@
 --- `arreo attach` stdout (the pane's transcript) ---
-tick-1 pid=442004
-tick-2 pid=442004
-tick-3 pid=442004
-tick-4 pid=442004
-tick-5 pid=442004
-tick-6 pid=442004
-tick-7 pid=442004
-tick-8 pid=442004
-tick-9 pid=442004
-tick-10 pid=442004
-tick-11 pid=442004
-tick-12 pid=442004
-tick-13 pid=442004
-tick-14 pid=442004
-tick-15 pid=442004
-tick-16 pid=442004
-tick-17 pid=442004
-tick-18 pid=442004
-tick-19 pid=442004
-tick-20 pid=442004
-tick-21 pid=442004
+tick-1 pid=656732
+tick-2 pid=656732
+tick-3 pid=656732
+tick-4 pid=656732
+tick-5 pid=656732
+tick-6 pid=656732
+tick-7 pid=656732
+tick-8 pid=656732
+tick-9 pid=656732
+tick-10 pid=656732
+tick-11 pid=656732
+tick-12 pid=656732
+tick-13 pid=656732
+tick-14 pid=656732
+tick-15 pid=656732
+tick-16 pid=656732
+tick-17 pid=656732
+tick-18 pid=656732
+tick-19 pid=656732
+tick-20 pid=656732
+tick-21 pid=656732
+tick-22 pid=656732
 got:CUT-1
 got:CUT-2
-tick-22 pid=442004
 got:CUT-3
+tick-23 pid=656732
 got:CUT-4
-tick-23 pid=442004
 got:CUT-5
+tick-24 pid=656732
 got:CUT-6
-tick-24 pid=442004
+tick-25 pid=656732
 got:CUT-7
-tick-25 pid=442004
-tick-26 pid=442004
+tick-26 pid=656732
 got:CUT-9
+tick-27 pid=656732
 got:CUT-10
-tick-27 pid=442004
 got:CUT-11
 got:CUT-12
-tick-28 pid=442004
+tick-28 pid=656732
 got:CUT-13
-tick-29 pid=442004
 got:CUT-14
-tick-30 pid=442004
-tick-31 pid=442004
+tick-29 pid=656732
 got:CUT-15
-tick-32 pid=442004
+tick-30 pid=656732
 got:CUT-16
 got:CUT-17
-tick-33 pid=442004
 got:CUT-18
+tick-31 pid=656732
 got:CUT-19
-tick-34 pid=442004
+tick-32 pid=656732
 got:CUT-20
-tick-35 pid=442004
 got:CUT-21
-tick-36 pid=442004
+tick-33 pid=656732
 got:CUT-22
+tick-34 pid=656732
+got:CUT-23
+got:CUT-24
+tick-35 pid=656732
+got:CUT-25
+got:CUT-26
+tick-36 pid=656732
+got:CUT-27
+got:CUT-28
+tick-37 pid=656732
+got:CUT-29
+got:CUT-30
+tick-38 pid=656732
 got:CUT-8
-tick-37 pid=442004
-tick-38 pid=442004
-tick-39 pid=442004
-tick-40 pid=442004
+tick-39 pid=656732
+tick-40 pid=656732
+tick-41 pid=656732
+tick-42 pid=656732
+tick-43 pid=656732
 
 --- `arreo attach` stderr (reconnect notices) ---
 attach: connection lost: server closed connection
-attach: reconnected after the daemon was replaced — resuming from line 21
+attach: reconnected after the daemon was replaced — resuming from line 24
 attach: connection lost: server closed connection
-attach: daemon not reachable (attempt 1): cannot connect to /tmp/arreo-e2e-reattach-441977/a.sock: Connection refused (os error 111) (is arreo-server running?) — retrying in 0.3s
-attach: daemon not reachable (attempt 2): cannot connect to /tmp/arreo-e2e-reattach-441977/a.sock: Connection refused (os error 111) (is arreo-server running?) — retrying in 0.5s
-attach: daemon not reachable (attempt 3): cannot connect to /tmp/arreo-e2e-reattach-441977/a.sock: Connection refused (os error 111) (is arreo-server running?) — retrying in 1.2s
-attach: daemon not reachable (attempt 4): cannot connect to /tmp/arreo-e2e-reattach-441977/a.sock: Connection refused (os error 111) (is arreo-server running?) — retrying in 2.1s
-attach: daemon not reachable (attempt 5): cannot connect to /tmp/arreo-e2e-reattach-441977/a.sock: Connection refused (os error 111) (is arreo-server running?) — retrying in 4.3s
+attach: daemon not reachable (attempt 1): cannot connect to /tmp/arreo-e2e-reattach-656705/a.sock: Connection refused (os error 111) (is arreo-server running?) — retrying in 0.3s
+attach: daemon not reachable (attempt 2): cannot connect to /tmp/arreo-e2e-reattach-656705/a.sock: Connection refused (os error 111) (is arreo-server running?) — retrying in 0.6s
+attach: daemon not reachable (attempt 3): cannot connect to /tmp/arreo-e2e-reattach-656705/a.sock: Connection refused (os error 111) (is arreo-server running?) — retrying in 1.0s
+attach: daemon not reachable (attempt 4): cannot connect to /tmp/arreo-e2e-reattach-656705/a.sock: Connection refused (os error 111) (is arreo-server running?) — retrying in 2.1s
+attach: daemon not reachable (attempt 5): cannot connect to /tmp/arreo-e2e-reattach-656705/a.sock: Connection refused (os error 111) (is arreo-server running?) — retrying in 4.2s
