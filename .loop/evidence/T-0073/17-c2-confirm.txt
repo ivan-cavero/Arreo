@@ -9,7 +9,7 @@
 │                          ││                                                                                          │
 │                      ┌stop this machine's daemon on exit?─────────────────────────────────────┐                      │
 │                      │quitting will drain-stop the daemon at                                  │                      │
-│                      │/tmp/arreo-e2e-tui73-c2-1183557.sock (flush every pane's ring,          │                      │
+│                      │/tmp/arreo-e2e-tui73-c2-1419166.sock (flush every pane's ring,          │                      │
 │                      │checkpoint its topology, exit 0).                                       │                      │
 │                      │the panes keep running, but nothing will be watching them; restart the  │                      │
 │                      │daemon to restore them from the checkpoint.                             │                      │

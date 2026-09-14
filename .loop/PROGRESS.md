@@ -1,32 +1,42 @@
 ## State snapshot          ← REWRITTEN (not appended) at every checkpoint
-Task: **T-0091 DONE** (`e3c8a11`) — worktree-per-task: a pane owns its own `git worktree` on
-its own branch. The Phase 4 queue is filed (T-0091..T-0105).
-Where you are: **842 tests / 0 failed / 68 targets**; clippy clean on both toolchains; fmt
-clean; **14/14 slices** (worktree 9, mesh 36+1, tui 80, update 27, handoff-abort 41);
+Task: **T-0092 DONE** (`0b6ada5`) — diff review: `arreo_core::diff`, `arreo diff <pane>`, the
+TUI view. **T-0106 DONE** (`989980d`) — the live handoff carries the worktree binding.
+Where you are: **861 tests / 0 failed / 70 targets**; clippy clean on both toolchains; fmt
+clean; **14/14 slices** (tui 87, worktree 9, mesh 36+1, update 27, handoff-abort 41);
 `xtask sync --check` 14/14; bench 6/6; vet 337, deny 4/4, audit 0, check-targets PASS/SKIP.
-Next step: **T-0092** (diff review over a worktree, the road this one opens) — then T-0093
-(notification rules), T-0095 (approval gates), T-0096 (adapter SDK linter), T-0105 (the
-deferred update's start path), T-0098 (plugin host v0).
+Next step: **T-0107** (restore must validate a recorded path against the configured root — a
+reproduced defect, medium) or **T-0108** (the kill path decides "dirty" from a read taken while
+the child may be alive); then T-0093 (notification rules), T-0095 (approval gates), T-0105
+(the deferred update's start path), T-0109 (store downgrade guard).
 Open workers: (none)
 Known broken: T-0063 (CI never-green — the user's) · Parked: T-0048 needs-human
-**T-0091 — the collision, and the two defects found on the way to it.** Every pane shared one
-working directory, so two agents editing one checkout overwrote each other. `arreo spawn
---worktree [NAME]` now gives a pane its own `git worktree` (`arreo/<NAME>`), with the git
-plumbing in one core module: the pane-id gate (a pane id is a *directory name* — `../../etc`
-escapes the root, and silent sanitising would merge two panes into one), `ensure` (make or
-reuse), `remove` (never a dirty checkout unless forced), `prune_clean`, and the porcelain
-parser as a pure function. The request is a **new wire variant**, not a field on `Spawn`,
-because `rmp-serde` encodes a struct as a positional array and one more element would be
-unreadable by an older server — the N−1 window's whole point. Store v10 carries the path so a
-restore brings the pane back in its own checkout.
-A worker found two real defects while wiring, both in core, both fixed there with tests:
-(a) `git worktree list` keeps reporting a **deleted** worktree (`prunable`), so `ensure`'s
-reuse branch returned a path that was not there; (b) worse, `portable-pty` **drops a `cwd` that
-is not a directory and falls back to the process's home** — so the pane above would have run
-in `$HOME`, silently. `Pane::spawn_in_dir` now refuses it. Five mutations red, one of them at
-the slice (the daemon ignoring the worktree path → 4 checks red). `Message` is 112 bytes and
-now **pinned by a test**: the first cut of the variant took it to 136, and the payload is boxed
-(`SpawnSpec`) the way T-0086 boxed `SyncOutcome`.
+**T-0106 — the security review earned its keep.** A `security-reviewer` pass over T-0091 found
+the live handoff **silently un-isolating every pane**: `HandoffPane` carried no worktree,
+`PaneEntry::adopted` never set one, and `run_handoff` built its daemon with `Daemon::new` (main
+resolved `[worktree]` *after* the handoff branch, which never returns). So an `arreo update
+--server` — the normal update route — left the adopted pane claiming the daemon's own
+directory, nulled the stored column on the next snapshot, leaked the checkout on kill, and put
+the agent back in the shared tree after a restart. Fixed: a trailing `#[serde(default)]`
+manifest field (old→new, so a sender that predates it still decodes), the setter in `adopted`,
+the config resolved before the handoff branch, and `arreo update --server --config` forwarded to
+the child. Regression test with a deliberately non-default root; three mutations red, one per
+half of the fix. The review's other three findings are filed, not folded: T-0107 (restore trusts
+a recorded path — reproduced), T-0108 (kill-path TOCTOU, hypothesis), T-0109 (no store
+downgrade guard).
+**T-0092 — the parser, and three defects testing found.** `arreo_core::diff` turns git's bytes
+into typed data, written against a capture of git 2.47.3's real output that is also the test's
+fixture. Measured traps: paths are **C-quoted** with octal *bytes*; a `---`/`+++` path with a
+space ends in a **TAB** the header lacks; the `diff --git` header is ambiguous for such a path
+and is therefore a fallback; a **pure rename has no hunks and no `---`/`+++`**. `worktree_diff`
+adds one `git diff --no-index` per **untracked** file — the common case for an agent's work, and
+invisible to `git diff HEAD` — never `git add -N` (a read-only verb must not write the index).
+The three defects: `str::lines()` **strips `\r`**, so a CRLF file's CR vanished; `run_git`'s
+"exit 1 means differences" **swallowed `rev-parse`'s "no HEAD"**; and both consumers resolved
+the repository from their own cwd, ignoring `[worktree] repo` — which the daemon honours, so a
+consumer elsewhere reported "no worktree" about a pane that had one (the TUI slice caught it).
+A fourth defect was in the *fixture itself*: `* text=auto` stripped the CRs from the committed
+blob, so the CRLF test would have failed on a fresh clone — fixed with a `-text` rule for
+`.loop/evidence/**/*.raw`, a regeneration script, and a `git clone` check that the bytes survive.
 ## Event log               ← append-only; newest last; never rewrite
 - 2026-09-10 [turn 1] ledger created; repo at e489fac (docs only); T-0001 + T-0022 (AGENTS.md gardened) done
 - 2026-09-10 [turn 2] T-0002 PTY manager done+pushed (342606c; 9 tests); PROMPT.md v2 synced + ADR 0001 (ef6c595)
@@ -204,3 +214,4 @@ now **pinned by a test**: the first cut of the variant took it to 136, and the p
 - 2026-09-14 [turn 81] T-0081 + T-0082 closed with the scope note each task allows; T-0089 filed as the single retry (gated on a credential, first step a one-command re-probe). The blocker is proven: Codex 0.154.0, [CC] 2.1.270, Copilot 1.0.83, Qwen Code 0.23.3, Kimi Code 0.42.0 and Kilo 7.6.2 all install from npm into scratch and all run, and every one refuses a turn for want of a credential; no provider key in the environment and `~/.codex`/`~/.claude` empty here. N = 0, stated; twelve per-harness lines with the exact refusal text; `xtask adapters --check` 24/24 unchanged (nothing fabricated). Two npm names that look right are different tools (`grok-cli`, `cursor-agent`). Criterion-4 finding confirmed against the real config.toml Orca writes: `hooks.state.*.trusted_hash` digests the local hooks.json, so it is never syncable.
 - 2026-09-14 [turn 82] T-0039 done + pushed (15aa539). The deferred update: `arreo_core::update::deferred` (one window rule `live_panes == 0`, `stage_next`/`promote`/`clear_after_confirm`, every marker fn in an `_in(state_dir)` form), `arreo update --status`/`--apply-now`, the deferral on a failed cut (the verified artifact used to be `remove_file`d), and `xtask e2e --slice update --case deferred` (7 checks, new `--case` flag whose default is the whole slice). Re-scoped: the Windows half is T-0090, because `cargo check --target x86_64-pc-windows-msvc -p arreo-server` dies in cc-rs (lib.exe missing), there is no clang/wine here, and check-targets SKIPs Windows for that reason; T-0042 now depends on T-0090. Three mutations red: `window_is_open` always true → 3 slice checks + 2 unit tests; `clear_after_confirm` ignoring the version → the confirm test; `promote` not discarding → the no-retry-loop test. Battery: 825 tests / 0 failed, clippy clean on both toolchains, fmt clean, vet 337, deny 4/4, audit 0, check-targets PASS/SKIP, 13/13 slices, sync --check 14/14, bench 6/6.
 - 2026-09-14 [turn 83] T-0091 done + pushed (e3c8a11). Worktree-per-task: `arreo_core::worktree` (pane-id gate, `ensure`/`remove`/`prune_clean`, porcelain parser), `Message::SpawnWorktree` (a variant, not a field on `Spawn` — rmp-serde positional arrays would break N−1), `Pane::spawn_in_dir`, store schema v10 carrying the worktree path, `[worktree] root`/`repo` in the one config parser, daemon spawn/kill/restore wiring, CLI `spawn --worktree` + `worktrees list|remove`, docs/worktrees.md, and `xtask e2e --slice worktree` (9 checks). Two real defects found by a worker while wiring, both in core, both fixed with tests: `git worktree list` keeps reporting a DELETED worktree (prunable) so `ensure` returned a path that was not there; and `portable-pty` drops a `cwd` that is not a directory and falls back to `$HOME`, so a pane whose worktree vanished would have run in the wrong place silently — `Pane::spawn_in_dir` now refuses it. Five mutations red (one at the slice: the daemon ignoring the worktree path reddens 4 checks). `Message` was 136 bytes after the first cut and is back to 112 with `the_message_enum_stays_at_its_budget` pinning it. Battery: 842 tests / 0 failed / 68 targets, clippy clean on both toolchains, fmt clean, vet 337, deny 4/4, audit 0, check-targets PASS/SKIP, 14/14 slices, sync --check 14/14, bench 6/6.
+- 2026-09-14 [turn 84] T-0106 done + pushed (989980d) and T-0092 done + pushed (0b6ada5). T-0106: a security-reviewer pass over T-0091 found the live handoff silently un-isolating every pane (HandoffPane carried no worktree, adopted() never set one, run_handoff built its daemon without the settings because main resolved [worktree] after a branch that never returns) — so an arreo update --server left the adopted pane in the daemon own directory, nulled the stored column, leaked the checkout on kill and put the agent back in the shared tree after a restart. Fixed with a trailing serde(default) manifest field, the setter, the config resolved before the handoff dispatch, and arreo update --server --config forwarded to the child; regression test with three mutations red. Review findings T-0107 (reproduced) and T-0108/T-0109 filed. T-0092: arreo_core::diff (parser written against a capture of real git output that is also the tests fixture), arreo diff <pane> [--json] with a key-by-key schema contract test, the TUI diff view (d) coloured from the existing diff* theme tokens, and six new tui-slice assertions (87 passed). Four defects found by testing: str::lines() strips \r (a CRLF files CR vanished), run_git exit-1 rule swallowed rev-parse no-HEAD, both consumers ignored [worktree] repo (so they reported no worktree about panes that had one), and * text=auto stripped the CRs from the committed fixture blob (a fresh clone would have failed) — fixed with a -text rule, a regeneration script, and a git clone check. Also fixed a flake in the T-0091 worktree test: it waited for its file to exist and could read it empty, now waits for the content. Battery: 861 tests / 0 failed / 70 targets, clippy clean both toolchains, fmt clean, vet 337, deny 4/4, audit 0, check-targets PASS/SKIP, 14/14 slices, sync --check 14/14, bench 6/6.
