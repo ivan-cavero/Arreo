@@ -2807,20 +2807,33 @@ fn remove_worktree(settings: &WorktreeSettings, id: &str, path: &Path) {
 /// record that never had a worktree — every pane spawned without one, and every
 /// row written before v10 — which restores exactly as it did before.
 ///
-/// The name and the root are read **out of the recorded path**: that is the
-/// checkout this pane worked in, and a `[worktree]` section edited while the
-/// daemon was down must not move a pane whose files are already somewhere else.
-/// The repository is the one thing the path cannot supply, so it comes from the
-/// settings — the same answer the spawn would have given.
+/// **The root comes from the configuration and the record supplies only the
+/// name** (T-0107). This used to read both out of the recorded path
+/// (`file_name()` and `parent()`), and the root half was a defect rather than a
+/// design: [`ensure`] calls `create_dir_all(root)` and `git worktree add`, so a
+/// record could make the daemon create a directory anywhere it could write —
+/// reproduced against the real binary with a row naming `<abs>/outside/nested/x`,
+/// and again with a row naming the repository's main checkout (which started the
+/// agent in the shared tree, the isolation silently off). [`pane_of_recorded`]
+/// is the check that closes it: the record must be the `<root>/<pane>` the
+/// configured root implies, so the name that reaches [`ensure`] is always inside
+/// that root by construction.
 ///
-/// What happens next is [`arreo_core::worktree::ensure`]'s rule, which is the
-/// rule the criterion asks for: a worktree that is still registered is reused, a
-/// directory deleted while the daemon was down is made again (a removed worktree
-/// keeps its branch, so the checkout comes back on the work the pane had
-/// committed), and a path that now holds a foreign directory is refused. The
-/// refusal comes back as prose and the caller skips the pane loudly — never a
-/// pane in the daemon's own directory, which is the one outcome this must not
-/// produce.
+/// A record from a different root is **refused, never repaired**. Re-creating it
+/// under the configured root would silently move the agent to a directory it was
+/// not working in — a different set of files, which is the collision
+/// worktree-per-task exists to prevent — while the checkout it *was* using sits
+/// in the old place with whatever it had not committed. The refusal comes back as
+/// prose and the caller skips the pane loudly, naming the record, the path and
+/// the configured root, so the operator can decide: re-spawn the pane, or point
+/// `[worktree] root` back. Never a pane in the daemon's own directory, and never
+/// a directory made where the record asked for one.
+///
+/// What happens next is [`ensure`]'s rule, which is the rule the criterion asks
+/// for: a worktree that is still registered is reused, a directory deleted while
+/// the daemon was down is made again (a removed worktree keeps its branch, so the
+/// checkout comes back on the work the pane had committed), and a path that now
+/// holds a foreign directory is refused.
 fn restore_worktree_dir(
     settings: &WorktreeSettings,
     recorded: Option<&str>,
@@ -2828,20 +2841,10 @@ fn restore_worktree_dir(
     let Some(recorded) = recorded else {
         return Ok(None);
     };
-    let path = Path::new(recorded);
-    let Some(name) = path
-        .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-    else {
-        return Err(format!(
-            "its recorded worktree {recorded} names no directory to make"
-        ));
-    };
-    let root = path
-        .parent()
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| worktree_root(settings));
+    let root = worktree_root(settings);
     let repo = worktree_repo(settings);
+    let name = arreo_core::worktree::pane_of_recorded(Path::new(recorded), &root)
+        .map_err(|e| e.to_string())?;
     let path = arreo_core::worktree::ensure(&repo, &root, &name)
         .map_err(|e| format!("its worktree {recorded} could not be re-made: {e}"))?;
     require_checkout(&path)?;

@@ -230,14 +230,24 @@ Worktrees are not tied to the daemon's lifetime, and a restart is where that
 matters:
 
 - A pane that was spawned with `--worktree` **comes back in its own worktree**:
-  restore re-ensures the worktree by pane id and starts the pane with that directory
-  as its cwd. It is the same checkout, on the same branch, with the work still in it.
+  the record's pane id is validated against the configured root and the checkout is
+  re-made as `<root>/<pane>` — it is the same checkout, on the same branch, with the
+  work still in it.
 - If the directory was **deleted while the daemon was down**, the worktree is
   re-created on its branch — the branch kept the commits, which is why removal never
   deletes it.
 - If the path now holds a **directory that is not a worktree of that repository**,
   the pane is skipped with a loud stderr line naming the id and the reason. Starting
   it in the wrong directory is the one outcome worse than not starting it.
+- **A record from a different root is refused, not repaired.** The root is the one
+  `[worktree] root` configures *now*, never the one the record names: a record is a
+  file your own uid can edit, and the restore path *creates* directories, so a root
+  taken from a record would let it make one anywhere. A record whose path is not
+  `<configured root>/<pane>` is therefore skipped with a line naming the record, the
+  path and the configured root — and nothing is created. Point `[worktree] root` back
+  at the directory its checkout is in, or spawn the pane again; the alternative
+  (silently re-creating it under the new root) would move the agent to a different set
+  of files while the work it had left behind sat in the old place.
 - A pane that exits has its worktree removed **only when it is clean**; a dirty one
   is kept and reported. `arreo worktrees list` is how you see what was kept.
 

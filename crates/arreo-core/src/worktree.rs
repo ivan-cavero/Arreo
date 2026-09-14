@@ -64,6 +64,15 @@ pub enum WorktreeError {
     BadPaneId { pane: String, reason: String },
     #[error("{path} exists and is not a worktree of {repo}: refusing to touch it")]
     NotOurWorktree { path: String, repo: String },
+    /// A **recorded** worktree path that the configured root does not imply
+    /// (T-0107). See [`pane_of_recorded`] for why a record is data rather than a
+    /// permission.
+    #[error(
+        "{path} is not under the worktree root {root} this machine configures — refusing to \
+         create or enter it (the record is from a different root: re-spawn the pane, or point \
+         `[worktree] root` back at the directory its checkout is in)"
+    )]
+    OutsideRoot { path: String, root: String },
     #[error("{path} has uncommitted changes: {files} — commit, stash or `--force`")]
     Dirty { path: String, files: String },
     #[error("git {command} failed in {cwd}: {detail}")]
@@ -168,6 +177,115 @@ pub fn path_for(root: &Path, pane: &str) -> PathBuf {
 /// nothing.
 fn canonical_root(root: &Path) -> PathBuf {
     std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf())
+}
+
+/// A path with `.` and `..` resolved **lexically** — no filesystem access.
+///
+/// Needed because the check [`pane_of_recorded`] makes is a comparison, and a
+/// raw string comparison is not the check: `/root/../escape` *starts with*
+/// `/root` as text while resolving to `/escape`, so anything built on
+/// `starts_with` would accept the escape it exists to refuse.
+///
+/// `..` cancels the previous component only when that component is a name. It
+/// does not climb past a root (`/..` is `/`, per POSIX) and it is not collapsed
+/// at the front of a relative path (`../../etc` stays `../../etc`: from an
+/// unknown working directory there is nothing to cancel, and pretending
+/// otherwise would turn one path into a different one).
+fn normalize(path: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for part in path.components() {
+        match part {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                let pops = out
+                    .components()
+                    .next_back()
+                    .is_some_and(|last| matches!(last, Component::Normal(_)));
+                if pops {
+                    out.pop();
+                } else if !out.has_root() {
+                    out.push(part.as_os_str());
+                }
+                // Otherwise `out` is a root and `..` is a no-op.
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+/// The two spellings a path comparison should use: the filesystem's when it can
+/// answer, and [`normalize`]'s when it cannot.
+///
+/// **Canonicalize first, because the false *refusal* matters too.** A configured
+/// root that is reached through a symlink is the same directory as the canonical
+/// spelling our own spawn recorded, and a check that compared the two as text
+/// would refuse every pane on such a machine. Canonicalizing falls back to
+/// normalization when the path does not exist — which is the interesting case
+/// here, since the whole point is a directory that must *not* be created.
+fn resolved(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| normalize(path))
+}
+
+/// The pane a **recorded** worktree path is allowed to name, or why it is
+/// refused (T-0107).
+///
+/// ## Why a record is not a permission
+///
+/// When the daemon starts a pane it does `create_dir_all(root)` and
+/// `git worktree add <root>/<name>` — so a *root* taken from a record is an
+/// arbitrary-directory primitive: a row naming `<abs>/outside/x` made the daemon
+/// create that directory and register it, and a row naming the repository's main
+/// checkout started the agent in the shared tree. Both were reproduced against
+/// the real binary before this function existed.
+///
+/// The spawn route cannot be fooled this way: `path_for(root, pane) =
+/// root.join(pane)` puts the pane inside the configured root **by construction**.
+/// A recorded path has no such property — and [`is_safe_pane_id`] does not give
+/// it one, because the name here is the last component of an absolute path the
+/// record chose, which is trivially "safe". So the containment is checked
+/// explicitly instead, and only the *name* survives the check: the caller passes
+/// the **configured** root to [`ensure`], never the recorded one, which makes the
+/// containment structural from there on.
+///
+/// The store is a file the operator's own uid can edit, so this is the "a path
+/// that arrives from a file is data" rule rather than a hardening nicety — the
+/// same class as the machine-name rules of T-0043. It also fires with no
+/// attacker at all: any record written under a different `[worktree] root`.
+///
+/// ## What it requires
+///
+/// The recorded path must be exactly `<root>/<pane>` for the configured root —
+/// parent and root must resolve to the same directory ([`resolved`], so a
+/// symlinked root still matches) and the name must pass [`is_safe_pane_id`]. The
+/// rule is deliberately the *shape our own spawn writes*, so every acceptance is
+/// a path this machine would have produced itself, and every refusal is reported
+/// rather than repaired: moving an agent to a directory it was not working in
+/// would silently change which files it edits.
+pub fn pane_of_recorded(recorded: &Path, root: &Path) -> Result<String, WorktreeError> {
+    let refuse = || WorktreeError::OutsideRoot {
+        path: recorded.display().to_string(),
+        root: root.display().to_string(),
+    };
+    // `file_name()` is `None` for a path ending in `..`, `/` or `.` — a record
+    // that names a directory rather than a pane.
+    let Some(name) = recorded
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+    else {
+        return Err(refuse());
+    };
+    if is_safe_pane_id(&name).is_err() {
+        return Err(refuse());
+    }
+    let Some(parent) = recorded.parent() else {
+        return Err(refuse());
+    };
+    if resolved(parent) != resolved(root) {
+        return Err(refuse());
+    }
+    Ok(name)
 }
 
 /// Where worktrees live when nothing says otherwise: `<state>/worktrees`.
@@ -514,6 +632,131 @@ mod tests {
         run(&["add", "."]);
         run(&["commit", "-q", "-m", "initial"]);
         (base, repo)
+    }
+
+    /// The lexical normalizer, checked on the cases the containment rule leans
+    /// on — including the two where "resolve `..` naively" is wrong.
+    #[test]
+    fn normalize_resolves_dots_without_climbing_past_a_root() {
+        use std::path::PathBuf;
+        let cases = [
+            ("/r/../escape", "/escape"),
+            ("/r/./x", "/r/x"),
+            ("/r/sub/../x", "/r/x"),
+            // `..` at a root is a no-op (POSIX), and at the front of a relative
+            // path there is nothing to cancel.
+            ("/..", "/"),
+            ("../../etc", "../../etc"),
+            ("/r", "/r"),
+        ];
+        for (input, want) in cases {
+            assert_eq!(
+                normalize(&PathBuf::from(input)),
+                PathBuf::from(want),
+                "{input}"
+            );
+        }
+    }
+
+    /// **A record is validated against the configured root, and only its name
+    /// survives** (T-0107).
+    ///
+    /// The refusal matters because `ensure` *creates* directories: a root taken
+    /// from a record let a row make the daemon create `<abs>/outside/nested/x`
+    /// and `git worktree add` it, or start the agent in the repository's main
+    /// checkout. Both were reproduced against the real binary before this
+    /// existed.
+    #[test]
+    fn a_recorded_path_must_be_what_the_configured_root_implies() {
+        use std::path::Path;
+        let root = Path::new("/srv/worktrees");
+
+        // The shape our own spawn writes — the only accepted one.
+        assert_eq!(
+            pane_of_recorded(Path::new("/srv/worktrees/fix"), root).expect("accepted"),
+            "fix"
+        );
+        // A redundant spelling of the same directory is still the same
+        // directory: the record is compared resolved, not as text.
+        assert_eq!(
+            pane_of_recorded(Path::new("/srv/worktrees/./fix"), root).expect("accepted"),
+            "fix"
+        );
+
+        // Outside the configured root: the reproduced case (a path that does not
+        // exist yet — the one that creates directories).
+        let outside = pane_of_recorded(Path::new("/abs/outside/nested/x"), root)
+            .expect_err("outside the root");
+        assert!(
+            matches!(outside, WorktreeError::OutsideRoot { .. }),
+            "{outside:?}"
+        );
+        // The message names both facts the operator needs to decide.
+        let text = outside.to_string();
+        assert!(text.contains("/abs/outside/nested/x"), "{text}");
+        assert!(text.contains("/srv/worktrees"), "{text}");
+
+        // The main checkout: a real directory that is not `root/<name>`.
+        assert!(pane_of_recorded(Path::new("/srv/project"), root).is_err());
+
+        // **The escape a `starts_with` comparison would accept**: this path
+        // begins with the root as text and resolves outside it.
+        let escape = pane_of_recorded(Path::new("/srv/worktrees/../escape"), root)
+            .expect_err("the dot-dot escape");
+        assert!(
+            matches!(escape, WorktreeError::OutsideRoot { .. }),
+            "{escape:?}"
+        );
+
+        // A record naming a directory rather than a pane.
+        assert!(pane_of_recorded(Path::new("/srv/worktrees/.."), root).is_err());
+        assert!(pane_of_recorded(Path::new("/srv/worktrees"), root).is_err());
+        assert!(pane_of_recorded(Path::new("/"), root).is_err());
+        // And a name that is not a safe directory name stays refused.
+        assert!(pane_of_recorded(Path::new("/srv/worktrees/."), root).is_err());
+    }
+
+    /// A root reached through a **symlink** is the same directory as the
+    /// canonical spelling the spawn recorded, so the check must not refuse it.
+    ///
+    /// This is the false-refusal half, and it is a real configuration: an
+    /// operator points `[worktree] root` at `/data/worktrees` while `/data` is a
+    /// link, and every pane's record carries the resolved path.
+    ///
+    /// Unix-only, and not merely because `std::os::unix::fs` is: on Windows a
+    /// symlink needs a privilege the test cannot assume, so the portable half of
+    /// this property is [`pane_of_recorded`]'s use of `canonicalize` itself. The
+    /// `#[cfg]` is what keeps the crate type-checking for `windows-msvc`
+    /// (`cargo xtask check-targets`), which is how this was caught: the
+    /// ungated version broke that gate rather than any Linux test.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_root_is_recognised_as_the_same_directory() {
+        use std::os::unix::fs::symlink;
+        let base = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/test-scratch/T-0107")
+            .join("symlink");
+        let _ = std::fs::remove_dir_all(&base);
+        let real = base.join("real");
+        std::fs::create_dir_all(&real).expect("scratch");
+        let link = base.join("link");
+        symlink(&real, &link).expect("symlink");
+
+        // The record carries the canonical spelling (that is what `ensure`
+        // returns), the configuration names the link.
+        let canonical = std::fs::canonicalize(&real).expect("canonical");
+        let recorded = canonical.join("pane-1");
+        assert_eq!(
+            pane_of_recorded(&recorded, &link).expect("the same directory"),
+            "pane-1"
+        );
+        // …and the reverse spelling too.
+        assert_eq!(
+            pane_of_recorded(&link.join("pane-2"), &canonical).expect("the same directory"),
+            "pane-2"
+        );
+        // While a *different* directory behind the same link is still refused.
+        assert!(pane_of_recorded(&base.join("elsewhere/pane-3"), &link).is_err());
     }
 
     /// The gate that keeps a pane id from naming a path.

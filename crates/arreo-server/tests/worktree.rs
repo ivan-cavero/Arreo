@@ -414,3 +414,257 @@ async fn a_plain_spawn_is_unchanged() {
         other => panic!("want Panes, got {other:?}"),
     }
 }
+
+// ---------------------------------------------------------------------------
+// T-0107: a recorded worktree path is data, not a permission
+// ---------------------------------------------------------------------------
+
+/// A guard around a real `arreo-server` **child process**, so the boot path (the
+/// one that restores panes) runs exactly as it does for an operator — including
+/// `--config`, which is how the configured root reaches it.
+struct DaemonChild {
+    child: std::process::Child,
+    log: PathBuf,
+}
+
+impl DaemonChild {
+    /// Start the daemon on `socket` with `config`, its stderr captured to
+    /// `log` so the operator-visible refusal can be read after the fact.
+    ///
+    /// Waits, bounded, until the socket answers — which is *after* the boot
+    /// restore, so a returned guard means the code under test has already run.
+    /// A child that exits first is a failure with its own log attached.
+    fn start(socket: &Path, config: &Path, log: &Path) -> Self {
+        let out = std::fs::File::create(log).expect("log file");
+        let err = out.try_clone().expect("log file");
+        let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_arreo-server"))
+            .arg("--socket")
+            .arg(socket)
+            .arg("--config")
+            .arg(config)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::from(out))
+            .stderr(std::process::Stdio::from(err))
+            .spawn()
+            .expect("arreo-server starts");
+        match wait_serving(&mut child, socket) {
+            Ok(()) => Self {
+                child,
+                log: log.to_path_buf(),
+            },
+            Err(why) => {
+                // **Reaped before the panic**, both halves: a failing test that
+                // leaves a daemon running on a fixed socket path makes the *next*
+                // run fail for a reason that has nothing to do with the code —
+                // which is the failure mode this whole repository keeps naming.
+                let text = std::fs::read_to_string(log).unwrap_or_default();
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("{why}: {text}");
+            }
+        }
+    }
+
+    fn log(&self) -> String {
+        std::fs::read_to_string(&self.log).unwrap_or_default()
+    }
+}
+
+/// Wait, bounded, until `socket` answers, or say why the daemon will not serve.
+///
+/// The socket answering is *after* the boot restore, so a returned `Ok` means the
+/// code under test has already run. The child is borrowed, never dropped, so the
+/// caller owns reaping it on both paths.
+fn wait_serving(child: &mut std::process::Child, socket: &Path) -> Result<(), String> {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while Instant::now() < deadline {
+        if std::os::unix::net::UnixStream::connect(socket).is_ok() {
+            return Ok(());
+        }
+        if let Ok(Some(status)) = child.try_wait() {
+            return Err(format!("the daemon exited before serving ({status})"));
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    Err(format!("the daemon never bound {}", socket.display()))
+}
+
+impl Drop for DaemonChild {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// Write one pane record with the given worktree into a fresh store.
+///
+/// The store is exactly what the reviewer used as the attack surface: a file the
+/// operator's own uid can edit. Writing the row directly is therefore the honest
+/// way to test it — no daemon is needed to *produce* a hostile row, only to
+/// refuse one.
+fn store_with_row(db: &Path, id: &str, worktree: Option<&str>, body: &str) {
+    let store = arreo_core::store::SessionStore::open(db).expect("store opens");
+    store
+        .save_topology(&[arreo_core::store::StoredPane {
+            id: id.to_string(),
+            program: "/bin/sh".to_string(),
+            args: vec!["-c".to_string(), body.to_string()],
+            cols: 80,
+            rows: 24,
+            scrollback: Vec::new(),
+            harness: None,
+            session_id: None,
+            worktree: worktree.map(str::to_string),
+        }])
+        .expect("row written");
+}
+
+/// **A row naming a path outside the configured root creates nothing** (T-0107).
+///
+/// The reproduced defect: `restore_worktree_dir` took the root *from the record*,
+/// and `ensure` then did `create_dir_all(root)` + `git worktree add` — so a store
+/// row made the daemon create a directory anywhere it could write and register it
+/// as a real worktree. The row here names a path that does not exist, which is
+/// the case that *creates* rather than merely enters: the assertion is that boot
+/// leaves the filesystem alone.
+#[test]
+fn a_record_outside_the_root_creates_nothing_and_skips_the_pane() {
+    let dir = t0107_scratch("outside");
+    let repo = repo_at(&dir);
+    let root = dir.join("cfgroot");
+    let config = t0107_config(&dir, &root, &repo);
+    let socket = dir.join("arreo.sock");
+    let db = arreo_server::persist::db_path_for(&socket);
+    std::fs::create_dir_all(dir.join("state")).expect("state");
+
+    // A row that asks for a directory three levels deep outside the root, and a
+    // program that would leave a trace if it ever ran.
+    let outside = dir.join("outside/nested/x");
+    let ran = dir.join("ran-outside.txt");
+    store_with_row(
+        &db,
+        "esc",
+        Some(&outside.display().to_string()),
+        &format!("echo ran > {}", ran.display()),
+    );
+
+    let log = dir.join("daemon.log");
+    let daemon = DaemonChild::start(&socket, &config, &log);
+    // A settle window: the restore runs during boot, before the socket answers,
+    // so anything it was going to create already exists by now.
+    std::thread::sleep(Duration::from_secs(1));
+
+    assert!(
+        !dir.join("outside").exists(),
+        "the daemon created a directory outside the configured root: {:?}",
+        std::fs::read_dir(&dir).map(|d| d
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .collect::<Vec<_>>())
+    );
+    assert!(!outside.exists(), "the recorded path itself must not exist");
+    assert!(
+        !ran.exists(),
+        "the pane was restored and its program ran — it must be skipped"
+    );
+    // And git knows nothing about it: no worktree was registered.
+    //
+    // Asserted on the **branch**, not on a path substring: an Arreo worktree is
+    // always on `arreo/<pane>`, while the repository's own path can contain any
+    // word the test happens to use for its scratch directory (this one did).
+    assert!(
+        !git_worktree_list(&repo).contains("arreo/"),
+        "a worktree was registered: {}",
+        git_worktree_list(&repo)
+    );
+
+    // The operator is told, with both facts they need to decide.
+    let log = daemon.log();
+    assert!(
+        log.contains("outside/nested/x"),
+        "the log names the path: {log}"
+    );
+    assert!(
+        log.contains(&root.display().to_string()),
+        "the log names the configured root: {log}"
+    );
+    assert!(log.contains("esc"), "the log names the pane: {log}");
+}
+
+/// **A row naming the main checkout is refused, never used as a cwd** (T-0107).
+///
+/// The second reproduced case: a record naming the repository root restored the
+/// pane *in the shared tree* — the isolation silently off, which is the collision
+/// worktree-per-task exists to prevent. The program writes a **relative** path, so
+/// the file's absence from the repository is direct evidence about the cwd.
+#[test]
+fn a_record_naming_the_main_checkout_is_refused() {
+    let dir = t0107_scratch("maincheckout");
+    let repo = repo_at(&dir);
+    let root = dir.join("cfgroot");
+    let config = t0107_config(&dir, &root, &repo);
+    let socket = dir.join("arreo.sock");
+    let db = arreo_server::persist::db_path_for(&socket);
+    std::fs::create_dir_all(dir.join("state")).expect("state");
+
+    store_with_row(
+        &db,
+        "shared",
+        Some(&repo.display().to_string()),
+        "echo ran > agent-was-here.txt",
+    );
+
+    let log = dir.join("daemon.log");
+    let daemon = DaemonChild::start(&socket, &config, &log);
+    std::thread::sleep(Duration::from_secs(1));
+
+    assert!(
+        !repo.join("agent-was-here.txt").exists(),
+        "the agent ran in the main checkout — the isolation was off"
+    );
+    assert!(
+        !root.join("shared/agent-was-here.txt").exists(),
+        "the record was re-made under the configured root instead of being refused"
+    );
+    let log = daemon.log();
+    assert!(log.contains("shared"), "the log names the pane: {log}");
+    assert!(
+        log.contains(&repo.display().to_string()),
+        "the log names the recorded path: {log}"
+    );
+}
+
+/// A scratch root for a T-0107 test, wiped first.
+fn t0107_scratch(name: &str) -> PathBuf {
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../target/test-scratch/T-0107")
+        .join(name);
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("scratch");
+    std::fs::canonicalize(&dir).expect("canonical")
+}
+
+/// The configuration file the daemon child is given: the only place the root the
+/// check compares against is written.
+fn t0107_config(dir: &Path, root: &Path, repo: &Path) -> PathBuf {
+    let config = dir.join("arreo.toml");
+    std::fs::write(
+        &config,
+        format!(
+            "[worktree]\nroot = \"{}\"\nrepo = \"{}\"\n",
+            root.display(),
+            repo.display()
+        ),
+    )
+    .expect("config written");
+    config
+}
+
+fn git_worktree_list(repo: &Path) -> String {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["worktree", "list", "--porcelain"])
+        .output()
+        .expect("git runs");
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}

@@ -3,7 +3,7 @@ id: T-0107
 title: Restore must validate a recorded worktree path against the configured root, not trust it
 phase: 2
 priority: 2
-status: proposed
+status: done
 depends_on: [T-0091]
 scope:
   - crates/arreo-server/src/daemon.rs
@@ -43,21 +43,21 @@ recorded path. The doc is wrong either way and must end up matching the code.
 
 ## Acceptance criteria
 
-- [ ] The recorded path is **validated against the configured root** before it is used:
+- [x] The recorded path is **validated against the configured root** before it is used:
       `ensure`'s containment becomes an explicit check on the restore route (the recorded path
       must be `path_for(root, name)` for the configured root), and a path outside it is refused
       with a loud line naming the pane, the recorded path and the configured root.
-- [ ] What happens to a row whose path is outside the root is a **decision, not a fallback**:
+- [x] What happens to a row whose path is outside the root is a **decision, not a fallback**:
       either skip the pane (recorded as a skip, naming why) or re-create it under the *configured*
       root from its branch. Pick one, write it in `docs/worktrees.md`, and say why in the task
       file — silently "using the recorded path anyway" is the defect.
-- [ ] A recorded path that is the **main checkout** (or any directory that is not a registered
+- [x] A recorded path that is the **main checkout** (or any directory that is not a registered
       worktree of the repository) is refused, never used as a cwd.
-- [ ] `require_checkout` (or whatever replaced it) is not the only guard: the test must fail on
+- [x] `require_checkout` (or whatever replaced it) is not the only guard: the test must fail on
       a row that points *outside* the root at a path that does not exist yet, since that is the
       case that creates directories rather than merely entering them.
-- [ ] The docs sentence about "by pane id" is corrected.
-- [ ] Regression tests for both reproduced cases, in `crates/arreo-server/tests/worktree.rs`.
+- [x] The docs sentence about "by pane id" is corrected.
+- [x] Regression tests for both reproduced cases, in `crates/arreo-server/tests/worktree.rs`.
 
 ## Notes
 
@@ -65,3 +65,33 @@ recorded path. The doc is wrong either way and must end up matching the code.
   "never trust a recorded path" rule, not a hardening nicety, because a path that arrives from a
   file is data — the same class as the machine-name rules of T-0043 and the T-0066 bootstrap.
 - Full report: `agent://T0091Security` (T-0091-02, CWE-22/CWE-73, with the exact repro).
+
+## The decision, and why
+
+**A record from a different root is refused and the pane is skipped — never
+re-created under the configured root.** Both options were on the table; refusal
+wins because repair is the more dishonest failure: re-creating the checkout under
+the new root would start the agent in a *different set of files* while the checkout
+it was actually using sat in the old place with whatever it had not committed. The
+refusal is prose naming the record, the path and the configured root, on the
+already-wired `skip_loudly` path, so the operator decides: re-spawn the pane, or
+point `[worktree] root` back at the directory its checkout is in.
+
+The rule this task ends up applying is narrower than "never trust a file":
+**a path from a record may be used to *find* something, never to *create* something.**
+That is why the *remove* path keeps reading name and root out of the record — it can
+only act on a worktree git reports as registered, and can never create — and why the
+handoff manifest's worktree field (T-0106) is not a new boundary.
+
+## Evidence
+
+`.loop/evidence/T-0107/recorded-path-validation.txt` — the defect, the fix and its
+two pieces of path math (`normalize` for the lexical `..` case a text comparison
+would accept, `resolved` for the symlinked root that must *not* be refused), 15 unit
+tests and 6 integration tests, and the mutation that restores the pre-fix body and
+reddens both integration tests with the reviewer's own symptoms.
+
+One self-inflicted test bug found while writing: the first version asserted the
+worktree list did not contain the substring `outside` — which the repository's own
+path contains, because that is what the test named its scratch directory. It now
+asserts on the `arreo/` branch, which is what actually identifies an Arreo worktree.

@@ -1,0 +1,150 @@
+T-0107 — the restore path trusts a recorded path, and now validates it
+=====================================================================
+
+FOUND BY: a `security-reviewer` pass over T-0091 (`agent://T0091Security`,
+finding T-0091-02, severity **medium**, CWE-22/CWE-73), **reproduced twice** by
+the reviewer against the real binary.
+
+THE DEFECT
+----------
+`restore_worktree_dir` read both the pane name *and the worktree root* out of the
+recorded path (`file_name()` and `parent()`) and handed them to
+`worktree::ensure` — which does `create_dir_all(root)` and
+`git worktree add <root>/<name>`. So a *record* supplied the root of a
+**directory-creating** operation.
+
+The `is_safe_pane_id` gate could not help: the name here is the last component of
+an absolute path the record chose, so it is trivially "safe". The containment that
+the spawn route gets for free — `path_for(root, pane) = root.join(pane)`, which
+puts the pane inside the configured root *by construction* — had no counterpart on
+the restore route.
+
+Reproduced, both cases:
+
+- a row naming `<abs>/outside/nested/x` made the daemon **create that directory**
+  and register it as a real worktree on `arreo/x`;
+- a row naming the repository's **main checkout** restored the pane with the main
+  checkout as its cwd — the worktree isolation silently off, which is the collision
+  worktree-per-task exists to prevent.
+
+Reachability is not only "an attacker with the store": it fires with no attacker at
+all whenever a record was written under a different `[worktree] root`.
+
+WHY IT IS A DEFECT AND NOT A DESIGN
+-----------------------------------
+The reviewer left the *remove* path's choice intact (it also derives name and root
+from the record) and so does this fix, because the two are not symmetric: `remove`
+can only act on a worktree **git reports as registered for that repository** and
+refuses the main working tree, so it cannot create or reach an arbitrary
+directory. `restore` creates. The rule is therefore "a path that arrives from a
+file is data" applied exactly where the filesystem is written to.
+
+THE FIX
+-------
+`arreo_core::worktree::pane_of_recorded(recorded, root) -> Result<String, _>`: the
+record must be the `<root>/<pane>` the **configured** root implies — the parent and
+the root must resolve to the same directory, and the name must pass
+`is_safe_pane_id`. Only the *name* survives; the daemon then passes the
+**configured** root to `ensure`, so containment is structural from there on.
+
+Two pieces of path math were needed, and both are load-bearing:
+
+- **`normalize`** resolves `.` and `..` **lexically**, because the check is a
+  comparison and a text comparison is not the check: `/root/../escape` *starts
+  with* `/root` as a string while resolving to `/escape`, so anything built on
+  `starts_with` would accept the escape it exists to refuse. `..` cancels only a
+  name component (it does not climb past a root, and `../../etc` stays as written).
+- **`resolved`** canonicalizes when the filesystem can answer, and normalizes when
+  it cannot. Canonicalizing first is not a detail: our own spawn records the
+  *canonical* path, so a configured root reached through a symlink would otherwise
+  refuse **every** pane on such a machine. Falling back to normalization covers the
+  non-existent directory, which is the interesting case (the one that would be
+  created).
+
+**A record from a different root is refused, never repaired.** Re-creating it under
+the configured root would silently move the agent to a different set of files while
+the checkout it *was* using sat in the old place with whatever it had not committed
+— a worse outcome than skipping it, and the opposite of the "never lie" rule. The
+refusal is prose naming the path and the configured root, on the already-wired
+`skip_loudly` path, so the operator can decide: re-spawn the pane, or point
+`[worktree] root` back.
+
+PROOF
+-----
+Unit (`cargo test -p arreo-core --lib worktree::` → 15 passed, was 12):
+
+- `normalize_resolves_dots_without_climbing_past_a_root` — including `/r/../escape`
+  → `/escape`, `/..` → `/`, and `../../etc` left as written.
+- `a_recorded_path_must_be_what_the_configured_root_implies` — accepts the shape our
+  spawn writes (and a redundant `.` spelling of it), refuses a path outside the root
+  (naming both the path and the root in the message), refuses the main checkout,
+  refuses **the `..` escape a `starts_with` comparison would accept**, and refuses a
+  path that names a directory rather than a pane.
+- `a_symlinked_root_is_recognised_as_the_same_directory` — the false-refusal half:
+  the record carries the canonical spelling while the configuration names the link,
+  in both directions, and a different directory behind the same link is still
+  refused.
+
+Integration (`cargo test -p arreo-server --test worktree` → 6 passed, was 4). Both
+tests drive a **real `arreo-server` child process** with `--config`, because the
+code under test is the boot path and the configured root reaches it through that
+flag:
+
+- `a_record_outside_the_root_creates_nothing_and_skips_the_pane` — a store row naming
+  a path that does not exist yet (the case that *creates* rather than merely enters);
+  asserts the directory was never made, the row's program never ran, git registered
+  no `arreo/*` worktree, and the daemon's stderr names the record, the path and the
+  configured root.
+- `a_record_naming_the_main_checkout_is_refused` — the program writes a **relative**
+  path, so the file's absence from the repository is direct evidence about the cwd;
+  also asserts the record was *not* quietly re-made under the configured root.
+
+MUTATIONS (run by the planner; both redden with the reviewer's own symptoms)
+---------------------------------------------------------------------------
+Restoring the pre-fix body verbatim (`file_name()` + `parent()`):
+
+```
+[FAIL] a_record_naming_the_main_checkout_is_refused
+        the agent ran in the main checkout — the isolation was off
+[FAIL] a_record_outside_the_root_creates_nothing_and_skips_the_pane
+        the daemon created a directory outside the configured root
+test result: FAILED. 4 passed; 2 failed
+```
+
+One self-inflicted test bug found and fixed while writing: the first version
+asserted the worktree list did not contain the substring `outside` — and the
+repository's own path contains it, because that is what the test named its scratch
+directory. It now asserts on the **branch** (`arreo/`), which is what actually
+identifies an Arreo worktree.
+
+DOCS
+----
+`docs/worktrees.md` claimed restore "re-ensures the worktree by pane id"; it
+re-ensured by recorded path. The section is corrected and now states the rule: the
+root is the one configured *now*, a record from a different root is refused rather
+than repaired, and nothing is created.
+
+BOUNDARIES CONSIDERED AND DELIBERATELY NOT CHANGED
+--------------------------------------------------
+Two nearby places take a path from a source that is not the configuration. Both were
+looked at, and neither is the same defect:
+
+- **`remove_worktree` (the kill path) also reads name and root out of the recorded
+  path.** Kept, because the two operations are not symmetric: `remove` can only act
+  on a worktree **git reports as registered for the repo** and refuses the main
+  working tree, so it can never *create* a directory or reach an arbitrary one. The
+  defect above was specifically that `ensure` creates. Making `remove` strict as
+  well would trade a real cleanup behaviour (after a `[worktree] root` change, a
+  killed pane's checkout gets tidied) for a safety gain that does not exist — and it
+  would fail in the leaking direction rather than the destructive one.
+- **The handoff manifest carries a worktree path** (added by T-0106), so an outgoing
+  daemon *could* name one. Not a new trust boundary: the outgoing side is a
+  same-uid process that already holds the socket and every pane (it can spawn, send
+  and kill), the transfer is authenticated by the nonce and the peer uid, and the
+  protocol window refuses a newer sender. The path it names is also now refused by
+  the restore check if it is outside the configured root, and the kill it could
+  influence is bounded by "registered worktree of the configured repository".
+
+The general rule this task applies is narrower than "never trust a file" and worth
+stating precisely: **a path from a record may be used to *find* something, never to
+*create* something.**
