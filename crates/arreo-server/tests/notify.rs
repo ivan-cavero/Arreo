@@ -665,3 +665,144 @@ async fn a_transition_a_poll_consumed_is_still_decided() {
         rows_all(&db, actions::NOTIFY_SENT)
     );
 }
+
+// ---------------------------------------------------------------------------
+// 7. The provenance outlives the tick that consumed the transition
+// ---------------------------------------------------------------------------
+
+/// **`wait` answers with how the state was derived, whoever observed the
+/// transition** — the client-visible half of the ungated tick (T-0110).
+///
+/// The tick pumps every pane once a second and is deliberately not gated on a
+/// `[notify]` section (that is what makes it classify an unattached pane), so the
+/// transition a waiting client's own pump used to produce is normally *already
+/// consumed* by the time the client asks. `Wait` then takes its "already in the
+/// wanted state" branch — which synthesised `direct:already` and dropped the
+/// matched pattern. The state was right; the provenance was gone, and for a
+/// `question` the pattern is the only field that says *what* the pane is asking.
+///
+/// This is that sequence, driven the way the defect was reported: a real
+/// `arreo-server` process, a real configuration file with **no `[notify]`
+/// section at all** (the default, i.e. every existing user), a pane that asks,
+/// and the tick left to classify it with nobody attached. Then a client connects
+/// and asks. The reply must carry the engine's own derivation and the pattern it
+/// matched — the same two fields the event path fills.
+#[tokio::test]
+async fn wait_reports_the_provenance_the_tick_consumed() {
+    let dir = scratch("wait-provenance");
+    // No `[notify]` anywhere in the file. The tick pumps regardless (a daemon
+    // that classified its panes only when a client asked is the bug the tick
+    // closes); notifications are simply off, so the log stays empty.
+    let config = config_file(&dir, "# nothing to notify about\n");
+    assert!(
+        Policy::load(&config)
+            .expect("a file without the section is not an error")
+            .is_none(),
+        "no section is not a policy"
+    );
+    let socket = dir.join("arreo.sock");
+    let _server = ServerChild::start(&socket, &config, &dir);
+
+    let pane = "wait-provenance";
+    let mut spawner = Client::connect(&socket).await;
+    spawn_asking_pane(&mut spawner, pane).await;
+    // **Nobody is attached from here on**, and the pane is left alone long enough
+    // for the tick to classify it: the prompt lands immediately, `question` needs
+    // the adapter's 2 s of quiet, and the tick is a 1 s loop — so ~4 s is the
+    // earliest and 5 s leaves a slow machine room. By the time the client below
+    // asks, the transition exists only in the engine's memory of it.
+    drop(spawner);
+    tokio::time::sleep(Duration::from_secs(5)).await;
+
+    let mut client = Client::connect(&socket).await;
+    let reply = client
+        .call(&Message::Wait {
+            v: VERSION,
+            id: pane.to_string(),
+            state: AgentState::Question,
+            timeout_ms: 5_000,
+        })
+        .await;
+    match reply {
+        Message::StateEvent {
+            state,
+            confidence,
+            matched_pattern,
+            ..
+        } => {
+            assert_eq!(state, AgentState::Question);
+            assert_eq!(
+                confidence, "inferred:silence+prompt-shape",
+                "the engine's own derivation — `direct:already` claims the pane \
+                 was already in the state before the watch, which is the lie"
+            );
+            assert_eq!(
+                matched_pattern.as_deref(),
+                Some("\\[y/n\\]"),
+                "the pattern that fired is what says what the pane is asking"
+            );
+        }
+        other => panic!("want the question event, got {other:?}"),
+    }
+}
+
+/// **`direct:already` survives only where it is true** — the other half of the
+/// distinction (T-0110).
+///
+/// A pane that has printed nothing has never transitioned: the engine's state is
+/// the initial `Unknown`, derived from no observation at all. That is the one
+/// answer `direct:already` was ever right for, and filling the reply from the
+/// engine's last transition must not swallow it — a pane nobody has classified
+/// must not be reported as classified. (`arreo wait <pane> --state unknown` is a
+/// real CLI request, so this is reachable, not hypothetical.)
+#[tokio::test]
+async fn wait_still_says_already_when_no_transition_derived_the_state() {
+    let dir = scratch("wait-already");
+    let config = config_file(&dir, "# nothing to notify about\n");
+    let socket = dir.join("arreo.sock");
+    let _server = ServerChild::start(&socket, &config, &dir);
+
+    // A pane that prints nothing, so the engine never sees output and never
+    // transitions.
+    let pane = "wait-already";
+    let mut client = Client::connect(&socket).await;
+    let reply = client
+        .call(&Message::Spawn {
+            v: VERSION,
+            id: pane.to_string(),
+            program: "/bin/sh".to_string(),
+            args: vec!["-c".to_string(), "sleep 60".to_string()],
+            cols: 80,
+            rows: 24,
+            memory_max: None,
+            pids_max: None,
+            kill_on_breach: false,
+        })
+        .await;
+    assert!(matches!(reply, Message::Ok { .. }), "spawn: {reply:?}");
+
+    let reply = client
+        .call(&Message::Wait {
+            v: VERSION,
+            id: pane.to_string(),
+            state: AgentState::Unknown,
+            timeout_ms: 5_000,
+        })
+        .await;
+    match reply {
+        Message::StateEvent {
+            state,
+            confidence,
+            matched_pattern,
+            ..
+        } => {
+            assert_eq!(state, AgentState::Unknown);
+            assert_eq!(
+                confidence, "direct:already",
+                "no transition has derived this state, so there is no provenance to quote"
+            );
+            assert_eq!(matched_pattern, None);
+        }
+        other => panic!("want the unknown event, got {other:?}"),
+    }
+}

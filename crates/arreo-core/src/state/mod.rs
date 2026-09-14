@@ -27,5 +27,5 @@ pub mod engine;
 pub mod registry;
 
 pub use adapter::{Adapter, Resume, ResumeKind};
-pub use engine::{Confidence, Engine, Event, State};
+pub use engine::{Confidence, Engine, Event, Provenance, State};
 pub use registry::{new_session_id, AdapterRegistry};

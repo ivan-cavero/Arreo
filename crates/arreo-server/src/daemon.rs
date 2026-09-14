@@ -21,7 +21,7 @@ use arreo_core::proto::{
 };
 use arreo_core::pty::{ExitState, Pane};
 use arreo_core::relay::config::WorktreeSettings;
-use arreo_core::state::{Adapter, AdapterRegistry, Confidence, Engine, State};
+use arreo_core::state::{Adapter, AdapterRegistry, Confidence, Engine, Provenance, State};
 use arreo_core::sync::engine::{ReceiveOutcome, SyncEngine, SyncPayload};
 use std::collections::HashMap;
 use std::os::unix::fs::PermissionsExt;
@@ -371,6 +371,18 @@ impl PaneEntry {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .state()
+    }
+
+    /// How the engine arrived at its current state (T-0110), or `None` before any
+    /// transition. `Wait`'s "already in the wanted state" branch reads this: the
+    /// transition that produced the state is usually gone (the 1 s tick consumed
+    /// it), but the engine's memory of how it got there is not.
+    fn engine_provenance(&self) -> Option<Provenance> {
+        self.engine
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .provenance()
+            .cloned()
     }
 
     /// Poll the cgroup guard: graded alerts first, breach last (T-0041).
@@ -4366,14 +4378,40 @@ async fn watch_state(
             .await;
         }
         if engine_state_to_wire(entry.engine_state()) == want {
+            // **How the state was derived, which is the engine's to say.**
+            //
+            // This branch used to answer `direct:already` and drop the matched
+            // pattern, on the assumption that nothing happened while this client
+            // watched. The 1 s notification tick (T-0093) pumps every pane and is
+            // deliberately not gated on a `[notify]` section, so the transition a
+            // client's own pump used to produce is normally *already consumed* by
+            // the time the client asks — and a `question`'s pattern is the only
+            // field that says what the pane is asking. So read the engine's own
+            // last transition, exactly as the event path above does: whoever
+            // observed the transition, the reply says the same thing about it.
+            //
+            // `direct:already` survives only where it is *true*: a pane already
+            // in the wanted state with no transition behind it in this engine's
+            // life, which is the fresh engine's initial `Unknown` and nothing
+            // else — every other state is only ever reached through a recorded
+            // transition. That distinction is the point of the field: it says
+            // "you asked for this state and it was already so", which is a
+            // different fact from "here is how this state was derived".
+            let (confidence, matched_pattern) = match entry.engine_provenance() {
+                Some(provenance) => (
+                    confidence_to_wire(&provenance.confidence),
+                    provenance.matched_pattern,
+                ),
+                None => ("direct:already".to_string(), None),
+            };
             return write_message(
                 writer,
                 &Message::StateEvent {
                     v: VERSION,
                     id: id.clone(),
                     state: want,
-                    confidence: "direct:already".to_string(),
-                    matched_pattern: None,
+                    confidence,
+                    matched_pattern,
                 },
             )
             .await;

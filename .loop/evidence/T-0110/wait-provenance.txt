@@ -1,0 +1,89 @@
+T-0110 — `wait` answers with how the state was derived, whoever observed the transition
+=======================================================================================
+
+The regression T-0093's review found, and the fix.
+
+The defect
+----------
+T-0093's notification tick pumps every pane once a second so an unattached pane is classified at
+all, and it is deliberately **not** gated on a `[notify]` section. The pump is therefore not
+observationally neutral: the engine fires each state change exactly once, so the transition that a
+*client's* own pump used to produce is normally already consumed by the time the client asks.
+`Wait` then takes its "already in the wanted state" branch, which synthesised
+
+    confidence = "direct:already", matched_pattern = None
+
+The state value was right; the provenance was gone — and for a `question` the matched pattern is
+the only field that says *what the pane is asking*. It fired with no `[notify]` section in the
+config, i.e. for every existing user, which is why it is a defect and not a documentation item.
+
+Reproduced by the reviewer against a running daemon, and reproduced here as the pre-fix failure of
+the new regression test:
+
+    test wait_reports_the_provenance_the_tick_consumed ... FAILED
+    assertion `left == right` failed: the engine's own derivation — `direct:already` claims the
+    pane was already in the state before the watch, which is the lie
+      left: "direct:already"
+     right: "inferred:silence+prompt-shape"
+
+The fix
+-------
+1. **The engine keeps how it got there.** `arreo_core::state::Provenance { confidence,
+   matched_pattern }` — the last transition's provenance — lives beside the state in `Engine`.
+   Every site that assigns `self.state` now routes through one private `Engine::record(&Event)`
+   which sets the state *and* the provenance together, so the two cannot drift; the constructor's
+   initial `Unknown` is the only state with `provenance: None`, because nothing derived it.
+   `Engine::provenance() -> Option<&Provenance>` is the accessor. **No event content, order or
+   timing changed** — the six sites were refactored, not altered (the one behavioural delta in the
+   engine is the new field).
+2. **`Wait` stops synthesising.** The already-branch fills `confidence` and `matched_pattern` from
+   the engine's last transition — the same two fields the event path fills — so the reply says the
+   same thing about a transition whoever observed it. **No new wire field**: the reply's shape is
+   untouched (T-0028's N−1 window).
+3. **`direct:already` survives only where it is true**: a pane already in the wanted state with no
+   transition behind it in this engine's life. That is the fresh engine's `Unknown`, and nothing
+   else, because every other state is only reachable through a recorded transition. The comment in
+   the branch says exactly this, because the distinction is the point of the field: "you asked for
+   this state and it was already so" is a different fact from "here is how this state was derived".
+
+Tests, and the mutation that proves each is load-bearing
+-------------------------------------------------------
+Added (all in `crates/arreo-server/tests/notify.rs` unless noted):
+
+| test | proves |
+|---|---|
+| `wait_reports_the_provenance_the_tick_consumed` | the regression: real `arreo-server` process, real socket, a config file with **no `[notify]` section at all**, a pane that asks, the tick left to classify it with nobody attached, then a client's `Wait` — the reply must carry `inferred:silence+prompt-shape` and the pattern |
+| `wait_still_says_already_when_no_transition_derived_the_state` | the other half of the distinction: a pane that printed nothing has never transitioned, so `direct:already` must survive there |
+| `engine::tests::provenance_is_none_until_a_transition_and_follows_the_last_one` (`arreo-core`) | the accessor's boundary: `None` before any transition, the working transition's direct/no-pattern, the question transition's inferred+pattern, then replacement by the done transition |
+
+MUTATION 1 — the fix is removed (the branch hardcodes `direct:already` again):
+    test wait_reports_the_provenance_the_tick_consumed ... FAILED
+      left: "direct:already"   right: "inferred:silence+prompt-shape"
+    8 passed; 1 failed
+
+MUTATION 2 — the `None` branch lies (`"fabricated"` instead of `direct:already`):
+    test wait_still_says_already_when_no_transition_derived_the_state ... FAILED
+      left: "fabricated"   right: "direct:already"
+    0 passed; 1 failed
+
+Each mutation reddens exactly the test that pins it and nothing else, so neither test is padding.
+
+Verified
+--------
+    cargo test -p arreo-core --lib state::        → 4 passed
+    cargo test -p arreo-server --test notify     → 9 passed
+    cargo test -p arreo-server --test api        → 6 passed
+    cargo test --workspace                       → see the commit's battery line
+    cargo clippy --workspace --all-targets -- -D warnings → 0 findings (and on +stable)
+    cargo fmt --all -- --check                   → clean
+    cargo xtask e2e (14 slices) · sync --check · vet --locked · deny check · audit ·
+    check-targets · bench                        → see the ledger
+
+Notes
+-----
+- The engine is on every pane's hot path (`feed`/`tick`/`child_exited` are called per poll and per
+  tick for every pane), so the bench is part of this task's verification, not a formality —
+  `vt_feed_1byte_ms` in particular.
+- The worker's shape choice: a named `Provenance` struct rather than
+  `Option<(Confidence, Option<String>)>`, because its fields keep `Event`'s names and so the event
+  path and the already-path read identically at the call site.

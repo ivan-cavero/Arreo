@@ -3,7 +3,7 @@ id: T-0110
 title: The ungated tick pump changes what `wait` reports — with notifications off
 phase: 4
 priority: 2
-status: proposed
+status: done
 depends_on: [T-0093]
 scope:
   - crates/arreo-server/src/daemon.rs
@@ -14,6 +14,8 @@ scope:
 verify:
   - cargo test -p arreo-server --test api
   - cargo test -p arreo-server --test notify
+evidence:
+  - .loop/evidence/T-0110/wait-provenance.txt
 ---
 
 ## Why this exists
@@ -51,21 +53,38 @@ for; it is the provenance that is lost.
 
 ## Acceptance criteria
 
-- [ ] `Wait` answers with the provenance of the transition that produced the state, whether or
+- [x] `Wait` answers with the provenance of the transition that produced the state, whether or
       not this process was the one that observed it. The engine already knows how it arrived at
       its state — the fix is to keep that fact (the last transition's `Confidence` and
       `matched_pattern`) alongside the state, and to read it in the "already in the wanted
       state" branch instead of synthesising `direct:already`.
-- [ ] `direct:already` survives only where it is *true*: a pane that was already in the state
+- [x] `direct:already` survives only where it is *true*: a pane that was already in the state
       before the watch began, with no transition behind it in this engine's life. The
       distinction the field exists for ("the state is the one you asked for, and here is how it
       was derived") must not be collapsed.
-- [ ] A regression test that fails on today's code: spawn a pane that asks a question, let the
+- [x] A regression test that fails on today's code: spawn a pane that asks a question, let the
       daemon's tick classify it with **no `[notify]` section**, then `wait --state question` and
       assert the reply carries the pattern. It must be driven through the real socket, since the
       defect is in the reply's construction.
-- [ ] No new wire field: the `Wait` reply's shape stays as it is (T-0028's N−1 window), and the
+- [x] No new wire field: the `Wait` reply's shape stays as it is (T-0028's N−1 window), and the
       fix is what fills `confidence`/`matched_pattern`.
+
+## Scope note
+
+The fence lists `crates/arreo-core/src/state/**` and the daemon, which is where the fix lives
+(`Engine` keeps the provenance; `Wait` reads it). `crates/arreo-core/src/state/mod.rs` gains the
+`Provenance` re-export — the module surface, so the type is reachable from the daemon.
+
+## Outcome
+
+Done. `Engine` keeps the last transition's `Provenance` (confidence + matched pattern) beside its
+state, set at every state assignment through one private `record`, so the two cannot drift;
+`Wait`'s already-branch reads it and fills the same two fields the event path fills.
+`direct:already` now survives only for a state no transition derived — the fresh engine's
+`Unknown`. Three tests, each mutation-proven (remove the fix → the regression test reddens with
+`left: "direct:already", right: "inferred:silence+prompt-shape"`; lie in the `None` branch → the
+other test reddens). No wire change. Evidence,
+including both mutation results and the pre-fix failure: `.loop/evidence/T-0110/`.
 
 ## Notes
 

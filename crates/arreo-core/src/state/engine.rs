@@ -23,6 +23,21 @@ pub enum Confidence {
     Inferred { rule: String },
 }
 
+/// How the engine arrived at its current state (T-0110).
+///
+/// The state alone cannot answer "how do you know?", and a reader that arrives
+/// *after* the transition has been consumed has nothing else to read it from:
+/// the daemon's 1 s notification tick (T-0093) pumps every pane, so the event
+/// that produced a state is usually already gone by the time a client asks.
+/// Kept beside the state, set wherever the state is, so the two cannot drift.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Provenance {
+    /// How much to trust the transition that produced the current state.
+    pub confidence: Confidence,
+    /// The adapter pattern that fired (question/error), if any.
+    pub matched_pattern: Option<String>,
+}
+
 /// One state transition.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Event {
@@ -143,6 +158,10 @@ fn tail_lines(text: &str, n: usize) -> String {
 pub struct Engine {
     adapter: Adapter,
     state: State,
+    /// How `state` was arrived at — the last transition's confidence and
+    /// matched pattern — or `None` before any transition (the initial
+    /// `Unknown`, which nothing derived). See [`Provenance`].
+    provenance: Option<Provenance>,
     /// Visible text accumulator (capped — see TEXT_CAP).
     text: String,
     /// Engine-clock of the last output byte.
@@ -191,6 +210,7 @@ impl Engine {
         Self {
             adapter,
             state: State::Unknown,
+            provenance: None,
             text: String::new(),
             last_output_ms: None,
             bell_pending: false,
@@ -207,6 +227,26 @@ impl Engine {
     #[must_use]
     pub fn state(&self) -> &State {
         &self.state
+    }
+
+    /// How the engine arrived at its current state, or `None` when nothing has
+    /// derived it — a fresh engine's initial `Unknown`, before any transition.
+    /// `None` is a fact about the engine's life, not a missing value: there is
+    /// no derivation to report, and a caller must not invent one.
+    #[must_use]
+    pub fn provenance(&self) -> Option<&Provenance> {
+        self.provenance.as_ref()
+    }
+
+    /// Take a transition: record the state it moved to **and** how it was
+    /// derived, together. The two are one fact, so every site that assigns
+    /// `state` goes through here and they cannot drift.
+    fn record(&mut self, event: &Event) {
+        self.state = event.state;
+        self.provenance = Some(Provenance {
+            confidence: event.confidence.clone(),
+            matched_pattern: event.matched_pattern.clone(),
+        });
     }
 
     /// The harness session this pane is on, if one is known (pinned at spawn
@@ -292,14 +332,15 @@ impl Engine {
             self.last_output_ms = Some(now_ms);
             // Output flowing → working (from anything except Done).
             if self.state != State::Working {
-                self.state = State::Working;
-                events.push(Event {
+                let event = Event {
                     t_ms: now_ms,
                     state: State::Working,
                     confidence: Confidence::Direct,
                     matched_pattern: None,
                     exit_code: None,
-                });
+                };
+                self.record(&event);
+                events.push(event);
             }
             // BEL → immediate attention on top of working.
             if self.bell_pending && self.adapter.bell_means_attention {
@@ -325,7 +366,7 @@ impl Engine {
                         exit_code: None,
                     },
                 };
-                self.state = next.state;
+                self.record(&next);
                 events.push(next);
             }
             return events;
@@ -351,8 +392,7 @@ impl Engine {
         if silent >= self.adapter.question_after_ms {
             if let Some(pattern) = self.adapter.match_question(&tail) {
                 if self.state != State::Question {
-                    self.state = State::Question;
-                    events.push(Event {
+                    let event = Event {
                         t_ms: now_ms,
                         state: State::Question,
                         confidence: Confidence::Inferred {
@@ -360,7 +400,9 @@ impl Engine {
                         },
                         matched_pattern: Some(pattern.to_string()),
                         exit_code: None,
-                    });
+                    };
+                    self.record(&event);
+                    events.push(event);
                     return events;
                 }
                 return events;
@@ -368,8 +410,7 @@ impl Engine {
         }
         if self.error_armed && silent >= self.adapter.blocked_after_ms {
             if self.state != State::Blocked {
-                self.state = State::Blocked;
-                events.push(Event {
+                let event = Event {
                     t_ms: now_ms,
                     state: State::Blocked,
                     confidence: Confidence::Inferred {
@@ -377,14 +418,15 @@ impl Engine {
                     },
                     matched_pattern: None,
                     exit_code: None,
-                });
+                };
+                self.record(&event);
+                events.push(event);
                 return events;
             }
             return events;
         }
         if silent >= self.adapter.idle_after_ms && self.state != State::Idle {
-            self.state = State::Idle;
-            events.push(Event {
+            let event = Event {
                 t_ms: now_ms,
                 state: State::Idle,
                 confidence: Confidence::Inferred {
@@ -392,7 +434,9 @@ impl Engine {
                 },
                 matched_pattern: None,
                 exit_code: None,
-            });
+            };
+            self.record(&event);
+            events.push(event);
         }
         events
     }
@@ -403,13 +447,62 @@ impl Engine {
             return Vec::new();
         }
         self.exited = true;
-        self.state = State::Done;
-        vec![Event {
+        let event = Event {
             t_ms: now_ms,
             state: State::Done,
             confidence: Confidence::Direct,
             matched_pattern: None,
             exit_code: Some(code),
-        }]
+        };
+        self.record(&event);
+        vec![event]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A tail the default adapter's first question pattern (`\[y/n\]`) matches.
+    const ASKING: &[u8] = b"Proceed? [y/n]\n";
+
+    /// The accessor's whole contract (T-0110): `None` is "nothing derived this
+    /// state yet" — a fact a caller must be able to tell from a derived one —
+    /// and a transition replaces it, so the reader always gets the *last* one.
+    #[test]
+    fn provenance_is_none_until_a_transition_and_follows_the_last_one() {
+        let mut engine = Engine::new(Adapter::default(), 0);
+        assert!(
+            engine.provenance().is_none(),
+            "a fresh engine's `Unknown` was derived from nothing"
+        );
+
+        // Output flowing → working: direct, and no pattern fired.
+        engine.feed(ASKING, 0);
+        let working = engine.provenance().expect("the working transition");
+        assert_eq!(working.confidence, Confidence::Direct);
+        assert_eq!(working.matched_pattern, None);
+
+        // Silence past `question_after_ms` → question: inferred, with the pattern.
+        let events = engine.tick(3_000);
+        assert!(
+            events.iter().any(|e| e.state == State::Question),
+            "prompt-shaped silence → question, got {events:?}"
+        );
+        let question = engine.provenance().expect("the question transition");
+        assert_eq!(
+            question.confidence,
+            Confidence::Inferred {
+                rule: "silence+prompt-shape".to_string()
+            }
+        );
+        assert_eq!(question.matched_pattern.as_deref(), Some("\\[y/n\\]"));
+
+        // The next transition replaces it — this is the last one, not a history.
+        engine.child_exited(0, 4_000);
+        let done = engine.provenance().expect("the done transition");
+        assert_eq!(done.confidence, Confidence::Direct);
+        assert_eq!(done.matched_pattern, None);
+        assert_eq!(*engine.state(), State::Done);
     }
 }
