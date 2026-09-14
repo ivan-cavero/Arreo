@@ -1,0 +1,13 @@
+T-0086 — the conflict: both machines edit, both push, neither overwrites
+=====================================================================
+
+Both payloads are built by `arreo sync payload` (the shipped CLI) BEFORE either is
+delivered, so the pair is genuinely concurrent — alpha's vector is {alpha:2} against
+beta's {alpha:1, beta:1}. The exchange is Message::Sync; the receiver runs the same
+SyncEngine::receive the local `apply` runs.
+
+[PASS] mesh: beta keeps alpha's edit beside its own, under alpha's device id
+[PASS] mesh: alpha keeps beta's edit beside its own, under beta's device id
+[PASS] mesh: neither live file was overwritten, and each machine holds both copies
+[PASS] mesh: each copy holds the other machine's bytes
+mesh: conflict copies — alpha-machine: ["opencode.conflict-dev_2190044edca8c92b3d68197b539cac95-20260914T013207.jsonc"] · beta-machine: ["opencode.conflict-dev_1bcc8ea439bf40520902690a8cd61fcf-20260914T013206.jsonc"]

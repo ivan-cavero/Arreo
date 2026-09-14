@@ -77,14 +77,35 @@ const WORKED_CASE: &str = r#"{
 }
 "#;
 
-/// One stand-in machine: its roots, its store, its secrets, its CLI calls.
+/// One stand-in machine: its roots, its store, its secrets, its CLI calls — and
+/// its **device identity**, because that is what a version vector is keyed by
+/// (T-0086). The slice used to count revisions under the machine's name; the
+/// transport decision moved the counter key to the id the mesh authenticates, so
+/// a stand-in machine now has to have one, exactly as a real machine does.
 struct Root {
     name: &'static str,
     dir: PathBuf,
     cli: PathBuf,
+    /// This machine's `dev_<hex>` id, as the CLI derives it from the key on disk.
+    device: String,
 }
 
 impl Root {
+    /// Give this stand-in machine a device identity: a key at the path
+    /// `identity_root()` resolves to under this root's `XDG_DATA_HOME`.
+    ///
+    /// The id is derived the same way the CLI derives it (`DeviceId::from_key`),
+    /// so the slice's expectations and the product's spelling cannot disagree —
+    /// which is the whole reason the conflict-copy assertion below names the
+    /// device rather than the machine.
+    fn issue_identity(dir: &Path) -> String {
+        let identity = dir.join("data/arreo/identity");
+        std::fs::create_dir_all(&identity).expect("identity dir");
+        let key = arreo_core::identity::DeviceKey::generate().expect("entropy");
+        key.save(&identity.join("device.key")).expect("save key");
+        arreo_core::identity::DeviceId::from_key(&key.public()).display_id()
+    }
+
     fn cfg(&self) -> PathBuf {
         self.dir.join("cfg")
     }
@@ -116,7 +137,13 @@ impl Root {
         command
             .arg("sync")
             .args(args)
-            .arg("--machine")
+            // **`--name`, not `--machine`.** The two flags mean different things
+            // since T-0086: `--name` is this machine's display name (what a
+            // preset's paths and the sentences resolve against), and `--machine`
+            // is *another* machine reached over the mesh — the spelling every
+            // other verb in this CLI uses. The slice is a stand-in for two
+            // machines, not a client pushing to a peer, so it names itself.
+            .arg("--name")
             .arg(self.name)
             .arg("--store")
             .arg(self.store())
@@ -217,14 +244,18 @@ pub fn run(rest: &[String]) -> ExitCode {
         }
     }
     let (_, cli, _) = crate::harness::bins();
+    let alpha_dir = scratch.join("a");
+    let beta_dir = scratch.join("b");
     let alpha = Root {
         name: ALPHA,
-        dir: scratch.join("a"),
+        device: Root::issue_identity(&alpha_dir),
+        dir: alpha_dir,
         cli: cli.clone(),
     };
     let beta = Root {
         name: BETA,
-        dir: scratch.join("b"),
+        device: Root::issue_identity(&beta_dir),
+        dir: beta_dir,
         cli,
     };
     let mut stages = Stages {
@@ -464,7 +495,9 @@ fn stage_conflict(alpha: &Root, beta: &Root, stages: &mut Stages) {
         .expect("dir")
         .filter_map(Result::ok)
         .map(|e| e.file_name().to_string_lossy().to_string())
-        .find(|name| name.starts_with(&format!("opencode.conflict-{ALPHA}-")))
+        // The loser's name is the sender's **device id**, not its display name:
+        // that is the counter key (T-0086), and it is what a peer can verify.
+        .find(|name| name.starts_with(&format!("opencode.conflict-{}-", alpha.device)))
         .unwrap_or_default();
     stages.check(
         "conflict-keep-both",

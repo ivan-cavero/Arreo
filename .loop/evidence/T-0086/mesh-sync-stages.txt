@@ -1,0 +1,51 @@
+T-0086 — the sync story in `cargo xtask e2e --slice mesh`
+=====================================================
+
+Command: cargo xtask e2e --slice mesh
+Result:  mesh: 36 passed, 1 skipped, 0 failed   (two consecutive runs)
+
+--- run 1 (run18) ---
+[PASS] mesh: alpha stores its own provider key
+[PASS] mesh: a receiver that cannot resolve the reference refuses it by name
+[PASS] mesh: beta stores its own value for the same name
+[PASS] mesh: the peer applies the revision and names the sender's device id
+[PASS] mesh: both machines hold the file byte for byte
+[PASS] mesh: the receiver resolves the reference from its own store
+mesh: sync alpha-machine -> beta-machine in 128.370179ms (waited 14.932760753s for the receiver's stream to clear): opencode.jsonc: Conflict copy opencode.conflict-dev_1bcc8ea439bf40520902690a8cd61fcf-20260914T013206.jsonc
+mesh: sync beta-machine -> alpha-machine in 160.277526ms (waited 19.156µs for the receiver's stream to clear): opencode.jsonc: Conflict copy opencode.conflict-dev_2190044edca8c92b3d68197b539cac95-20260914T013207.jsonc
+[PASS] mesh: beta keeps alpha's edit beside its own, under alpha's device id
+[PASS] mesh: alpha keeps beta's edit beside its own, under beta's device id
+[PASS] mesh: neither live file was overwritten, and each machine holds both copies
+[PASS] mesh: each copy holds the other machine's bytes
+mesh: sync operator-laptop -> beta-machine in 126.930269ms (waited 12.894µs for the receiver's stream to clear): opencode.jsonc: Refused — refused opencode.jsonc: possible secrets detected:
+[PASS] mesh: a payload that would put a literal secret on the receiver is refused with the finding
+mesh: sync operator-laptop -> beta-machine in 115.784649ms (waited 15.005913765s for the receiver's stream to clear): zed-settings.json: Refused — zed-settings.json: not a preset file and not an absolute path — presets exist for the harnesses whose paths were measured (opencode, pi, omp); anything else needs a path of your own, and a machine will not receive a file it has no preset for
+[PASS] mesh: a payload for a file the receiver has no preset for is refused
+mesh: sync operator-laptop -> beta-machine in 202.009772ms (waited 15.009797774s for the receiver's stream to clear): opencode.jsonc: Refused — refused opencode.jsonc: the payload counts its revision under dev_1bcc8ea439bf40520902690a8cd61fcf, but this session is authenticated as dev_a777ee3091bdcfdee06281229a556ab3 — a machine is the authority on its own counter, and only on its own
+[PASS] mesh: a payload claiming another machine's identity is refused, not corrected
+[PASS] mesh: none of the three refusals wrote anything on the receiver
+mesh: conflict copies — alpha-machine: ["opencode.conflict-dev_2190044edca8c92b3d68197b539cac95-20260914T013207.jsonc"] · beta-machine: ["opencode.conflict-dev_1bcc8ea439bf40520902690a8cd61fcf-20260914T013206.jsonc"]
+mesh: forged-identity probe — dev_a777ee3091bdcfdee06281229a556ab3 claimed dev_1bcc8ea439bf40520902690a8cd61fcf
+
+--- run 2 (run19), the confirmation ---
+[PASS] mesh: alpha stores its own provider key
+[PASS] mesh: a receiver that cannot resolve the reference refuses it by name
+[PASS] mesh: beta stores its own value for the same name
+[PASS] mesh: the peer applies the revision and names the sender's device id
+[PASS] mesh: both machines hold the file byte for byte
+[PASS] mesh: the receiver resolves the reference from its own store
+mesh: sync alpha-machine -> beta-machine in 134.822547ms (waited 14.922735796s for the receiver's stream to clear): opencode.jsonc: Conflict copy opencode.conflict-dev_d008f2e7fd0a653bcc38d1a0b91236b4-20260914T013337.jsonc
+mesh: sync beta-machine -> alpha-machine in 146.148221ms (waited 34.475µs for the receiver's stream to clear): opencode.jsonc: Conflict copy opencode.conflict-dev_b931e9578090c06efc9b681b1c27121f-20260914T013338.jsonc
+[PASS] mesh: beta keeps alpha's edit beside its own, under alpha's device id
+[PASS] mesh: alpha keeps beta's edit beside its own, under beta's device id
+[PASS] mesh: neither live file was overwritten, and each machine holds both copies
+[PASS] mesh: each copy holds the other machine's bytes
+mesh: sync operator-laptop -> beta-machine in 171.245691ms (waited 14.306µs for the receiver's stream to clear): opencode.jsonc: Refused — refused opencode.jsonc: possible secrets detected:
+[PASS] mesh: a payload that would put a literal secret on the receiver is refused with the finding
+mesh: sync operator-laptop -> beta-machine in 110.054922ms (waited 15.013829186s for the receiver's stream to clear): zed-settings.json: Refused — zed-settings.json: not a preset file and not an absolute path — presets exist for the harnesses whose paths were measured (opencode, pi, omp); anything else needs a path of your own, and a machine will not receive a file it has no preset for
+[PASS] mesh: a payload for a file the receiver has no preset for is refused
+mesh: sync operator-laptop -> beta-machine in 123.680204ms (waited 15.017757477s for the receiver's stream to clear): opencode.jsonc: Refused — refused opencode.jsonc: the payload counts its revision under dev_d008f2e7fd0a653bcc38d1a0b91236b4, but this session is authenticated as dev_540ef98d6a9ad8da8c80ad651d627f83 — a machine is the authority on its own counter, and only on its own
+[PASS] mesh: a payload claiming another machine's identity is refused, not corrected
+[PASS] mesh: none of the three refusals wrote anything on the receiver
+mesh: conflict copies — alpha-machine: ["opencode.conflict-dev_b931e9578090c06efc9b681b1c27121f-20260914T013338.jsonc"] · beta-machine: ["opencode.conflict-dev_d008f2e7fd0a653bcc38d1a0b91236b4-20260914T013337.jsonc"]
+mesh: forged-identity probe — dev_540ef98d6a9ad8da8c80ad651d627f83 claimed dev_d008f2e7fd0a653bcc38d1a0b91236b4

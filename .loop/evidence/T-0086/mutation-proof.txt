@@ -1,0 +1,17 @@
+T-0086 — mutation proof: the identity check is load-bearing
+==========================================================
+
+1. cp crates/arreo-server/src/daemon.rs <scratch>/daemon.rs.orig
+2. delete the `if payload.machine != device { .. }` block from serve_sync
+3. cargo build -p arreo-server -p xtask
+4. cargo xtask e2e --slice mesh
+     -> [FAIL] mesh: a payload claiming another machine's identity is refused, not corrected
+     -> [FAIL] mesh: none of the three refusals wrote anything on the receiver
+     -> mesh: 32 passed, 1 skipped, 4 failed
+5. cp <scratch>/daemon.rs.orig crates/arreo-server/src/daemon.rs
+6. cargo build -p arreo-server -p xtask && cargo xtask e2e --slice mesh
+     -> [PASS] mesh: a payload claiming another machine's identity is refused, not corrected
+     -> mesh: 36 passed, 1 skipped, 0 failed
+
+The probe is therefore the mutation target: it is the only check in the slice that
+goes red when the identity check is removed.

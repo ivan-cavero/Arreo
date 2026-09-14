@@ -22,9 +22,44 @@
 //! daemons are the shipped binaries under test — no mocks, no in-process fakes —
 //! but they are two processes on one box, and anything about real networks is
 //! out of scope by design rather than by omission.
+//!
+//! ## The sync story (T-0086), and why it needs a client of its own
+//!
+//! The last section runs ROADMAP §3.8's owner case across the two live machines:
+//! one `opencode.jsonc` edited on alpha, `arreo sync push --machine beta-machine`,
+//! both files byte-identical, the receiver resolving the reference from its own
+//! keychain; then the conflict — both machines edit, both publish, neither
+//! overwrites — and the three refusals a receiver owes a peer (a literal secret,
+//! a file it has no preset for, and a payload claiming another machine's
+//! identity).
+//!
+//! Two of those stages cannot be driven by the shipped CLI, and the reason is a
+//! property of the product rather than a gap in it. `arreo sync push --machine`
+//! counts the revision *and then* builds the payload, so two machines exchanging
+//! through it are never concurrent: the second push carries the first push's
+//! absorbed counter and lands as an ordinary update instead of a conflict. And a
+//! payload that must be *wrong* — a literal secret, a name no preset knows, a
+//! forged `machine` field — cannot be produced by a verb whose job is to refuse
+//! exactly those. So the slice sends those payloads itself, with the product's
+//! own client (`arreo_core::mesh::session`) over the product's own frames to the
+//! shipped daemon; what it hand-builds is the payload, which is the thing under
+//! test. Everything else — the revision counting, the file edits, the keychain —
+//! is the CLI.
+//!
+//! The sender's daemon is stopped for the length of its own send. That is not
+//! tidiness: a machine's daemon and its CLI are one device, so a client dialing
+//! with that identity *replaces* the daemon's relay session (T-0060) and the
+//! daemon reconnects on its own 250 ms backoff — which would race the very
+//! exchange the stage is measuring. Stopping it makes the exchange deterministic,
+//! and each machine's daemon is back before the next stage runs.
 
 use crate::harness::{bins, TuiSession};
-use arreo_core::identity::{DeviceCert, DeviceKey, Role, RootKey};
+use arreo_core::identity::{DeviceCert, DeviceId, DeviceKey, Role, RootKey};
+use arreo_core::mesh::{MeshClient, RemoteTarget, Target};
+use arreo_core::proto::{Message, SyncExchange, SyncOutcome, SyncStatus, VERSION};
+use arreo_core::sync::keychain::{plan, SecretStore};
+use arreo_core::update::verify::sha256;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitCode, Stdio};
 use std::sync::{mpsc, Arc, Mutex};
@@ -35,6 +70,80 @@ use std::time::{Duration, Instant};
 /// and B is which.
 const ALPHA: &str = "alpha-machine";
 const BETA: &str = "beta-machine";
+
+/// The variable the synced file references, and the two machines' own values.
+///
+/// Dummies, the same name `docs/harness-centralization.md` uses: a value never
+/// crosses the wire (the payload carries the reference), which is the property
+/// the convergence stage asserts and the reason each machine has its own.
+const SYNC_KEY: &str = "VBK_PROD_KEY";
+const ALPHA_KEY_VALUE: &str = "alpha-key-value-3f19";
+const BETA_KEY_VALUE: &str = "beta-key-value-8a02";
+
+/// The owner's file (`docs/harness-centralization.md` §4 step 1), in opencode's
+/// own spelling — `{env:NAME}`, which is what the harness on this machine reads.
+///
+/// `__PROVIDER__` marks the one thing two concurrent edits differ in, so the
+/// conflict stage's two files are the same file with two edits rather than two
+/// unrelated documents.
+const OPENCODE_CASE: &str = r#"{
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "verboo": {
+      "name": "__PROVIDER__",
+      "npm": "@ai-sdk/openai-compatible",
+      "options": {
+        "baseURL": "https://code.verboo.ai/router/v1",
+        "apiKey": "{env:VBK_PROD_KEY}"
+      }
+    }
+  }
+}
+"#;
+
+/// The worked case with `provider` named, so two machines' edits differ.
+fn opencode_case(provider: &str) -> String {
+    OPENCODE_CASE.replace("__PROVIDER__", provider)
+}
+
+/// What a hostile (or buggy) peer would put where a reference belongs.
+///
+/// A literal, in a provider key field: exactly what T-0083's scanner exists to
+/// refuse, and what the sender's own `push` would never let leave this machine —
+/// which is why the payload carrying it is built here rather than by the CLI.
+const LITERAL_SECRET_CONTENT: &str =
+    r#"{"provider":{"verboo":{"options":{"apiKey":"sk-live-4f8a1c9b2d7e"}}}}"#;
+
+/// The environment that *is* one machine.
+///
+/// `XDG_CONFIG_HOME` is what a preset's symbolic path resolves against **and**
+/// where the machine's own keychain lives (`$XDG_CONFIG_HOME/arreo/secrets.json`),
+/// so two machines on one host need two of them — and the operator's real one is
+/// never read or written. `HOME` and the other XDG roots point inside the same
+/// scratch tree for the same reason: a verb run by this slice must not touch a
+/// file the person running it owns.
+fn machine_env(dir: &Path) -> [(String, String); 5] {
+    let path = |name: &str| dir.join(name).display().to_string();
+    [
+        ("HOME".to_string(), path("home")),
+        ("XDG_CONFIG_HOME".to_string(), path("cfg")),
+        ("XDG_DATA_HOME".to_string(), path("data")),
+        ("XDG_STATE_HOME".to_string(), path("state")),
+        ("XDG_CACHE_HOME".to_string(), path("cache")),
+    ]
+}
+
+/// The directories [`machine_env`] names, created up front.
+///
+/// Not tidiness: `HOME` is also the working directory a pane's spawn inherits
+/// when it names none (`portable-pty` chdirs to it), so a home that does not
+/// exist makes every pane spawn fail with ENOENT — which surfaces as "pty
+/// backend: No such file or directory" and has nothing to do with ptys.
+fn prepare_machine(dir: &Path) {
+    for part in ["cfg", "home", "data", "state", "cache"] {
+        let _ = std::fs::create_dir_all(dir.join(part));
+    }
+}
 
 /// A process whose stderr is drained for its whole life.
 ///
@@ -123,11 +232,25 @@ fn debug_bin(name: &str) -> PathBuf {
 /// turns a stall into a named FAIL with whatever the command printed.
 const CLI_DEADLINE: Duration = Duration::from_secs(20);
 
-/// Run the CLI with `ARREO_IDENTITY_DIR` pointed at `dir` and `ARREO_CONFIG`
-/// pointed at `config`, bounded by [`CLI_DEADLINE`]. Returns
-/// (success, combined output); a timeout is a failure whose output says so.
+/// Run the CLI with `ARREO_IDENTITY_DIR` pointed at `dir`, `ARREO_CONFIG` at
+/// `config`, and the `XDG_*` roots of `dir` (see [`machine_env`]), bounded by
+/// [`CLI_DEADLINE`]. Returns (success, combined output); a timeout is a failure
+/// whose output says so.
 fn cli(dir: &Path, config: &Path, cli_bin: &Path, args: &[&str]) -> (bool, String) {
-    cli_with_deadline(CLI_DEADLINE, dir, config, cli_bin, args)
+    cli_with_stdin(dir, config, cli_bin, args, None)
+}
+
+/// The same, with a value on stdin — `arreo sync secret set` reads the secret
+/// there and never from argv (a value on argv is a value in the process table and
+/// in the shell's history file).
+fn cli_with_stdin(
+    dir: &Path,
+    config: &Path,
+    cli_bin: &Path,
+    args: &[&str],
+    stdin: Option<&str>,
+) -> (bool, String) {
+    cli_with_deadline(CLI_DEADLINE, dir, config, cli_bin, args, stdin)
 }
 
 /// The same, with a caller-chosen deadline.
@@ -137,15 +260,29 @@ fn cli_with_deadline(
     config: &Path,
     cli_bin: &Path,
     args: &[&str],
+    stdin: Option<&str>,
 ) -> (bool, String) {
     let mut child = Command::new(cli_bin)
         .args(args)
         .env("ARREO_IDENTITY_DIR", dir)
         .env("ARREO_CONFIG", config)
+        .envs(machine_env(dir))
+        .stdin(if stdin.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .expect("the CLI starts");
+    if let Some(text) = stdin {
+        use std::io::Write as _;
+        if let Some(mut pipe) = child.stdin.take() {
+            let _ = pipe.write_all(text.as_bytes());
+            // Dropped here, so the child sees EOF and stops reading.
+        }
+    }
     let deadline = Instant::now() + deadline;
     loop {
         match child.try_wait() {
@@ -207,6 +344,12 @@ fn hostname_name(text: &str) -> String {
 /// a shortcut to it.
 struct Machine {
     dir: PathBuf,
+    /// This machine's display name — what the sentences an operator reads call
+    /// it. **Not** the counter key: that is the device id (T-0086).
+    name: String,
+    /// This machine's `XDG_CONFIG_HOME`: what a preset's symbolic path resolves
+    /// against, and where the machine's own keychain lives.
+    cfg: PathBuf,
     socket: PathBuf,
     config: PathBuf,
     key: DeviceKey,
@@ -252,8 +395,12 @@ impl Machine {
             ),
         )
         .expect("config");
+        prepare_machine(&dir);
+        let cfg = dir.join("cfg");
         Self {
             dir,
+            name: name.to_string(),
+            cfg,
             socket,
             config,
             key,
@@ -306,7 +453,11 @@ impl Machine {
             .arg(&self.socket)
             .arg("--config")
             .arg(&self.config)
-            .env("ARREO_IDENTITY_DIR", &self.dir);
+            .env("ARREO_IDENTITY_DIR", &self.dir)
+            // The daemon resolves the synced files' paths and its own keychain
+            // from these, so a daemon started without them would read — and on a
+            // receive, *write* — the config home of whoever ran the slice.
+            .envs(machine_env(&self.dir));
         let (daemon, _) = Proc::spawn(&mut cmd, None);
         assert!(
             daemon.await_log("serving on"),
@@ -356,8 +507,12 @@ impl Machine {
             format!("[relay]\nenabled = true\naddr = \"{relay_addr}\"\naccount = \"{account}\"\n"),
         )
         .expect("config");
+        prepare_machine(&dir);
+        let cfg = dir.join("cfg");
         Self {
             dir,
+            name: "operator-laptop".to_string(),
+            cfg,
             socket,
             config,
             key,
@@ -383,11 +538,741 @@ impl Machine {
         false
     }
 
+    /// This machine's device id: the counter key every revision and every
+    /// conflict copy is named after (T-0086), derived the way the CLI derives it
+    /// (`DeviceId::from_key`), so the slice's expectation and the product's
+    /// spelling cannot disagree.
+    fn device_id(&self) -> String {
+        DeviceId::from_key(&self.key.public()).display_id()
+    }
+
+    /// The preset's live file on this machine
+    /// (`$XDG_CONFIG_HOME/opencode/opencode.jsonc`).
+    fn opencode(&self) -> PathBuf {
+        self.cfg.join("opencode").join("opencode.jsonc")
+    }
+
+    /// This machine's own keychain — where `arreo sync secret set` puts a value.
+    fn secrets_path(&self) -> PathBuf {
+        self.cfg.join("arreo").join("secrets.json")
+    }
+
+    fn write_file(&self, path: &Path, content: &str) {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("the file's directory");
+        }
+        std::fs::write(path, content).expect("the file is written");
+    }
+
+    fn read_file(&self, path: &Path) -> String {
+        std::fs::read_to_string(path).unwrap_or_default()
+    }
+
+    /// Run `arreo sync …` on this machine: its identity, its config, its own
+    /// `XDG_CONFIG_HOME` (the file a preset names is under *this* machine's
+    /// root), its display name, and **its own store**.
+    ///
+    /// `--socket` is not decoration: it is what selects the store
+    /// (`<socket>.db`), and without it the CLI falls back to the machine-wide
+    /// default socket — so every machine in this slice, and every previous run,
+    /// would share one SQLite file. The vectors would then be other machines'
+    /// revisions of the same file name, which is exactly what a version vector
+    /// exists to distinguish. Passing it also makes the store the *daemon's own*
+    /// (same path), which is what lets the audit check below read back the row
+    /// the receiving daemon wrote.
+    fn sync_cli(&self, cli_bin: &Path, args: &[&str]) -> (bool, String) {
+        let mut full: Vec<String> = vec!["sync".to_string()];
+        full.extend(args.iter().map(|arg| (*arg).to_string()));
+        full.push("--socket".to_string());
+        full.push(self.socket.display().to_string());
+        full.push("--name".to_string());
+        full.push(self.name.clone());
+        let refs: Vec<&str> = full.iter().map(String::as_str).collect();
+        cli(&self.dir, &self.config, cli_bin, &refs)
+    }
+
     fn kill_daemon(&mut self) {
         if let Some(daemon) = self.daemon.take() {
             drop(daemon);
         }
     }
+}
+
+/// What the sync stages need from the fabric `run` already built.
+struct SyncFabric<'a> {
+    relay: SocketAddr,
+    account: &'a str,
+    server_bin: &'a Path,
+    cli_bin: &'a Path,
+    /// Where the payloads this slice builds are written (never the operator's
+    /// directories).
+    scratch: &'a Path,
+    /// The relay's own log, for a failure message that names the session that
+    /// was replaced rather than leaving the reader to guess.
+    relay_log: &'a Proc,
+}
+
+/// One `Message::Sync` to `peer`'s daemon, **authenticating as `sender`**.
+///
+/// The client is the product's (`arreo_core::mesh::session`), the frames are the
+/// product's, and the daemon at the far end is the shipped binary; what this
+/// builds is the payload, which is the thing the conflict and the refusals have
+/// to control. The target is built from the two machines' own keys rather than
+/// resolved through the directory: the peer's device key is what `pin` wrote into
+/// the other machine's trust list, and the Noise handshake is what proves the
+/// machine at the other end holds it.
+fn send_sync(
+    sender: &Machine,
+    peer: &Machine,
+    relay: SocketAddr,
+    account: &str,
+    payload: &[u8],
+) -> Result<SyncOutcome, String> {
+    let identity = sender.dir.join("identity");
+    let key = DeviceKey::load(&identity.join("device.key"))
+        .map_err(|e| format!("{}: {e}", identity.display()))?;
+    let id = DeviceId::from_key(&key.public());
+    let cert = DeviceCert::load(
+        &identity
+            .join("devices")
+            .join(format!("{}.cert", id.as_str())),
+    )
+    .map_err(|e| format!("{}: {e}", identity.display()))?;
+    let target = Target::Remote(Box::new(RemoteTarget {
+        relay,
+        account: account.to_string(),
+        peer: DeviceId::from_key(&peer.key.public()),
+        server_key: peer.key.public(),
+        device: Arc::new(key),
+        cert: Arc::new(cert),
+    }));
+    let exchange = SyncExchange {
+        payload: payload.to_vec(),
+    };
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| format!("no runtime for the exchange: {e}"))?;
+    runtime.block_on(async move {
+        match MeshClient::request_to(
+            &target,
+            &Message::Sync {
+                v: VERSION,
+                exchange,
+            },
+        )
+        .await
+        {
+            Ok(Message::SyncReply { outcome, .. }) => Ok(*outcome),
+            Ok(Message::Error { message, .. }) => Err(message),
+            Ok(other) => Err(format!("unexpected reply {other:?}")),
+            Err(e) => Err(format!("{}: {e}", peer.name)),
+        }
+    })
+}
+
+/// Wait, bounded, until the receiver holds **no stream** for `sender`.
+///
+/// The fact is the receiver's own pair of lines: it logs one `relay peer <id>
+/// authenticated` per session it opens for a sender, and one `<id> went offline`
+/// per stream it tears down. Every session opened has been torn down exactly when
+/// the second count has caught the first — so that invariant, read from the
+/// daemon's log, is "there is nothing left for this sender's next exchange to
+/// race", and it is a fact rather than a duration. The deadline only bounds the
+/// wait.
+fn await_no_stream(peer: &Machine, sender: &Machine, deadline: Duration) -> Option<Duration> {
+    let id = sender.device_id();
+    let opened = format!("relay peer {id} authenticated");
+    let torn_down = format!("{id} went offline");
+    let until = Instant::now() + deadline;
+    let started = Instant::now();
+    loop {
+        let log = peer.log_text();
+        if log.matches(&torn_down).count() >= log.matches(&opened).count() {
+            return Some(started.elapsed());
+        }
+        if Instant::now() >= until {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+/// One send, as the receiver's answer or the reason there is none.
+///
+/// **The wait before the send is a fix for a measured race, not politeness.** A
+/// machine's daemon holds one peer stream per sending device, and it only drops
+/// that stream when the relay tells it the peer is gone. A *second* exchange from
+/// one sender that starts while the first exchange's stream is still there has
+/// its opening Noise flight read as garbage by an established session; that
+/// stream dies, and all three of the sender's handshake attempts time out — 9 s
+/// of silence, measured on every run before this wait existed. Waiting for the
+/// receiver to have torn the old stream down is waiting for the fact, and the
+/// receiver is the only party that knows it.
+fn exchange(
+    sender: &Machine,
+    peer: &Machine,
+    fabric: &SyncFabric<'_>,
+    payload: &[u8],
+) -> Result<SyncOutcome, String> {
+    let settled = await_no_stream(peer, sender, Duration::from_secs(30));
+    assert!(
+        settled.is_some(),
+        "{} still holds a stream for {} after 30 s, so this exchange would race the previous one",
+        peer.name,
+        sender.name
+    );
+    let started = Instant::now();
+    let outcome = send_sync(sender, peer, fabric.relay, fabric.account, payload);
+    println!(
+        "mesh: sync {} -> {} in {:?} (waited {:?} for the receiver's stream to clear): {}",
+        sender.name,
+        peer.name,
+        started.elapsed(),
+        settled.unwrap_or_default(),
+        describe(&outcome)
+    );
+    outcome
+}
+
+/// The status the receiver reported, or `None` when nothing answered.
+fn status_of(outcome: &Result<SyncOutcome, String>) -> Option<SyncStatus> {
+    outcome.as_ref().ok().map(|outcome| outcome.status)
+}
+
+/// The receiver's own words — its refusal, or the transport's failure.
+fn reason_of(outcome: &Result<SyncOutcome, String>) -> String {
+    match outcome {
+        Ok(outcome) => outcome.reason.clone(),
+        Err(e) => e.clone(),
+    }
+}
+
+/// One exchange, as one line for a check's detail.
+fn describe(outcome: &Result<SyncOutcome, String>) -> String {
+    match outcome {
+        Ok(outcome) => {
+            let mut text = format!("{}: {:?}", outcome.file, outcome.status);
+            if !outcome.copy.is_empty() {
+                text.push_str(&format!(" copy {}", outcome.copy));
+            }
+            if !outcome.reason.is_empty() {
+                text.push_str(&format!(" — {}", outcome.reason));
+            }
+            text
+        }
+        Err(e) => format!("no outcome: {e}"),
+    }
+}
+
+/// The payload the CLI builds for `file` on `machine` (`arreo sync payload`,
+/// which counts the revision and prints what a peer receives).
+///
+/// The half of "both machines edit and both push" that the exchange cannot do
+/// for itself: both payloads must exist before either machine has seen the
+/// other's, or the pair is not concurrent and the receiver is right to treat it
+/// as an ordinary update.
+fn payload_bytes(
+    machine: &Machine,
+    cli_bin: &Path,
+    file: &str,
+    out: &Path,
+) -> Result<String, String> {
+    let (ok, text) = machine.sync_cli(
+        cli_bin,
+        &["payload", file, "--out", &out.display().to_string()],
+    );
+    if !ok {
+        return Err(format!(
+            "{} could not publish {file}: {}",
+            machine.name,
+            collapse(&text)
+        ));
+    }
+    std::fs::read_to_string(out).map_err(|e| format!("{}: {e}", out.display()))
+}
+
+/// Replace one field's value in the payload JSON the CLI printed.
+///
+/// Line-anchored, because `serde_json::to_string_pretty` writes one field per
+/// line and the payload's `content` is a whole document of quotes that a naive
+/// scan for a closing quote would walk straight into. What this edits is the
+/// payload; the receiver is never touched.
+fn rewrite_field(json: &str, field: &str, value: &str) -> Result<String, String> {
+    let needle = format!("\n  \"{field}\": \"");
+    let start = json
+        .find(&needle)
+        .ok_or_else(|| format!("the payload carries no {field:?} field"))?
+        + needle.len();
+    let rest = &json[start..];
+    let bytes = rest.as_bytes();
+    let mut end = None;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' => i += 2,
+            b'"' => {
+                end = Some(i);
+                break;
+            }
+            _ => i += 1,
+        }
+    }
+    let end = end.ok_or_else(|| format!("the payload's {field:?} value is unterminated"))?;
+    Ok(format!("{}{}{}", &json[..start], value, &rest[end..]))
+}
+
+/// `text` as a JSON string's contents.
+fn json_escape(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// The conflict copies beside a machine's live file, by name — the file system's
+/// answer, not the reply's.
+fn conflict_copies(machine: &Machine) -> Vec<String> {
+    let live = machine.opencode();
+    let Some(dir) = live.parent() else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .map(|entries| {
+            entries
+                .filter_map(Result::ok)
+                .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                .filter(|name| name.contains(".conflict-"))
+                .collect()
+        })
+        .unwrap_or_default();
+    names.sort();
+    names
+}
+
+/// A daemon's own log, tail-first, for a failure message worth reading.
+fn log_tail(machine: &Machine) -> String {
+    text_tail(&machine.log_text())
+}
+
+/// The last few hundred characters of a log, collapsed onto one line.
+fn text_tail(text: &str) -> String {
+    let tail: String = text
+        .chars()
+        .rev()
+        .take(600)
+        .collect::<Vec<char>>()
+        .into_iter()
+        .rev()
+        .collect();
+    collapse(&tail)
+}
+
+/// A machine's own audit trail, through the CLI's own reader of its own store.
+fn audit_of(machine: &Machine, cli_bin: &Path) -> String {
+    let output = Command::new(cli_bin)
+        .args([
+            "audit",
+            "--limit",
+            "50",
+            "--socket",
+            &machine.socket.display().to_string(),
+        ])
+        .env("ARREO_IDENTITY_DIR", &machine.dir)
+        .envs(machine_env(&machine.dir))
+        .output()
+        .expect("audit runs");
+    let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
+    text.push_str(&String::from_utf8_lossy(&output.stderr));
+    text
+}
+
+/// T-0086's story across the two live machines: the owner case, the conflict, and
+/// the three refusals a receiver owes a peer.
+///
+/// `check` is the slice's own pass/fail printer, so every stage reports the same
+/// way as the rest of the slice and the transcript carries the evidence — the
+/// conflict copies' names, and the receivers' own refusal sentences.
+fn sync_stages(
+    alpha: &mut Machine,
+    beta: &mut Machine,
+    client: &Machine,
+    fabric: &SyncFabric<'_>,
+    check: &mut dyn FnMut(&str, bool, &str),
+) {
+    let cli_bin = fabric.cli_bin;
+
+    // ---- the owner case: edit once on alpha, converge on beta ----
+    //
+    // Step 0 of §3.8's design, once per machine and never synced: each machine
+    // stores the provider key itself. Alpha's is here; beta's absence is the
+    // point of the next check.
+    let (ok, out) = cli_with_stdin(
+        &alpha.dir,
+        &alpha.config,
+        cli_bin,
+        &["sync", "secret", "set", SYNC_KEY, "--name", ALPHA],
+        Some(ALPHA_KEY_VALUE),
+    );
+    check(
+        "alpha stores its own provider key",
+        ok && out.contains(SYNC_KEY),
+        &collapse(&out),
+    );
+
+    // **Alpha's daemon is stopped here and stays stopped until the moment it has
+    // to receive.** A machine's daemon and its CLI are one device, so a client
+    // dialing with that identity replaces the daemon's relay session (T-0060) —
+    // and the daemon's own reconnect 250 ms later replaces the client's, which is
+    // how the first version of this stage lost an exchange mid-flight. Neither
+    // end of that race is what any of these stages measures: the machine under
+    // test is the *receiver*, and the receiver is live throughout.
+    alpha.kill_daemon();
+
+    // The edit, and the push. What travels is the reference; what stays is the
+    // value. Beta has no key yet, and the machine that must say so is the
+    // receiver — in the receiver's own words, naming the variable.
+    alpha.write_file(&alpha.opencode(), &opencode_case("Verboo Code"));
+    let (ok, refused) = alpha.sync_cli(cli_bin, &["push", "opencode.jsonc", "--machine", BETA]);
+    let by_name = format!(
+        "{SYNC_KEY} is not set on {}",
+        arreo_core::mesh::default_machine_name()
+    );
+    check(
+        "a receiver that cannot resolve the reference refuses it by name",
+        !ok && refused.contains(&format!("{BETA} refused")) && refused.contains(&by_name),
+        &format!(
+            "{}\nrelay said: {}",
+            collapse(&refused),
+            text_tail(&fabric.relay_log.log_text())
+        ),
+    );
+
+    // Beta supplies its own value — never alpha's, never from the payload — and
+    // the same push converges.
+    let (ok, out) = cli_with_stdin(
+        &beta.dir,
+        &beta.config,
+        cli_bin,
+        &["sync", "secret", "set", SYNC_KEY, "--name", BETA],
+        Some(BETA_KEY_VALUE),
+    );
+    check(
+        "beta stores its own value for the same name",
+        ok && out.contains(SYNC_KEY) && !out.contains(ALPHA_KEY_VALUE),
+        &collapse(&out),
+    );
+
+    let alpha_id = alpha.device_id();
+    let beta_id = beta.device_id();
+    let (ok, applied) = alpha.sync_cli(cli_bin, &["push", "opencode.jsonc", "--machine", BETA]);
+    // The reply names the **sender's device id**, which is the counter key: the
+    // machine's display name is a label a rename would change, and a counter
+    // keyed by it would fork (T-0086's decision).
+    check(
+        "the peer applies the revision and names the sender's device id",
+        ok && applied.contains(&format!("applied {alpha_id}'s revision 1"))
+            && !applied.contains(&format!("applied {ALPHA}'s")),
+        &format!(
+            "{}\nrelay said: {}",
+            collapse(&applied),
+            text_tail(&fabric.relay_log.log_text())
+        ),
+    );
+
+    let alpha_live = alpha.read_file(&alpha.opencode());
+    let beta_live = beta.read_file(&beta.opencode());
+    check(
+        "both machines hold the file byte for byte",
+        !alpha_live.is_empty()
+            && alpha_live == beta_live
+            && alpha_live.contains("{env:VBK_PROD_KEY}")
+            && !alpha_live.contains(ALPHA_KEY_VALUE),
+        &format!(
+            "{ALPHA}: {} bytes {:?}\n{BETA}: {} bytes {:?}",
+            alpha_live.len(),
+            alpha_live,
+            beta_live.len(),
+            beta_live
+        ),
+    );
+
+    let audit = audit_of(beta, cli_bin);
+    check(
+        "the receiving daemon recorded the apply, naming the sender's device id",
+        audit.contains("sync.apply")
+            && audit.contains(&alpha_id)
+            && audit.contains("opencode.jsonc"),
+        &collapse(&audit),
+    );
+
+    // Each machine resolves the reference from **its own** store: one file, two
+    // keychains, and the value that reaches the harness is this machine's.
+    let secrets = SecretStore::open(beta.secrets_path()).expect("beta's keychain");
+    let resolved = plan(&beta_live, &secrets, BETA);
+    let environment = resolved.environment();
+    check(
+        "the receiver resolves the reference from its own store",
+        resolved.missing().is_empty()
+            && environment.len() == 1
+            && environment[0].0 == SYNC_KEY
+            && environment[0].1 == BETA_KEY_VALUE,
+        &format!(
+            "{} resolves {SYNC_KEY} to its own value; nothing is missing",
+            BETA
+        ),
+    );
+
+    // ---- the conflict: both edit, both publish, neither overwrites ----
+    //
+    // Both payloads are built before either is delivered. That is what makes the
+    // pair concurrent (`{alpha: 2}` against `{alpha: 1, beta: 1}`): the shipped
+    // CLI counts the revision and builds the payload in one breath, so a second
+    // `push --machine` would carry the first push's absorbed counter and land as
+    // an ordinary update.
+    let alpha_edit = opencode_case("Verboo Code (alpha)");
+    let beta_edit = opencode_case("Verboo Code (beta)");
+    alpha.write_file(&alpha.opencode(), &alpha_edit);
+    beta.write_file(&beta.opencode(), &beta_edit);
+    let published = (
+        payload_bytes(
+            alpha,
+            cli_bin,
+            "opencode.jsonc",
+            &fabric.scratch.join("alpha-payload.json"),
+        ),
+        payload_bytes(
+            beta,
+            cli_bin,
+            "opencode.jsonc",
+            &fabric.scratch.join("beta-payload.json"),
+        ),
+    );
+    let (alpha_payload, beta_payload) = match published {
+        (Ok(alpha_payload), Ok(beta_payload)) => (alpha_payload, beta_payload),
+        (Err(e), _) | (_, Err(e)) => {
+            check("both machines publish their concurrent edit", false, &e);
+            return;
+        }
+    };
+
+    // Alpha's daemon is still stopped (it has been the sender since the first
+    // push), so this send has no session of its own to race. Beta's daemon is the
+    // receiver, and it is up. Alpha comes back to *receive* beta's payload, and
+    // then stops being a sender, so beta's daemon goes down for its own send.
+    let at_beta = exchange(alpha, beta, fabric, alpha_payload.as_bytes());
+    let at_beta_evidence = format!("{BETA} said: {}", log_tail(beta));
+    // Alpha receives beta's payload, and beta goes down to send its own: a
+    // machine's daemon and its CLI are one device, so leaving the daemon up while
+    // its CLI dials would have the CLI displace the daemon's own session — and a
+    // second daemon on the same socket would then refuse to start at all.
+    alpha.start(fabric.server_bin);
+    beta.kill_daemon();
+    let at_alpha = exchange(beta, alpha, fabric, beta_payload.as_bytes());
+    let at_alpha_evidence = format!("{ALPHA} said: {}", log_tail(alpha));
+    beta.start(fabric.server_bin);
+
+    let beta_copies = conflict_copies(beta);
+    let alpha_copies = conflict_copies(alpha);
+    let reply_copy = at_beta
+        .as_ref()
+        .ok()
+        .map(|outcome| outcome.copy.clone())
+        .unwrap_or_default();
+    check(
+        "beta keeps alpha's edit beside its own, under alpha's device id",
+        status_of(&at_beta) == Some(SyncStatus::Conflict)
+            && beta_copies.len() == 1
+            && reply_copy == beta_copies[0]
+            && reply_copy.contains(&alpha_id)
+            && reply_copy.ends_with(".jsonc"),
+        &format!(
+            "{BETA} kept {beta_copies:?}; the reply named {reply_copy:?} ({}).\n{at_beta_evidence}",
+            describe(&at_beta)
+        ),
+    );
+    let reply_copy = at_alpha
+        .as_ref()
+        .ok()
+        .map(|outcome| outcome.copy.clone())
+        .unwrap_or_default();
+    check(
+        "alpha keeps beta's edit beside its own, under beta's device id",
+        status_of(&at_alpha) == Some(SyncStatus::Conflict)
+            && alpha_copies.len() == 1
+            && reply_copy == alpha_copies[0]
+            && reply_copy.contains(&beta_id)
+            && reply_copy.ends_with(".jsonc"),
+        &format!(
+            "{ALPHA} kept {alpha_copies:?}; the reply named {reply_copy:?} ({}).\n{at_alpha_evidence}",
+            describe(&at_alpha)
+        ),
+    );
+
+    let alpha_after = alpha.read_file(&alpha.opencode());
+    let beta_after = beta.read_file(&beta.opencode());
+    let copy_bytes = |machine: &Machine, copies: &[String]| {
+        copies
+            .first()
+            .map(|name| machine.read_file(&machine.opencode().with_file_name(name)))
+            .unwrap_or_default()
+    };
+    let alpha_copy = copy_bytes(alpha, &alpha_copies);
+    let beta_copy = copy_bytes(beta, &beta_copies);
+    check(
+        "neither live file was overwritten, and each machine holds both copies",
+        alpha_after == alpha_edit && beta_after == beta_edit,
+        &format!(
+            "the live files are still each machine's own edit ({} and {} bytes)",
+            alpha_after.len(),
+            beta_after.len()
+        ),
+    );
+    check(
+        "each copy holds the other machine's bytes",
+        !alpha_copy.is_empty()
+            && !beta_copy.is_empty()
+            && alpha_copy == beta_edit
+            && beta_copy == alpha_edit,
+        &format!(
+            "{ALPHA}'s copy is {BETA}'s edit and {BETA}'s copy is {ALPHA}'s — the neutral form \
+             round-tripped byte for byte"
+        ),
+    );
+
+    // ---- the three refusals over the wire ----
+    //
+    // All three are sent by the **client** — the operator's laptop, which runs no
+    // daemon — so none of them displaces a machine's relay session, and the
+    // receiver under test is beta's daemon throughout. The payloads are the
+    // client's own, with one field edited: the sender's `push` refuses exactly
+    // these files, which is why the wire is the only place they can be probed.
+    client.write_file(&client.opencode(), &opencode_case("Verboo Code"));
+    let honest = match payload_bytes(
+        client,
+        cli_bin,
+        "opencode.jsonc",
+        &fabric.scratch.join("client-payload.json"),
+    ) {
+        Ok(payload) => payload,
+        Err(e) => {
+            check(
+                "the client publishes the payload the probes edit",
+                false,
+                &e,
+            );
+            return;
+        }
+    };
+    let client_id = client.device_id();
+    let beta_before = beta.read_file(&beta.opencode());
+    let copies_before = conflict_copies(beta);
+
+    // (a) A literal where a reference belongs. The digest covers the content, so
+    // it is recomputed over the edited bytes: a payload that failed the digest
+    // check would prove nothing about the scan.
+    let literal_path = fabric.scratch.join("literal-secret.json");
+    std::fs::write(&literal_path, LITERAL_SECRET_CONTENT).expect("the scratch file");
+    let Ok(with_literal) = rewrite_field(&honest, "content", &json_escape(LITERAL_SECRET_CONTENT))
+    else {
+        check(
+            "the literal-secret payload is built",
+            false,
+            "no content field",
+        );
+        return;
+    };
+    let Ok(digest) = sha256(&literal_path) else {
+        check(
+            "the literal-secret payload is built",
+            false,
+            "the tampered content could not be digested",
+        );
+        return;
+    };
+    let Ok(literal) = rewrite_field(&with_literal, "digest", &digest) else {
+        check(
+            "the literal-secret payload is built",
+            false,
+            "no digest field",
+        );
+        return;
+    };
+    let reply = exchange(client, beta, fabric, literal.as_bytes());
+    check(
+        "a payload that would put a literal secret on the receiver is refused with the finding",
+        status_of(&reply) == Some(SyncStatus::Refused)
+            && reason_of(&reply).contains("refused opencode.jsonc: possible secrets detected")
+            && reason_of(&reply).contains("possible api key (sk- prefix)"),
+        &reason_of(&reply),
+    );
+
+    // (b) A file this machine has no preset for: the receiver resolves the
+    // destination from its own registry, and a name it does not know is not a
+    // destination.
+    let Ok(unknown) = rewrite_field(&honest, "file", "zed-settings.json") else {
+        check("the no-preset payload is built", false, "no file field");
+        return;
+    };
+    let reply = exchange(client, beta, fabric, unknown.as_bytes());
+    check(
+        "a payload for a file the receiver has no preset for is refused",
+        status_of(&reply) == Some(SyncStatus::Refused)
+            && reason_of(&reply)
+                .contains("zed-settings.json: not a preset file and not an absolute path")
+            && reason_of(&reply).contains("will not receive a file it has no preset for"),
+        &reason_of(&reply),
+    );
+
+    // (c) **The forged identity.** An honest payload whose `machine` claims
+    // another device: the counter key is the identity the Noise handshake proved,
+    // and a peer that lies about who it is is a finding, not a value to correct.
+    let Ok(forged) = rewrite_field(&honest, "machine", &alpha_id) else {
+        check(
+            "the forged-identity payload is built",
+            false,
+            "no machine field",
+        );
+        return;
+    };
+    let reply = exchange(client, beta, fabric, forged.as_bytes());
+    let expected = format!(
+        "refused opencode.jsonc: the payload counts its revision under {alpha_id}, but this session \
+         is authenticated as {client_id} — a machine is the authority on its own counter, and only \
+         on its own"
+    );
+    check(
+        "a payload claiming another machine's identity is refused, not corrected",
+        status_of(&reply) == Some(SyncStatus::Refused) && reason_of(&reply) == expected,
+        &format!(
+            "expected: {expected}\nthe receiver said: {}",
+            reason_of(&reply)
+        ),
+    );
+
+    let beta_after = beta.read_file(&beta.opencode());
+    let copies_after = conflict_copies(beta);
+    check(
+        "none of the three refusals wrote anything on the receiver",
+        beta_after == beta_before && copies_after == copies_before,
+        &format!(
+            "{BETA}'s live file is unchanged and it still has {} conflict copy(ies)",
+            copies_after.len()
+        ),
+    );
+
+    // The names, on their own line: the evidence a reader greps for.
+    println!("mesh: conflict copies — {ALPHA}: {alpha_copies:?} · {BETA}: {copies_after:?}");
+    println!("mesh: forged-identity probe — {client_id} claimed {alpha_id}");
 }
 
 pub fn run(rest: &[String]) -> ExitCode {
@@ -753,6 +1638,7 @@ pub fn run(rest: &[String]) -> ExitCode {
         &gamma_config,
         &cli_bin,
         &["panes", "--machine", BETA],
+        None,
     );
     // The message is what proves the refusal is the ledger's (it names the grant
     // command) rather than a network failure — and the exit code (5, the trust
@@ -943,6 +1829,28 @@ pub fn run(rest: &[String]) -> ExitCode {
     tui.send("q");
     std::thread::sleep(Duration::from_millis(500));
     drop(tui);
+
+    // ---- T-0086: the sync transport over the two live machines ----
+    // After the TUI (which needs beta's pane alive) and before the isolation
+    // stage (which kills beta's daemon on purpose): this section stops and
+    // restarts daemons of its own, and it must be the last word on their state
+    // before that stage arranges its own.
+    let sync_scratch = base.join("sync");
+    let _ = std::fs::create_dir_all(&sync_scratch);
+    sync_stages(
+        &mut alpha,
+        &mut beta,
+        &client,
+        &SyncFabric {
+            relay: relay_addr,
+            account,
+            server_bin: &server_bin,
+            cli_bin: &cli_bin,
+            scratch: &sync_scratch,
+            relay_log: &relay,
+        },
+        &mut check,
+    );
 
     // ---- node isolation: beta dies mid-attach, alpha is untouched ----
     // A pane on alpha, alive throughout. Killing beta must not touch it, and

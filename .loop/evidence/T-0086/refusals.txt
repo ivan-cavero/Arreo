@@ -1,0 +1,25 @@
+T-0086 — the three refusals a receiver owes a peer
+==================================================
+
+All three are sent by the operator's laptop (an identity that runs no daemon),
+over the product's own mesh client and frames, to the shipped beta daemon. Each
+payload is an honest one with exactly one field edited.
+
+1. a literal secret where a reference belongs
+   [PASS] mesh: a payload that would put a literal secret on the receiver is refused with the finding
+   receiver: "refused opencode.jsonc: possible secrets detected: line 1: possible api key (sk- prefix)"
+
+2. a file the receiver has no preset for
+   [PASS] mesh: a payload for a file the receiver has no preset for is refused
+   receiver: "zed-settings.json: not a preset file and not an absolute path — presets exist
+   for the harnesses whose paths were measured (opencode, pi, omp); anything else needs a
+   path of your own, and a machine will not receive a file it has no preset for"
+
+3. a forged identity
+   [PASS] mesh: a payload claiming another machine's identity is refused, not corrected
+   receiver: "refused opencode.jsonc: the payload counts its revision under <alpha's
+   device id>, but this session is authenticated as <the laptop's device id> — a machine
+   is the authority on its own counter, and only on its own"
+
+and none of the three wrote anything:
+   [PASS] mesh: none of the three refusals wrote anything on the receiver
