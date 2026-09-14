@@ -1,39 +1,61 @@
 ## State snapshot          ← REWRITTEN (not appended) at every checkpoint
-Task: **T-0093 in progress** — the notification rules engine. The **pure core is done and
-frozen** (`arreo_core::notify`, 21 tests green); the daemon tick and the CLI verb are out with
-workers on disjoint crates.
-Where you are: core rule + quiet hours + policy loader + row format written and tested; the two
-audit actions (`notify.sent` / `notify.suppressed`) added to `store::actions`. Battery last run
-green at `43ae033` (869 tests, 14/14 slices, bench 6/6).
-Next step: workers land → I run a reviewer over the daemon diff → extend the api slice with the
-notified/coalesced/suppressed paths → full battery → commit + push.
-Open workers: `NotifyDaemon` (the 1 s tick + rows + `tests/notify.rs`), `NotifyCli`
-(`arreo notify --why|--policy` + `docs/notifications.md`).
-Known broken: T-0063 (CI never-green — the user's) · Parked: T-0048 needs-human
+
+Task: **T-0093 done** — the notification rules engine (one config, every transition, no noise).
+Where you are: committed and pushed. The pure rule (`arreo_core::notify`, 27 tests with quiet
+hours), the daemon's 1 s classification tick, `arreo notify --why|--policy`, an 8-test socket
+suite in the api slice, and `docs/notifications.md`. An independent review produced seven findings
+*after* integration; four are fixed here (each mutation-proven), three filed as T-0110 / T-0111.
+Battery on the integrated tree: **899 tests, 0 failed; 14/14 slices; sync 14/14; vet 337; deny
+4/4; audit 0; check-targets PASS/SKIP; bench 6/6; clippy 0 findings on both toolchains; fmt clean.**
+Next step: pick the next unblocked unit — **T-0095** (approval gates) or **T-0105** (the deferred
+update's start path) are the highest-priority Phase-4/2 items; **T-0110** is the regression this
+task's review found and is the one an operator would feel (it fires with notifications *off*).
+Open workers: none.
+Known broken: T-0063 (CI never-green — the user's, untouched) · Parked: T-0048 needs-human
 **T-0093 — the rule, and the three design decisions that shaped it.** The pure half is
 `arreo_core::notify`: `Policy::decide(transition, history) -> Decision`, with quiet hours, a
 coalescing window, the once-per-episode rule, pane globs and machine scoping — no clock, no I/O,
-no interior mutability, so every boundary is a test. Twenty-one of them: both edges of a quiet
-window, both edges of the coalesce window, the episode rule's two halves, the documented order of
-the four questions, the one-wildcard glob including the backtracking case, and the config
-loader's every refusal.
+no interior mutability, so every boundary is a test. Both edges of a quiet window, both edges of
+the coalesce window, the episode rule's two halves, the documented order of the four questions,
+the one-wildcard glob including the backtracking case, and the config loader's every refusal.
 Three decisions were made before writing a line, and two changed the task's shape:
-1. **The scout found that no background loop pumps the state engine** — `PaneEntry::pump` is
-   called only from client-driven paths, so a pane that becomes blocked **with nobody attached is
-   never classified at all**. That is precisely the case a notification exists for, so the tick
-   has to pump as well as judge; the pump is not gated on the policy.
+1. **No background loop pumped the state engine** — `PaneEntry::pump` was called only from
+   client-driven paths, so a pane that becomes blocked **with nobody attached is never classified
+   at all** — precisely the case a notification exists for. The tick pumps as well as judges, and
+   the pump is deliberately **not** gated on the policy. The review then showed the pump is not
+   observationally neutral: it consumed transitions that clients' own pumps used to see, which is
+   T-0110.
 2. **The audit log is the memory.** Episode and coalescing state are reconstructed from the
    `notify.sent` rows rather than a new table: durable across a restart by construction, queryable
-   (which the "why was I not told?" criterion needs anyway), and no second source of truth. One
-   bounded scan per transition.
+   (which the "why was I not told?" criterion needs anyway), and no second source of truth.
 3. **Quiet hours are local wall-clock plus an explicit `utc_offset_minutes`**, not a time zone:
    `std` has no local time, and the `time` crate's `local_offset` returns an error in a
    multithreaded process unless an unsound feature is enabled — a trap, not a solution. The DST
    caveat is documented rather than hidden.
-The one ambiguous criterion (`coalesce_secs`'s "the newest reason winning") is decided in the
-open: the first transition delivers and the rest are suppressed-and-counted with the reason
-recorded, because the alternative — debouncing to the end of the window — needs a timer per pane
-to deliver a notification the operator has already waited for. Written into the task file.
+**The decision order is the design**: no-rule → quiet → coalesce → same-episode, because each
+position answers "which reason does the operator see, and what does the count mean?" — quiet
+before coalesce so the quiet count means "the noise I asked you to hold".
+**What the review found, and what it cost to learn.** The rule was right; the *reads around it*
+were not. (F1) the history used the store's oldest-first read, whose limit keeps the *oldest* rows,
+so a pane's first-ever notification was its history for ever and past 200 rows every transition
+re-notified. One new store read (`audit_recent_by_action`, newest-first) and both consumers share
+it. (F2) a transition consumed by a client's pump reached **no decision at all** — the common case,
+since the TUI asks for the whole wall once a pass and races the tick for every transition. The
+tick now tracks the state it last saw per pane; a pane the engine moved *is* a transition,
+whoever pumped it. (F5) the same map removed a racy `from`. (F6) the coalesced detail printed a
+Unix time as a duration. All four mutation-proven; the two mutations are recorded in the evidence.
+**A criterion met in part, on purpose**: `once_per_episode`'s "a flap within one episode notifies
+once" is tested at the rule level and is **unreachable in the daemon** — the engine cannot emit a
+same-state transition (probed; a daemon-level test for it would be a test that cannot fail). The
+cycle half is met end to end. Recorded in the task file with the probe, not worked around.
+**Two slice failures during verification, both attributed and neither a product defect.**
+`persistence` failed deterministically: its plain pane is a fixed 60 s marker and the check that
+looks for it sits after harness waits bounded by 300 s. One token (`sleep 60` → `sleep 600`) and
+it is 16/16 — filed and closed as **T-0112**. `handoff-abort` failed 2 of 41 in the batch and is
+41/41 alone: it SIGKILLs daemons at sub-second deadlines and does not tolerate a neighbour slice.
+**A supply-chain gate went red on a new advisory, not on this work**: RUSTSEC-2026-0285 (published
+today, TLS 1.3 message-acceptance across encryption levels, `rustls 0.23.44`). Bumped to 0.23.45,
+exemption extended, audit/deny/vet green — its own commit.
 ## Event log               ← append-only; newest last; never rewrite
 - 2026-09-10 [turn 1] ledger created; repo at e489fac (docs only); T-0001 + T-0022 (AGENTS.md gardened) done
 - 2026-09-10 [turn 2] T-0002 PTY manager done+pushed (342606c; 9 tests); PROMPT.md v2 synced + ADR 0001 (ef6c595)
@@ -214,3 +236,41 @@ to deliver a notification the operator has already waited for. Written into the 
 - 2026-09-14 [turn 84] T-0106 done + pushed (989980d) and T-0092 done + pushed (0b6ada5). T-0106: a security-reviewer pass over T-0091 found the live handoff silently un-isolating every pane (HandoffPane carried no worktree, adopted() never set one, run_handoff built its daemon without the settings because main resolved [worktree] after a branch that never returns) — so an arreo update --server left the adopted pane in the daemon own directory, nulled the stored column, leaked the checkout on kill and put the agent back in the shared tree after a restart. Fixed with a trailing serde(default) manifest field, the setter, the config resolved before the handoff dispatch, and arreo update --server --config forwarded to the child; regression test with three mutations red. Review findings T-0107 (reproduced) and T-0108/T-0109 filed. T-0092: arreo_core::diff (parser written against a capture of real git output that is also the tests fixture), arreo diff <pane> [--json] with a key-by-key schema contract test, the TUI diff view (d) coloured from the existing diff* theme tokens, and six new tui-slice assertions (87 passed). Four defects found by testing: str::lines() strips \r (a CRLF files CR vanished), run_git exit-1 rule swallowed rev-parse no-HEAD, both consumers ignored [worktree] repo (so they reported no worktree about panes that had one), and * text=auto stripped the CRs from the committed fixture blob (a fresh clone would have failed) — fixed with a -text rule, a regeneration script, and a git clone check. Also fixed a flake in the T-0091 worktree test: it waited for its file to exist and could read it empty, now waits for the content. Battery: 861 tests / 0 failed / 70 targets, clippy clean both toolchains, fmt clean, vet 337, deny 4/4, audit 0, check-targets PASS/SKIP, 14/14 slices, sync --check 14/14, bench 6/6.
 - 2026-09-14 [turn 85] T-0107 done + pushed (c4dccb4) and T-0108 done + pushed (07ad5db) — both from the T-0091 security review. T-0107: the restore path took the worktree ROOT out of the recorded path (`file_name()` + `parent()`) and handed it to `ensure`, which does create_dir_all + git worktree add — so a store row made the daemon create a directory anywhere it could write (reproduced) or start the agent in the main checkout with the isolation off (reproduced). Fixed with `worktree::pane_of_recorded`: the record must be the `<root>/<pane>` the configured root implies, only the name survives, and the configured root reaches `ensure` — containment structural. Two pieces of path math carry it: `normalize` (lexical `..`, because a text comparison accepts `/root/../escape`) and `resolved` (canonicalize first, so a symlinked root is not refused). A record from a different root is refused, never repaired. 15 unit tests + 6 integration tests (real arreo-server child with --config); mutation restores the pre-fix body and reddens both with the reviewer own symptoms. check-targets caught a regression of mine: the new symlink test used std::os::unix ungated and broke the windows-msvc type-check. T-0108: the kill path discarded its wait and decided dirty from a status read taken while the child might be writing. Measuring reframed it — `git worktree remove` without --force RE-CHECKS and refuses a dirty checkout (so the predicted file-loss does not happen; git is the guard and our pre-check is the message layer, now documented with the rule that nothing may pass force=true where a live process could write), and kill_shared sends SIGKILL (probed: a trap-TERM child dies anyway), which is why the reviewer could not reproduce it and why the criterion test cannot be written. The fix uses the wait result (keep + report when the child had not exited); the decision is a unit-tested, mutation-proven function. One criterion left unticked with its reason recorded rather than faked. Battery: 868 tests / 0 failed / 70 targets, clippy clean both toolchains, fmt clean, vet 337, deny 4/4, audit 0, check-targets PASS/SKIP, 14/14 slices, sync --check 14/14, bench 6/6.
 - 2026-09-14 [turn 86] T-0109 done + pushed (90418f3) — the last of the four T-0091 review findings (T-0106/T-0107/T-0108 were the others). The store had no downgrade guard: `migrate` read the version then wrote its own unconditionally, so an older binary opening a newer store rewrote the version and its next snapshot dropped every column it did not know — silently, which became behaviour-changing the moment a column arrived whose value cannot be re-derived (T-0091 `worktree`). Fixed by reading the version BEFORE any DDL or write and refusing a newer store with a typed `SchemaTooNew { path, found, supported }`; deliberately not corruption, so no quarantine (the store is good, the binary is old). `>` not `>=`, pinned by a boundary test. Verified against a real daemon with a store stamped 99: refuses to serve, names both versions and the remedy, binds no socket, file left at (99,). Mutation both ways: guard removed → the unit test fails AND the same store ends at (10,), the silent rewrite. docs/release.md gains "Rolling back: the store is forward-only" beside the N−1 protocol window, including what --rollback may and may not cross. Battery: 869 tests / 0 failed / 70 targets, clippy clean both toolchains, fmt clean, vet 337, deny 4/4, audit 0, check-targets PASS/SKIP, 14/14 slices, sync --check 14/14, bench 6/6.
+- 2026-09-14 [turn 26] **T-0093 done** — notification rules engine. `arreo_core::notify` (pure rule,
+  quiet hours, coalescing, episode rule, globs, machine scope; 27 tests), the daemon's 1 s
+  classification tick (not gated on the policy: an unattached pane is the pane a notification
+  exists for), `arreo notify --why|--policy`, an 8-test socket suite wired into the api slice, and
+  `docs/notifications.md` (354 lines). Decision order is the design: no-rule → quiet → coalesce →
+  same-episode. The audit log is the memory (no second table). Quiet hours are local wall-clock +
+  explicit `utc_offset_minutes`, with the DST caveat documented.
+- 2026-09-14 [turn 26] T-0093 **review findings 1, 2, 5, 6 fixed, each mutation-proven.** (F1) the
+  history read the store's *oldest* `notify.sent` row — `audit_by_action` is oldest-first and its
+  limit keeps the oldest — so `coalesce_secs` never suppressed again past the first notification
+  and, past 200 rows, every transition re-notified; fixed with `audit_recent_by_action` (newest
+  first), shared by the daemon and the CLI, and `audit_by_action`'s false "newest first" doc
+  corrected. Mutation: back to `audit_by_action` → `left: Some(1000), right: Some(5000)`. (F2) a
+  transition consumed by a *client's* pump reached no decision at all — the TUI's `PanesDetail`
+  races the tick for every transition; the tick now tracks the state it last observed per pane, so
+  a pane the engine moved is a transition whoever pumped it. Mutation: disabling the branch reddens
+  `a_transition_a_poll_consumed_is_still_decided`. (F5) that map removed a racy `from`. (F6) the
+  coalesced detail printed a Unix time as a duration; the variant now carries `since_ms`.
+- 2026-09-14 [turn 26] T-0093 review findings 3 and 7 **filed, not fixed**: **T-0110** (p2) the
+  ungated tick pump changes what `wait` reports with notifications *off* — `confidence=direct:already,
+  pattern=None` where the real provenance (`inferred:silence+prompt-shape`, `pattern=Some("[y/n]")`)
+  used to come back, reproduced by the reviewer; **T-0111** (p3) `notify_history` costs an
+  unindexed `SCAN audit` per transition, and `PaneEntry::pump` can regress `fed` and re-feed
+  consumed bytes. One criterion recorded met-in-part on purpose: the episode rule's "a flap within
+  one episode notifies once" is unreachable in the daemon (the engine cannot emit a same-state
+  transition — probed), so the rule-level test stands and no daemon-level test was written for it.
+- 2026-09-14 [turn 26] **T-0112 filed and closed** (p3, slice defect found while verifying T-0093):
+  `persistence` failed deterministically because its plain pane is `echo … && sleep 60` and the
+  check that looks for it sits after harness waits bounded by `HARNESS_RUN_TIMEOUT = 300s`. One
+  token (`sleep 600`) → 16 passed, 0 failed, and the pre-crash pid capture goes from `[]` to a real
+  pid. `handoff-abort`'s 2-in-41 failure in the batch is **contention**: 41/41 alone.
+- 2026-09-14 [turn 26] **RUSTSEC-2026-0285** (published today; TLS 1.3 handshake messages accepted
+  across encryption level boundaries) tripped `cargo audit` and `cargo deny` on `rustls 0.23.44`.
+  Bumped to 0.23.45, `supply-chain/config.toml` exemption extended, vet 337 green. Its own commit.
+- 2026-09-14 [turn 26] Battery green on the integrated tree: 899 tests / 0 failed; clippy 0 findings
+  on both toolchains; fmt clean; 14/14 slices (api = 2 suites; tui 87, worktree 9, mesh 36+1,
+  update 27, handoff-abort 41, persistence 16); sync 14/14; vet 337; deny 4/4; audit 0;
+  check-targets PASS/SKIP; bench 6/6 (19 MB RSS, 211 KB/pane, 0 ms detect, 61 ms sweep).
