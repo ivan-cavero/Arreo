@@ -407,6 +407,44 @@ pub enum Message {
         /// corpus test pins.
         outcome: Box<SyncOutcome>,
     },
+    /// Client → server: act on a notification in one verb (T-0094) — the single
+    /// door `arreo notify act <pane> <action> [--text …]` and the TUI panel's
+    /// keys both use, so a script and a phone share one implementation.
+    ///
+    /// The actions are the bounded three of [`crate::notify::NotifyAction`]:
+    /// `reply` sends `text + "\n"` through the very same send path a direct
+    /// [`Message::Send`] takes (same per-verb trust gate — a viewer-role device
+    /// reads the direct-send sentence — same audit redaction), `skip` writes no
+    /// pane bytes at all, and `kill` ends the pane through the pane-kill path.
+    /// The answer is [`Message::NotifyActReply`], and **every** outcome — sent
+    /// or refused — is an audit row under `actions::NOTIFY_ACT` with the pane as
+    /// `agent`, so a refused action is on the record, never a silence.
+    ///
+    /// `text` is `#[serde(default)]` so the field's absence decodes (N−1, ADR
+    /// 0017); the *daemon* is the fence: a reply without text, text on a
+    /// non-reply, or text past [`crate::notify::MAX_REPLY_BYTES`] is refused,
+    /// never guessed at. A peer that never heard of the variant at all is
+    /// refused typed by its read loop (an unknown request answers `Error` with
+    /// the connection left open), which is the accepted behaviour for a new verb.
+    NotifyAct {
+        v: u32,
+        pane: String,
+        action: crate::notify::NotifyAction,
+        /// The operator's reply text (for `action: Reply`): the daemon sends
+        /// `text + "\n"` to the pane and redacts the row with the send path's
+        /// secret scan. `None` for `skip`/`kill`.
+        #[serde(default)]
+        text: Option<String>,
+    },
+    /// Server → client: the outcome of a [`Message::NotifyAct`].
+    ///
+    /// `ok == true` means the action was taken. `detail` is the operator's
+    /// sentence for a refusal — the pinned [`crate::notify::PANE_EXITED`] bytes
+    /// when the pane's state says it has exited (the exact string the CLI keys
+    /// its exit code on), the state gate's reason, or the send path's own error.
+    /// Refusals are the pane's or the role's, never the notifier's, so the
+    /// detail is always a sentence whose authority lives elsewhere.
+    NotifyActReply { v: u32, ok: bool, detail: String },
 }
 
 /// The pane a [`Message::SpawnWorktree`] asks for: everything
@@ -892,6 +930,33 @@ mod tests {
         assert_eq!(codec::decode(&bytes).expect("decode"), detail);
     }
 
+    /// **The quick-action pair round-trips** (T-0094): the CLI and the TUI both
+    /// send `NotifyAct` and read `NotifyActReply`, so the shape must survive the
+    /// codec byte for byte before anything else about the feature is claimed.
+    #[test]
+    fn the_notify_act_pair_round_trips() {
+        use crate::notify::NotifyAction;
+        use crate::proto::codec;
+
+        let act = Message::NotifyAct {
+            v: VERSION,
+            pane: "p".into(),
+            action: NotifyAction::Reply,
+            text: Some("y".into()),
+        };
+        let encoded = codec::encode(&act).expect("encode");
+        assert_eq!(codec::decode(&encoded).expect("decode"), act);
+
+        let reply = Message::NotifyActReply {
+            v: VERSION,
+            ok: false,
+            detail: crate::notify::PANE_EXITED.to_string(),
+        };
+        let encoded = codec::encode(&reply).expect("encode");
+        assert_eq!(codec::decode(&encoded).expect("decode"), reply);
+    }
+
+    /// **`text`'s `#[serde(default)]` is the N−1 mechanism for the field**:
     /// The enum is copied per frame, so its size is a budget, not a detail: the
     /// largest variant sets it. T-0086 boxed `SyncOutcome` to get from 128 to 112,
     /// and T-0091 boxed `SpawnSpec` to get back to 112 from 136. If a future variant

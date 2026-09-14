@@ -40,6 +40,10 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+/// T-0094's pinned refusal sentence — the exact bytes the CLI keys its exit
+/// code on, one definition (crates/arreo-core/src/notify/mod.rs).
+use arreo_core::notify::PANE_EXITED;
+
 /// How long a test waits for the background tick to write a row. Generous: the
 /// tick is a 1 s loop and a pane only *becomes* `question` after the adapter's
 /// 2 s of quiet, so the row cannot exist immediately — and a loaded machine is
@@ -804,5 +808,434 @@ async fn wait_still_says_already_when_no_transition_derived_the_state() {
             assert_eq!(matched_pattern, None);
         }
         other => panic!("want the unknown event, got {other:?}"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 8. Quick actions (T-0094): a notification is answerable where it is read
+// ---------------------------------------------------------------------------
+//
+// These tests drive the **CLI** (`arreo notify act <pane> <action> [--text…]`),
+// which is the contract's single door — the TUI panel key sends the very same
+// message — so the bytes under test are the operator's verb over the real
+// socket, plus the audit rows it leaves. The wire shape itself is covered at
+// the unit level (`arreo-core`'s proto tests); what only a real daemon can show
+// is that a reply lands in the pane's transcript exactly once, that the pane's
+// own state is the authority on refusals, and that every outcome is a row.
+
+/// The `arreo` CLI binary, sitting beside the server binary cargo builds for
+/// this package. The conpty note in `tests/trust.rs` applies here too: build
+/// the workspace (`cargo test --workspace`, which builds every binary) or at
+/// least `cargo build -p arreo-cli` before running this file.
+fn cli_binary() -> PathBuf {
+    let path = PathBuf::from(env!("CARGO_BIN_EXE_arreo-server"))
+        .parent()
+        .expect("the server binary lives in a target dir")
+        .join("arreo");
+    assert!(
+        path.exists(),
+        "{} is missing — build the CLI first (`cargo build -p arreo-cli`, or \
+         `cargo test --workspace` which builds every binary)",
+        path.display()
+    );
+    path
+}
+
+/// Run `arreo notify act … --socket <socket>`; returns (exit code, output).
+/// The exit codes are part of the contract: 0 ok · 2 pane-exited · 1 refusal ·
+/// 2 usage — so the tests assert on them, never on output alone.
+fn notify_act_cli(socket: &Path, args: &[&str]) -> (Option<i32>, String) {
+    let output = std::process::Command::new(cli_binary())
+        .args(["notify", "act"])
+        .args(args)
+        .arg("--socket")
+        .arg(socket)
+        .output()
+        .expect("the arreo CLI runs");
+    let mut text = String::from_utf8_lossy(&output.stdout).to_string();
+    text.push_str(&String::from_utf8_lossy(&output.stderr));
+    (output.status.code(), text)
+}
+
+/// A real daemon **process** on its own socket, plus the store path its log
+/// lives in. No `[notify]` section: acting does not depend on the policy, and
+/// the tick classifies an unattached pane regardless.
+///
+/// A process, not the in-process [`Daemon`]: the act tests block on a CLI
+/// subprocess (`Command::output()`), and on the test runtime's single thread a
+/// blocked `.output()` would starve an in-process daemon task — the CLI's
+/// handshake would never be served and the test would hang. The operator's
+/// shape is the honest one anyway: `arreo notify act` talks to a serving daemon.
+struct ActDaemon {
+    socket: PathBuf,
+    db: PathBuf,
+    _server: ServerChild,
+}
+
+async fn bind_daemon(dir: &Path) -> ActDaemon {
+    let config = config_file(dir, "# quick-action tests: no [notify] section\n");
+    let socket = dir.join("arreo.sock");
+    let server = ServerChild::start(&socket, &config, dir);
+    ActDaemon {
+        db: store_path(&socket),
+        socket,
+        _server: server,
+    }
+}
+
+async fn spawn_script(client: &mut Client, id: &str, script: &str) {
+    let reply = client
+        .call(&Message::Spawn {
+            v: VERSION,
+            id: id.to_string(),
+            program: "/bin/sh".to_string(),
+            args: vec!["-c".to_string(), script.to_string()],
+            cols: 80,
+            rows: 24,
+            memory_max: None,
+            pids_max: None,
+            kill_on_breach: false,
+        })
+        .await;
+    assert!(matches!(reply, Message::Ok { .. }), "spawn: {reply:?}");
+}
+
+async fn panes_detail(client: &mut Client) -> Vec<arreo_core::proto::PaneDetail> {
+    let reply = client
+        .call(&Message::PanesDetail {
+            v: VERSION,
+            panes: Vec::new(),
+        })
+        .await;
+    let Message::PanesDetail { panes, .. } = reply else {
+        panic!("panes detail: {reply:?}");
+    };
+    panes
+}
+
+/// Wait until the daemon's own derived detail says the pane is asking — the
+/// state the reply gate keys on, and the state the action list rides.
+async fn wait_for_asking(client: &mut Client, id: &str) {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let panes = panes_detail(client).await;
+        if panes
+            .iter()
+            .any(|p| p.id == id && p.state == AgentState::Question)
+        {
+            return;
+        }
+        assert!(Instant::now() < deadline, "pane {id} never became question");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+/// The number of lines the daemon holds for a pane: `Read` with an impossibly
+/// large cursor clamps to the ring's length and answers an empty tail whose
+/// `from_line` *is* that length. The stable cursor the once-check reads after.
+async fn read_line_count(client: &mut Client, id: &str) -> usize {
+    let reply = client
+        .call(&Message::Read {
+            v: VERSION,
+            id: id.to_string(),
+            from_line: usize::MAX,
+        })
+        .await;
+    let Message::Delta { from_line, .. } = reply else {
+        panic!("read: {reply:?}");
+    };
+    from_line
+}
+
+/// A pane that prints a prompt, then **actually reads its answer and echoes
+/// it** — so "the answer landed" is proved by the pane's own output
+/// (`ANSWER=…`), not by the pty's echo. The engine derives `question` from the
+/// prompt-shaped tail plus silence, exactly like [`spawn_asking_pane`].
+const ASKS_AND_READS: &str = "printf 'Proceed? [y/n]\\n'; read ans; echo \"ANSWER=$ans\"; sleep 30";
+
+/// **The reply-lands-once assertion, end to end.** A blocked pane asks; the
+/// operator answers in place with one CLI call; and the pane's own transcript
+/// shows the answer exactly once — a read-back from the pre-act cursor finds
+/// it, and a read from the post-act cursor finds nothing, so a second copy
+/// fails by construction. The act is an audit row with the pane as agent and
+/// the reply text as the prompt.
+#[tokio::test]
+async fn a_quick_action_reply_lands_in_the_pane_transcript_exactly_once() {
+    let dir = scratch("act-reply");
+    let daemon = bind_daemon(&dir).await;
+    let (socket, db) = (&daemon.socket, &daemon.db);
+    let pane = "act-reply";
+    let mut client = Client::connect(socket).await;
+    spawn_script(&mut client, pane, ASKS_AND_READS).await;
+    wait_for_asking(&mut client, pane).await;
+
+    let before = read_line_count(&mut client, pane).await;
+
+    // The single door, as the operator uses it.
+    let (code, out) = notify_act_cli(socket, &[pane, "reply", "--text", "y"]);
+    assert_eq!(code, Some(0), "the act succeeds: {out}");
+
+    // The answer is in the transcript, exactly once.
+    let reply = client
+        .call(&Message::Read {
+            v: VERSION,
+            id: pane.to_string(),
+            from_line: before,
+        })
+        .await;
+    let Message::Delta {
+        lines, from_line, ..
+    } = reply
+    else {
+        panic!("read: {reply:?}");
+    };
+    assert_eq!(from_line, before, "the read starts at the pre-act cursor");
+    let answers = lines
+        .iter()
+        .filter(|l| l.trim_end_matches(['\r', '\n']).trim() == "ANSWER=y")
+        .count();
+    assert_eq!(
+        answers, 1,
+        "the answer appears exactly once, however the pty echoed it: {lines:?}"
+    );
+
+    // And a second copy fails: nothing new after the answer's line.
+    let again = client
+        .call(&Message::Read {
+            v: VERSION,
+            id: pane.to_string(),
+            from_line: before + lines.len(),
+        })
+        .await;
+    let Message::Delta { lines: tail, .. } = again else {
+        panic!("read: {again:?}");
+    };
+    assert!(tail.is_empty(), "nothing duplicates: {tail:?}");
+    drop(client);
+
+    // The act is on the record: the pane is the agent, the outcome is Ok, the
+    // detail names the action, and the prompt is the reply text itself (the
+    // send path's secret scan redacts it on the way in).
+    let rows = wait_for_rows(db, actions::NOTIFY_ACT, pane, |rows| !rows.is_empty()).await;
+    assert_eq!(rows[0].outcome, AuditOutcome::Ok, "{rows:?}");
+    assert!(
+        rows[0]
+            .detail
+            .as_deref()
+            .is_some_and(|d| d.contains("action=reply")),
+        "{rows:?}"
+    );
+    assert_eq!(
+        rows[0].prompt.trim(),
+        "y",
+        "the prompt is the reply text: {rows:?}"
+    );
+}
+
+/// **The pane has exited → the pane's word, exit 2.** The pane's state is the
+/// authority on refusals, never the notifier's or the caller's opinion: it is
+/// read by the same `try_wait` the daemon's own listing uses, and the reply is
+/// the pinned sentence — the exact bytes the CLI keys its exit code on. The
+/// refusal is an audit row like any other outcome.
+#[tokio::test]
+async fn a_quick_action_on_an_exited_pane_is_refused_with_the_panes_word() {
+    let dir = scratch("act-exited");
+    let daemon = bind_daemon(&dir).await;
+    let (socket, db) = (&daemon.socket, &daemon.db);
+    let pane = "act-exited";
+    let mut client = Client::connect(socket).await;
+    spawn_script(&mut client, pane, "printf 'Proceed? [y/n]\\n'; exit 0").await;
+
+    // Wait until the daemon itself reports the process gone — the very reading
+    // the act path must trust.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let panes = panes_detail(&mut client).await;
+        if panes.iter().any(|p| p.id == pane && !p.alive) {
+            break;
+        }
+        assert!(Instant::now() < deadline, "the pane never exited");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    drop(client);
+
+    let (code, out) = notify_act_cli(socket, &[pane, "reply", "--text", "y"]);
+    assert_eq!(code, Some(2), "a pane that has exited is exit 2: {out}");
+    assert!(
+        out.contains(PANE_EXITED),
+        "the refusal is the pane's exact word: {out}"
+    );
+
+    let rows = wait_for_rows(db, actions::NOTIFY_ACT, pane, |rows| !rows.is_empty()).await;
+    assert_eq!(rows[0].outcome, AuditOutcome::Refused, "{rows:?}");
+    assert!(
+        rows[0]
+            .detail
+            .as_deref()
+            .is_some_and(|d| d.contains(PANE_EXITED)),
+        "{rows:?}"
+    );
+}
+
+/// **You cannot `reply` to a pane that is not asking** — the state gate — while
+/// `skip` (which writes no pane bytes) and `kill` (the kill path) still act.
+/// Each outcome is a row naming the action; the refused reply's row names the
+/// reason too.
+#[tokio::test]
+async fn a_reply_to_a_pane_that_is_not_asking_is_refused_but_skip_and_kill_act() {
+    let dir = scratch("act-state-gate");
+    let daemon = bind_daemon(&dir).await;
+    let (socket, db) = (&daemon.socket, &daemon.db);
+    let pane = "act-working";
+    let mut client = Client::connect(socket).await;
+    // Alive and never asking: the echo puts it in `working`, and nothing on
+    // its tail looks like a question.
+    spawn_script(&mut client, pane, "echo busy; sleep 60").await;
+
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let panes = panes_detail(&mut client).await;
+        if panes.iter().any(|p| {
+            p.id == pane
+                && p.alive
+                && p.state != AgentState::Unknown
+                && p.state != AgentState::Question
+        }) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the pane never left unknown without asking"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    // reply → the state-gate refusal, exit 1 (a refusal, not a usage error).
+    let (code, out) = notify_act_cli(socket, &[pane, "reply", "--text", "y"]);
+    assert_eq!(code, Some(1), "the state gate is a refusal, exit 1: {out}");
+    assert!(out.contains("not asking"), "{out}");
+
+    // skip → accepted, and it writes no pane bytes: the transcript does not
+    // grow (the daemon never called the pane's send).
+    let before = read_line_count(&mut client, pane).await;
+    let (code, out) = notify_act_cli(socket, &[pane, "skip"]);
+    assert_eq!(code, Some(0), "skip: {out}");
+    let after = read_line_count(&mut client, pane).await;
+    assert_eq!(after, before, "skip writes no pane bytes");
+
+    // kill → the kill path, accepted; the pane leaves the daemon's wall.
+    let (code, out) = notify_act_cli(socket, &[pane, "kill"]);
+    assert_eq!(code, Some(0), "kill: {out}");
+    let panes = panes_detail(&mut client).await;
+    assert!(
+        !panes.iter().any(|p| p.id == pane),
+        "the kill removed the pane: {panes:?}"
+    );
+    drop(client);
+
+    let rows = wait_for_rows(db, actions::NOTIFY_ACT, pane, |rows| rows.len() >= 3).await;
+    let refused = rows
+        .iter()
+        .find(|r| {
+            r.outcome == AuditOutcome::Refused
+                && r.detail
+                    .as_deref()
+                    .is_some_and(|d| d.contains("action=reply"))
+        })
+        .unwrap_or_else(|| panic!("the refused reply row: {rows:?}"));
+    assert!(
+        refused
+            .detail
+            .as_deref()
+            .is_some_and(|d| d.contains("not asking")),
+        "{refused:?}"
+    );
+    assert!(
+        rows.iter().any(|r| {
+            r.outcome == AuditOutcome::Ok
+                && r.detail
+                    .as_deref()
+                    .is_some_and(|d| d.contains("action=skip"))
+        }),
+        "the skip row: {rows:?}"
+    );
+    assert!(
+        rows.iter().any(|r| {
+            r.outcome == AuditOutcome::Ok
+                && r.detail
+                    .as_deref()
+                    .is_some_and(|d| d.contains("action=kill"))
+        }),
+        "the kill row: {rows:?}"
+    );
+}
+
+/// **A reply that trips the secret scan is handled and redacted exactly like a
+/// direct send**: the text is *sent* (a direct send is not refused either — the
+/// scan protects the log, not the pty), and the act row is redacted by the same
+/// store writer the send path uses, so the flag and the masking are identical.
+#[tokio::test]
+async fn a_quick_action_reply_text_is_redacted_by_the_send_paths_scan() {
+    let dir = scratch("act-redaction");
+    let daemon = bind_daemon(&dir).await;
+    let (socket, db) = (&daemon.socket, &daemon.db);
+    let pane = "act-redacted";
+    let mut client = Client::connect(socket).await;
+    spawn_script(&mut client, pane, ASKS_AND_READS).await;
+    wait_for_asking(&mut client, pane).await;
+    drop(client);
+
+    let secret = "export GITHUB_TOKEN=ghp_AAAABBBBCCCCDDDDEEEEFFFF";
+    let (code, out) = notify_act_cli(socket, &[pane, "reply", "--text", secret]);
+    assert_eq!(
+        code,
+        Some(0),
+        "the reply is sent, like a direct send: {out}"
+    );
+
+    let rows = wait_for_rows(db, actions::NOTIFY_ACT, pane, |rows| !rows.is_empty()).await;
+    let row = rows
+        .iter()
+        .find(|r| r.outcome == AuditOutcome::Ok)
+        .expect("the sent row");
+    assert!(row.redacted, "{row:?}");
+    assert!(
+        !row.prompt.contains("ghp_"),
+        "the secret never reaches the log: {row:?}"
+    );
+}
+
+/// **Usage errors are the operator's, before any verb is sent**: exit 2 and a
+/// line that names exactly what was wrong — an unknown action, a missing
+/// `--text` for a reply, `--text` on a non-reply, or a reply text past the
+/// 4096-byte bound. A bound is a refusal, never a truncation.
+#[tokio::test]
+async fn notify_act_usage_errors_are_exit_2_and_name_the_problem() {
+    let dir = scratch("act-usage");
+    let daemon = bind_daemon(&dir).await;
+    let socket = &daemon.socket;
+
+    let cases: Vec<(Vec<String>, &str)> = vec![
+        (vec!["p".into(), "reply".into()], "reply needs --text"),
+        (vec!["p".into(), "teleport".into()], "unknown action"),
+        (
+            vec!["p".into(), "skip".into(), "--text".into(), "x".into()],
+            "--text applies only to reply",
+        ),
+        (
+            vec![
+                "p".into(),
+                "reply".into(),
+                "--text".into(),
+                "x".repeat(4097),
+            ],
+            "4096",
+        ),
+    ];
+    for (args, want) in cases {
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        let (code, out) = notify_act_cli(socket, &args);
+        assert_eq!(code, Some(2), "{args:?} must be usage, exit 2: {out}");
+        assert!(out.contains(want), "{args:?}: want {want:?} in {out}");
     }
 }

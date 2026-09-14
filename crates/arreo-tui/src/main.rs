@@ -389,6 +389,14 @@ enum Command {
         id: String,
         text: String,
     },
+    /// A T-0094 quick action (reply/skip/kill): the same `Message::NotifyAct`
+    /// the CLI's `arreo notify act` sends — one daemon door for the panel and
+    /// the script.
+    NotifyAct {
+        id: String,
+        action: arreo_core::proto::NotifyAction,
+        text: Option<String>,
+    },
 }
 
 /// Options from the command line that shape how this process renders (they
@@ -700,6 +708,15 @@ async fn run(
                         })
                         .await;
                 }
+                Action::NotifyAct { id, action, text } => {
+                    let _ = commands
+                        .send(Command::NotifyAct {
+                            id: id.clone(),
+                            action: *action,
+                            text: text.clone(),
+                        })
+                        .await;
+                }
                 // The quit confirmation's `yes` (T-0073): leave the loop with
                 // the stop armed. Nothing is sent to the daemon from here —
                 // the drain-stop runs after the terminal is handed back.
@@ -818,6 +835,39 @@ async fn run_command(conn: &mut Client, command: Command) -> String {
                 Err(e) => format!("send: {e}"),
             }
         }
+        Command::NotifyAct { id, action, text } => {
+            // The daemon's `notify act` door (T-0094): the same message the
+            // CLI's `arreo notify act` sends. Success answers with an empty
+            // detail, so the panel writes its own line in the established
+            // "sent to X"/"killed X" voice; a refusal carries the daemon's
+            // sentence, shown with the CLI's own `notify act:` prefix so the
+            // panel and the script say the same thing. An old daemon that has
+            // never heard of the verb refuses it by name — same shape, same
+            // surface.
+            match conn
+                .call(&Message::NotifyAct {
+                    v: VERSION,
+                    pane: id.clone(),
+                    action,
+                    text,
+                })
+                .await
+            {
+                Ok(Message::NotifyActReply { ok: true, .. }) => match action {
+                    arreo_core::proto::NotifyAction::Reply => format!("reply sent to {id}"),
+                    arreo_core::proto::NotifyAction::Skip => {
+                        format!("skipped {id}: question dismissed, no bytes sent")
+                    }
+                    arreo_core::proto::NotifyAction::Kill => format!("killed {id}"),
+                },
+                Ok(Message::NotifyActReply {
+                    ok: false, detail, ..
+                }) => format!("notify act: {detail}"),
+                Ok(Message::Error { message, .. }) => format!("notify act: {message}"),
+                Ok(other) => format!("notify act: unexpected {other:?}"),
+                Err(e) => format!("notify act: {e}"),
+            }
+        }
     }
 }
 
@@ -882,12 +932,15 @@ async fn run_fleet_action(fleet: Fleet, action: Action, tx: tokio::sync::mpsc::S
                 Err(e) => Some(blocking_failed("machines trust", &e)),
             }
         }
-        // Verbs with no fleet answer: a spawn/kill/send rides the daemon
-        // connection the poller holds, and a diff (T-0092) is read from this
-        // machine's disk with its answer delivered as `Poll::Diff`.
-        Action::Spawn { .. } | Action::Kill { .. } | Action::Send { .. } | Action::Diff { .. } => {
-            None
-        }
+        // Verbs with no fleet answer: a spawn/kill/send and a quick action
+        // (T-0094) ride the daemon connection the poller holds, and a diff
+        // (T-0092) is read from this machine's disk with its answer delivered
+        // as `Poll::Diff`.
+        Action::Spawn { .. }
+        | Action::Kill { .. }
+        | Action::Send { .. }
+        | Action::NotifyAct { .. }
+        | Action::Diff { .. } => None,
         // Answered by the event loop before it ever gets here (T-0073): a quit
         // is not a fleet verb.
         Action::QuitDaemon => None,

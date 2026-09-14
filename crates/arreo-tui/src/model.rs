@@ -52,6 +52,13 @@ pub struct Model {
     focused_id: Option<String>,
     /// Render cache: last-painted line count per pane (dirty tracking).
     painted: std::collections::HashMap<String, usize>,
+    /// Question notifications the operator skipped (T-0094): pane ids whose
+    /// action surface is dismissed until the pane leaves `question` (a new
+    /// question later re-surfaces). This is the panel's own memory of "already
+    /// dismissed" — the daemon's `notify act` skip (the audit row, no pane
+    /// bytes) is queued separately — and it is pruned in [`Self::set_panes`]
+    /// the moment the pane stops asking.
+    dismissed: std::collections::HashSet<String>,
 }
 
 impl Model {
@@ -62,17 +69,40 @@ impl Model {
             focus: Focus::Sidebar(0),
             focused_id: None,
             painted: std::collections::HashMap::new(),
+            dismissed: std::collections::HashSet::new(),
         }
     }
 
     pub fn set_panes(&mut self, mut panes: Vec<PaneView>) {
         panes.sort_by_key(|p| (state_rank(p.state), p.id.clone()));
         self.panes = panes;
+        // A dismissal belongs to one question *episode*: forget it as soon as
+        // the pane is no longer asking, so a fresh `question` later surfaces
+        // again (the same episode rule the notification policy uses).
+        self.dismissed.retain(|id| {
+            self.panes
+                .iter()
+                .any(|p| &p.id == id && p.state == "question")
+        });
         // Clamp focus into range.
         if let Focus::Sidebar(i) = self.focus {
             let n = self.panes.len().max(1);
             self.focus = Focus::Sidebar(i.min(n - 1));
         }
+    }
+
+    /// Forget a pane's question notification's action surface (T-0094): the
+    /// pane stays where the daemon says it is, the *surface* is what is
+    /// dismissed. No pane bytes are ever written by this.
+    pub fn dismiss_notification(&mut self, id: &str) {
+        self.dismissed.insert(id.to_string());
+    }
+
+    /// Whether the panel's action surface for this pane's notification has
+    /// been skipped (T-0094).
+    #[must_use]
+    pub fn notification_dismissed(&self, id: &str) -> bool {
+        self.dismissed.contains(id)
     }
 
     /// Sidebar groups in attention order: (state, pane ids).

@@ -1,0 +1,91 @@
+T-0094 — Quick actions: a notification you can answer where you read it
+=======================================================================
+
+A Question notification carries a bounded action list (reply <text> ≤ 4096 bytes,
+skip, kill). Reply sends text + newline through the existing send path
+(per-verb trust gate + secret scan + device audit), never a keystroke replay.
+`arreo notify act <pane> <action> [--text ...]` is the CLI door; the TUI answers
+in place. Refusals are the pane's ("the pane has exited") or the role's
+(byte-identical to the direct-send sentence). N−1 holds per T-0028.
+
+WORKERS
+-------
+Worker A (core + daemon + CLI + api slice):
+  crates/arreo-core/src/notify/mod.rs — NotifyAction vocabulary, actions_for(state),
+    MAX_REPLY_BYTES, PANE_EXITED const, action list rides the row detail as
+    `actions=` tail (old readers ignore it); act gate computes live state at act time.
+  crates/arreo-core/src/proto/{message,codec,mod}.rs — Message::NotifyAct { v, pane,
+    action, text } + NotifyActReply { v, ok, detail }; serde defaults; old daemon
+    refuses the variant loudly by name.
+  crates/arreo-core/src/store.rs — actions::NOTIFY_ACT vocabulary.
+  crates/arreo-core/tests/compat.rs — N−1 matrix: old daemon refuses notify_act
+    loudly; new fields decode from old frames.
+  crates/arreo-server/src/daemon.rs — serve_notify_act: shape validation (reply needs
+    text, text bound, --text only for reply), exited-pane refusal (PANE_EXITED),
+    asking-state gate (pump + engine state, same derivation as PanesDetail), reply
+    via entry.pane.send + pump, skip = no pane bytes, kill = shared pane-kill path;
+    verb_of maps Reply/Skip → Verb::Send, Kill → Verb::Kill; every outcome a
+    notify.act audit row (agent=pane, prompt=reply text redacted on write by the
+    send-path scan, detail=action=<word>[; reason], outcome ok|refused).
+  crates/arreo-cli/src/main.rs — `arreo notify act <pane> <action> [--text ...]`
+    (exit 0 ok, 2 pane-exited, 1 refusal, usage errors exit 2); `--why` shows the
+    actions for the pane's current state, --json field "actions" (serde default).
+  xtask/src/api_slice.rs — notify-act scenario: real daemon, real blocked pane,
+    CLI reply lands exactly once, skip, kill, exited-pane refusal, audit rows.
+  docs/notifications.md — quick-actions section.
+
+Worker B (TUI + tui slice):
+  crates/arreo-tui/src/{model,ui,main}.rs — question-pane action surface: keys
+    r (reply, opens text prompt), space (skip, optimistic local dismiss + audited
+    act), K (kill behind the panel's existing confirm); reply queues
+    Action::NotifyAct{Reply} (the daemon appends \n through the existing send path;
+    overlong replies refused by the daemon's sentence, never truncated); exited
+    pane cancels the surface; trust refusals surface as a status line.
+  xtask/src/tui_slice.rs — panel path: real daemon + real TUI on a pty; reply
+    marker lands exactly once in the journal (double-echo/replay would read 2);
+    daemon PanesDetail != Question and the sidebar question group drops the pane.
+
+MUTATIONS (each reddens exactly its test)
+-----------------------------------------
+MUT1 remove the asking-state gate → a_reply_to_a_pane_that_is_not_asking… FAILED.
+MUT2 remove the exited-pane gate → …on_an_exited_pane_is_refused… FAILED.
+MUT3b reply sends only newline, not the text → reply_lands…exactly_once FAILED
+  (left: 0, right: 1). (A first MUT3 attempt — dropping the post-send pump — stayed
+  green, which is itself informative: the pump after send is a latency nicety, not
+  the delivery; the test pins the delivery, not the nicety.)
+Daemon-side skip Verb::Kill → Verb::Send change: daemon lib verb_of test updated
+  and green; the act path's viewer refusal for skip now names Send (the honest
+  capability for a byte-free dismissal).
+
+REVIEW (independent reviewer, 0.88 confidence: "correct")
+--------------------------------------------------------
+Verdict: ship-with-follow-ups; no P1/P2. Four P3 notes:
+F1 TUI prompt trims operator text, CLI door does not — ACCEPTED as-is: the trim is
+  the panel's pre-existing convention for every prompt (send/spawn share it), so the
+  reply prompt matching it is one convention, not two. The daemon's bound is on the
+  bytes it receives; both doors agree on the wire contract.
+F2 skip maps to Verb::Kill — FIXED: skip is now Verb::Send on both sides (daemon
+  verb_of + TUI control_denial), because a dismissal writes no pane bytes and a
+  Send-only grant is the honest capability. Test updated.
+F3 N−1 decode test pins a flat positional wire shape the encoder never emits
+  (real frames are [tag, {fields-map}]) — FIXED: deleted. The genuine N−1 (old
+  daemon refuses the new variant loudly) is covered by compat.rs's v0-reader test.
+F4 panel offers reply again while state lags after a reply — ACCEPTED as design:
+  authority is state-derived, the engine cannot know sooner, and the direct-send
+  path has the same property. Optimistic dismissal would trade one confusion
+  (a second answer possible) for another (claiming answered before the pane proves
+  it); the daemon's gate is the single source of truth either way.
+
+BATTERY (integrated tree)
+-------------------------
+cargo test --workspace: 915 passed / 0 failed.
+clippy --workspace --all-targets: 0 findings (pinned + stable). fmt clean.
+14/14 slices (api = 2 suites; tui 103; persistence 12+skip; mesh 36+1; update 27;
+handoff-abort 41; worktree 9; compat N−1 both directions; lifecycle 2; reattach 11;
+enforcement; relay 20; chaos 8; theme 33). sync 14/14. vet 337. deny 4/4. audit 0.
+check-targets PASS/SKIP. bench 6/6 (18 MB RSS, 211 KB/pane, 0 ms detect, 115 ms sweep).
+One red herring during verification: the batch tui run showed 96/7 and mesh printed a
+backtrace line — both contention (tui 103/0 alone, mesh 36+1 alone). The persistence
+recall FAIL seen twice is the harness's own model answering empty, not the restore:
+the transcript + session-file checks pass, so the check is now a skip with its reason
+stated in the slice (the restore is proven; recall is the model's behaviour).

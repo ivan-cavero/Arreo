@@ -266,6 +266,17 @@ pub mod actions {
     /// I not get told?" is the question it creates, and an unrecorded suppression
     /// is exactly the silence an operator cannot explain.
     pub const NOTIFY_SUPPRESSED: &str = "notify.suppressed";
+    /// One quick action taken on a notification (T-0094): `arreo notify act
+    /// <pane> <action>` or the TUI panel key — `reply` (sent through the same
+    /// path a direct `send` takes), `skip` (no pane bytes), or `kill` (the kill
+    /// path). Written by the daemon for **every** outcome — sent or refused —
+    /// with the pane id in `agent`, the reply text in `prompt` (redacted by the
+    /// send path's secret scan on the way in), and `detail` in the
+    /// `action=<word>[; <reason>]` shape naming the action and, for a refusal,
+    /// the reason. The actor is the session's device, like every other verb the
+    /// trail records; a refused act is a row with `outcome = refused`, never a
+    /// silence.
+    pub const NOTIFY_ACT: &str = "notify.act";
 }
 
 /// One audit row (prompt already redacted on write).

@@ -1,10 +1,11 @@
 # Notifications — which agent transitions are worth telling you about (T-0093)
 
 > Operator's reference for the `[notify]` policy: what a notification is in this
-> product, which transitions produce one, the four reasons one is withheld, and
-> the two commands that answer the questions the feature creates — *why was I not
-> told?* (`arreo notify --why`) and *is my configuration doing what I think?*
-> (`arreo notify --policy`). The rule itself is
+> product, which transitions produce one, the four reasons one is withheld, the
+> commands that answer the questions the feature creates — *why was I not told?*
+> (`arreo notify --why`), *is my configuration doing what I think?*
+> (`arreo notify --policy`) — and the quick actions that answer a notification
+> where it is read (`arreo notify act`, §9). The rule itself is
 > `crates/arreo-core/src/notify/`; the rows are the audit log
 > ([docs/audit.md](audit.md)).
 
@@ -16,6 +17,7 @@ so "why was I not told?" has an answer that outlives the daemon.
 ```console
 arreo notify --why <pane> [--json] [--socket PATH] [--config PATH]
 arreo notify --policy [--config PATH]
+arreo notify act <pane> <reply|skip|kill> [--text ...] [--socket PATH]
 ```
 
 ## 1. What a notification is
@@ -35,6 +37,7 @@ of those are news*, and the daemon applies it on **every state transition**:
 | --- | --- |
 | `notify.sent` | the policy said to tell you; the row carries the sentence |
 | `notify.suppressed` | the policy withheld it; the row carries **why** |
+| `notify.act` | a quick action was taken on a notification (reply / skip / kill) — §9 |
 
 A row's shape (the same columns every audit row has — see
 [docs/audit.md](audit.md) §2):
@@ -44,8 +47,8 @@ A row's shape (the same columns every audit row has — see
 | `device` | `daemon` — the background tick, not a human |
 | `agent` | the **pane id**, so "what have I been told about this pane" is one filter |
 | `prompt` | the human sentence: `blocked (inferred:silence)`, `question: Proceed?` |
-| `detail` | `state=blocked; blocked (inferred:silence)` for a sent row, `state=blocked; quiet-hours — inside quiet hours 22:00-07:00` for a suppressed one |
-| `action` | `notify.sent` / `notify.suppressed` |
+| `detail` | `state=blocked; blocked (inferred:silence) actions=skip,kill` for a sent row, `state=blocked; quiet-hours — inside quiet hours 22:00-07:00 actions=skip,kill` for a suppressed one — the `actions=` tail is the bounded list of quick actions that answer the notification (§9), and an older reader that never heard of it reads the row exactly as before |
+| `action` | `notify.sent` / `notify.suppressed` / `notify.act` |
 
 **The log is the memory.** "Have I already told them about this pane, and when?"
 is answered by reading the newest `notify.sent` row for that pane — there is no
@@ -240,6 +243,7 @@ pane      worker-1
 when      2026-09-14T15:04:32.891Z (1789398272891)
 decision  suppressed (notify.suppressed)
 state     blocked
+actions   skip, kill
 reason    quiet-hours — inside quiet hours 22:00-07:00
 sentence  blocked (inferred:silence)
 ```
@@ -250,7 +254,10 @@ the answer survives the pane, the daemon and the reboot — and reports the newe
 decision it was, the sentence, and for a suppression the reason word and its
 text. The state comes from the row's own `state=` prefix, read with the same
 function the daemon reads its history back with, so a writer and this reader
-cannot drift.
+cannot drift — and the `actions` line is the bounded quick-action list the row
+itself carries (§9), so the operator reads the notification and its answers
+together. A row written before quick actions existed simply has no `actions`
+line (and `null` in `--json`): absent, never an empty list.
 
 **Three outcomes, and they stay three:**
 
@@ -289,16 +296,21 @@ yet, one extra line says so before the same sentence.
   "decision": "suppressed",
   "reason": "quiet-hours",
   "detail": "inside quiet hours 22:00-07:00",
-  "prompt": "blocked (inferred:silence)"
+  "prompt": "blocked (inferred:silence)",
+  "actions": ["skip", "kill"]
 }
 ```
 
-- Keys are exactly those ten; the shape is **additive-only** (a renamed or
+- Keys are exactly those eleven; the shape is **additive-only** (a renamed or
   removed key is a wire break for a script).
 - `decision` is the closed pair `sent` / `suppressed`. `reason` is the reason
   **word** (`no-rule`, `quiet-hours`, `coalesced`, `same-episode`) and `detail`
   is the text after it, so a script never has to take the row's format apart
   itself. `prompt` is the sentence the row recorded.
+- `actions` is the bounded quick-action list the notification carries (§9), as
+  the operator's words — `["reply", "skip", "kill"]` on a question, `["skip",
+  "kill"]` on anything else. `null` for a row written before the feature, never
+  an empty list.
 - **A value that cannot be known is `null`, never invented** — the rule
   `arreo machines` and `arreo worktrees` follow. With `"found": false` everything
   but `schema`, `pane` and `found` is `null`; a **sent** row has no `reason` and
@@ -344,6 +356,54 @@ likely reason nothing has been notified. **No configuration named is exit 2, not
 daemon this command was not told about may well have a `[notify]` section, and
 answering "off" from the absence of a flag would be a second answer to a question
 this project only ever answers once.
+
+## 9. Quick actions — answering where you read it
+
+A blocked agent is a question, and a notification for a `question` pane carries
+the actions that answer it. The vocabulary is **exactly three**, and it is
+bounded on purpose — a fourth action is a product decision, not a plug-in:
+
+| Action | What it does | Audited as |
+| --- | --- | --- |
+| `reply <text>` | sends `text` plus a newline through the pane's **existing send path** — the very path a direct `arreo send` takes, so it is gated by the same per-verb trust rule, audited as the acting device, and subject to the same secret scan | `notify.act` / `action=reply`, outcome `ok`, `prompt` = the text (redacted on the way in) |
+| `skip` | dismisses the notification; **writes no pane bytes at all** | `notify.act` / `action=skip`, outcome `ok`, no prompt |
+| `kill` | ends the pane through the pane-kill path (the same one `arreo kill` uses) | `notify.act` / `action=kill`, outcome `ok` |
+
+The text a `reply` sends is **at most 4096 bytes** — longer is a refusal the
+operator sees named with both numbers, never a truncation. And it is never a
+keystroke replay: the bytes are constructed from the operator's own input, not
+read back from any recording of the pane.
+
+Two doors, one implementation: `arreo notify act <pane> <action> [--text …]`
+(the CLI) and the TUI's notification-panel keys both send the same `NotifyAct`
+message to the daemon, which has exactly one act path.
+
+```console
+$ arreo notify --why q1          # the notification and its answers, together
+state     question
+actions   reply, skip, kill
+$ arreo notify act q1 reply --text "use the staging branch"
+$ arreo notify act q1 skip
+$ arreo notify act other kill
+```
+
+**What a pane may be acted on by is its own state, and the refusals are its
+own.** A `question` pane offers all three actions; any other state offers
+`skip` and `kill` only — you cannot `reply` to a pane that is not asking, which
+is refused with `cannot reply: the pane is not asking (state=…)`. A pane whose
+process has since exited is refused with the exact sentence
+`the pane has exited` — the pane's state is the authority, and the CLI keys its
+exit code on that sentence. A viewer-role device gets the trust refusal naming
+the role — the same sentence the CLI prints for a direct `send` — because a
+`reply` is a send. A refused act is still a row: `outcome = refused` with the
+action and the reason in `detail`, never a silence.
+
+| Situation | Exit |
+| --- | --- |
+| the action was taken | 0 |
+| the pane has exited | 2 |
+| usage (unknown action, `reply` without `--text`, `--text` on `skip`/`kill`, over the byte bound) | 2 |
+| any other refusal (state gate, unknown pane, role, an older daemon's "unknown request") | 1 |
 
 ## See also
 

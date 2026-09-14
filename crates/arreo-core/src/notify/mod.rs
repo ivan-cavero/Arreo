@@ -241,13 +241,6 @@ pub fn state_from_word(word: &str) -> Option<AgentState> {
 /// the log says — the failure this whole module exists to make impossible.
 const DETAIL_STATE_PREFIX: &str = "state=";
 
-/// The `detail` a notification row carries: the state it was about, then the
-/// sentence a human reads.
-#[must_use]
-pub fn detail_for(state: AgentState, reason: &str) -> String {
-    format!("{DETAIL_STATE_PREFIX}{}; {reason}", state_word(state))
-}
-
 /// The state a notification row was about, if it carries one.
 ///
 /// `None` for a row written by a version that did not record one: the caller then
@@ -259,6 +252,161 @@ pub fn state_from_detail(detail: &str) -> Option<AgentState> {
     let rest = detail.strip_prefix(DETAIL_STATE_PREFIX)?;
     let word = rest.split(';').next()?;
     state_from_word(word)
+}
+
+// ---------------------------------------------------------------------------
+// Quick actions (T-0094): the bounded vocabulary that answers a notification
+// ---------------------------------------------------------------------------
+
+/// The three quick actions a notification can carry — the whole vocabulary, and
+/// exactly this: `reply <text>` sends the operator's text plus a newline
+/// through the **same** send path a direct `send` takes (same per-verb trust
+/// gate, same audit redaction), `skip` writes no pane bytes at all, and `kill`
+/// ends the pane through the pane-kill path. A fourth action is a product
+/// decision, not an implementation detail — there is deliberately no way to
+/// extend this list from outside the crate.
+///
+/// Serde derives so the same value travels on the wire ([`crate::proto`]
+/// re-uses it, see `Message::NotifyAct`) and is named in the `--json` schema.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NotifyAction {
+    /// Send the operator's text + newline through the pane's send path.
+    Reply,
+    /// Dismiss the notification; write no pane bytes.
+    Skip,
+    /// End the pane through the kill path.
+    Kill,
+}
+
+impl NotifyAction {
+    /// The operators' word for the action, used on the wire, in the row's
+    /// `detail` (`action=reply`) and in the `--json` `actions` array.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Reply => "reply",
+            Self::Skip => "skip",
+            Self::Kill => "kill",
+        }
+    }
+
+    /// Parse an operator's action word.
+    #[must_use]
+    pub fn parse(word: &str) -> Option<Self> {
+        match word.trim().to_ascii_lowercase().as_str() {
+            "reply" => Some(Self::Reply),
+            "skip" => Some(Self::Skip),
+            "kill" => Some(Self::Kill),
+            _ => None,
+        }
+    }
+
+    /// Which actions need the operator to supply text.
+    #[must_use]
+    pub fn needs_text(self) -> bool {
+        matches!(self, Self::Reply)
+    }
+}
+
+/// The bound on a quick-action reply's text, in **bytes** (T-0094): `text` is
+/// at most this long, and longer is a refusal the operator sees — never a
+/// truncation. Both the CLI (a usage error before the socket) and the daemon (a
+/// refusal on the way in) check the same bound, so one definition cannot drift.
+pub const MAX_REPLY_BYTES: usize = 4096;
+
+/// Whether a reply's text is within the quick-action bound.
+#[must_use]
+pub fn reply_text_within_bound(text: &str) -> bool {
+    text.len() <= MAX_REPLY_BYTES
+}
+
+/// The refusal an action gets on a pane that has since exited — the pane's
+/// **state** is the authority, so the sentence is the pane's own, pinned here
+/// once: the daemon replies with it (byte for byte), the audit row's `detail`
+/// carries it, and the CLI keys its exit code (2) on the exact string.
+pub const PANE_EXITED: &str = "the pane has exited";
+
+/// The actions available for a pane in `state` (T-0094): a pane that is asking
+/// can be answered (`reply`), dismissed (`skip`) or killed; any other state
+/// still offers `skip` and `kill` — you cannot `reply` to a pane that is not
+/// asking. The daemon's act gate and the notification's action list both read
+/// this, so the list an operator sees and the gate that refuses are the same
+/// rule.
+#[must_use]
+pub fn actions_for(state: AgentState) -> Vec<NotifyAction> {
+    let mut actions: Vec<NotifyAction> = Vec::with_capacity(3);
+    if state == AgentState::Question {
+        actions.push(NotifyAction::Reply);
+    }
+    actions.push(NotifyAction::Skip);
+    actions.push(NotifyAction::Kill);
+    actions
+}
+
+/// The action-list tail on a notification row's `detail`.
+///
+/// The format is [`detail_for`] (via [`detailed`]) and [`actions_from_detail`],
+/// and it lives here beside the `state=` prefix for the same reason that prefix
+/// does: **two places read it back** — the daemon, which wrote it, and
+/// `arreo notify --why`, which answers the operator — and one definition is
+/// what keeps a writer and a reader from drifting. An older client that never
+/// heard of the tail still parses the row: `state_from_detail` reads the
+/// `state=` prefix, and the tail simply goes unread (`actions_from_detail`
+/// returns `None`; [`strip_actions`] removes it).
+const DETAIL_ACTIONS_PREFIX: &str = " actions=";
+
+/// The full notification-row `detail`: the state, the passed-through sentence,
+/// then the bounded action list that answers it. The row an operator reads
+/// carries its actions with it — "the notification and the answers, together".
+#[must_use]
+pub fn detailed(state: AgentState, rest: &str) -> String {
+    format!(
+        "{DETAIL_STATE_PREFIX}{}; {rest}{DETAIL_ACTIONS_PREFIX}{}",
+        state_word(state),
+        actions_for(state)
+            .iter()
+            .map(|action| action.as_str())
+            .collect::<Vec<_>>()
+            .join(",")
+    )
+}
+
+/// The `detail` a notification row carries: the state it was about, then the
+/// sentence a human reads — and, behind it, the quick actions that answer it.
+#[must_use]
+pub fn detail_for(state: AgentState, reason: &str) -> String {
+    detailed(state, reason)
+}
+
+/// The actions a notification row carries, if it carries them.
+///
+/// `None` for a row written by a version that did not record the list: the
+/// caller then treats the actions as unknown, which is the honest answer for a
+/// row old enough to predate the feature. A row that cannot be read must never
+/// be read as "no actions".
+#[must_use]
+pub fn actions_from_detail(detail: &str) -> Option<Vec<NotifyAction>> {
+    let list = detail.rsplit_once(DETAIL_ACTIONS_PREFIX)?.1;
+    let mut actions = Vec::new();
+    for word in list.split(',') {
+        actions.push(NotifyAction::parse(word)?);
+    }
+    Some(actions)
+}
+
+/// A notification row's `detail` without the action-list tail.
+///
+/// The tail lives at the end of the row's sentence, so a reader that parses the
+/// rest (the CLI's `--why` reason split, for one) must see the row exactly as
+/// it would have read before the feature existed — the tail says nothing about
+/// the reason, and must not leak into it.
+#[must_use]
+pub fn strip_actions(detail: &str) -> &str {
+    match detail.rsplit_once(DETAIL_ACTIONS_PREFIX) {
+        Some((head, _)) => head,
+        None => detail,
+    }
 }
 
 /// A pane-id pattern with exactly one wildcard: `*`.
@@ -983,7 +1131,10 @@ mod tests {
     #[test]
     fn the_notification_row_format_round_trips() {
         let detail = detail_for(AgentState::Blocked, "blocked (inferred:silence)");
-        assert_eq!(detail, "state=blocked; blocked (inferred:silence)");
+        assert_eq!(
+            detail,
+            "state=blocked; blocked (inferred:silence) actions=skip,kill"
+        );
         assert_eq!(state_from_detail(&detail), Some(AgentState::Blocked));
 
         for state in [
@@ -1001,7 +1152,105 @@ mod tests {
         assert_eq!(state_from_detail(""), None);
         assert_eq!(state_from_detail("blocked"), None);
         assert_eq!(state_from_detail("state=blockd; x"), None);
-        assert_eq!(state_from_detail("state="), None);
+    }
+
+    /// **The action list rides the notification row, and one definition serves
+    /// the writer and all its readers** (T-0094): `detail_for`/`detailed` write
+    /// the bounded list, `actions_from_detail` reads it back, `strip_actions`
+    /// removes it for a reader that parses the rest — and an old reader that
+    /// never heard of the tail (the daemon rebuilding its history, an older
+    /// `--why`) still sees the `state=` prefix and the sentence exactly as it
+    /// did before the feature existed.
+    #[test]
+    fn the_action_list_rides_the_row_and_old_readers_ignore_it() {
+        for state in [
+            AgentState::Unknown,
+            AgentState::Working,
+            AgentState::Idle,
+            AgentState::Question,
+            AgentState::Blocked,
+            AgentState::Done,
+        ] {
+            let detail = detail_for(state, "sent");
+            assert_eq!(
+                actions_from_detail(&detail).as_deref(),
+                Some(actions_for(state).as_slice()),
+                "the row carries the actions for its state: {detail:?}"
+            );
+            // The old readers: the state prefix and the sentence are untouched
+            // by the tail, and the tail itself can be stripped cleanly.
+            assert_eq!(state_from_detail(&detail), Some(state));
+            let word = state_word(state);
+            assert_eq!(
+                strip_actions(&detail),
+                &format!("state={word}; sent"),
+                "stripping restores the pre-feature row exactly"
+            );
+        }
+
+        // A row written before the feature (no tail) carries no actions — the
+        // honest answer is `None`, never an empty list pretending "no actions".
+        assert_eq!(actions_from_detail("state=blocked; blocked"), None);
+        assert_eq!(
+            strip_actions("state=blocked; blocked"),
+            "state=blocked; blocked"
+        );
+    }
+
+    /// The vocabulary is exactly the three actions, and the mapping from a
+    /// pane's **state** to the actions that answer it (T-0094): a `question`
+    /// shows all three, anything else shows `skip` and `kill` only — you cannot
+    /// `reply` to a pane that is not asking.
+    #[test]
+    fn the_vocabulary_is_three_actions_and_the_state_map_is_bounded() {
+        use NotifyAction::{Kill, Reply, Skip};
+        assert_eq!(
+            actions_for(AgentState::Question),
+            vec![Reply, Skip, Kill],
+            "a question is answerable"
+        );
+        for state in [
+            AgentState::Unknown,
+            AgentState::Working,
+            AgentState::Idle,
+            AgentState::Blocked,
+            AgentState::Done,
+        ] {
+            assert_eq!(
+                actions_for(state),
+                vec![Skip, Kill],
+                "nothing that is not asking can be answered: {state:?}"
+            );
+        }
+
+        // The operators' words round-trip, and nothing else parses.
+        for action in [Reply, Skip, Kill] {
+            assert_eq!(NotifyAction::parse(action.as_str()), Some(action));
+        }
+        assert_eq!(NotifyAction::parse("teleport"), None);
+        assert_eq!(NotifyAction::parse(""), None);
+        assert_eq!(NotifyAction::parse(" REPLY "), Some(Reply));
+
+        // Only `reply` needs the operator's text.
+        assert!(Reply.needs_text());
+        assert!(!Skip.needs_text());
+        assert!(!Kill.needs_text());
+    }
+
+    /// The reply-text bound is a **byte** bound, checked by one function that
+    /// both the CLI (usage error) and the daemon (refusal) call: at most 4096
+    /// bytes, and longer is a refusal, never a truncation. Multi-byte UTF-8
+    /// counts by byte, not by character.
+    #[test]
+    fn the_reply_text_bound_is_4096_bytes() {
+        assert_eq!(MAX_REPLY_BYTES, 4096);
+        assert!(reply_text_within_bound(&"x".repeat(4096)));
+        assert!(!reply_text_within_bound(&"x".repeat(4097)));
+        // 1500 "λ" are 3000 bytes: under the byte bound while over any char
+        // bound that existed; 2048 of them are exactly the bound.
+        assert!(reply_text_within_bound(&"λ".repeat(1500)));
+        assert!(reply_text_within_bound(&"λ".repeat(2048)));
+        assert!(!reply_text_within_bound(&"λ".repeat(2049)));
     }
 
     /// The one-word reason, so the tests read as the thing an operator sees.

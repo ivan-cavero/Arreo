@@ -590,12 +590,22 @@ pub fn run(rest: &[String]) -> ExitCode {
     session.send("delta /bin/sh -c 'cat'");
     std::thread::sleep(Duration::from_millis(400));
     session.send("\r");
-    std::thread::sleep(Duration::from_secs(1));
-    let refused = session.screen();
+    // The answer rides the poller's select, which can lose a coin-flip to the
+    // 1 s tick and land up to ~1 s late — poll the frame instead of sleeping
+    // once (the same race the T-0094 panel checks poll for).
+    let refusal_deadline = Instant::now() + Duration::from_secs(5);
+    let mut refused = String::new();
+    while Instant::now() < refusal_deadline {
+        refused = session.screen();
+        if refused.contains("spawn: pane \"delta\" already exists") {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
     check(
         "a refused spawn names why (pane \"delta\" already exists)",
         refused.contains("spawn: pane \"delta\" already exists"),
-        "the refusal line never reached the status",
+        &format!("status: {:?}", refused.lines().last().unwrap_or_default()),
     );
 
     // Focus delta by clicking its sidebar row — looked up on the rendered frame
@@ -697,18 +707,22 @@ pub fn run(rest: &[String]) -> ExitCode {
     session.send("still-alive?");
     std::thread::sleep(Duration::from_millis(300));
     session.send("\r");
-    std::thread::sleep(Duration::from_secs(1));
-    if evidence {
-        let _ = std::fs::write(
-            evidence_dir_74.join("04-dead-pane-refusal.txt"),
-            session.screen(),
-        );
+    let dead_deadline = Instant::now() + Duration::from_secs(5);
+    let mut dead = String::new();
+    while Instant::now() < dead_deadline {
+        dead = session.screen();
+        if dead.contains("send: pane \"delta\" not found") {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(200));
     }
-    let dead = session.screen();
+    if evidence {
+        let _ = std::fs::write(evidence_dir_74.join("04-dead-pane-refusal.txt"), &dead);
+    }
     check(
         "sending to a dead pane says so (send: pane \"delta\" not found)",
         dead.contains("send: pane \"delta\" not found"),
-        "the dead-pane refusal never reached the status",
+        &format!("status: {:?}", dead.lines().last().unwrap_or_default()),
     );
 
     // Steady state: the app must repaint cells, not the screen. A frame is
@@ -1596,12 +1610,19 @@ pub fn run(rest: &[String]) -> ExitCode {
 
                         tui.send("d");
                         // The read runs git off the event loop; poll rather than
-                        // guess a duration.
+                        // guess a duration, and require the status line's half
+                        // too — the summary and the position arrive with the
+                        // body in the same frame, so a frame that has one but
+                        // not the other is being read mid-apply.
                         let deadline = Instant::now() + Duration::from_secs(15);
                         let mut screen = String::new();
                         while Instant::now() < deadline {
                             screen = tui.screen();
-                            if screen.contains("notes.md") && screen.contains("TWO CHANGED") {
+                            if screen.contains("notes.md")
+                                && screen.contains("TWO CHANGED")
+                                && screen.contains("files changed")
+                                && screen.contains("file 1/")
+                            {
                                 break;
                             }
                             std::thread::sleep(Duration::from_millis(250));
@@ -1675,12 +1696,521 @@ pub fn run(rest: &[String]) -> ExitCode {
         }
     }
 
+    // ---- T-0094: a question pane answered where it is read -----------------
+    //
+    // The panel: a `question` pane under the sidebar cursor carries three
+    // actions — `r` reply (opens a prompt; the typed text goes to the daemon's
+    // `notify act` door — the same message `arreo notify act` sends — which
+    // appends the newline and writes through the existing send path, so the
+    // pane's transcript shows the answer exactly once), `␣` skip (dismisses the
+    // surface; writes no pane bytes), `K` kill (the same kill path the CLI's
+    // pane kill uses, behind its confirmation). Its own daemon on its own
+    // socket: the reply *ends* the question, so a shared daemon would make
+    // every later case depend on this one's outcome.
+    //
+    // The "exactly once" proof reads the pane's journal over the protocol (the
+    // same `Read` the TUI's focused view paints) — the daemon is gone at the
+    // end of the case, so the journal cannot be re-read after. `--case qa` runs
+    // only this section (the same fast-feedback door the metrics-graph case
+    // has).
+    if case.is_none() || case == Some("qa") {
+        let qa_scratch = workspace()
+            .join("target")
+            .join("test-scratch")
+            .join("T-0094");
+        let _ = std::fs::create_dir_all(&qa_scratch);
+        let qa_socket = qa_scratch.join(format!("qa-{}.sock", std::process::id()));
+        for path in sidecars(&qa_socket) {
+            let _ = std::fs::remove_file(path);
+        }
+        let qa_server = match TestServer::spawn(&server_bin, &qa_socket, "T-0094 server start") {
+            Ok(server) => server,
+            Err(code) => return code,
+        };
+        wait_bound(&qa_socket);
+
+        // asker reads one line and then prints its own record of it plus two
+        // more lines — enough output to push its prompt out of the engine's
+        // three-line tail, so the state stays out of `question` after the reply
+        // (the prompt line surviving in the journal must not re-trigger the
+        // inference). `ANSWER=$ans` is the pane's own reprint of what it read —
+        // the exact-once assertion counts it, so the pty's echo of the typed
+        // bytes (which the TTY may or may not render, and may flush in any
+        // chunk order) is never what proves the reply landed. This is the
+        // fixture Worker A's reply-lands-once test uses, for the same reason.
+        let qa_bodies = [
+            (
+                "asker",
+                "printf 'Proceed? [y/n]\\n'; read ans; echo \"ANSWER=$ans\"; echo TWO; echo THREE; sleep 120",
+            ),
+            ("dying", "printf 'Proceed? [y/n] '; sleep 120"),
+            ("skippy", "printf 'Proceed? [y/n] '; sleep 120"),
+        ];
+        for (id, body) in &qa_bodies {
+            let (ok, out) = cli(&cli_bin, &qa_socket, &["spawn", id, "/bin/sh", "-c", body]);
+            if !ok {
+                check(
+                    "T-0094: the fixture spawns",
+                    false,
+                    &format!("spawn {id}: {out}"),
+                );
+                drop(qa_server);
+                for path in sidecars(&qa_socket) {
+                    let _ = std::fs::remove_file(path);
+                }
+                return ExitCode::FAILURE;
+            }
+        }
+        // Precondition: every pane classified `question` before any action key
+        // is pressed — waiting here keeps the case about the panel, not about
+        // the classifier's latency (the state slice owns that).
+        std::thread::sleep(Duration::from_secs(2));
+        for (id, _) in &qa_bodies {
+            let (ok, out) = cli(
+                &cli_bin,
+                &qa_socket,
+                &["wait", id, "--state", "question", "--timeout", "10s"],
+            );
+            if !ok {
+                check(
+                    "T-0094: the fixture enters question",
+                    false,
+                    &format!("{id}: {out}"),
+                );
+                drop(qa_server);
+                for path in sidecars(&qa_socket) {
+                    let _ = std::fs::remove_file(path);
+                }
+                return ExitCode::FAILURE;
+            }
+        }
+
+        let qa_marker = format!("REPLY-{}", std::process::id());
+        let mut qa = match TuiSession::start(&tui_bin, &qa_socket) {
+            Some(session) => session,
+            None => {
+                check("T-0094: the TUI starts on a pty", false, "no pty");
+                drop(qa_server);
+                for path in sidecars(&qa_socket) {
+                    let _ = std::fs::remove_file(path);
+                }
+                return ExitCode::FAILURE;
+            }
+        };
+        // Settle: one poll cycle plus the frame that paints the panel under the
+        // cursor (which starts on the first pane, asker: question panes sort by
+        // id).
+        std::thread::sleep(Duration::from_secs(3));
+        let panel = qa.screen();
+        let _ = std::fs::write(qa_scratch.join("01-settle.txt"), &panel);
+        check(
+            "T-0094: the question pane under the cursor shows all three actions",
+            panel.contains("r reply") && panel.contains("␣ skip") && panel.contains("K kill"),
+            &format!("sidebar: {:?}", question_group_rows(&panel)),
+        );
+
+        // `K` kills the pane *under the cursor* behind the same confirmation `x`
+        // uses. `j` moves the cursor from asker to dying (second row). Every
+        // step below polls the frame it needs rather than sleeping once: the
+        // key handler and the frame it paints race the event loop under load.
+        qa.send("j");
+        std::thread::sleep(Duration::from_millis(500));
+        qa.send("K");
+        let confirm_deadline = Instant::now() + Duration::from_secs(5);
+        let mut kill_confirm = String::new();
+        while Instant::now() < confirm_deadline {
+            kill_confirm = qa.screen();
+            if kill_confirm.contains("kill pane dying") {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        let _ = std::fs::write(qa_scratch.join("02-kill-confirm.txt"), &kill_confirm);
+        check(
+            "T-0094: K asks before it kills, naming the pane under the cursor",
+            kill_confirm.contains("kill pane dying"),
+            &format!(
+                "status: {:?}",
+                kill_confirm.lines().last().unwrap_or_default()
+            ),
+        );
+        qa.send("y");
+        // The pane leaves the sidebar once the kill's registry removal is
+        // reflected in the next poll pass — poll for that state.
+        let kill_deadline = Instant::now() + Duration::from_secs(6);
+        let mut killed;
+        loop {
+            killed = qa.screen();
+            // The status bar spans the terminal's full width, so the "killed
+            // dying" sentence it carries is inside the sidebar *columns* too;
+            // the sidebar itself is everything above the status row (the same
+            // exclusion the T-0074 kill check makes).
+            let killed_body = killed.lines().collect::<Vec<_>>();
+            let killed_body = killed_body[..killed_body.len().saturating_sub(1)].join("\n");
+            if killed.contains("killed dying") && !sidebar_region(&killed_body).contains("dying") {
+                break;
+            }
+            if Instant::now() >= kill_deadline {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        let _ = std::fs::write(qa_scratch.join("02-killed.txt"), &killed);
+        let killed_body = killed.lines().collect::<Vec<_>>();
+        let killed_body = killed_body[..killed_body.len().saturating_sub(1)].join("\n");
+        check(
+            "T-0094: the panel's kill ended the pane (the sidebar drops it)",
+            killed.contains("killed dying") && !sidebar_region(&killed_body).contains("dying"),
+            &format!(
+                "status: {:?}; sidebar has dying: {}",
+                killed.lines().last().unwrap_or_default(),
+                sidebar_region(&killed_body).contains("dying")
+            ),
+        );
+        check(
+            "T-0094: the kill's answer was the CLI's own line (killed dying)",
+            killed.contains("killed dying"),
+            "killed dying never reached the status",
+        );
+
+        // `␣` skips the pane *under the cursor*. With dying gone the sorted
+        // question list is asker, skippy, and the cursor (second row) is skippy
+        // — its surface must disappear and the daemon must see no pane bytes.
+        let cursor_deadline = Instant::now() + Duration::from_secs(5);
+        let mut cursor_on_skippy = String::new();
+        while Instant::now() < cursor_deadline {
+            cursor_on_skippy = qa.screen();
+            if cursor_on_skippy.contains("r reply") && cursor_on_skippy.contains("K kill") {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        check(
+            "T-0094: the surface follows the cursor onto the next question pane",
+            cursor_on_skippy.contains("r reply") && cursor_on_skippy.contains("K kill"),
+            &format!("sidebar: {:?}", question_group_rows(&cursor_on_skippy)),
+        );
+        qa.send(" ");
+        // The daemon verb rides the poller's select, which can lose a coin-flip
+        // to the 1 s tick and deliver the answer up to ~1 s later — poll the
+        // frame for the sentence rather than sleeping once.
+        let skip_deadline = Instant::now() + Duration::from_secs(5);
+        let mut skipped = String::new();
+        while Instant::now() < skip_deadline {
+            skipped = qa.screen();
+            if !skipped.contains("r reply") && skipped.contains("skipped skippy") {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        let _ = std::fs::write(qa_scratch.join("03-skipped.txt"), &skipped);
+        check(
+            "T-0094: ␣ dismisses the surface without writing a byte",
+            !skipped.contains("r reply") && skipped.contains("skipped skippy"),
+            &format!("status: {:?}", skipped.lines().last().unwrap_or_default()),
+        );
+        let skippy_lines = read_pane_lines(&qa_socket, "skippy").unwrap_or_default();
+        check(
+            "T-0094: the skipped pane's transcript holds no reply bytes",
+            !skippy_lines.iter().any(|line| line.contains(&qa_marker)),
+            "skip wrote pane bytes",
+        );
+
+        // `r` replies to the pane *under the cursor*: back up to asker, open
+        // the prompt, type the answer. This is the operator's own typing —
+        // panel input, never a keystroke replay of stored scrollback.
+        qa.send("k");
+        let on_asker_deadline = Instant::now() + Duration::from_secs(5);
+        let mut on_asker = String::new();
+        while Instant::now() < on_asker_deadline {
+            on_asker = qa.screen();
+            if on_asker.contains("r reply") && on_asker.contains("K kill") {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        let _ = std::fs::write(qa_scratch.join("04-on-asker.txt"), &on_asker);
+        check(
+            "T-0094: the cursor is back on asker and the panel is live again",
+            on_asker.contains("r reply") && on_asker.contains("K kill"),
+            &format!("sidebar: {:?}", question_group_rows(&on_asker)),
+        );
+        qa.send("r");
+        let prompt_deadline = Instant::now() + Duration::from_secs(5);
+        let mut reply_prompt = String::new();
+        while Instant::now() < prompt_deadline {
+            reply_prompt = qa.screen();
+            if reply_prompt.contains("reply to asker") {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        let _ = std::fs::write(qa_scratch.join("05-reply-prompt.txt"), &reply_prompt);
+        check(
+            "T-0094: r opens the reply prompt named for that pane",
+            reply_prompt.contains("reply to asker"),
+            &format!(
+                "status: {:?}",
+                reply_prompt.lines().last().unwrap_or_default()
+            ),
+        );
+
+        // **The exact-once proof, Worker A's construction.** A cursor taken
+        // before the act; a read-back from it after the act: the pane's own
+        // record of the reply (`ANSWER=<marker>`) is there exactly once — a
+        // second copy would make the count 2, and absence makes it 0, so a
+        // duplicate copy fails by construction. A read from just past the
+        // answer's line finds nothing more.
+        let before = read_pane_cursor(&qa_socket, "asker").unwrap_or(0);
+        qa.send(&qa_marker);
+        std::thread::sleep(Duration::from_millis(300));
+        qa.send("\r");
+        let reply_deadline = Instant::now() + Duration::from_secs(5);
+        let mut replied = String::new();
+        while Instant::now() < reply_deadline {
+            replied = qa.screen();
+            if replied.contains("reply sent to asker") {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        let _ = std::fs::write(qa_scratch.join("06-replied.txt"), &replied);
+        check(
+            "T-0094: the reply's answer was the panel's own line (reply sent to asker)",
+            replied.contains("reply sent to asker"),
+            &format!("status: {:?}", replied.lines().last().unwrap_or_default()),
+        );
+
+        let transcript_deadline = Instant::now() + Duration::from_secs(8);
+        let mut after_lines: Vec<String> = Vec::new();
+        while Instant::now() < transcript_deadline {
+            if let Some(found) = read_pane_lines_from(&qa_socket, "asker", before) {
+                after_lines = found;
+                if after_lines
+                    .iter()
+                    .any(|line| line.trim_end_matches('\r').trim() == format!("ANSWER={qa_marker}"))
+                {
+                    break;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(250));
+        }
+        let answer_count = after_lines
+            .iter()
+            .filter(|line| line.trim_end_matches('\r').trim() == format!("ANSWER={qa_marker}"))
+            .count();
+        check(
+            "T-0094: the answer lands in the pane's transcript exactly once",
+            answer_count == 1,
+            &format!(
+                "the pane's record of the reply appears {answer_count} times (want exactly 1): {after_lines:?}"
+            ),
+        );
+        // The same shape's second half: nothing more after the answer's line —
+        // a duplicate copy would be found here.
+        let again = read_pane_lines_from(&qa_socket, "asker", before + after_lines.len())
+            .unwrap_or_default();
+        check(
+            "T-0094: nothing follows the answer (a duplicate would show here)",
+            !again
+                .iter()
+                .any(|line| line.trim_end_matches('\r').trim() == format!("ANSWER={qa_marker}")),
+            &format!("a second copy of the answer followed: {again:?}"),
+        );
+
+        // The state visibly leaves Question, **as the daemon reports it** and
+        // as the sidebar renders it: the protocol probe (the same `PanesDetail`
+        // the sidebar reads) must no longer classify asker as asking, and the
+        // sidebar's question group must no longer hold it.
+        let state_deadline = Instant::now() + Duration::from_secs(8);
+        let mut settled = String::new();
+        while Instant::now() < state_deadline {
+            settled = qa.screen();
+            if !sidebar_question_group_has(&settled, "asker") {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(250));
+        }
+        let _ = std::fs::write(qa_scratch.join("06-after-reply.txt"), &settled);
+        let told_after = probe_pane_states(&qa_socket).unwrap_or_default();
+        let asker_state = told_after
+            .iter()
+            .find(|(id, _)| id == "asker")
+            .map(|(_, state)| state);
+        check(
+            "T-0094: after the reply the pane's state visibly leaves Question",
+            !sidebar_question_group_has(&settled, "asker")
+                && !matches!(asker_state, Some(Some(AgentState::Question))),
+            &format!(
+                "daemon state: {asker_state:?}; question span rows: {:?}",
+                question_group_rows(&settled)
+            ),
+        );
+        check(
+            "T-0094: the answered pane's action surface is gone",
+            !settled.contains("r reply"),
+            "the panel still offers actions for a pane that is not asking",
+        );
+
+        // Cleanup: the two live panes die over the protocol (no `sh` survives
+        // the slice), the TUI quits, the daemon goes, and the scratch socket
+        // with it.
+        for id in ["asker", "skippy"] {
+            check(
+                "T-0094: the fixture's panes are killed before their daemon goes",
+                kill_pane(&qa_socket, id),
+                &format!("kill {id} refused"),
+            );
+        }
+        qa.send("q");
+        let _ = wait_exit(&mut qa, Duration::from_secs(5));
+        drop(qa_server);
+        for path in sidecars(&qa_socket) {
+            let _ = std::fs::remove_file(path);
+        }
+    }
     if failures == 0 {
         println!("tui: {passes} passed, 0 failed");
         ExitCode::SUCCESS
     } else {
         println!("tui: {passes} passed, {failures} failed");
         ExitCode::FAILURE
+    }
+}
+
+/// Whether `id` sits inside the sidebar's `question` group: between the
+/// "◉ question" header and the next state-group header. The id appears once
+/// per group, so presence here is "the pane is asking", presence elsewhere
+/// (a `working`/`idle` rows) is "it has moved on" — the two are the whole
+/// T-0094 state-leaves-Question assertion.
+fn sidebar_question_group_has(screen: &str, id: &str) -> bool {
+    let region = sidebar_region(screen);
+    // `sidebar_region` keeps the left border column (the sidebar's first
+    // column is the `│`), so strip it before matching the group headers,
+    // which are indented by the two-glyph gutter from the border.
+    let lines: Vec<&str> = region
+        .lines()
+        .map(|line| line.strip_prefix('│').unwrap_or(line))
+        .collect();
+    let Some(q) = lines.iter().position(|line| line.contains("◉ question")) else {
+        return false; // no question group at all: nothing is asking
+    };
+    // The next group header is a state dot + name at the two-glyph gutter; a
+    // pane row and an indented asking line both start three columns in.
+    let next_header = lines.iter().enumerate().skip(q + 1).find(|(_, line)| {
+        let trimmed = line.trim_start();
+        (trimmed.starts_with("◉ ")
+            || trimmed.starts_with("● ")
+            || trimmed.starts_with("○ ")
+            || trimmed.starts_with("⬢ ")
+            || trimmed.starts_with("✓ "))
+            && line.starts_with("  ")
+            && !line.starts_with("   ")
+    });
+    let end = next_header.map_or(lines.len(), |(i, _)| i);
+    lines[q + 1..end].iter().any(|line| line.contains(id))
+}
+
+/// The sidebar's `question` group rows, for a failure message a reviewer can
+/// read (T-0094): the same slice the checks above decide on.
+fn question_group_rows(screen: &str) -> Vec<String> {
+    let region = sidebar_region(screen);
+    let lines: Vec<&str> = region
+        .lines()
+        .map(|line| line.strip_prefix('│').unwrap_or(line))
+        .collect();
+    let Some(q) = lines.iter().position(|line| line.contains("◉ question")) else {
+        return Vec::new();
+    };
+    let next_header = lines.iter().enumerate().skip(q + 1).find(|(_, line)| {
+        let trimmed = line.trim_start();
+        (trimmed.starts_with("◉ ")
+            || trimmed.starts_with("● ")
+            || trimmed.starts_with("○ ")
+            || trimmed.starts_with("⬢ ")
+            || trimmed.starts_with("✓ "))
+            && line.starts_with("  ")
+            && !line.starts_with("   ")
+    });
+    let end = next_header.map_or(lines.len(), |(i, _)| i);
+    lines[q + 1..end]
+        .iter()
+        .map(|line| line.to_string())
+        .collect()
+}
+
+/// Read a pane's journal from the daemon, over the protocol by hand (the same
+/// `Read` a focused pane's transcript is built from, `from_line = 0` = the
+/// hot ring start). Bounded and closed on the way out, like [`probe_pane_states`].
+fn read_pane_lines(socket: &std::path::Path, id: &str) -> Option<Vec<String>> {
+    read_pane_lines_from(socket, id, 0)
+}
+
+/// Read a pane's journal from a cursor (T-0094): the lines written at or after
+/// ring position `from`. The daemon answers a `Delta` with `from_line`
+/// clamped into the ring, so a cursor past the end returns nothing — which is
+/// what "nothing follows the answer" asserts.
+fn read_pane_lines_from(socket: &std::path::Path, id: &str, from: usize) -> Option<Vec<String>> {
+    use arreo_core::proto::{client_versions, Message, VERSION};
+
+    let mut stream = std::os::unix::net::UnixStream::connect(socket).ok()?;
+    stream.set_read_timeout(Some(Duration::from_secs(2))).ok()?;
+    write_message(
+        &mut stream,
+        &Message::Hello {
+            v: VERSION,
+            client: "xtask-tui-slice".to_string(),
+            wants: client_versions(),
+        },
+    )?;
+    if !matches!(read_message(&mut stream)?, Message::Welcome { .. }) {
+        return None;
+    }
+    write_message(
+        &mut stream,
+        &Message::Read {
+            v: VERSION,
+            id: id.to_string(),
+            from_line: from,
+        },
+    )?;
+    match read_message(&mut stream)? {
+        Message::Delta { lines, .. } | Message::Snapshot { lines, .. } => Some(lines),
+        _ => None,
+    }
+}
+
+/// The ring's current length: `Read { from_line: usize::MAX }` answers a
+/// `Delta` whose `from_line` is the ring length clamped (the marker for
+/// "everything written so far" — the same cursor Worker A's reply-lands-once
+/// test takes before the act).
+fn read_pane_cursor(socket: &std::path::Path, id: &str) -> Option<usize> {
+    use arreo_core::proto::{client_versions, Message, VERSION};
+
+    let mut stream = std::os::unix::net::UnixStream::connect(socket).ok()?;
+    stream.set_read_timeout(Some(Duration::from_secs(2))).ok()?;
+    write_message(
+        &mut stream,
+        &Message::Hello {
+            v: VERSION,
+            client: "xtask-tui-slice".to_string(),
+            wants: client_versions(),
+        },
+    )?;
+    if !matches!(read_message(&mut stream)?, Message::Welcome { .. }) {
+        return None;
+    }
+    write_message(
+        &mut stream,
+        &Message::Read {
+            v: VERSION,
+            id: id.to_string(),
+            from_line: usize::MAX,
+        },
+    )?;
+    match read_message(&mut stream)? {
+        Message::Delta { from_line, .. } => Some(from_line),
+        _ => None,
     }
 }
 

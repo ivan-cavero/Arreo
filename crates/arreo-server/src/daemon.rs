@@ -1674,14 +1674,14 @@ fn record_notify(
         ),
         // A decision *not* to act, recorded as a refusal: the log then says the
         // policy saw this transition and chose not to deliver it, which is a
-        // different statement from "nothing happened".
+        // different statement from "nothing happened". The same row builder as
+        // the sent arm, so the bounded action list rides every notification row
+        // (T-0094) with one definition.
         notify::Decision::Suppressed { reason } => (
             actions::NOTIFY_SUPPRESSED,
-            format!(
-                "state={}; {} — {}",
-                notify::state_word(transition.to),
-                reason.word(),
-                reason.detail()
+            notify::detailed(
+                transition.to,
+                &format!("{} — {}", reason.word(), reason.detail()),
             ),
             AuditOutcome::Refused,
         ),
@@ -2424,6 +2424,36 @@ where
                 .await?;
                 continue;
             }
+            // The quick-action door (T-0094): `arreo notify act` and the TUI's
+            // panel keys both end here. It is handled in the session loop (like
+            // the sync exchange) rather than by `dispatch` because its audit
+            // rows name the acting device and carry the *outcome* — a refused
+            // act is a row with `outcome = refused`, never a bare Ok that would
+            // have to be walked back — and the pane's own state is the
+            // authority on the refusal.
+            Message::NotifyAct { v, .. } => {
+                if let Err(reply) = check_version(*v) {
+                    write_message(writer, &reply).await?;
+                    continue;
+                }
+                let reply = serve_notify_act(&message, &db, &audit, &registry, &worktree).await;
+                write_message(writer, &reply).await?;
+                continue;
+            }
+            // A reply is never a request either: the same typed refusal keeps
+            // the response to a quick action from being re-sent as if it were
+            // the act itself.
+            Message::NotifyActReply { .. } => {
+                write_message(
+                    writer,
+                    &Message::Error {
+                        v: VERSION,
+                        message: "unexpected notify_act_reply here".to_string(),
+                    },
+                )
+                .await?;
+                continue;
+            }
             _ => {}
         }
         let reply = dispatch(&message, &registry, &db, &worktree).await;
@@ -2449,26 +2479,7 @@ where
             .values()
             .any(|entry| entry.take_session_learned());
         if mutated || learned {
-            let registry = Arc::clone(&registry);
-            let db = db.clone();
-            tokio::spawn(async move {
-                let _gate = SNAPSHOT_GATE.lock().await;
-                let panes: Vec<super::persist::SnapshotPane> = registry
-                    .read()
-                    .await
-                    .iter()
-                    .map(|(id, entry)| super::persist::SnapshotPane {
-                        id: id.clone(),
-                        pane: Arc::clone(&entry.pane),
-                        harness: entry.harness.clone(),
-                        session_id: entry.session(),
-                        worktree: entry.worktree(),
-                    })
-                    .collect();
-                if let Err(e) = super::persist::snapshot(&panes, &db) {
-                    eprintln!("daemon: snapshot failed: {e}");
-                }
-            });
+            snapshot_registry(&registry, &db);
         }
         if let Some(reply) = reply {
             write_message(writer, &reply).await?;
@@ -2785,6 +2796,26 @@ fn verb_of(message: &Message) -> Verb {
         Message::SpawnWorktree { .. } => Verb::Spawn,
         Message::Split { .. } => Verb::Split,
         Message::Kill { .. } => Verb::Kill,
+        // A quick action drives the pane (T-0094): a `reply` is a **send** — the
+        // same verb, so a viewer-role device gets the byte-identical trust
+        // refusal a direct send prints, which is the contract's sentence, not a
+        // second one. `skip` and `kill` are control acts a viewer may not take
+        // either; they map to `Kill`, the stronger of the two control verbs.
+        // Reply and skip are the "answer the question" path: `reply` sends, and
+        // `skip` writes no pane bytes at all (a dismissal is an audit row and
+        // nothing else), so both are the Send capability — a device granted
+        // Send-only on a machine can answer *and* dismiss a question, and its
+        // refusal for either names Send, not Kill. `kill` ends the pane and
+        // stays a Control capability (review, T-0094).
+        Message::NotifyAct {
+            action: arreo_core::notify::NotifyAction::Reply | arreo_core::notify::NotifyAction::Skip,
+            ..
+        } => Verb::Send,
+        Message::NotifyAct {
+            action: arreo_core::notify::NotifyAction::Kill,
+            ..
+        } => Verb::Kill,
+        Message::NotifyActReply { .. } => Verb::Admin,
         // The handoff request drives the machine (it replaces the daemon), so
         // it needs the control capability; the readiness notice is news.
         Message::Handoff { .. } => Verb::Admin,
@@ -2840,6 +2871,8 @@ fn op_name(message: &Message) -> &'static str {
         Message::SyncReply { .. } => "sync_reply",
         Message::Split { .. } => "split",
         Message::MetricsReq { .. } => "metrics-req",
+        Message::NotifyAct { .. } => "notify_act",
+        Message::NotifyActReply { .. } => "notify_act_reply",
     }
 }
 
@@ -2873,6 +2906,237 @@ fn not_found(id: &str) -> Message {
         v: VERSION,
         message: format!("pane {id:?} not found"),
     }
+}
+
+/// The quick-action path (T-0094): one daemon implementation behind
+/// `arreo notify act <pane> <action>` and the TUI panel's keys, so a script,
+/// a phone and the panel can never drift into three behaviours.
+///
+/// Everything an act can be — sent or refused — is written as an audit row
+/// under [`actions::NOTIFY_ACT`] with the session's identity (the same recorder
+/// a direct `send` uses, so a local act is the operator and a remote one the
+/// device) and with the pane in `agent`. The refusal sentences are borrowed,
+/// never invented:
+///
+/// - **The pane's state is the authority.** A pane whose process has exited
+///   answers with the pinned [`notify::PANE_EXITED`] bytes — read by the same
+///   `try_wait` the daemon's own listing uses — and a `reply` only flies when
+///   the engine actually sees the pane asking. A pane that is not in the
+///   registry at all is the ordinary not-found.
+/// - **A viewer-role device never reaches this function.** The session gate
+///   answers `reply` with the *direct-send* trust sentence and `skip`/`kill`
+///   with the control one — this path only ever runs for a device the gate let
+///   through.
+/// - **A reply is a send.** The bytes are `text + "\n"` through the exact
+///   `entry.pane.send` + pump the `Message::Send` arm uses, and the row's
+///   `prompt` is the reply text, redacted on the way in by the send path's own
+///   secret scan. `skip` writes no pane bytes at all; `kill` removes the pane
+///   through the kill helper shared with `Message::Kill`.
+async fn serve_notify_act(
+    message: &Message,
+    db: &std::path::Path,
+    audit: &crate::audit::SessionAudit,
+    registry: &Registry,
+    worktree: &WorktreeSettings,
+) -> Message {
+    use arreo_core::notify::{self, NotifyAction, PANE_EXITED};
+    use arreo_core::store::{actions, AuditOutcome};
+
+    let Message::NotifyAct {
+        pane, action, text, ..
+    } = message
+    else {
+        return Message::NotifyActReply {
+            v: VERSION,
+            ok: false,
+            detail: "not an act request".to_string(),
+        };
+    };
+    let action = *action;
+    // The row's prompt is the reply text (redacted on write by the store — the
+    // send path's scan, one writer); skip and kill carry no content.
+    let prompt = match &action {
+        NotifyAction::Reply => text.clone().unwrap_or_default(),
+        NotifyAction::Skip | NotifyAction::Kill => String::new(),
+    };
+    // One refusal writer: the wire answer and the row, built from the same
+    // sentence so what the operator reads and what the log says cannot drift.
+    let refused = |detail: String| {
+        audit.record_with_prompt(
+            actions::NOTIFY_ACT,
+            AuditOutcome::Refused,
+            pane,
+            &prompt,
+            Some(&format!("action={}; {detail}", action.as_str())),
+        );
+        Message::NotifyActReply {
+            v: VERSION,
+            ok: false,
+            detail,
+        }
+    };
+
+    // The shape is validated here as well as at the CLI: a caller that does not
+    // go through the CLI gets a refusal naming what was wrong, never a truncation
+    // and never a guess. The bound is the library's one definition.
+    let reply_text: Option<&str> = match (&action, text.as_deref()) {
+        (NotifyAction::Reply, None) => return refused("reply needs text".to_string()),
+        (NotifyAction::Reply, Some(reply)) if !notify::reply_text_within_bound(reply) => {
+            return refused(format!(
+                "reply text is too long: {} bytes, the bound is {}",
+                reply.len(),
+                notify::MAX_REPLY_BYTES
+            ));
+        }
+        (NotifyAction::Skip | NotifyAction::Kill, Some(_)) => {
+            return refused("--text applies only to reply".to_string());
+        }
+        (NotifyAction::Reply, Some(reply)) => Some(reply),
+        (NotifyAction::Skip | NotifyAction::Kill, None) => None,
+    };
+
+    // The pane's own state is the authority on refusals. The entry is read under
+    // the read lock and cloned out; the reply runs on the clone, exactly like
+    // the `Send` arm's `entry.pane.send`.
+    let entry = {
+        let registry = registry.read().await;
+        let Some(entry) = registry.get(pane) else {
+            return refused(format!("pane {pane:?} not found"));
+        };
+        if !matches!(entry.pane.try_wait(), ExitState::Running) {
+            return refused(PANE_EXITED.to_string());
+        }
+        Arc::clone(entry)
+    };
+    // A reply needs a pane the engine actually sees asking — the same derived
+    // state `PanesDetail` reports, fed from the journal first so a pane that
+    // printed since the last pass is classified now.
+    if action == NotifyAction::Reply {
+        entry.pump(now_ms());
+        let state = engine_state_to_wire(entry.engine_state());
+        if state != AgentState::Question {
+            return refused(format!(
+                "cannot reply: the pane is not asking (state={})",
+                notify::state_word(state)
+            ));
+        }
+    }
+
+    let outcome = match action {
+        NotifyAction::Reply => match entry
+            .pane
+            .send(format!("{}\n", reply_text.expect("validated above")).as_bytes())
+        {
+            Ok(()) => {
+                entry.pump(now_ms());
+                Ok(())
+            }
+            Err(e) => Err(format!("send failed: {e}")),
+        },
+        // Skip is a dismissal: it writes no pane bytes at all, and its row is
+        // the whole trace of it.
+        NotifyAction::Skip => Ok(()),
+        NotifyAction::Kill => {
+            // The kill path is the pane-kill verb's own: remove from the
+            // registry, kill the tree, wait, clear the worktree — one behaviour
+            // whether the operator typed `arreo kill` or acted on a notification.
+            match registry.write().await.remove(pane) {
+                Some(entry) => {
+                    kill_pane(entry, pane, worktree);
+                    snapshot_registry(registry, db);
+                    Ok(())
+                }
+                None => Err(format!("pane {pane:?} not found")),
+            }
+        }
+    };
+
+    match outcome {
+        Ok(()) => {
+            audit.record_with_prompt(
+                actions::NOTIFY_ACT,
+                AuditOutcome::Ok,
+                pane,
+                &prompt,
+                Some(&format!("action={}", action.as_str())),
+            );
+            Message::NotifyActReply {
+                v: VERSION,
+                ok: true,
+                detail: String::new(),
+            }
+        }
+        Err(detail) => refused(detail),
+    }
+}
+
+/// The kill half shared by `Message::Kill` and a quick-action `kill` (T-0094) —
+/// one kill path, so the act verb can never drift from the CLI verb: remove the
+/// entry, SIGKILL the tree, wait out the bound, and only then clear the
+/// worktree.
+///
+/// **The wait result decides** (T-0108): `None` means "still running after the
+/// bound", which is reachable even though `kill_shared` sends SIGKILL — a
+/// process in uninterruptible sleep (blocked on a hung mount, a stuck disk)
+/// does not die until its syscall returns, and a poisoned killer mutex means
+/// the signal was never delivered at all. That case **keeps and reports** the
+/// checkout: a live process can write into it, so "is it dirty?" has no stable
+/// answer to read.
+///
+/// Once the child has exited, the pane's worktree goes with it (T-0091). What
+/// protects the files from here is **git's own refusal**, not this call:
+/// `remove` passes `force = false`, and `git worktree remove` without
+/// `--force` re-checks the checkout and refuses a dirty one — measured, and
+/// recorded in `.loop/evidence/T-0108/`. A descendant that outlives its leader
+/// and writes in the meantime makes git refuse, and the checkout is kept.
+/// **That is why the kill path must never pass `--force`.**
+fn kill_pane(entry: Arc<PaneEntry>, id: &str, worktree: &WorktreeSettings) {
+    let _ = entry.pane.kill_shared();
+    let settings = worktree.clone();
+    let id = id.to_string();
+    tokio::task::spawn_blocking(move || {
+        if let Some(reason) =
+            still_running_after_kill(entry.pane.wait_timeout(std::time::Duration::from_secs(5)))
+        {
+            if let Some(path) = entry.worktree() {
+                eprintln!(
+                    "daemon: pane {id:?} kept its worktree {} — {reason}",
+                    path.display()
+                );
+            }
+            return;
+        }
+        if let Some(path) = entry.worktree() {
+            remove_worktree(&settings, &id, &path);
+        }
+    });
+}
+
+/// Write the daemon's topology snapshot after a registry-mutating verb (T-0014):
+/// spawn/kill/split — and a quick-action kill (T-0094) — change which panes
+/// exist, so the DB must reflect it. Async task (never blocks the connection);
+/// failures logged, never fatal.
+fn snapshot_registry(registry: &Registry, db: &std::path::Path) {
+    let registry = Arc::clone(registry);
+    let db = db.to_path_buf();
+    tokio::spawn(async move {
+        let _gate = SNAPSHOT_GATE.lock().await;
+        let panes: Vec<super::persist::SnapshotPane> = registry
+            .read()
+            .await
+            .iter()
+            .map(|(id, entry)| super::persist::SnapshotPane {
+                id: id.clone(),
+                pane: Arc::clone(&entry.pane),
+                harness: entry.harness.clone(),
+                session_id: entry.session(),
+                worktree: entry.worktree(),
+            })
+            .collect();
+        if let Err(e) = super::persist::snapshot(&panes, &db) {
+            eprintln!("daemon: snapshot failed: {e}");
+        }
+    });
 }
 
 /// One spawn request, as either spawn verb states it (T-0091).
@@ -3507,49 +3771,7 @@ async fn dispatch(
             match registry.remove(id) {
                 Some(entry) => {
                     drop(registry);
-                    let _ = entry.pane.kill_shared();
-                    let settings = worktree.clone();
-                    let id = id.clone();
-                    tokio::task::spawn_blocking(move || {
-                        // **The wait result decides** (T-0108). It used to be
-                        // discarded (`let _ = …`) and the removal ran regardless,
-                        // so a pane whose process had *not* exited was still
-                        // treated as if it had: the code's own comment said "the
-                        // child is dead by now", and nothing enforced it.
-                        //
-                        // `None` means "still running after the bound", which is
-                        // reachable even though `kill_shared` sends SIGKILL — a
-                        // process in uninterruptible sleep (blocked on a hung
-                        // mount, a stuck disk) does not die until its syscall
-                        // returns, and a poisoned killer mutex means the signal was
-                        // never delivered at all. In that case the checkout is
-                        // **kept and reported**: a live process can write into it,
-                        // so "is it dirty?" has no stable answer to read.
-                        if let Some(reason) = still_running_after_kill(
-                            entry.pane.wait_timeout(std::time::Duration::from_secs(5)),
-                        ) {
-                            if let Some(path) = entry.worktree() {
-                                eprintln!(
-                                    "daemon: pane {id:?} kept its worktree {} — {reason}",
-                                    path.display()
-                                );
-                            }
-                            return;
-                        }
-                        // T-0091: the pane's worktree goes with the pane, and the
-                        // child has exited. What protects the files from here is
-                        // **git's own refusal**, not this call: `remove` passes
-                        // `force = false`, and `git worktree remove` without
-                        // `--force` re-checks the checkout and refuses a dirty one
-                        // ("contains modified or untracked files") — measured, and
-                        // recorded in `.loop/evidence/T-0108/`. So a descendant
-                        // that outlives its leader and writes in the meantime makes
-                        // git refuse, and the checkout is kept. **That is why the
-                        // kill path must never pass `--force`.**
-                        if let Some(path) = entry.worktree() {
-                            remove_worktree(&settings, &id, &path);
-                        }
-                    });
+                    kill_pane(entry, id, worktree);
                     Some(Message::Ok { v: VERSION })
                 }
                 None => Some(not_found(id)),
@@ -3748,7 +3970,11 @@ async fn dispatch(
                 }),
             }
         }
-        // Streaming verbs + handshake replies never reach dispatch.
+        // Streaming verbs + handshake replies never reach dispatch. The quick
+        // action (T-0094) and the sync exchange are handled by the session loop
+        // too — they need the acting identity and their own audit rows — so
+        // dispatch's fallback for them, like `Sync`'s, is the loud "unexpected"
+        // that is never actually served.
         Message::Attach { .. }
         | Message::Resume { .. }
         | Message::Wait { .. }
@@ -3764,6 +3990,8 @@ async fn dispatch(
         | Message::HandoffReady { .. }
         | Message::Sync { .. }
         | Message::SyncReply { .. }
+        | Message::NotifyAct { .. }
+        | Message::NotifyActReply { .. }
         | Message::Ok { .. }
         | Message::Exited { .. } => Some(Message::Error {
             v: VERSION,
@@ -4877,5 +5105,63 @@ mod session_registry_tests {
         assert_eq!(sessions.counts().get("dev_a"), Some(&64));
         drop(guards);
         assert!(sessions.counts().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod notify_act_tests {
+    use super::*;
+    use arreo_core::notify::NotifyAction;
+
+    fn act(action: NotifyAction) -> Message {
+        Message::NotifyAct {
+            v: VERSION,
+            pane: "p".to_string(),
+            action,
+            text: Some("y".to_string()),
+        }
+    }
+
+    /// A quick-action `reply` is gated as a **send** (T-0094), so a viewer-role
+    /// device gets the byte-identical trust refusal a direct send prints — the
+    /// sentence is the gate's, and the gate only needs to see the same verb.
+    /// `skip`/`kill` are control acts too (a viewer cannot act at all), mapped
+    /// to `Kill`, the stronger of the two control verbs; both mapping decisions
+    /// change only the *wording* of the refusal, never whether there is one.
+    #[test]
+    fn a_notify_act_reply_is_gated_exactly_as_a_direct_send() {
+        assert_eq!(verb_of(&act(NotifyAction::Reply)), Verb::Send);
+        assert_eq!(verb_of(&act(NotifyAction::Skip)), Verb::Send);
+        assert_eq!(verb_of(&act(NotifyAction::Kill)), Verb::Kill);
+
+        // The role policy is the one source of the refusal sentence; `Send`
+        // from a viewer is the direct-send refusal, and it is `Control`-capped
+        // just like `Kill` — so the act's reply runs the exact same gate.
+        use arreo_core::identity::role::{check, required, Capability, Verb as RoleVerb};
+        use arreo_core::identity::{Role, RoleError};
+        assert!(matches!(
+            check(Role::Viewer, RoleVerb::Send),
+            Err(RoleError::Denied {
+                capability: Capability::Control,
+                ..
+            })
+        ));
+        for verb in [RoleVerb::Send, RoleVerb::Kill] {
+            assert_eq!(required(verb), Capability::Control);
+        }
+    }
+
+    /// A quick action is **not** a bare audited verb: the act path writes its
+    /// own rows with the true outcome (sent or refused), so the session loop's
+    /// pre-emptive Ok row must not fire for it — otherwise every act would get
+    /// an untruthful `Ok` row before the state gate even ran.
+    #[test]
+    fn a_notify_act_is_not_pre_audited_as_ok() {
+        for action in [NotifyAction::Reply, NotifyAction::Skip, NotifyAction::Kill] {
+            assert!(
+                audited(&act(action)).is_none(),
+                "{action:?} writes its own outcome row"
+            );
+        }
     }
 }

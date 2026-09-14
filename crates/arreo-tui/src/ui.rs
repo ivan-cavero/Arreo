@@ -53,6 +53,7 @@ use arreo_core::identity::authority::VerbDenial;
 use arreo_core::identity::role::{self, Verb};
 use arreo_core::identity::{DeviceId, Role};
 use arreo_core::mesh::Presence;
+use arreo_core::proto::NotifyAction;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -110,6 +111,21 @@ const KEY_LIST: &[(&str, &str, Option<Verb>)] = &[
     ),
     ("i", "send text to the attached pane", Some(Verb::Send)),
     ("x", "kill the attached pane (confirm)", Some(Verb::Kill)),
+    (
+        "r",
+        "on a question pane under the cursor: reply (text + newline, the send path)",
+        Some(Verb::Send),
+    ),
+    (
+        "␣",
+        "on a question pane under the cursor: skip (dismiss, no bytes sent)",
+        Some(Verb::Kill),
+    ),
+    (
+        "K",
+        "on a question pane under the cursor: kill it (confirm)",
+        Some(Verb::Kill),
+    ),
     ("m", "machines: list · a add · r rename · x remove", None),
     (
         "g",
@@ -130,6 +146,12 @@ const ID_WIDTH: usize = 9;
 /// (the two-glyph gutter plus a space), so the question reads as a line *of*
 /// that pane rather than as a new one (T-0076).
 const ASK_INDENT: &str = "   ";
+
+/// The panel's three quick actions on a question pane under the cursor
+/// (T-0094): reply (opens a prompt), skip (dismiss, no bytes), kill (the
+/// existing kill verb, behind its confirmation). Shown compact enough to fit
+/// the 28-column default sidebar.
+const PANEL_ACTIONS: &str = " r reply · ␣ skip · K kill";
 
 /// How many columns the sidebar actually gets: what the user asked for,
 /// clamped to what this terminal can pay for (T-0076).
@@ -210,6 +232,17 @@ pub enum Action {
         id: String,
         text: String,
     },
+    /// A T-0094 quick action (reply/skip/kill) on a pane, under the daemon's
+    /// `notify act` door: the same `Message::NotifyAct` the CLI's
+    /// `arreo notify act` sends, so the panel and a script share one
+    /// implementation — the audit row, the pane-state gate and the secret
+    /// scan are all the daemon's, and the reply's bytes are `text + "\n"`
+    /// through the send path.
+    NotifyAct {
+        id: String,
+        action: NotifyAction,
+        text: Option<String>,
+    },
     MachinesList,
     MachinesRename {
         from: String,
@@ -261,6 +294,17 @@ pub enum PromptKind {
     Spawn,
     /// Text to send to the (attached) pane.
     Send {
+        id: String,
+    },
+    /// The T-0094 panel's reply to a question pane under the cursor: the
+    /// operator's text, sent through the daemon's `notify act` door — the
+    /// daemon appends the newline and writes through the same path `i`'s send
+    /// takes, so it is audited as the device, gated by the same per-verb trust
+    /// rule and secret-scanned exactly like a direct send. A distinct kind
+    /// because a reply is not a keystroke replay — the text is the operator's
+    /// own typing, and the daemon's bound (4096 bytes) is the refusal, never a
+    /// truncation.
+    Reply {
         id: String,
     },
     /// The new name for the machine the panel has selected.
@@ -1147,6 +1191,32 @@ impl App {
                         self.theme.muted_style(),
                     ))));
                 }
+                // **T-0094: the quick-action panel.** The three actions on the
+                // question pane the cursor is on: `r` reply (a prompt, the
+                // send path), `␣` skip (dismiss, no bytes), `K` kill (the
+                // existing kill verb, confirmed). The surface exists exactly
+                // while the pane is live and asking and the notification has
+                // not been skipped — a pane that exited cancels it, because
+                // the pane's state is the authority.
+                if cursor == Some(id.as_str()) {
+                    if let Some(pane) = pane {
+                        if pane.state == "question"
+                            && pane.alive
+                            && !self.model.notification_dismissed(&pane.id)
+                        {
+                            items.push(ListItem::new(Line::from(Span::styled(
+                                truncate(
+                                    PANEL_ACTIONS,
+                                    // `area` here is the *sidebar chunk*, not
+                                    // the terminal: the two border columns are
+                                    // the whole budget the line must fit.
+                                    usize::from(area.width).saturating_sub(2),
+                                ),
+                                self.theme.primary_style(),
+                            ))));
+                        }
+                    }
+                }
             }
         }
         let list = List::new(items).block(
@@ -1427,6 +1497,30 @@ impl App {
         if self.view == ViewMode::Diff && self.on_key_diff(code) {
             return true;
         }
+        // T-0094: the quick-action panel. While the cursor is on a live,
+        // undismissed question pane, `r`/`␣`/`K` act on *that* pane; anything
+        // else falls through to the shared bindings (including `q` quit). The
+        // keys are the ones the sidebar's action line advertises, so the
+        // surface and the handler cannot drift apart.
+        if self.panel_active() {
+            if let Some(id) = self.model.cursor_id().map(str::to_string) {
+                match code {
+                    K::Char('r') => {
+                        self.open_reply(&id);
+                        return true;
+                    }
+                    K::Char(' ') => {
+                        self.skip_notification(&id);
+                        return true;
+                    }
+                    K::Char('K') => {
+                        self.open_panel_kill(&id);
+                        return true;
+                    }
+                    _ => {}
+                }
+            }
+        }
         match code {
             K::Char('q') => false,
             K::Esc => {
@@ -1665,6 +1759,7 @@ impl App {
             Action::Spawn { .. }
             | Action::Kill { .. }
             | Action::Send { .. }
+            | Action::NotifyAct { .. }
             | Action::TrustPreview { .. } => {}
             // Never reaches here: the main loop answers a quit before it asks
             // the fleet for anything (T-0073).
@@ -1714,6 +1809,82 @@ impl App {
             title: format!("kill pane {id}"),
             lines: vec![format!("kill pane {id:?}? its process is terminated.")],
             yes: Action::Kill { id },
+            force: None,
+            cancel: None,
+        });
+    }
+
+    /// Whether the quick-action panel is live (T-0094): the sidebar cursor is
+    /// on a pane the daemon reports as `question` and alive, and its
+    /// notification has not been skipped. An exited pane cancels the surface —
+    /// the pane's state is the authority, so there is nothing to act on.
+    #[must_use]
+    fn panel_active(&self) -> bool {
+        match self.model.cursor_id() {
+            Some(id) => self.model.panes().iter().any(|p| {
+                p.id == id
+                    && p.state == "question"
+                    && p.alive
+                    && !self.model.notification_dismissed(&p.id)
+            }),
+            None => false,
+        }
+    }
+
+    /// `r` on a question pane under the cursor: reply to that pane (T-0094).
+    /// The reply is the operator's typing plus a newline, through the same
+    /// gate `i` uses — a viewer is refused with the daemon's own sentence for
+    /// a direct send, so the refusal names the role, not this panel.
+    fn open_reply(&mut self, id: &str) {
+        if let Some(reason) = self.control_denial(Verb::Send) {
+            self.status = reason;
+            return;
+        }
+        self.prompt = Some(Prompt::new(
+            format!("reply to {id}"),
+            PromptKind::Reply { id: id.to_string() },
+        ));
+    }
+
+    /// `␣` on a question pane under the cursor: skip (T-0094). The surface is
+    /// dismissed locally this instant (the pane stays wherever the daemon says
+    /// it is), and the daemon is told through the `notify act` door so the
+    /// skip is an audited act (`actions::NOTIFY_ACT`, no pane bytes) rather
+    /// than a ghost only this screen knows about.
+    fn skip_notification(&mut self, id: &str) {
+        // `skip` is the Send capability (a dismissal writes no pane bytes —
+        // it is an audit row and nothing else), matching the daemon's gate, so
+        // the refusal this panel shows for it is the same sentence the daemon
+        // answers a viewer with (review, T-0094).
+        if let Some(reason) = self.control_denial(Verb::Send) {
+            self.status = reason;
+            return;
+        }
+        self.model.dismiss_notification(id);
+        self.queue(Action::NotifyAct {
+            id: id.to_string(),
+            action: NotifyAction::Skip,
+            text: None,
+        });
+    }
+
+    /// `K` on a question pane under the cursor: kill *that* pane (T-0094),
+    /// behind the same confirmation the attached-pane `x` uses — the wire verb
+    /// is the daemon's `notify act` kill, which ends the pane through the
+    /// pane-kill path (the audit row names `action=kill`).
+    fn open_panel_kill(&mut self, id: &str) {
+        if let Some(reason) = self.control_denial(Verb::Kill) {
+            self.status = reason;
+            return;
+        }
+        self.confirm = Some(Confirm {
+            title: format!("kill pane {id}"),
+            lines: vec![format!("kill pane {id:?}? its process is terminated.")],
+            yes: Action::NotifyAct {
+                id: id.to_string(),
+                action: NotifyAction::Kill,
+                text: None,
+            },
             force: None,
             cancel: None,
         });
@@ -1907,6 +2078,26 @@ impl App {
                     self.status = format!("send: nothing to send to {id}");
                 } else {
                     self.queue(Action::Send { id, text });
+                }
+            }
+            // T-0094: the panel's reply. The operator's text goes to the
+            // daemon's `notify act` door — the daemon appends the newline and
+            // writes `text + "\n"` through the *existing* send path, so the
+            // audit, the per-verb trust gate and the secret scan are the send
+            // path's own; a reply longer than the bound is refused by the
+            // daemon with its own sentence (`reply text is too long: N bytes,
+            // the bound is 4096`), never truncated. The text is the operator's
+            // own typing, never a read-back of scrollback (no keystroke
+            // replay).
+            PromptKind::Reply { id } => {
+                if text.is_empty() {
+                    self.status = format!("reply: nothing to send to {id}");
+                } else {
+                    self.queue(Action::NotifyAct {
+                        id,
+                        action: NotifyAction::Reply,
+                        text: Some(text),
+                    });
                 }
             }
             PromptKind::Rename { from } => {

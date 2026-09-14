@@ -13,6 +13,7 @@
 //! no v1 yet — the window is proven for v0→v1 only, and the first major break
 //! names itself refused.
 
+use arreo_core::proto::NotifyAction;
 use arreo_core::proto::{
     classify_op, client_versions, client_versions_from, frame_body_len, negotiate, CodecError,
     Direction, Message, PaneDetail, PaneInfo, SyncExchange, SyncOutcome, SyncStatus,
@@ -627,6 +628,68 @@ fn v1_frame(op: &str) -> Vec<u8> {
     frame.extend(rmp_encode_str("id"));
     frame.extend(rmp_encode_str("p"));
     frame
+}
+
+/// **The quick-action pair classifies by the same rule** (T-0094): `NotifyAct`
+/// is a client→server request (it drives a pane) and `NotifyActReply` an event
+/// (it answers one), both learned from the map head rather than by a version
+/// bump — so a v0 peer that receives either does not decode it and answers a
+/// typed refusal, which is exactly what a sender's error path is written to
+/// report.
+#[test]
+fn the_notify_act_pair_classifies_by_the_same_rule() {
+    let request = body_of(&Message::NotifyAct {
+        v: VERSION,
+        pane: "p".into(),
+        action: NotifyAction::Reply,
+        text: Some("y".into()),
+    });
+    assert_eq!(
+        classify_op(&request),
+        Some(Direction::Request),
+        "a quick action asks the daemon to do work"
+    );
+    let reply = body_of(&Message::NotifyActReply {
+        v: VERSION,
+        ok: true,
+        detail: String::new(),
+    });
+    assert_eq!(
+        classify_op(&reply),
+        Some(Direction::Event),
+        "the outcome answers one"
+    );
+}
+
+/// **A new verb is refused loudly by a reader that does not speak it** — the
+/// N−1 behaviour for `notify_act` (ADR 0017). A v0 mirror of the message set
+/// cannot decode the frame at all, so an old daemon answers a typed `Error` and
+/// keeps the session open (the live-daemon half of the same rule is
+/// `an_unknown_request_is_refused_and_the_session_survives` in
+/// `arreo-server/tests/compat.rs`): the new verb never reads as an old one.
+#[test]
+fn a_v0_reader_refuses_notify_act_rather_than_misreading_it() {
+    /// A v0 peer's schema — what shipped before T-0094.
+    #[derive(serde::Serialize, serde::Deserialize, Debug, PartialEq)]
+    #[serde(tag = "op", rename_all = "snake_case")]
+    enum V0Message {
+        Hello {
+            v: u32,
+            client: String,
+            wants: Vec<u32>,
+        },
+    }
+    let act = body_of(&Message::NotifyAct {
+        v: VERSION,
+        pane: "p".into(),
+        action: NotifyAction::Reply,
+        text: Some("y".into()),
+    });
+    assert!(
+        rmp_serde::from_slice::<V0Message>(&act).is_err(),
+        "a v0 reader must not be handed a verb it cannot decode — the refusal \
+         is the typed Error an unknown request always gets"
+    );
 }
 
 fn rmp_encode_str(text: &str) -> Vec<u8> {

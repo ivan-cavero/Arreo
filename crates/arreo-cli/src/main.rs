@@ -2,6 +2,7 @@
 //! daemon verbs `serve`-side client: `panes`, `spawn`, `attach`, `send` (T-0005),
 //! lifecycle: `service`, `server` (T-0012).
 
+use arreo_core::notify::{MAX_REPLY_BYTES, PANE_EXITED};
 use arreo_core::proto::codec;
 use arreo_core::proto::{client_versions, AgentState, Message, VERSION};
 use arreo_core::relay::session::backoff_delay;
@@ -84,6 +85,11 @@ fn usage() -> ExitCode {
     eprintln!("      quiet_hours — and whether notifications are on at all (no daemon needed)");
     eprintln!("      exit 0 an answer (including \"nothing is notified\") · 2 no configuration");
     eprintln!("      named, or one that does not parse. See docs/notifications.md");
+    eprintln!("  arreo notify act <pane> <reply|skip|kill> [--text ...] [--socket PATH]");
+    eprintln!("      act on a notification where it is read: reply sends the text plus a newline");
+    eprintln!("      through the same audited send path a direct `arreo send` uses (at most");
+    eprintln!("      {MAX_REPLY_BYTES} bytes), skip writes nothing, kill ends the pane");
+    eprintln!("      exit 0 the action was taken · 2 the pane has exited, or usage · 1 refused");
     eprintln!("  arreo attach --machine <name> [<pane>] [--link auto|relay] [--config PATH]");
     eprintln!("      reach another machine's pane by name, through the account's directory —");
     eprintln!("      no IP, no port, no SSH target, and nothing dialed from argv.");
@@ -2955,6 +2961,7 @@ const REASON_SEPARATOR: &str = " — ";
 fn notify_usage() -> ExitCode {
     eprintln!("usage: arreo notify --why <pane> [--json] [--socket PATH] [--config PATH]");
     eprintln!("       arreo notify --policy [--config PATH]");
+    eprintln!("       arreo notify act <pane> <reply|skip|kill> [--text ...] [--socket PATH]");
     eprintln!("       --why: the newest notification decision for a pane, read from the audit log");
     eprintln!("              (notify.sent / notify.suppressed) — and, when it was withheld, why");
     eprintln!("       exit codes --why: 0 a decision · 2 usage, or the log could not be read ·");
@@ -2963,6 +2970,11 @@ fn notify_usage() -> ExitCode {
         "       exit codes --policy: 0 the policy (or \"nothing is notified\") · 2 usage, no"
     );
     eprintln!("                            configuration named, or one that does not parse");
+    eprintln!("       act: reply sends the text plus a newline through the same audited send");
+    eprintln!("            path a direct `arreo send` uses (at most {MAX_REPLY_BYTES} bytes);");
+    eprintln!("            skip writes no pane bytes; kill ends the pane");
+    eprintln!("       exit codes act: 0 the action was taken · 2 the pane has exited, or usage ·");
+    eprintln!("                       1 refused (state gate, unknown pane, or role)");
     eprintln!("       docs/notifications.md");
     ExitCode::from(2)
 }
@@ -2977,6 +2989,12 @@ fn notify_usage() -> ExitCode {
 /// a running daemon, and neither is a push: see docs/notifications.md.
 fn cmd_notify(rest: &[String]) -> ExitCode {
     let (socket, kept) = take_socket(rest);
+    // The act verb is the third half: `arreo notify act <pane> <action>` drives
+    // the daemon, unlike `--why`/`--policy` which read. It is parsed as its own
+    // subcommand because its operands are positional, not flags.
+    if kept.first().map(String::as_str) == Some("act") {
+        return rt::block_on(notify_act(&socket, &kept[1..]));
+    }
     let mut why: Option<String> = None;
     let mut policy = false;
     let mut json = false;
@@ -3038,6 +3056,130 @@ fn cmd_notify(rest: &[String]) -> ExitCode {
     }
 }
 
+/// `arreo notify act <pane> <action> [--text …]` (T-0094): the single door
+/// onto the daemon's quick-action path — the same message the TUI panel keys
+/// send, so a script, a phone and the panel share one implementation.
+///
+/// The exit codes are the contract: `0` the action was taken, `2` the pane has
+/// exited or the call was a usage error, `1` any other refusal (the state gate,
+/// an unknown pane, the trust gate's answer for a too-low role device, or an
+/// old daemon's typed refusal of the new verb).
+async fn notify_act(socket: &PathBuf, rest: &[String]) -> ExitCode {
+    use arreo_core::notify::NotifyAction;
+    use arreo_core::proto::Message::NotifyActReply;
+
+    const USAGE: &str =
+        "usage: arreo notify act <pane> <reply|skip|kill> [--text ...] [--socket PATH]";
+    if rest.is_empty() {
+        eprintln!("notify act: {USAGE}");
+        return ExitCode::from(2);
+    }
+    let (mut session, kept) = match connect(socket, rest).await {
+        Ok(pair) => pair,
+        Err((code, message)) => {
+            eprintln!("notify act: {message}");
+            return ExitCode::from(code);
+        }
+    };
+    let (pane, rest) = match kept.split_first() {
+        Some((pane, rest)) => (pane.clone(), rest.to_vec()),
+        None => {
+            eprintln!("notify act: {USAGE}");
+            return ExitCode::from(2);
+        }
+    };
+    let (action_word, rest) = match rest.split_first() {
+        Some((action, rest)) => (action.clone(), rest.to_vec()),
+        None => {
+            eprintln!("notify act: {USAGE}");
+            return ExitCode::from(2);
+        }
+    };
+    let action = match NotifyAction::parse(&action_word) {
+        Some(action) => action,
+        None => {
+            eprintln!("notify act: unknown action {action_word:?} (want reply, skip, or kill)");
+            return ExitCode::from(2);
+        }
+    };
+    // Everything after `--text` is the operator's reply, joined the way
+    // `arreo send` joins its text — the flag is the door, the text is free-form.
+    let text: Option<String> = match rest.split_first() {
+        None => None,
+        Some((flag, tail)) if flag == "--text" => Some(tail.join(" ")),
+        Some(_) => {
+            eprintln!("notify act: unexpected {rest:?}");
+            eprintln!("notify act: {USAGE}");
+            return ExitCode::from(2);
+        }
+    };
+    // Usage errors the operator sees, never a truncation and never a request
+    // the daemon would have to guess at.
+    let text = match (&action, &text) {
+        (NotifyAction::Reply, None) => {
+            eprintln!("notify act: reply needs --text");
+            return ExitCode::from(2);
+        }
+        (NotifyAction::Reply, Some(text)) if !arreo_core::notify::reply_text_within_bound(text) => {
+            eprintln!(
+                "notify act: reply text is too long: {} bytes — at most {MAX_REPLY_BYTES}",
+                text.len()
+            );
+            return ExitCode::from(2);
+        }
+        (NotifyAction::Skip | NotifyAction::Kill, Some(_)) => {
+            eprintln!("notify act: --text applies only to reply");
+            return ExitCode::from(2);
+        }
+        (NotifyAction::Reply, Some(text)) => Some(text.clone()),
+        (NotifyAction::Skip | NotifyAction::Kill, None) => None,
+    };
+
+    match session
+        .call(&Message::NotifyAct {
+            v: VERSION,
+            pane,
+            action,
+            text,
+        })
+        .await
+    {
+        Ok(NotifyActReply { ok: true, .. }) => ExitCode::SUCCESS,
+        Ok(NotifyActReply {
+            ok: false, detail, ..
+        }) if detail == PANE_EXITED => {
+            // The pane's state is the authority and its word is pinned: exit 2,
+            // exactly as the contract's table says.
+            eprintln!("notify act: {detail}");
+            ExitCode::from(2)
+        }
+        Ok(NotifyActReply {
+            ok: false, detail, ..
+        }) => {
+            // A refusal with the daemon's sentence: the state gate, an unknown
+            // pane, or the send path's own failure.
+            eprintln!("notify act: {detail}");
+            ExitCode::FAILURE
+        }
+        Ok(Message::Error { message, .. }) => {
+            // The trust gate's answer for a too-low role device is the same
+            // `Error` a direct send gets — the direct-send sentence, printed
+            // the same way — and an old daemon's typed refusal of the new verb
+            // arrives in the same shape.
+            eprintln!("notify act: {message}");
+            ExitCode::FAILURE
+        }
+        Ok(other) => {
+            eprintln!("notify act: unexpected {other:?}");
+            ExitCode::FAILURE
+        }
+        Err(e) => {
+            eprintln!("notify act: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
 /// One notification row, decoded.
 ///
 /// Everything here comes from the row itself. The state is read with the
@@ -3062,6 +3204,12 @@ struct NotifyRow {
     /// The reason's own text, after the word. `None` for a sent row, and for a
     /// suppressed row that carries a word and nothing else.
     reason_detail: Option<String>,
+    /// The bounded quick actions the notification carries (T-0094): what the
+    /// operator can *do* about this notification, read from the row's own
+    /// `actions=` tail with the daemon's reader. `None` for a row written
+    /// before the feature (no tail) — reported as unknown, never as an empty
+    /// list that would claim "nothing to do".
+    actions: Option<Vec<arreo_core::notify::NotifyAction>>,
     /// The human sentence, from the row's `prompt`. Empty when the row recorded
     /// none — reported as unknown, never invented.
     prompt: String,
@@ -3073,7 +3221,12 @@ impl NotifyRow {
         use arreo_core::store::actions;
 
         let sent = row.action == actions::NOTIFY_SENT;
-        let detail = row.detail.as_deref().unwrap_or_default();
+        let raw_detail = row.detail.as_deref().unwrap_or_default();
+        // The `actions=` tail is the row's answer list; it is stripped before
+        // the reason split so the tail can never leak into a suppression's
+        // reason text (the tail says what to do, not why it was withheld).
+        let detail = notify::strip_actions(raw_detail);
+        let actions = notify::actions_from_detail(raw_detail);
         // `state=<word>; <rest>`: the prefix is the library's, and the rest is
         // the sentence for a sent row and `<word> — <text>` for a suppressed one.
         // A row with no `;` keeps its whole detail as the rest, so a reason is
@@ -3100,6 +3253,7 @@ impl NotifyRow {
             decision: if sent { "sent" } else { "suppressed" },
             reason,
             reason_detail,
+            actions,
             prompt: row.prompt.clone(),
         }
     }
@@ -3195,6 +3349,12 @@ fn notify_why(socket: &Path, pane: &str, json: bool, config: Option<PathBuf>) ->
     if let Some(state) = row.state {
         println!("state     {}", arreo_core::notify::state_word(state));
     }
+    // The actions the notification carries (T-0094): what the operator can do
+    // about it, read from the same row tail the daemon wrote.
+    if let Some(actions) = &row.actions {
+        let names: Vec<&str> = actions.iter().map(|a| a.as_str()).collect();
+        println!("actions   {}", names.join(", "));
+    }
     if let Some(reason) = &row.reason {
         match &row.reason_detail {
             Some(text) => println!("reason    {reason}{REASON_SEPARATOR}{text}"),
@@ -3264,6 +3424,18 @@ fn notify_json(pane: &str, row: Option<&NotifyRow>) -> serde_json::Value {
         "reason": row.and_then(|row| row.reason.clone()),
         "detail": row.and_then(|row| row.reason_detail.clone()),
         "prompt": row.and_then(|row| (!row.prompt.is_empty()).then(|| row.prompt.clone())),
+        // The bounded quick actions the notification carries (T-0094), as the
+        // operator's words (`["reply", "skip", "kill"]`). `null` for a row
+        // written before the feature — absent, never an empty list, which
+        // would claim "nothing to do".
+        "actions": row
+            .and_then(|row| row.actions.as_ref())
+            .map(|actions| {
+                actions
+                    .iter()
+                    .map(|action| action.as_str())
+                    .collect::<Vec<_>>()
+            }),
     })
 }
 
