@@ -7,7 +7,7 @@ use arreo_core::proto::{client_versions, AgentState, Message, VERSION};
 use arreo_core::relay::session::backoff_delay;
 use arreo_core::store::{audit_json, AuditQuery, ExportFormat, SessionStore, StoredAudit};
 use std::future::Future;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
@@ -74,6 +74,16 @@ fn usage() -> ExitCode {
     eprintln!("  arreo audit export [--format jsonl|json] [--since MS] [--until MS] [--action NAME] [--out PATH|-]");
     eprintln!("      MS is Unix milliseconds; --out - (the default) is stdout");
     eprintln!("  arreo audit prune --before MS   (never automatic; says how many rows went)");
+    eprintln!("  arreo notify --why <pane> [--json] [--socket PATH] [--config PATH]");
+    eprintln!("      the newest notification decision for a pane, read from the audit log");
+    eprintln!("      (notify.sent / notify.suppressed) — and, when it was withheld, why");
+    eprintln!("      exit 0 a decision · 2 usage, or the log could not be read · 4 no history");
+    eprintln!("      for this pane (--json is the script contract, schema {NOTIFY_SCHEMA})");
+    eprintln!("  arreo notify --policy [--config PATH]");
+    eprintln!("      the effective [notify] policy: rules, once_per_episode, coalesce_secs,");
+    eprintln!("      quiet_hours — and whether notifications are on at all (no daemon needed)");
+    eprintln!("      exit 0 an answer (including \"nothing is notified\") · 2 no configuration");
+    eprintln!("      named, or one that does not parse. See docs/notifications.md");
     eprintln!("  arreo attach --machine <name> [<pane>] [--link auto|relay] [--config PATH]");
     eprintln!("      reach another machine's pane by name, through the account's directory —");
     eprintln!("      no IP, no port, no SSH target, and nothing dialed from argv.");
@@ -180,6 +190,7 @@ fn main() -> ExitCode {
         Some("service") => cmd_service(&args[2..]),
         Some("server") => rt::block_on(cmd_server(&args[2..])),
         Some("audit") => cmd_audit(&args[2..]),
+        Some("notify") => cmd_notify(&args[2..]),
         Some("devices") => cmd_devices(&args[2..]),
         Some("pair") => cmd_pair(&args[2..]),
         Some("machines") => machines::run(&args[2..]),
@@ -2620,6 +2631,18 @@ mod audit {
     use std::path::{Path, PathBuf};
     use std::process::ExitCode;
 
+    /// The sidecar DB that lies beside the socket: `<socket>.db`.
+    ///
+    /// One spelling for it, because two verbs now read the same log — `arreo
+    /// audit` and `arreo notify --why` — and "which file is the store" answered
+    /// twice is how a notification query ends up looking at a store the daemon
+    /// never wrote.
+    pub(super) fn db_path(socket: &Path) -> PathBuf {
+        let mut db = socket.to_path_buf().into_os_string();
+        db.push(".db");
+        PathBuf::from(db)
+    }
+
     /// The store behind the daemon socket, or `None` when nothing has ever been
     /// logged there.
     ///
@@ -2628,18 +2651,33 @@ mod audit {
     /// so — the tail explains, `--json` and `export` still print an empty result
     /// a script can parse. The file is never created here: `SessionStore::open`
     /// would create and migrate it, and a read must not write.
-    pub(super) fn open(socket: &Path) -> Result<Option<SessionStore>, ExitCode> {
-        let mut db = socket.to_path_buf().into_os_string();
-        db.push(".db");
-        let db = PathBuf::from(db);
+    ///
+    /// **Silent, and that is the point of the split from [`open`]**: the failure
+    /// comes back as a message so a verb that is not `audit` can name itself
+    /// under it (and choose its own exit code) instead of printing `audit: …`
+    /// about a query that was never audit's.
+    pub(super) fn store(socket: &Path) -> Result<Option<SessionStore>, String> {
+        let db = db_path(socket);
         if !db.exists() {
-            eprintln!("audit: no log yet (no prompts sent through this daemon)");
             return Ok(None);
         }
-        SessionStore::open(&db).map(Some).map_err(|e| {
-            eprintln!("audit: {e}");
-            ExitCode::FAILURE
-        })
+        SessionStore::open(&db).map(Some).map_err(|e| e.to_string())
+    }
+
+    /// [`store`], in this verb's voice: the line, and the exit code, that
+    /// `arreo audit` has always answered a missing or unreadable log with.
+    pub(super) fn open(socket: &Path) -> Result<Option<SessionStore>, ExitCode> {
+        match store(socket) {
+            Ok(Some(store)) => Ok(Some(store)),
+            Ok(None) => {
+                eprintln!("audit: no log yet (no prompts sent through this daemon)");
+                Ok(None)
+            }
+            Err(e) => {
+                eprintln!("audit: {e}");
+                Err(ExitCode::FAILURE)
+            }
+        }
     }
 
     /// A Unix-millisecond bound. Non-numeric is a usage error: a typo'd filter
@@ -2882,6 +2920,451 @@ mod audit {
             }
         }
     }
+}
+
+/// The schema of `arreo notify --why --json` — the script contract (T-0093). The
+/// human block the same flag prints alongside is not one and may change.
+/// Additive-only: a renamed or removed key is a wire break for a script that
+/// parses this.
+const NOTIFY_SCHEMA: u32 = 1;
+
+/// `arreo notify --why`: this pane has no notification history. The question was
+/// answerable and the answer is that nothing has been decided about this pane —
+/// which is a different answer from exit 2's "the log could not be read", and a
+/// different one again from "notifications are off", which the message names as
+/// a possibility because the log cannot tell the two apart.
+const NO_HISTORY: u8 = 4;
+
+/// How many rows of one notification action a `--why` scan looks at.
+///
+/// **Bounded on purpose.** A pane whose last notification is older than the
+/// newest [`NOTIFY_SCAN_LIMIT`] rows of that action reads here as "no history",
+/// which this verb says out loud — the failure direction is a stated gap, never a
+/// stale row reported as the last decision. The daemon reconstructs the same
+/// history from the same log, and a scan of it has to end somewhere for both:
+/// the log is the memory, not an index.
+const NOTIFY_SCAN_LIMIT: usize = 200;
+
+/// The separator `SuppressReason`'s `Display` puts between the reason and its
+/// text, which is what the row's `detail` holds verbatim
+/// (`quiet-hours — inside quiet hours 22:00-07:00`). Reading a row back is one
+/// split on this string, and joining the halves reproduces the row's own bytes —
+/// no other part of the format is re-derived here.
+const REASON_SEPARATOR: &str = " — ";
+
+fn notify_usage() -> ExitCode {
+    eprintln!("usage: arreo notify --why <pane> [--json] [--socket PATH] [--config PATH]");
+    eprintln!("       arreo notify --policy [--config PATH]");
+    eprintln!("       --why: the newest notification decision for a pane, read from the audit log");
+    eprintln!("              (notify.sent / notify.suppressed) — and, when it was withheld, why");
+    eprintln!("       exit codes --why: 0 a decision · 2 usage, or the log could not be read ·");
+    eprintln!("                         {NO_HISTORY} this pane has no notification history");
+    eprintln!(
+        "       exit codes --policy: 0 the policy (or \"nothing is notified\") · 2 usage, no"
+    );
+    eprintln!("                            configuration named, or one that does not parse");
+    eprintln!("       docs/notifications.md");
+    ExitCode::from(2)
+}
+
+/// `arreo notify` (T-0093): the two halves of "the notification feature is not a
+/// black box".
+///
+/// `--why <pane>` answers *why was I not told?* from the rows the daemon wrote —
+/// the audit log is the memory, so the answer outlives the daemon, the pane and
+/// the operator's patience. `--policy` answers *is my configuration doing what I
+/// think?* from the same file and the same loader the daemon uses. Neither needs
+/// a running daemon, and neither is a push: see docs/notifications.md.
+fn cmd_notify(rest: &[String]) -> ExitCode {
+    let (socket, kept) = take_socket(rest);
+    let mut why: Option<String> = None;
+    let mut policy = false;
+    let mut json = false;
+    let mut config: Option<PathBuf> = None;
+    let mut i = 0;
+    while i < kept.len() {
+        match kept[i].as_str() {
+            "--why" => match kept.get(i + 1) {
+                Some(pane) => {
+                    why = Some(pane.clone());
+                    i += 2;
+                }
+                None => {
+                    eprintln!("notify: --why needs a pane id");
+                    return notify_usage();
+                }
+            },
+            "--policy" => {
+                policy = true;
+                i += 1;
+            }
+            "--json" => {
+                json = true;
+                i += 1;
+            }
+            "--config" => match kept.get(i + 1) {
+                Some(path) => {
+                    config = Some(PathBuf::from(path));
+                    i += 2;
+                }
+                None => {
+                    eprintln!("notify: --config needs a path");
+                    return notify_usage();
+                }
+            },
+            other => {
+                eprintln!("notify: unknown argument {other:?}");
+                return notify_usage();
+            }
+        }
+    }
+    match (why, policy) {
+        (Some(pane), false) => notify_why(&socket, &pane, json, config),
+        (None, true) => {
+            // `--json` belongs to `--why`: a policy has one shape and no version,
+            // so accepting the flag here would promise a schema that does not
+            // exist.
+            if json {
+                eprintln!("notify: --json describes --why; --policy prints one policy");
+                return notify_usage();
+            }
+            notify_policy(config)
+        }
+        (Some(_), true) => {
+            eprintln!("notify: --why and --policy are different questions; ask one of them");
+            notify_usage()
+        }
+        (None, false) => notify_usage(),
+    }
+}
+
+/// One notification row, decoded.
+///
+/// Everything here comes from the row itself. The state is read with the
+/// library's own [`arreo_core::notify::state_from_detail`] — the same function
+/// the daemon reads its history back with, so a writer and this reader cannot
+/// drift into disagreeing about what the log says — the decision word comes from
+/// the action, and the reason is kept as the row's own word plus its text rather
+/// than mapped back from the wording.
+struct NotifyRow {
+    action: String,
+    ts_ms: u64,
+    /// The state the decision was about, when the row records one. `None` for a
+    /// row written without the `state=` prefix (an older version, or a hand-made
+    /// row), which is reported as unknown rather than guessed.
+    state: Option<AgentState>,
+    /// `sent` or `suppressed` — the word `--json` carries under `decision`.
+    decision: &'static str,
+    /// A suppression's reason word (`no-rule`, `quiet-hours`, `coalesced`,
+    /// `same-episode`), exactly as the row wrote it. `None` for a sent row:
+    /// nothing was withheld, so there is no reason to give.
+    reason: Option<String>,
+    /// The reason's own text, after the word. `None` for a sent row, and for a
+    /// suppressed row that carries a word and nothing else.
+    reason_detail: Option<String>,
+    /// The human sentence, from the row's `prompt`. Empty when the row recorded
+    /// none — reported as unknown, never invented.
+    prompt: String,
+}
+
+impl NotifyRow {
+    fn from_row(row: &StoredAudit) -> Self {
+        use arreo_core::notify;
+        use arreo_core::store::actions;
+
+        let sent = row.action == actions::NOTIFY_SENT;
+        let detail = row.detail.as_deref().unwrap_or_default();
+        // `state=<word>; <rest>`: the prefix is the library's, and the rest is
+        // the sentence for a sent row and `<word> — <text>` for a suppressed one.
+        // A row with no `;` keeps its whole detail as the rest, so a reason is
+        // never lost merely because a row predates the prefix.
+        let rest = match detail.split_once(';') {
+            Some((_, tail)) => Some(tail.trim()),
+            None if !detail.is_empty() => Some(detail.trim()),
+            None => None,
+        };
+        let (reason, reason_detail) = if sent {
+            (None, None)
+        } else {
+            match rest.and_then(|tail| tail.split_once(REASON_SEPARATOR)) {
+                Some((word, text)) => {
+                    (Some(word.trim().to_string()), Some(text.trim().to_string()))
+                }
+                None => (rest.map(str::to_string), None),
+            }
+        };
+        Self {
+            action: row.action.clone(),
+            ts_ms: row.ts_ms,
+            state: notify::state_from_detail(detail),
+            decision: if sent { "sent" } else { "suppressed" },
+            reason,
+            reason_detail,
+            prompt: row.prompt.clone(),
+        }
+    }
+}
+
+/// The newest notification row for a pane, across both actions.
+///
+/// Both, because the question is "what was the last thing the policy decided
+/// about this pane", and a suppression is a decision. The two scans are merged on
+/// the row's own timestamp; a tie — two rows in the same millisecond, which a
+/// clock that stepped backwards can also produce — resolves to whichever action
+/// is scanned first, which is `notify.sent`: an operator asking "why was I not
+/// told?" is better served by the row that says they were.
+fn newest_notify_row(store: &SessionStore, pane: &str) -> Result<Option<NotifyRow>, String> {
+    use arreo_core::store::actions;
+
+    let mut newest: Option<NotifyRow> = None;
+    for action in [actions::NOTIFY_SENT, actions::NOTIFY_SUPPRESSED] {
+        // **Newest-first**, so the bound keeps the rows that matter: the
+        // sibling read is oldest-first and its limit keeps the *oldest* rows, so
+        // on a log past the bound this verb would answer with a notification from
+        // long ago and the daemon's own history read would agree with it — which
+        // is exactly the shared bug the review found (T-0093). One read, one
+        // ordering, both sides.
+        let rows = store
+            .audit_recent_by_action(action, NOTIFY_SCAN_LIMIT)
+            .map_err(|e| e.to_string())?;
+        for row in rows {
+            // `agent` holds the pane id for both actions (the row shape the
+            // daemon writes and reads back), so "this pane's rows" is a filter
+            // and never a second query language.
+            if row.agent != pane {
+                continue;
+            }
+            let newer = match &newest {
+                None => true,
+                Some(current) => row.ts_ms > current.ts_ms,
+            };
+            if newer {
+                newest = Some(NotifyRow::from_row(&row));
+            }
+        }
+    }
+    Ok(newest)
+}
+
+/// `arreo notify --why <pane>`: the last decision the policy made about a pane,
+/// read from the log the daemon wrote.
+///
+/// **Three outcomes, and they stay three.** A decision (exit 0). No rows for this
+/// pane (exit [`NO_HISTORY`]), which is neither "notifications are off" nor "the
+/// log is empty" — the daemon's own configuration is not visible from here, and
+/// the message says so rather than choosing. A log that cannot be read (exit 2)
+/// prints no `--json` at all: an object saying `"found": false` about a store
+/// nobody could open would be the one lie this verb exists to prevent.
+fn notify_why(socket: &Path, pane: &str, json: bool, config: Option<PathBuf>) -> ExitCode {
+    let store = match audit::store(socket) {
+        Ok(Some(store)) => store,
+        Ok(None) => {
+            // The log itself does not exist, which is a different fact from a pane
+            // having no rows in a log that does — so it is said, and then the
+            // ordinary answer follows.
+            eprintln!(
+                "notify: no log yet at {} — nothing has been logged through this daemon",
+                audit::db_path(socket).display()
+            );
+            return notify_no_history(pane, json, config);
+        }
+        Err(e) => {
+            eprintln!("notify: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    let row = match newest_notify_row(&store, pane) {
+        Ok(Some(row)) => row,
+        Ok(None) => return notify_no_history(pane, json, config),
+        Err(e) => {
+            eprintln!("notify: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    if json {
+        println!("{}", notify_json(pane, Some(&row)));
+        return ExitCode::SUCCESS;
+    }
+    println!("pane      {pane}");
+    println!(
+        "when      {} ({})",
+        arreo_core::store::rfc3339_ms(row.ts_ms as i64),
+        row.ts_ms
+    );
+    println!("decision  {} ({})", row.decision, row.action);
+    if let Some(state) = row.state {
+        println!("state     {}", arreo_core::notify::state_word(state));
+    }
+    if let Some(reason) = &row.reason {
+        match &row.reason_detail {
+            Some(text) => println!("reason    {reason}{REASON_SEPARATOR}{text}"),
+            None => println!("reason    {reason}"),
+        }
+    }
+    if !row.prompt.is_empty() {
+        println!("sentence  {}", row.prompt);
+    }
+    ExitCode::SUCCESS
+}
+
+/// The pane has no notification rows: exit [`NO_HISTORY`], with the sentence that
+/// names both possibilities the log cannot tell apart from here.
+///
+/// **Neither possibility is guessed.** The daemon's `[notify]` section lives in
+/// *its* configuration file, read at its start-up; this command can see the file
+/// it was told about (`--config`, else `$ARREO_CONFIG`) and reports what that one
+/// says — as a fact about that file, never as a claim about the daemon's, which
+/// may be a different one. That is also why `--config` is optional here: without
+/// it the operator still gets the honest two-way answer.
+fn notify_no_history(pane: &str, json: bool, config: Option<PathBuf>) -> ExitCode {
+    if json {
+        println!("{}", notify_json(pane, None));
+    }
+    eprintln!(
+        "notify: no notification history for {pane} — either nothing has happened, or the \
+         daemon has no [notify] section"
+    );
+    if let Some(path) = config.or_else(|| std::env::var_os("ARREO_CONFIG").map(PathBuf::from)) {
+        match arreo_core::notify::Policy::load(&path) {
+            Ok(None) => eprintln!(
+                "notify: {} has no [notify] section, so a daemon started with it notifies nothing",
+                path.display()
+            ),
+            Ok(Some(_)) => eprintln!(
+                "notify: {} has a [notify] section, so a daemon started with it does notify — \
+                 this pane simply has no rows",
+                path.display()
+            ),
+            Err(e) => eprintln!("notify: the configuration you named cannot be read: {e}"),
+        }
+    }
+    ExitCode::from(NO_HISTORY)
+}
+
+/// `arreo notify --why --json` — the script contract, schema [`NOTIFY_SCHEMA`].
+///
+/// Keys are fixed and additive-only. **A value that cannot be known is `null`,
+/// never invented** (the rule `arreo machines` and `arreo worktrees` follow):
+/// with `"found": false` nothing about the pane is known, a sent row has no
+/// suppression `reason` or `detail` to give, and a row that recorded no sentence
+/// has no `prompt`. `decision` is the closed pair `sent`/`suppressed`; `detail`
+/// is the reason's own text without the word (`reason` carries the word), so a
+/// script never has to take the row's format apart itself.
+fn notify_json(pane: &str, row: Option<&NotifyRow>) -> serde_json::Value {
+    serde_json::json!({
+        "schema": NOTIFY_SCHEMA,
+        "pane": pane,
+        "found": row.is_some(),
+        "action": row.map(|row| row.action.clone()),
+        "at_ms": row.map(|row| row.ts_ms),
+        "state": row
+            .and_then(|row| row.state)
+            .map(arreo_core::notify::state_word),
+        "decision": row.map(|row| row.decision),
+        "reason": row.and_then(|row| row.reason.clone()),
+        "detail": row.and_then(|row| row.reason_detail.clone()),
+        "prompt": row.and_then(|row| (!row.prompt.is_empty()).then(|| row.prompt.clone())),
+    })
+}
+
+/// `arreo notify --policy [--config PATH]`: the policy the *daemon* would get from
+/// this configuration file, field by field.
+///
+/// It needs no daemon, no socket and no pane, and it reuses the daemon's own
+/// loader ([`arreo_core::notify::Policy::load`]) — one parser, so the answer
+/// cannot drift from what a notification tick would decide. That is the point of
+/// the half-verb: "is my config doing what I think?" is otherwise answered by
+/// waiting for a notification that never comes.
+///
+/// **No configuration named is exit 2, not "notifications are off".** The daemon
+/// reads `--config`/`$ARREO_CONFIG` and nothing else, so a daemon this command was
+/// not told about may well have a `[notify]` section; answering "off" from the
+/// absence of a flag would be the two-answers defect the other verbs refuse.
+fn notify_policy(config: Option<PathBuf>) -> ExitCode {
+    let path = config.or_else(|| std::env::var_os("ARREO_CONFIG").map(PathBuf::from));
+    let Some(path) = path else {
+        eprintln!("notify: no configuration named: pass --config PATH, or set $ARREO_CONFIG");
+        eprintln!("        the daemon reads the same flag and environment, so a daemon started");
+        eprintln!("        without either has no [notify] section and notifies nothing — name the");
+        eprintln!("        file it was started with to see the policy it uses");
+        return ExitCode::from(2);
+    };
+    let policy = match arreo_core::notify::Policy::load(&path) {
+        Ok(Some(policy)) => policy,
+        Ok(None) => {
+            // Off is a complete answer, so it exits 0 and says what it is: the
+            // default, and the reason the daemon writes no notification rows.
+            println!("config {}", path.display());
+            println!(
+                "[notify] absent — nothing is notified ({})",
+                if path.exists() {
+                    "this file has no such section"
+                } else {
+                    "there is no file at that path"
+                }
+            );
+            println!("         that is the default on purpose: a machine that never wrote a");
+            println!("         [notify] section keeps writing no notification rows at all");
+            return ExitCode::SUCCESS;
+        }
+        Err(e) => {
+            eprintln!("notify: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    println!("config {}", path.display());
+    println!("[notify] present — notifications are on");
+    println!("rules");
+    for (index, rule) in policy.rules.iter().enumerate() {
+        let on = rule
+            .on
+            .iter()
+            .map(|state| arreo_core::notify::state_word(*state))
+            .collect::<Vec<_>>()
+            .join(", ");
+        println!(
+            "  {}  on {on}   panes {}   machine {}",
+            index + 1,
+            rule.panes.as_ref().map_or("*", |glob| glob.as_str()),
+            rule.machine.as_deref().unwrap_or("*")
+        );
+    }
+    println!(
+        "once_per_episode {} — {}",
+        policy.once_per_episode,
+        if policy.once_per_episode {
+            "one notification per episode: a second event inside the same run is not news"
+        } else {
+            "every matching transition notifies, repeats included"
+        }
+    );
+    println!(
+        "coalesce_secs {} — {}",
+        policy.coalesce_secs,
+        if policy.coalesce_secs == 0 {
+            "no coalescing".to_string()
+        } else {
+            format!(
+                "at most one notification per pane per {}",
+                render_duration(policy.coalesce_secs.saturating_mul(1000))
+            )
+        }
+    );
+    match &policy.quiet {
+        Some(quiet) => println!(
+            "quiet_hours {quiet} — local wall-clock, half-open [start, end); \
+             utc_offset_minutes {}",
+            policy.utc_offset_minutes
+        ),
+        None => println!(
+            "quiet_hours none — nothing is held back by the clock (utc_offset_minutes {})",
+            policy.utc_offset_minutes
+        ),
+    }
+    println!(
+        "(what the daemon gets from --config/$ARREO_CONFIG; a daemon started without one notifies nothing)"
+    );
+    ExitCode::SUCCESS
 }
 
 /// `arreo devices …` (T-0025): the server-host operator's view of device

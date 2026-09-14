@@ -996,6 +996,89 @@ fn the_worktree_binding_survives_the_cut() {
     let _ = std::fs::remove_dir_all(&scratch);
 }
 
+/// T-0093: the `[notify]` policy reaches the daemon that **takes over** — the
+/// incoming process resolves it for itself, before the branch that never
+/// returns.
+///
+/// This is T-0106's shape one section over. `run_handoff` never returns, so a
+/// policy resolved *after* the handoff dispatch is missing from the daemon that
+/// takes over: an update would silently stop the operator's notifications, with
+/// nothing in any log to say so.
+///
+/// **Two configurations, deliberately.** The outgoing daemon is started with a
+/// file that has no `[notify]` section, the incoming one with a file that has
+/// it — so the log cannot be attributed to the old process, and a `notify.sent`
+/// row for the pane can only have been written by the daemon that was started
+/// with the section, after the cut. With one configuration for both, a row the
+/// *outgoing* daemon wrote before the cut would pass this test even with the
+/// defect present.
+///
+/// What removal turns red: resolving the policy after the handoff branch, or
+/// not threading it through `run_handoff` — no row ever appears, because the
+/// incoming daemon has no policy and the outgoing one never had one.
+#[test]
+fn the_notify_policy_reaches_the_daemon_that_takes_over() {
+    use arreo_core::store::actions;
+
+    let scratch = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../target/test-scratch/T-0093/handoff");
+    let _ = std::fs::remove_dir_all(&scratch);
+    std::fs::create_dir_all(&scratch).expect("scratch");
+    let scratch = std::fs::canonicalize(&scratch).expect("canonical");
+
+    let quiet = scratch.join("quiet.toml");
+    std::fs::write(&quiet, "# no [notify] section here\n").expect("config");
+    let loud = scratch.join("loud.toml");
+    std::fs::write(&loud, "[notify]\n").expect("config");
+    let quiet = quiet.display().to_string();
+    let loud = loud.display().to_string();
+
+    let socket = temp_socket("notify-cut");
+    cleanup(&socket);
+    let pane = "handed-over";
+
+    let mut old = spawn_daemon(&socket, &["--config", &quiet], std::process::Stdio::null());
+    wait_serving(&mut old, &socket, Duration::from_secs(10));
+    // A pane that asks a question and waits: the adapter infers `question` from
+    // two seconds of quiet behind a prompt-shaped tail, with nobody typing.
+    let reply = spawn_pane(
+        &socket,
+        pane,
+        "/bin/sh",
+        &["-c", "printf 'Proceed? [y/n]\\n'; sleep 30"],
+    );
+    assert!(matches!(reply, Message::Ok { .. }), "spawn: {reply:?}");
+
+    // ---- the cut ------------------------------------------------------------
+    let mut new = spawn_handoff(&socket, &["--config", &loud], std::process::Stdio::null());
+    assert!(
+        until(Duration::from_secs(30), || matches!(
+            old.try_wait(),
+            Ok(Some(_))
+        )),
+        "the outgoing daemon exits after the cut"
+    );
+    let _ = old.wait();
+    wait_serving(&mut new, &socket, Duration::from_secs(10));
+
+    // The pane's engine is rebuilt here from the transferred journal (the cut
+    // does not carry engine state), so the question is re-derived on this side
+    // rather than being lost with the outgoing daemon — and the only daemon
+    // holding a policy is this one.
+    let rows = || handoff_rows(&socket, actions::NOTIFY_SENT);
+    assert!(
+        until(Duration::from_secs(20), || rows()
+            .iter()
+            .any(|row| row.agent == pane)),
+        "the daemon that took over notifies: {:?}",
+        rows()
+    );
+
+    drop(new);
+    cleanup(&socket);
+    let _ = std::fs::remove_dir_all(&scratch);
+}
+
 /// Criterion 3: the lock survives the handoff — immediately after the cut, a
 /// third daemon on the same socket is refused.
 ///

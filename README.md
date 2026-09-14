@@ -259,6 +259,7 @@ Everything is in this repository; no external docs site exists yet.
 | [AGENTS.md](AGENTS.md) | The build, test and evidence commands for this repo |
 | [ROADMAP.md](ROADMAP.md) | The product's design and its phases (§6 phases, §7 licensing) |
 | [docs/audit.md](docs/audit.md) | What the audit log records, redacts, and refuses to record |
+| [docs/notifications.md](docs/notifications.md) | The `[notify]` policy: which transitions notify, the four suppression reasons, quiet hours, `arreo notify` |
 | [docs/machines.md](docs/machines.md) | The machine directory, presence, per-machine trust |
 | [docs/worktrees.md](docs/worktrees.md) | One git worktree per pane: `spawn --worktree`, `arreo worktrees` |
 | [docs/relay-protocol.md](docs/relay-protocol.md) | The relay wire protocol, version 1 (normative) |

@@ -1,0 +1,127 @@
+T-0093 — Notification rules engine
+==================================
+
+One config file decides which agent transitions notify: `[notify]` in the daemon config, a pure
+rule in `arreo_core::notify`, delivery as an audit row, and `arreo notify --why <pane>` to answer
+"why was I not told?". Written by a worker against a frozen contract
+(`local://t0093-contract.md`), integrated and independently reviewed.
+
+What shipped
+------------
+crates/arreo-core/src/notify/mod.rs   the pure rule (21 tests)
+crates/arreo-core/src/notify/quiet.rs QuietHours, local wall-clock minutes (6 tests)
+crates/arreo-core/src/store.rs        actions::NOTIFY_SENT/NOTIFY_SUPPRESSED;
+                                      audit_recent_by_action (newest-first read)
+crates/arreo-server/src/daemon.rs     the policy on the daemon, the 1 s classification tick,
+                                      notify_sentence/notify_history/record_notify
+crates/arreo-server/src/main.rs       the policy resolved before the handoff branch
+crates/arreo-server/tests/notify.rs   8 tests, over the real socket
+crates/arreo-cli/src/main.rs          arreo notify --why <pane> [--json] / --policy
+xtask/src/api_slice.rs                the api slice now runs two suites (api, notify)
+docs/notifications.md                 354 lines: the config, the decision order, the caveats
+
+
+The design decisions (the ones a later reader would otherwise have to re-derive)
+-------------------------------------------------------------------------------
+1. **The decision order is the design.** no-rule → quiet hours → coalescing → same-episode.
+   Each position answers "which reason does the operator see, and what does the count mean?"
+   Quiet before coalesce, so the quiet-hours count means "the noise I asked you to hold".
+2. **An "episode" is a maximal run of one state, and the engine cannot emit a same-state
+   transition.** Probed: two BELs give `Working` *then* `Blocked`; every `tick`/`Working` push is
+   guarded. So the criterion's "a flap within one episode notifies once" is unreachable *in the
+   daemon* on today's engine — the rule is tested at `decide` level and the daemon's round trip
+   (its own written row → its own history read) is tested end to end. **Do not write a
+   daemon-level same-episode test: it would assert something the engine cannot do.**
+3. **The audit log is the memory** — no new table for episode/coalesce state: durable across
+   restart (the criterion's "a machine restart mid-episode"), queryable, and the same artefact
+   `--why` reads.
+4. **Quiet hours are local wall-clock + an explicit `utc_offset_minutes`**, not a time zone:
+   `std` has no local time, and `time`'s `local_offset` errors in a multi-threaded process
+   without the *unsound* feature. The DST caveat is documented rather than papered over.
+5. **Off means off**: no `[notify]` section → no store opened, no row written. The *pump* is
+   deliberately not gated — an unattached pane is exactly the pane a notification exists for.
+6. **One ambiguous criterion decided in the open**: `coalesce_secs`'s "newest reason winning" =
+   the first transition delivers, the rest are suppressed-and-counted with their reason
+   recorded — not debounced to the end of the window, which would need a timer per pane.
+
+Proven, not asserted
+--------------------
+$ cargo test -p arreo-core --lib notify::      → 21 passed
+$ cargo test -p arreo-server --test notify     → 8 passed
+$ cargo test -p arreo-server --lib notify_history_tests → 2 passed
+$ cargo xtask e2e --slice api                  → 2 suites (api, notify): green
+$ cargo test -p arreo-core --test store        → green (audit_recent_by_action)
+$ cargo test --workspace                       → 899 passed, 0 failed
+$ cargo clippy --workspace --all-targets -- -D warnings → 0 findings (and on +stable)
+
+
+The review pass, and what it found
+----------------------------------
+An independent `reviewer` read the frozen rule and both consumer slices and produced seven
+findings. Four are fixed here, each mutation-proven; three became T-0110 (p2), T-0111 (p3) and
+T-0111 (p3, the pump race).
+
+F1 — **the history read the pane's *oldest* row** (`audit_by_action` orders oldest-first *and its
+limit keeps the oldest*), so a pane's first-ever notification was its history for ever: the
+coalescing window measured against it and never suppressed again, and past 200 rows in the store
+the pane's recent row fell outside the window entirely and every transition re-notified. Both
+reproduced. Fixed with `SessionStore::audit_recent_by_action` (newest-first, limit keeps the
+newest), used by **both** the daemon's history read and the CLI's `--why`; `audit_by_action`'s
+false "newest first" doc corrected to say what its SQL does.
+  MUTATION: swapping back to `audit_by_action` reddens
+  `daemon::notify_history_tests::the_history_is_the_newest_row_for_the_pane`:
+      assertion `left == right` failed: the newest row for this pane
+        left: Some(1000)   right: Some(5000)
+
+F2 — **a transition consumed by a client pump reached no decision at all.** The engine fires each
+state change exactly once and every client-side pump drops the events it does not want, so a
+transition consumed by `PanesDetail`/`Read`/`Send`/`Wait`/`stream_attach` never reached the
+tick — not even the "no rule" row. That is the common case, not a corner: the TUI asks for the
+whole wall once per pass and therefore races the 1 s tick for every transition. Reproduced
+against the running daemon (0 notify rows for a pane that had become `question`, while every
+other transition got one). Fixed: the tick keeps the state it last observed per pane and treats
+"the state moved since I last looked" as a transition, whoever pumped it.
+  MUTATION: disabling that branch (`if false && …`) reddens
+  `tests/notify.rs::a_transition_a_poll_consumed_is_still_decided`.
+
+F5 — **stale `from`.** The tick read the pane's state immediately before its own pump; a
+concurrent client pump can move the pane inside that window, so the value read is not the state
+the pane was in when it changed. Fixed by the same last-seen map: the tick's own memory of what
+it last observed is not racy. (The chain within one batch is unchanged — a bell still lands
+`Working` then `Blocked` in a single feed, and the second transition's `from` is the first's `to`.)
+
+F6 — **the coalesced detail printed a Unix time as a duration.** A real row read
+"a notification for this pane went out 1789400866s ago" for a gap of three seconds.
+`SuppressReason::Coalesced` now carries `since_ms`, computed where the decision is made, and the
+detail prints `since_ms / 1000.0`.
+
+Filed, not fixed — with the reviewer's evidence in `agent://NotifyReview`:
+- **T-0110** (p2): the ungated tick pump changes what `wait` reports *with notifications off*.
+  `wait --state question` now answers `confidence=direct:already, pattern=None` where the event's
+  real provenance (`inferred:silence+prompt-shape`, `pattern=Some("[y/n]")`) used to come back.
+  A client-visible behaviour change for every user who never opts in; filed as a defect, not a
+  documentation item.
+- **T-0111** (p3): `notify_history` costs an unindexed `SCAN audit` per *transition* (the
+  reviewer measured `EXPLAIN QUERY PLAN`), and `PaneEntry::pump` snapshots the journal before
+  taking the `fed` lock and writes the length back unconditionally, so `fed` can regress and
+  re-feed consumed bytes (hypothesis, plain in the source).
+
+
+The criterion that is met in part, with its reason
+--------------------------------------------------
+Criterion: "`once_per_episode` (a blocked→working→blocked cycle notifies twice, a flap within one
+episode notifies once)."
+- A blocked→working→blocked cycle notifies twice: **met**, end to end
+  (`tests/notify.rs::a_cycle_that_comes_back_notifies_twice`).
+- A flap within one episode notifies once: **met at the rule level, unreachable end to end on
+  today's engine.** `decide` suppresses a repeat of the state it last notified about; the engine
+  cannot produce the same-state transition that would exercise it in the daemon (probed above).
+  Recorded here rather than worked around, because a daemon-level test for it would be a test
+  that cannot fail.
+
+Environment
+-----------
+Rust 1.98.0, 8 CPUs. Slice wall-clock and bench numbers from the integrated tree, run after
+`pkill -f target/test-scratch` and a 45–60 s settle. The two slice failures seen in the batch run
+are attributed and closed in `.loop/evidence/T-0112/` (persistence: a pre-existing slice defect)
+and in the ledger (handoff-abort: contention — 41/41 when run alone).

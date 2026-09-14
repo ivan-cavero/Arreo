@@ -253,6 +253,19 @@ pub mod actions {
     /// empty), because a synced file is configuration and the trail is not the
     /// place for a copy of it.
     pub const SYNC: &str = "sync.apply";
+    /// A transition the operator's `[notify]` policy said to deliver (T-0093).
+    /// Written by the daemon's notification tick with `device = "daemon"`, the
+    /// **pane id in `agent`** (so "what have I been told about this pane" is one
+    /// query), the sentence in `prompt`, and `detail` in the
+    /// [`crate::notify::detail_for`] shape — which is also how the daemon
+    /// reconstructs its history after a restart, so the format has one definition.
+    pub const NOTIFY_SENT: &str = "notify.sent";
+    /// A transition the policy **withheld**, with the reason in `detail`
+    /// (T-0093): quiet hours, the coalescing window, the same episode, or no rule
+    /// at all. A row for every suppression is the point of the feature — "why did
+    /// I not get told?" is the question it creates, and an unrecorded suppression
+    /// is exactly the silence an operator cannot explain.
+    pub const NOTIFY_SUPPRESSED: &str = "notify.suppressed";
 }
 
 /// One audit row (prompt already redacted on write).
@@ -1502,8 +1515,15 @@ impl SessionStore {
         Ok(out)
     }
 
-    /// Every row with a given action, newest first — the operator's "show me
-    /// every revocation" query.
+    /// Up to `limit` rows with a given action, **oldest first** — the operator's
+    /// "show me every revocation" query.
+    ///
+    /// **Oldest first, and the limit keeps the oldest** (`audit_query`'s
+    /// `ORDER BY ts_ms ASC, rowid ASC LIMIT`). This said "newest first" until
+    /// T-0093's notification history trusted the doc instead of the SQL and read
+    /// a pane's *first* notification for ever. A caller that wants the newest row
+    /// uses [`SessionStore::audit_recent_by_action`]; a caller that wants a
+    /// window of history is already right here.
     pub fn audit_by_action(
         &self,
         action: &str,
@@ -1513,6 +1533,38 @@ impl SessionStore {
             action: Some(action.to_string()),
             ..AuditQuery::all(limit)
         })
+    }
+
+    /// Up to `limit` rows with a given action, **newest first**.
+    ///
+    /// The sibling of [`SessionStore::audit_by_action`] with the ordering a
+    /// "what happened last?" question needs, and the reason it exists rather than
+    /// that one being reversed: `audit_by_action` is the right shape for a window
+    /// of history (oldest first, "every revocation"), and reversing it would
+    /// change what every existing caller reads. Here the **limit keeps the newest
+    /// rows**, so a caller asking about the recent past is not defeated by a log
+    /// that has grown — which is what T-0093's notification history needs, on a
+    /// log that is append-only and pruned only by hand.
+    pub fn audit_recent_by_action(
+        &self,
+        action: &str,
+        limit: usize,
+    ) -> Result<Vec<StoredAudit>, SessionError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| SessionError::Sqlite(rusqlite::Error::InvalidQuery))?;
+        let mut stmt = conn.prepare(
+            "SELECT ts_ms, device, agent, prompt, redacted, kind, action, outcome, peer, detail
+             FROM audit WHERE (?1 IS NULL OR action = ?1)
+             ORDER BY ts_ms DESC, rowid DESC LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![action, limit as i64], read_audit_row)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
     }
 
     /// Export the audit log, oldest first, as JSON lines or a JSON array.

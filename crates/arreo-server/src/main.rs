@@ -119,8 +119,28 @@ async fn main() {
         // that is never asked for one never reads either.
         None => arreo_server::WorktreeSettings::default(),
     };
+    // The `[notify]` policy (T-0093), resolved here — at the same moment, from
+    // the same file, and for the same reason as the worktree settings above:
+    // the handoff branch below **never returns**, so a policy resolved after it
+    // would be missing from the daemon that takes over. That is not a
+    // hypothetical; it is the defect T-0106 was, one section over.
+    //
+    // `Ok(None)` means "no `[notify]` section", which is the default and a
+    // working answer: notifications off, no rows, no log growth. Only a section
+    // that is *present* and unusable is fatal — an operator who asked for
+    // notifications and silently did not get them has a bug they cannot see.
+    let notify = match &config_path {
+        Some(path) => match arreo_core::notify::Policy::load(path) {
+            Ok(policy) => policy,
+            Err(e) => {
+                eprintln!("arreo-server: notification policy is unusable: {e}");
+                std::process::exit(1);
+            }
+        },
+        None => None,
+    };
     if let Some(from) = handoff_from {
-        run_handoff(from, handoff_timeout, worktree_settings).await;
+        run_handoff(from, handoff_timeout, worktree_settings, notify).await;
     }
     let socket = socket.unwrap_or_else(default_socket);
     // Bootstrap the device authority before serving: a device-gated session
@@ -141,8 +161,9 @@ async fn main() {
         &authority.root_fingerprint()[..16],
         authority.devices().len()
     );
-    let daemon =
-        arreo_server::Daemon::new(&socket).with_worktree_settings(worktree_settings.clone());
+    let daemon = arreo_server::Daemon::new(&socket)
+        .with_worktree_settings(worktree_settings.clone())
+        .with_notify_policy(notify);
     let registry = daemon.registry();
     let sessions = daemon.sessions();
     let socket_path = socket.clone();
@@ -480,8 +501,9 @@ async fn run_handoff(
     socket: PathBuf,
     timeout: std::time::Duration,
     worktree_settings: arreo_server::WorktreeSettings,
+    notify: Option<arreo_core::notify::Policy>,
 ) -> ! {
-    let failure = run_handoff_inner(&socket, timeout, worktree_settings).await;
+    let failure = run_handoff_inner(&socket, timeout, worktree_settings, notify).await;
     eprintln!("arreo-server: handoff failed: {}", failure.detail());
     eprintln!(
         "arreo-server: the old daemon is still serving {}",
@@ -494,6 +516,7 @@ async fn run_handoff_inner(
     socket: &std::path::Path,
     timeout: std::time::Duration,
     worktree_settings: arreo_server::WorktreeSettings,
+    notify: Option<arreo_core::notify::Policy>,
 ) -> HandoffFailure {
     use arreo_core::proto::{codec, Message, VERSION};
     use std::io::Write;
@@ -797,7 +820,9 @@ async fn run_handoff_inner(
     // there is a failure**: committing on it would exit the outgoing daemon
     // with nobody serving, which is the half-dead state this whole mechanism
     // exists to prevent.
-    let daemon = arreo_server::Daemon::new(socket).with_worktree_settings(worktree_settings);
+    let daemon = arreo_server::Daemon::new(socket)
+        .with_worktree_settings(worktree_settings)
+        .with_notify_policy(notify);
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
     // The entries are cloned into the serving task (an `Arc` clone each) and
     // kept here too: this thread is the one that starts the pumps, and it may

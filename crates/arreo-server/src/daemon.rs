@@ -681,6 +681,17 @@ pub struct Daemon {
     /// the composition root, so a request can never see a different answer from
     /// the one the daemon was started with.
     worktree: WorktreeSettings,
+    /// The `[notify]` section of the daemon's configuration file (T-0093): which
+    /// state transitions are worth telling the operator about, and which are
+    /// noise.
+    ///
+    /// `None` — the default, and every daemon started without the section — means
+    /// notifications are **off**: no `notify.sent` row, no `notify.suppressed`
+    /// row, nothing for a machine that never asked (see the notification tick in
+    /// `serve_on`). Read at the composition root, like the worktree settings, so
+    /// the policy that decides a transition is the one the operator started this
+    /// daemon with.
+    notify: Option<arreo_core::notify::Policy>,
 }
 
 impl Daemon {
@@ -695,6 +706,7 @@ impl Daemon {
             instance: std::sync::Mutex::new(None),
             stop_accepting: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             worktree: WorktreeSettings::default(),
+            notify: None,
         }
     }
 
@@ -706,6 +718,18 @@ impl Daemon {
     #[must_use]
     pub fn with_worktree_settings(mut self, settings: WorktreeSettings) -> Self {
         self.worktree = settings;
+        self
+    }
+
+    /// Run with the `[notify]` policy from the daemon's configuration file
+    /// (T-0093). `None` — no `[notify]` section, which is the default — leaves
+    /// notifications off: the tick still pumps every pane (see the field), and
+    /// writes nothing. `Some` turns the policy on, which is the operator's
+    /// opt-in: a background writer that began appending rows for every machine's
+    /// every transition would be a behaviour change nobody asked for.
+    #[must_use]
+    pub fn with_notify_policy(mut self, policy: Option<arreo_core::notify::Policy>) -> Self {
+        self.notify = policy;
         self
     }
 
@@ -1052,6 +1076,126 @@ impl Daemon {
                     for (id, entry) in entries {
                         if entry.has_guard() {
                             entry.poll_breach(&id, &db);
+                        }
+                    }
+                }
+            });
+        }
+        // Notification tick (T-0093): 1 s tick over every pane — pump the state
+        // engine, then put every transition it produced to the operator's
+        // `[notify]` policy.
+        //
+        // **The pump is half the feature.** Every other `pump` call site is
+        // client-driven (`Read`, `Wait`, `Send`, `PanesDetail`, `stream_attach`),
+        // so a pane nobody is attached to is never classified at all — which is
+        // precisely the pane a notification exists for. That is why this tick
+        // is not gated on a policy being configured: a daemon that classified
+        // its panes only when a client asked is the bug this tick closes, and
+        // the classification is a function of the pane's own output and the
+        // clock — the same answer a client-driven pump computes, at the moment
+        // the pane changed rather than at the moment somebody looked.
+        //
+        // What *is* gated on the policy is the writing. No `[notify]` section
+        // means no store is opened here and no row is written — a daemon that
+        // never asked for notifications must not start appending to its audit log.
+        {
+            let registry = Arc::clone(&self.registry);
+            let db = self.db.clone();
+            let policy = self.notify.clone();
+            // The machine name is a fact about this process, not about a tick:
+            // resolved once, at spawn, so a rule scoped to a machine cannot see
+            // two answers for one run.
+            let machine = arreo_core::mesh::default_machine_name();
+            tokio::spawn(async move {
+                // The state this tick last observed per pane (T-0093 review, F2).
+                // In memory and per-process on purpose: it is not history — the
+                // audit log is — it is only "what did I see last time I looked",
+                // and a restart simply means the next look is the first.
+                let mut last_seen: std::collections::HashMap<String, AgentState> =
+                    std::collections::HashMap::new();
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    let entries: Vec<(String, Arc<PaneEntry>)> = registry
+                        .read()
+                        .await
+                        .iter()
+                        .map(|(id, entry)| (id.clone(), Arc::clone(entry)))
+                        .collect();
+                    // One connection per tick, not one per transition: a
+                    // transition is rare, a tick is not, and the history read and
+                    // the row write are the only two things that need the log.
+                    let store = match &policy {
+                        Some(_) => arreo_core::store::SessionStore::open(&db).ok(),
+                        None => None,
+                    };
+                    let live: std::collections::HashSet<&str> =
+                        entries.iter().map(|(id, _)| id.as_str()).collect();
+                    last_seen.retain(|id, _| live.contains(id.as_str()));
+                    for (id, entry) in entries {
+                        // **The state this tick last saw, which is the only honest
+                        // `from`.** Reading the state immediately before the pump
+                        // looks equivalent and is not: a client-driven pump can
+                        // move the pane inside that window, so the value read is
+                        // not the state the pane was in when it changed (T-0093
+                        // review, F5). The tick's own memory of the last state it
+                        // observed is not racy, and it is what makes the next
+                        // paragraph work.
+                        let observed = engine_state_to_wire(entry.engine_state());
+                        let events = entry.pump(now_ms());
+                        let after = engine_state_to_wire(entry.engine_state());
+                        let previous = last_seen.insert(id.clone(), after).unwrap_or(observed);
+                        let (Some(policy), Some(store)) = (policy.as_ref(), store.as_ref()) else {
+                            continue;
+                        };
+                        // **A transition no client pump may consume.** The engine
+                        // fires each state change exactly once and every pump call
+                        // site drops the events it does not care about, so a
+                        // transition consumed by `PanesDetail`, `Read`, `Send`,
+                        // `Wait` or `stream_attach` never reached this loop at all
+                        // — no decision, not even the "no rule" row, which is the
+                        // common case rather than a corner: the TUI asks for the
+                        // whole wall once per pass, so it races this tick for every
+                        // transition (T-0093 review, F2, reproduced). Comparing the
+                        // state this tick last saw against the state now catches
+                        // exactly the changes its own pump did not report.
+                        if events.is_empty() && previous != after {
+                            let transition = arreo_core::notify::Transition {
+                                pane: id.clone(),
+                                machine: machine.clone(),
+                                at_ms: now_ms(),
+                                from: previous,
+                                to: after,
+                                reason: format!(
+                                    "{} (observed by the tick: the transition was consumed by a \
+                                     client's poll)",
+                                    arreo_core::notify::state_word(after)
+                                ),
+                            };
+                            let decision = policy.decide(&transition, &notify_history(store, &id));
+                            record_notify(store, &transition, &decision);
+                        }
+                        // `from` for the first event of a batch is the state the
+                        // tick last saw. Each later event starts where the one
+                        // before it left off — a bell lands `Working` then
+                        // `Blocked` in a single feed, and the second transition's
+                        // `from` is the first's `to`.
+                        let mut from = previous;
+                        for event in events {
+                            let to = engine_state_to_wire(event.state);
+                            let transition = arreo_core::notify::Transition {
+                                pane: id.clone(),
+                                machine: machine.clone(),
+                                at_ms: event.t_ms,
+                                from,
+                                to,
+                                reason: notify_sentence(&event, to, &entry),
+                            };
+                            // One transition, one decision: the policy sees the
+                            // transition and this pane's history, and both
+                            // answers (deliver, withhold) are recorded.
+                            from = to;
+                            let decision = policy.decide(&transition, &notify_history(store, &id));
+                            record_notify(store, &transition, &decision);
                         }
                     }
                 }
@@ -1404,6 +1548,142 @@ fn last_nonempty_line(lines: &[String]) -> Option<String> {
         .map(|line| line.trim())
         .find(|line| !line.is_empty())
         .map(str::to_string)
+}
+
+/// How many of the newest `notify.sent` rows the history read looks at.
+///
+/// The same bound `arreo notify --why` scans with, so the daemon's own memory
+/// and the operator's reader cannot disagree about which row is "the last time
+/// we told them". A pane whose last notification is older than this many rows
+/// reads as never told and is notified again — noise in the safe direction,
+/// never the silence that cannot be explained.
+const NOTIFY_HISTORY_SCAN: usize = 200;
+
+/// The sentence an operator reads, and the row's `prompt`: the state's own word,
+/// the event's confidence, the pattern it matched, and — for a pane that is
+/// *asking* — the line it is waiting on.
+///
+/// `question (inferred:silence+prompt-shape): \[y/n\] — Proceed? [y/n]` is the
+/// shape: everything the engine knows about why it moved, in the order it knows
+/// it. The tail is read the same way, and only for the same state, as
+/// `PanesDetail` does it — a notification and a sidebar must not quote different
+/// prompts for the same pane. An inferred question is inferred from *silence*,
+/// which has no text, so such a sentence stops at the pattern rather than
+/// inventing a prompt.
+fn notify_sentence(event: &arreo_core::state::Event, to: AgentState, entry: &PaneEntry) -> String {
+    let mut sentence = format!(
+        "{} ({})",
+        arreo_core::notify::state_word(to),
+        confidence_to_wire(&event.confidence)
+    );
+    if let Some(pattern) = &event.matched_pattern {
+        sentence.push_str(": ");
+        sentence.push_str(pattern);
+    }
+    if to == AgentState::Question {
+        if let Some(asking) = last_nonempty_line(&entry.pane.drain()) {
+            sentence.push_str(" — ");
+            sentence.push_str(&asking);
+        }
+    }
+    sentence
+}
+
+/// What the policy knows about a pane's past, read from the audit log.
+///
+/// The log **is** the memory — there is no second table — so the two facts the
+/// rule asks for (when this pane was last told something, and about which state)
+/// come from its newest `notify.sent` row, which outlives the process that wrote
+/// it by construction. Suppressed rows are not history: "we withheld a
+/// notification" is not "we told them", and counting it as one would turn a
+/// withheld notification into silence about the next real one.
+///
+/// Best-effort in the direction that is safe: a log that cannot be read reads as
+/// "never told", which notifies again.
+fn notify_history(
+    store: &arreo_core::store::SessionStore,
+    pane: &str,
+) -> arreo_core::notify::History {
+    use arreo_core::notify::History;
+    use arreo_core::store::actions;
+
+    // **`audit_recent_by_action`, not `audit_by_action`.** The latter is oldest
+    // first and its limit keeps the *oldest* rows, so trusting it here read a
+    // pane's very first notification for ever: `coalesce_secs` then measured
+    // against a notification from minutes ago and never suppressed again, and
+    // once a store held more than the scan bound the pane's recent row fell
+    // outside the window entirely and every transition re-notified. Both were
+    // reproduced (T-0093 review). The newest-first read makes the limit keep the
+    // rows that matter and the first match the *last* time the pane was told.
+    let Ok(rows) = store.audit_recent_by_action(actions::NOTIFY_SENT, NOTIFY_HISTORY_SCAN) else {
+        return History::default();
+    };
+    match rows.into_iter().find(|row| row.agent == pane) {
+        Some(row) => History {
+            last_notified_ms: Some(row.ts_ms),
+            last_notified_state: row
+                .detail
+                .as_deref()
+                .and_then(arreo_core::notify::state_from_detail),
+        },
+        None => History::default(),
+    }
+}
+
+/// Record one decision — told, or withheld — against the pane (T-0093).
+///
+/// **Both answers are rows, and that is the point.** The question this feature
+/// creates is "why was I not told?", and a suppression that left no trace would
+/// be a silence with no answer; `arreo notify --why` and
+/// `arreo audit export --action notify.suppressed` read exactly these rows. The
+/// shape is a contract because the daemon reads its own rows back (see
+/// [`notify_history`]): `device = "daemon"` (no session made this decision, the
+/// tick did), `agent = <pane>`, `prompt = <the sentence>`, and
+/// `detail = notify::detail_for(...)` for a sent row or
+/// `state=<word>; <reason word> — <reason detail>` for a withheld one — the
+/// prefix written and read by the library's own pair of functions, never
+/// hand-rolled on either side.
+///
+/// Best-effort: a store that cannot be written never stops the pass, and never
+/// stops another pane's row.
+fn record_notify(
+    store: &arreo_core::store::SessionStore,
+    transition: &arreo_core::notify::Transition,
+    decision: &arreo_core::notify::Decision,
+) {
+    use arreo_core::notify;
+    use arreo_core::store::{actions, AuditEvent, AuditKind, AuditOutcome};
+
+    let (action, detail, outcome) = match decision {
+        notify::Decision::Notify { reason } => (
+            actions::NOTIFY_SENT,
+            notify::detail_for(transition.to, reason),
+            AuditOutcome::Ok,
+        ),
+        // A decision *not* to act, recorded as a refusal: the log then says the
+        // policy saw this transition and chose not to deliver it, which is a
+        // different statement from "nothing happened".
+        notify::Decision::Suppressed { reason } => (
+            actions::NOTIFY_SUPPRESSED,
+            format!(
+                "state={}; {} — {}",
+                notify::state_word(transition.to),
+                reason.word(),
+                reason.detail()
+            ),
+            AuditOutcome::Refused,
+        ),
+    };
+    let _ = store.record(&AuditEvent {
+        device: "daemon".to_string(),
+        agent: transition.pane.clone(),
+        prompt: transition.reason.clone(),
+        detail: Some(detail),
+        // The row is timestamped by the **transition**, not by the write: the
+        // coalescing window measures how far apart the events were, and it is
+        // read back from this column.
+        ..AuditEvent::new(action, AuditKind::Unknown, outcome, transition.at_ms)
+    });
 }
 
 /// Read exactly one framed message (buffering partial reads).
@@ -4251,6 +4531,80 @@ trait ReadHelper: AsyncReadExt + Unpin {
 }
 
 impl<T: AsyncReadExt + Unpin> ReadHelper for T {}
+
+#[cfg(test)]
+mod notify_history_tests {
+    use super::*;
+
+    /// A scratch store: the daemon's own `db_path_for` beside a scratch socket.
+    fn store_at(tag: &str) -> (arreo_core::store::SessionStore, std::path::PathBuf) {
+        let db = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/test-scratch/T-0093/history")
+            .join(format!("{tag}.db"));
+        let _ = std::fs::remove_file(&db);
+        std::fs::create_dir_all(db.parent().expect("parent")).expect("scratch");
+        (
+            arreo_core::store::SessionStore::open(&db).expect("store"),
+            db,
+        )
+    }
+
+    /// Write one `notify.sent` row for `pane` at `ts_ms`.
+    fn sent(store: &arreo_core::store::SessionStore, pane: &str, state: AgentState, ts_ms: u64) {
+        use arreo_core::store::{actions, AuditEvent, AuditKind, AuditOutcome};
+        store
+            .record(&AuditEvent {
+                ts_ms,
+                device: "daemon".to_string(),
+                agent: pane.to_string(),
+                prompt: arreo_core::notify::state_word(state).to_string(),
+                detail: Some(arreo_core::notify::detail_for(state, "test")),
+                ..AuditEvent::new(
+                    actions::NOTIFY_SENT,
+                    AuditKind::Unknown,
+                    AuditOutcome::Ok,
+                    ts_ms,
+                )
+            })
+            .expect("row written");
+    }
+
+    /// **The history is the pane's *newest* notification, not its first**
+    /// (T-0093 review, F1).
+    ///
+    /// This read used `audit_by_action`, whose ordering is oldest-first *and whose
+    /// limit keeps the oldest rows*, so a pane's first-ever notification was its
+    /// history for ever: `coalesce_secs` measured against it and never suppressed
+    /// again, and once a log held more rows than the bound the pane's recent row
+    /// fell outside the window entirely and every transition re-notified. Both
+    /// were reproduced against the running daemon before this test existed.
+    #[test]
+    fn the_history_is_the_newest_row_for_the_pane() {
+        let (store, _) = store_at("newest");
+        sent(&store, "pane-a", AgentState::Question, 1_000);
+        sent(&store, "pane-a", AgentState::Blocked, 5_000);
+        sent(&store, "pane-b", AgentState::Question, 9_000);
+
+        let history = notify_history(&store, "pane-a");
+        assert_eq!(
+            history.last_notified_ms,
+            Some(5_000),
+            "the newest row for this pane"
+        );
+        assert_eq!(
+            history.last_notified_state,
+            Some(AgentState::Blocked),
+            "and its state travels with the time"
+        );
+
+        // A pane with no sent rows has no history at all — and another pane's
+        // rows are not it.
+        assert_eq!(
+            notify_history(&store, "pane-c"),
+            arreo_core::notify::History::default()
+        );
+    }
+}
 
 #[cfg(test)]
 mod kill_tests {

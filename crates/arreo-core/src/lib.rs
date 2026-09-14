@@ -12,6 +12,7 @@ pub mod lifecycle;
 pub mod lock;
 pub mod mesh;
 pub mod metrics;
+pub mod notify;
 pub mod pairing;
 pub mod proto;
 pub mod pty;
