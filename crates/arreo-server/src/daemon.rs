@@ -2757,6 +2757,35 @@ fn worktree_error(error: &arreo_core::worktree::WorktreeError) -> Message {
     }
 }
 
+/// Why a killed pane's worktree must be **kept** because the process is still
+/// running, or `None` when it may be removed (T-0108).
+///
+/// A function rather than an `if` at the call site, and the reason is not style:
+/// the branch is not reachable on demand from a test (see the module's note on
+/// `wait_timeout` below), so the *decision* is made checkable on its own and the
+/// call site stays a line of wiring. Same shape as
+/// [`arreo_core::update::deferred::window_is_open`] — one rule, one function.
+///
+/// The line it returns is the operator's: it says what happened and what to do,
+/// because "the worktree was not removed" with no reason reads like a bug.
+fn still_running_after_kill(exit: Option<ExitState>) -> Option<&'static str> {
+    match exit {
+        // Still running after the bound. `kill_shared` sends SIGKILL, so this is
+        // reached only by a process the signal cannot finish off (uninterruptible
+        // sleep on a hung mount or a stuck disk) or by a signal that was never
+        // delivered (a poisoned killer mutex) — both of which mean the checkout
+        // may be written to *after* any status read we could take.
+        None => Some(
+            "its process had not exited when the pane was removed, so the checkout was left \
+             alone — a running process can write into it; check `arreo worktrees list` once it \
+             is gone, then `arreo worktrees remove <pane>`",
+        ),
+        // Exited (or already reaped): the removal proceeds, and **git** is what
+        // protects the files from a descendant that outlives its leader.
+        Some(_) => None,
+    }
+}
+
 /// Remove a killed pane's worktree, and tell the operator when it is kept
 /// (T-0091).
 ///
@@ -3190,11 +3219,41 @@ async fn dispatch(
                     let settings = worktree.clone();
                     let id = id.clone();
                     tokio::task::spawn_blocking(move || {
-                        let _ = entry.pane.wait_timeout(std::time::Duration::from_secs(5));
-                        // T-0091: the pane's worktree goes with the pane. The
-                        // child is dead by now — removing a checkout underneath a
-                        // live process would be asking for a dirty refusal the
-                        // operator has to read twice.
+                        // **The wait result decides** (T-0108). It used to be
+                        // discarded (`let _ = …`) and the removal ran regardless,
+                        // so a pane whose process had *not* exited was still
+                        // treated as if it had: the code's own comment said "the
+                        // child is dead by now", and nothing enforced it.
+                        //
+                        // `None` means "still running after the bound", which is
+                        // reachable even though `kill_shared` sends SIGKILL — a
+                        // process in uninterruptible sleep (blocked on a hung
+                        // mount, a stuck disk) does not die until its syscall
+                        // returns, and a poisoned killer mutex means the signal was
+                        // never delivered at all. In that case the checkout is
+                        // **kept and reported**: a live process can write into it,
+                        // so "is it dirty?" has no stable answer to read.
+                        if let Some(reason) = still_running_after_kill(
+                            entry.pane.wait_timeout(std::time::Duration::from_secs(5)),
+                        ) {
+                            if let Some(path) = entry.worktree() {
+                                eprintln!(
+                                    "daemon: pane {id:?} kept its worktree {} — {reason}",
+                                    path.display()
+                                );
+                            }
+                            return;
+                        }
+                        // T-0091: the pane's worktree goes with the pane, and the
+                        // child has exited. What protects the files from here is
+                        // **git's own refusal**, not this call: `remove` passes
+                        // `force = false`, and `git worktree remove` without
+                        // `--force` re-checks the checkout and refuses a dirty one
+                        // ("contains modified or untracked files") — measured, and
+                        // recorded in `.loop/evidence/T-0108/`. So a descendant
+                        // that outlives its leader and writes in the meantime makes
+                        // git refuse, and the checkout is kept. **That is why the
+                        // kill path must never pass `--force`.**
                         if let Some(path) = entry.worktree() {
                             remove_worktree(&settings, &id, &path);
                         }
@@ -4192,6 +4251,41 @@ trait ReadHelper: AsyncReadExt + Unpin {
 }
 
 impl<T: AsyncReadExt + Unpin> ReadHelper for T {}
+
+#[cfg(test)]
+mod kill_tests {
+    use super::*;
+
+    /// **A process still running after the wait keeps its checkout** (T-0108).
+    ///
+    /// The kill path used to discard this result (`let _ = wait_timeout(…)`) and
+    /// remove the worktree regardless — deriving "dirty" from a status read taken
+    /// while the pane's process could still have been writing into it. Keeping the
+    /// checkout is the only answer that cannot destroy uncommitted work: a live
+    /// process means "is this dirty?" has no stable value to read.
+    #[test]
+    fn a_process_that_outlives_the_wait_keeps_its_worktree() {
+        let reason = still_running_after_kill(None).expect("still running => keep");
+        // The line is the operator's: it says what happened and what to do next,
+        // because "the worktree was not removed" with no reason reads like a bug.
+        assert!(reason.contains("had not exited"), "{reason}");
+        assert!(reason.contains("arreo worktrees"), "{reason}");
+    }
+
+    /// An exited process lets the removal proceed — and then git is the guard, not
+    /// this decision: `git worktree remove` without `--force` refuses a dirty
+    /// checkout by itself (measured; see `worktree::remove`'s docs).
+    #[test]
+    fn an_exited_process_proceeds_to_removal() {
+        assert_eq!(still_running_after_kill(Some(ExitState::Exited(0))), None);
+        assert_eq!(still_running_after_kill(Some(ExitState::Exited(143))), None);
+        // The sentinel for a process this daemon did not fork: known gone.
+        assert_eq!(
+            still_running_after_kill(Some(ExitState::Exited(arreo_core::pty::UNKNOWN_EXIT))),
+            None
+        );
+    }
+}
 
 #[cfg(test)]
 mod alert_tests {

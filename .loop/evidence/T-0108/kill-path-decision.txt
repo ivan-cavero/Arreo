@@ -1,0 +1,111 @@
+T-0108 — the kill path decides "dirty" from a read taken while the child may be alive
+====================================================================================
+
+FOUND BY: the same `security-reviewer` pass over T-0091 (`agent://T0091Security`,
+finding T-0091-03, CWE-367), reported as a **hypothesis**: the code path is real,
+but the reviewer could not reproduce it (the window is small and the test child
+really did die). It was filed because the outcome it threatens is the one thing
+T-0091 forbids absolutely — deleting an agent's uncommitted work.
+
+THE CODE PATH, AS FILED
+-----------------------
+`Message::Kill` killed, waited at most 5 s, **discarded the result**
+(`let _ = entry.pane.wait_timeout(…)`), and then called
+`worktree::remove(…, force = false)` — whose dirty check is a `git status
+--porcelain` read followed immediately by `git worktree remove`. The comment beside
+it asserted "the child is dead by now"; nothing enforced it.
+
+WHAT MEASURING CHANGED — AND WHY THE HYPOTHESIS WAS HALF WRONG
+--------------------------------------------------------------
+Two facts settle this, both measured rather than read; the transcript is
+`measured.txt`:
+
+**1. `git worktree remove` is itself the guard.** Without `--force` it re-checks the
+checkout and refuses:
+
+```
+$ git worktree remove <dirty worktree>
+fatal: '<path>' contains modified or untracked files, use --force to delete it
+exit=128
+```
+
+So the **file-loss** the hypothesis describes — "any file the child writes between
+the `git status` read and the `git worktree remove` is deleted with the checkout" —
+does not happen: the file written in that window makes **git** refuse, and the work
+is kept. The `status()` read is not the guard, it is the message layer (it is what
+lets the refusal name the files, and it is how a caller tells "kept because dirty"
+from "kept because git would not run" without parsing git's prose). That distinction
+is now written down in `worktree::remove`'s own documentation, with the measurement,
+and with the rule that follows from it: **nothing may pass `force = true` on a path a
+live process could be writing to** — that flag is what turns the guard off.
+
+**2. `kill_shared` sends SIGKILL, so the wait almost always succeeds.** A throwaway
+probe (a shell that traps and ignores `TERM`, spawned through the real `Pane`) shows
+the child dying regardless of the trap:
+
+```
+PROBE child_pid              = Some(1528569)
+PROBE wait(200ms) before kill = None            # alive, as intended
+PROBE kill_shared()           = Ok(())
+PROBE wait(5s) after kill     = Some(Exited(1)) # dead: SIGKILL cannot be trapped
+PROBE /proc/1528569 exists    = false
+PROBE kill_shared() again     = Err(Io(Os { code: 3, message: "No such process" })
+```
+
+That is why the reviewer could not reproduce the race, and it is also why the
+criterion's test ("a pane whose child ignores SIGTERM and outlives the wait") **cannot
+be written as specified**: no child can outlive SIGKILL.
+
+THE FIX, AND THE HONEST SCOPE OF THE BRANCH
+-------------------------------------------
+The kill path now **uses** the wait result. `still_running_after_kill(exit)` returns
+the operator's line when `wait_timeout` came back `None` — still running after the
+bound — and the checkout is then **kept and reported** instead of removed:
+
+```
+daemon: pane "build" kept its worktree <path> — its process had not exited when the
+pane was removed, so the checkout was left alone — a running process can write into
+it; check `arreo worktrees list` once it is gone, then `arreo worktrees remove <pane>`
+```
+
+The decision is a function rather than an `if` at the call site for one reason: the
+branch is not reachable on demand, so the *rule* is made checkable on its own while
+the call site stays a line of wiring (the same shape as
+`update::deferred::window_is_open`).
+
+`None` is reachable, and both ways are real rather than theoretical:
+
+- a process in **uninterruptible sleep** (blocked on a hung mount, a stuck disk)
+  does not die until its syscall returns, so SIGKILL is delivered and the process
+  stays;
+- a **poisoned killer mutex** means the signal was never delivered at all.
+
+Neither can be produced deterministically in a test, which is exactly the gap:
+
+**Criterion 3 cannot be met as written, and saying so is the honest answer.** No
+test can make a child outlive the wait, so no test can fail on the pre-fix behaviour
+for this branch. What is proven instead:
+
+- the **decision** is unit-tested both ways (`kill_tests`), and mutation-proven —
+  making the `None` arm return `None` reddens
+  `a_process_that_outlives_the_wait_keeps_its_worktree`;
+- the **guard for the residual window** (a descendant that outlives its leader and
+  writes later) is git's refusal, recorded as a measurement rather than asserted;
+- the **observable contract** — a killed pane never loses uncommitted work — was
+  already pinned by `a_killed_pane_leaves_a_dirty_worktree_and_removes_a_clean_one`
+  (T-0091), which is why no second test was added for it: it would assert the same
+  behaviour through the same path.
+
+THE DOC LINE
+------------
+"the child is dead by now" was a promise the code did not keep. It now states what
+is actually true: the wait result decides, and what protects the files from there on
+is git's own refusal — which is also the reason the kill path must never pass
+`--force`.
+
+VERIFICATION
+------------
+- `cargo test -p arreo-server --lib kill_tests` → 2 passed.
+- `cargo test --workspace` → 868 passed, 0 failed.
+- Mutation: the `None` arm returning `None` reddens the still-running test.
+- Both measured facts: `.loop/evidence/T-0108/measured.txt`.

@@ -523,6 +523,27 @@ pub fn ensure(repo: &Path, root: &Path, pane: &str) -> Result<PathBuf, WorktreeE
 
 /// Remove a pane's worktree, refusing a dirty one unless `force`.
 ///
+/// ## Two layers, and which one is the guard
+///
+/// The `status()` read below and `git worktree remove` **both** refuse a dirty
+/// checkout, and they are not redundant — they answer different needs (T-0108):
+///
+/// - **git is the guard.** `git worktree remove` without `--force` re-checks the
+///   checkout itself and refuses, by name, a worktree with modified or untracked
+///   files (measured: `fatal: '<path>' contains modified or untracked files, use
+///   --force to delete it`, exit 128 — transcript in
+///   `.loop/evidence/T-0108/`). So a file written between this function's read
+///   and git's own removal makes git refuse, and the work is kept. **Nothing may
+///   pass `force = true` on a path a live process could be writing to** — that
+///   flag is what turns the guard off.
+/// - **The `status()` read is the message.** It is what lets the refusal name the
+///   files in the same breath, and it is why a caller can distinguish "kept
+///   because dirty" from "kept because git would not run" without parsing git's
+///   prose. It is deliberately *not* the safety argument: a snapshot taken before
+///   a race is not a guard, and treating it as one is how the daemon came to
+///   decide "dirty" from a read taken while the pane's process might still have
+///   been running.
+///
 /// The branch is **not** deleted: it holds the commits, and a worktree is a
 /// checkout of it. An operator who wants the branch gone says so with
 /// `git branch -D`, which is a different decision from "stop working here".
