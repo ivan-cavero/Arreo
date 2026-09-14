@@ -1,0 +1,67 @@
+T-0112 — The persistence slice's plain-pane marker outlived by its own waits
+============================================================================
+
+Found while verifying T-0093: `cargo xtask e2e --slice persistence` came back
+`10 passed, 1 failed` on the integrated tree, deterministically (twice).
+
+The failure
+-----------
+[info] persistence/live: pre-crash pane pids: []
+[FAIL] persistence/live: the plain pane did not come back after the restart
+persistence: 10 passed, 1 failed
+
+The product behaviour was correct and the other checks said so: the store's `panes` row for
+`live-plain` was intact (`/bin/sh -c "echo plain-fallback-marker && sleep 60"`, harness/session
+null) and the daemon logged `daemon: restored 3 pane(s)`. The check that failed is the *process*
+one:
+
+    let plain_pids = matching_argv(&["plain-fallback-marker"]);
+    let restored_new = plain_pids.iter().any(|(pid, _)| !before.contains(pid));
+    if !restored_new { fail!("the plain pane did not come back after the restart"); }
+
+Root cause
+----------
+The plain pane is spawned as `echo plain-fallback-marker && sleep 60`
+(`xtask/src/persistence_slice.rs:457`) — a **fixed 60 s lifetime**. The check that looks for it
+sits *after* the post-restart waits for pi and opencode to make a resumed turn, and those waits
+are bounded by
+
+    const HARNESS_RUN_TIMEOUT: Duration = Duration::from_secs(300);   // :334
+
+The pre-crash capture made the same race visible one line earlier: `pre-crash pane pids: []`, i.e.
+by capture time the marker process was already gone. So on any run where the harness turns take
+more than a minute — network-bound, and the reason the slice's own timeout is 300 s — the plain
+pane's `sleep 60` expires and the check reports a restored pane as missing.
+
+The defect is in the slice, not in the daemon: a fixed-lifetime marker racing a harness wait five
+times longer. It has nothing to do with T-0093 (the only change of mine that runs in this slice is
+the classification tick, and it writes nothing without a `[notify]` section).
+
+Attribution, by experiment
+--------------------------
+One token changed — `sleep 60` → `sleep 600` — and nothing else:
+
+    $ cargo xtask e2e --slice persistence
+    [info] persistence/live: pre-crash pane pids: [1860665]
+    persistence: 16 passed, 0 failed
+
+The marker is now found pre-crash *and* post-restart, and the whole slice is green. That is the
+proof: the check was failing because the process it looks for had a lifetime shorter than the
+wait that precedes the look.
+
+The fix
+-------
+`xtask/src/persistence_slice.rs`: the marker's lifetime must exceed every wait that precedes the
+check that looks for it. `sleep 600` is the smallest value that is comfortably past
+`HARNESS_RUN_TIMEOUT` (300 s) and still bounded, so a leaked process cannot outlive the run.
+
+Verified
+--------
+$ cargo xtask e2e --slice persistence   → 16 passed, 0 failed
+$ cargo test --workspace                → green (the slice is an xtask surface; no unit test
+                                          covers it, which is why this was a slice-only fix)
+$ cargo xtask e2e --slice persistence   (full battery, T-0093) → green
+
+Note for the next reader: the other slice that failed in the same batch run, `handoff-abort`
+(2 failures), is **contention, not a defect** — run alone it is `41 checks` / 41 pass. Its own
+harness kills daemons by SIGKILL at sub-second deadlines, so it does not tolerate neighbours.

@@ -454,7 +454,7 @@ fn live_harness_resume() -> LiveReport {
             "live-plain",
             "/bin/sh",
             "-c",
-            "echo plain-fallback-marker && sleep 60",
+            "echo plain-fallback-marker && sleep 600",
         ],
     );
     if !ok {
