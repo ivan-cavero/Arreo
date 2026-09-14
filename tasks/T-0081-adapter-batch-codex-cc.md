@@ -3,7 +3,7 @@ id: T-0081
 title: Adapter suite v2 batch B — Codex and [CC] native tier, gated on live recordings
 phase: 4
 priority: 3
-status: proposed
+status: done
 depends_on: [T-0075, T-0080]
 scope:
   - adapters/**
@@ -29,24 +29,48 @@ codex/gemini. Shipping an unrecorded TOML would break the rule this repository i
 (every claim points at an artifact), and a guessed adapter is worse than the honest universal
 fallback it would replace.
 
+## Outcome — the scope-note branch of criterion 1
+
+**The blocker is credentials, not the binary.** Both CLIs install from npm into scratch and
+both run on this box (`codex-cli 0.154.0`, `[CC] 2.1.270`); neither can drive a turn:
+
+- `codex doctor` (isolated HOME): `✗ auth  no Codex credentials were found`.
+- `codex exec "say hi"`: `401 Unauthorized: Missing bearer or basic authentication`.
+- `claude -p "say hi"`: `Not logged in · Please run /login`.
+- No provider API key in the environment; `~/.codex` and `~/.claude` are empty here.
+
+The four state fixtures the TOML branch requires (question/working/idle/stress) each need a
+real agent turn, so no TOML was written and no fixture was synthesized. Live facts recorded
+anyway, so the retry starts warm: codex resume is `codex resume [SESSION_ID] [PROMPT]`
+(`--last`), config `~/.codex/config.toml`; [CC] resume is `--resume <id>` / `--continue` /
+`--fork-session`, config `~/.claude/settings.json`. Full transcript and note:
+`.loop/evidence/T-0081/`.
+
 ## Acceptance criteria
 
-- [ ] Either: `adapters/codex.toml` and `adapters/claude.toml` (harness id, program match,
-      native-tier event map, resume strategy, patterns) each with **≥4 live-recorded fixtures**
-      (question/working/idle/stress) and the CLI version they were recorded from stated in the
-      TOML header — or a scope note naming the exact blocker (binary absent, no credentials, no
-      license) plus the transcript proving the attempt.
-- [ ] No third option: no TOML is edited without a recording behind it, and no fixture is
-      synthesized from documentation.
-- [ ] `cargo xtask adapters --check` green with the fixture count stated (the count is the
-      evidence that the new fixtures actually run).
-- [ ] If Codex's hooks land: `hooks.state.*.trusted_hash` is **never** proposed for sync in
-      `docs/harness-centralization.md` (it hashes a local file, so syncing it would re-prompt
-      hook trust on every machine) — note it in the task's evidence either way.
+- [x] Scope note naming the exact blocker (no credentials) plus the transcript proving the
+      attempt — `.loop/evidence/T-0081/scope-note.md` + `transcript.txt` (which CLIs exist,
+      what npm offers, install, `--version`, `doctor`, a real turn attempt, credential
+      stores, env). The TOML branch is unreachable: a live turn is required and none can run.
+- [x] No TOML edited without a recording behind it, and no fixture synthesized from
+      documentation — `adapters/**` and `fixtures/**` are untouched in this task.
+- [x] `cargo xtask adapters --check` green: **24 passed, 0 failed** — the fixture count is
+      unchanged because the branch that adds fixtures was not taken, and the count is stated
+      in the evidence.
+- [x] `hooks.state.*.trusted_hash` recorded as **never syncable**: the real
+      `config.toml` Orca writes carries one `trusted_hash = "sha256:…"` per hook, keyed by an
+      absolute path, and the digest is of the *local* `hooks.json` — syncing it would
+      re-prompt hook trust on every machine. Note in `.loop/evidence/T-0081/scope-note.md`.
+
+## Follow-up
+
+T-0089 — the retry, gated on any credential appearing (or a `codex login` / `claude /login`
+on this box). It carries this note's live facts as its input.
 
 ## Notes
 
 - Inputs: `specs/harness-matrix.md` (T-0075) rows for Codex and [CC];
   `.loop/evidence/T-0075/herdr-integrations.txt` and `host-integration-artifacts.txt`.
-- The survey deliberately marked these rows `untried`/host-artifact-only. Do not promote them
-  to claims without a recording — that is this task's first job, not its formality.
+- The survey deliberately marked these rows `untried`/host-artifact-only. They stay that way:
+  this task's job was to obtain a recording, and the recording is impossible without a
+  credential — a fact now proven rather than assumed.

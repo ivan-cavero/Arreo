@@ -1,0 +1,111 @@
+=== 1. are the CLIs already on this box? ===
+$ which codex claude gemini copilot
+exit=1
+
+=== 2. the installed agent CLIs on PATH ===
+$ ls ~/.bun/bin ~/.local/bin
+/home/dev/.bun/bin:
+bun
+bunx
+omp
+opencode
+pi
+
+/home/dev/.local/bin:
+herdr
+orca
+orca-ide
+
+=== 3. obtainable from npm? ===
+$ npm view @openai/codex version
+0.154.0
+$ npm view @anthropic-ai/claude-code version
+2.1.270
+
+=== 4. install both into scratch ===
+$ npm install --prefix <scratch>/install @openai/codex @anthropic-ai/claude-code
+
+up to date in 823ms
+npm warn allow-scripts 1 package has install scripts not yet covered by allowScripts:
+npm warn allow-scripts   @anthropic-ai/claude-code@2.1.270 (postinstall: node install.cjs)
+npm warn allow-scripts
+npm warn allow-scripts Run `npm approve-scripts --allow-scripts-pending` to review, or `npm approve-scripts <pkg>` to allow.
+exit=0
+
+=== 5. both binaries run ===
+$ codex --version
+codex-cli 0.154.0
+$ claude --version
+2.1.270 (Claude Code)
+
+=== 6. is there a credential? (codex asks its own doctor) ===
+$ codex doctor        # isolated HOME
+Codex Doctor v0.154.0 · linux-x86_64
+
+Notes
+   ✗ auth         no Codex credentials were found - Run codex login or provide an API key through a supported auth env var.
+   ⚠ websocket    Responses WebSocket failed; HTTPS fallback may still work - Check proxy, VPN, firewall, DNS, custom CA, and WebSocket policy support.
+─────────────────────────────────────────────────────────────
+
+Environment
+  ✓ system       C
+      os                       Debian 13.0.0 (trixie) [64-bit]
+      OS language              C
+      LANG                     C.UTF-8
+
+=== 7. can a real turn run? codex ===
+$ codex exec --skip-git-repo-check "say hi"        # isolated HOME
+warning: Falling back from WebSockets to HTTPS transport. unexpected status 401 Unauthorized: Missing bearer or basic authentication in header, url: wss://api.openai.com/v1/responses, cf-ray: a3ac49c29d411e56-FRA
+ERROR: Reconnecting... 1/5
+ERROR: Reconnecting... 2/5
+ERROR: Reconnecting... 3/5
+ERROR: Reconnecting... 4/5
+ERROR: Reconnecting... 5/5
+ERROR: unexpected status 401 Unauthorized: Missing bearer or basic authentication in header, url: https://api.openai.com/v1/responses, cf-ray: a3ac49f5fd89db9b-FRA, request id: req_2b7269c4a39e4330a86bdcfc36e76eec
+ERROR: unexpected status 401 Unauthorized: Missing bearer or basic authentication in header, url: https://api.openai.com/v1/responses, cf-ray: a3ac49f5fd89db9b-FRA, request id: req_2b7269c4a39e4330a86bdcfc36e76eec
+
+=== 8. can a real turn run? [CC] ===
+$ claude -p "say hi"        # isolated HOME
+Not logged in · Please run /login
+
+=== 9. credential stores and env ===
+$ ls -a ~/.codex ~/.claude
+/home/dev/.claude:
+.
+..
+
+/home/dev/.codex:
+.
+..
+$ printenv | cut -d= -f1 | grep -E "^(OPENAI|ANTHROPIC|GEMINI|GOOGLE|XAI|GROK|QWEN|DASHSCOPE|MOONSHOT|DEEPSEEK|OPENROUTER|AZURE)"
+exit=1 (1 = none set)
+
+=== 10. resume argv, live from the binaries ===
+$ codex resume --help        # first 4 lines
+Resume a previous interactive session (picker by default; use --last to continue the most recent)
+
+Usage: codex resume [OPTIONS] [SESSION_ID] [PROMPT]
+
+$ claude --help | grep -E "resume|continue|fork-session"
+                                        --resume <session-id>, continues that
+  -c, --continue                        Continue the most recent conversation in
+  --fork-session                        When resuming, create a new session ID
+                                        with --resume or --continue)
+  -r, --resume [value]                  Resume a conversation by session ID, or
+                                        <id>` opens it again, `claude --resume`
+
+=== 11. hooks.state.*.trusted_hash — the real config.toml Orca writes ===
+$ head -6 ~/.config/orca/codex-runtime-home/home/config.toml
+[hooks.state."/home/dev/.config/orca/codex-runtime-home/home/hooks.json:session_start:0:0"]
+enabled = true
+trusted_hash = "sha256:d88f619c310bc84a3064045df2970d4148569998de77e084807643b60ac9cd0f"
+[hooks.state."/home/dev/.config/orca/codex-runtime-home/home/hooks.json:user_prompt_submit:0:0"]
+enabled = true
+trusted_hash = "sha256:437fbb8b10be3dab8c284c072b6143ea397208024bdfa194c20e304600631a90"
+$ grep -c trusted_hash ~/.config/orca/codex-runtime-home/home/config.toml
+8
+
+=== 12. the fixture suite today (unchanged — no TOML written) ===
+$ cargo xtask adapters --check | tail -2
+[PASS] pi/pi-tui.pty: flow Working, end Idle
+adapters: 24 passed, 0 failed

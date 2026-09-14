@@ -1,0 +1,75 @@
+=== 1. is any long-tail harness already on this box? ===
+PATH  grok           ABSENT
+PATH  qwen           ABSENT
+PATH  qoder          ABSENT
+PATH  droid          ABSENT
+PATH  cursor-agent   ABSENT
+PATH  copilot        ABSENT
+PATH  devin          ABSENT
+PATH  kimi           ABSENT
+PATH  antigravity    ABSENT
+PATH  mastracode     ABSENT
+PATH  kilo           ABSENT
+PATH  hermes         ABSENT
+
+=== 2. does a package exist on npm? (candidate names, identity checked) ===
+npm   @xai/grok-cli                NOT-FOUND
+npm   grok-cli                     1.0.5
+npm   @qwen-code/qwen-code         0.23.3
+npm   @qoder/qoder-cli             NOT-FOUND
+npm   @factory-ai/droid            NOT-FOUND
+npm   cursor-agent                 1.0.3
+npm   @github/copilot              1.0.83
+npm   @cognition-ai/devin          NOT-FOUND
+npm   @moonshot-ai/kimi-code       0.42.0
+npm   @google/antigravity          NOT-FOUND
+npm   @mastra/code                 NOT-FOUND
+npm   @kilocode/cli                7.6.2
+
+=== 3. identity of the names that resolved (a name is not a product) ===
+grok-cli                     A CLI tool that starts anthropic-proxy with Grok model and runs claude-code | git+https://github.com/whitesmith/grok-cli.git
+cursor-agent                 Task sequence creator for Cursor AI agents | git+https://github.com/zalab-inc/cursor_agent.git
+@github/copilot              GitHub Copilot CLI brings the power of Copilot coding agent directly to your ter | git+https://github.com/github/copilot-cli.git
+@qwen-code/qwen-code         Qwen Code - AI-powered coding assistant | git+https://github.com/QwenLM/qwen-code.git
+@moonshot-ai/kimi-code       The Starting Point for Next-Gen Agents | git+https://github.com/MoonshotAI/kimi-code.git
+@kilocode/cli                The AI coding agent built for the terminal. Generate code from natural language, | git+https://github.com/Kilo-Org/kilocode.git
+
+=== 4. install the four that are the real product, into scratch ===
+npm warn allow-scripts   @moonshot-ai/kimi-code@0.42.0 (postinstall: node scripts/postinstall.mjs)
+npm warn allow-scripts
+npm warn allow-scripts Run `npm approve-scripts --allow-scripts-pending` to review, or `npm approve-scripts <pkg>` to allow.
+
+=== 5. do they run, and what version? (isolated HOME) ===
+$ copilot --version
+GitHub Copilot CLI 1.0.83.
+Run 'copilot update' to check for updates.
+$ qwen --version
+0.23.3
+$ kimi --version
+0.42.0
+$ kilo --version
+7.6.2
+
+=== 6. can a live turn run? (isolated HOME, no tty) ===
+$ copilot -p "say hi"
+Error: No authentication information found.
+
+Copilot can be authenticated with GitHub using an OAuth Token or a Fine-Grained Personal Access Token.
+
+To authenticate, you can use any of the following methods:
+  • Start 'copilot' and run the '/login' command
+$ qwen -p "say hi"
+No auth type is selected. Please configure an auth type (e.g. via settings or `--auth-type`) before running in non-interactive mode.
+$ kimi -p "say hi"
+kimi version 0.42.0
+error: failed to run prompt: No model configured. Run `kimi` and use /login to sign in, then retry; or set default_model in config.toml.
+See log: /home/dev/dev/Arreo/target/test-scratch/T-0081/iso-home/.kimi-code/logs/kimi-code.log
+$ kilo run "say hi"
+[0m
+> code · google/gemini-3-pro-image
+[0m
+[91m[1mError: [0mYou need to sign in to use this model.
+
+=== 7. the fixture suite today (unchanged — no TOML written, no fixture synthesized) ===
+$ cargo xtask adapters --check | tail -1
+adapters: 24 passed, 0 failed
