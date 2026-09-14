@@ -168,18 +168,34 @@ impl RingBuffer {
         }
     }
 
-    /// Flush an unterminated trailing partial line (e.g. a shell prompt).
-    pub fn flush_partial(&mut self) {
+    /// The lines a reader sees: the ring, plus the **unterminated trailing
+    /// line** — the partial a program has written but not yet finished — as a
+    /// trailing element. **Non-mutating**, and that is the point.
+    ///
+    /// The partial has to be visible: a question a harness prints without a
+    /// trailing newline is the single most important thing an operator reads out
+    /// of a pane, so a reader that hid it would hide the product's flagship
+    /// signal. But it must not *enter* the ring, because a program's line is one
+    /// line: materialising a partial and then appending its completion gave the
+    /// same written line two entries in the ring — permanently, and every reader
+    /// of it (`arreo read`, `attach`, the TUI, the handoff manifest, the
+    /// persisted snapshot) saw the split. Measured through the product (T-0088):
+    /// a program writing one line in two writes with a poll in between left the
+    /// ring holding `burst-2|aaaa…` and `bbbb…` as separate lines for ever.
+    ///
+    /// Truncated to [`MAX_LINE_BYTES`] like any other line, so a program that
+    /// never emits a newline cannot make a reader allocate without bound.
+    #[must_use]
+    pub fn lines_with_partial(&self) -> Vec<String> {
+        let mut out = self.lines();
         if !self.pending.is_empty() {
-            let mut line: String = std::mem::take(&mut self.pending)
-                .chars()
-                .take(MAX_LINE_BYTES)
-                .collect();
+            let mut line: String = self.pending.chars().take(MAX_LINE_BYTES).collect();
             while line.ends_with('\r') {
                 line.pop();
             }
-            self.push_line(line);
+            out.push(line);
         }
+        out
     }
 
     #[must_use]
@@ -189,11 +205,10 @@ impl RingBuffer {
 
     /// The unterminated trailing partial line, **without** flushing it.
     ///
-    /// Distinct from [`Self::flush_partial`] on purpose: the handoff's snapshot
-    /// must not mutate the ring it is reading (T-0038 stage 2) — a flush would
-    /// move the partial into `lines` on the pane that goes on serving if the
-    /// handoff does not commit, and the transfer would then carry a line the
-    /// sender's own ring no longer has as a partial.
+    /// The handoff's snapshot reads this rather than a materialised line
+    /// (T-0038 stage 2): the transfer carries the partial *as* a partial, so the
+    /// receiving pane resumes with the same unterminated line its sender had —
+    /// and the ring it is read from is not mutated either way (T-0088).
     #[must_use]
     pub fn pending_line(&self) -> &str {
         &self.pending
@@ -981,15 +996,32 @@ impl Pane {
         Ok(())
     }
 
-    /// Snapshot of buffered lines (oldest first), flushing any partial line.
+    /// Snapshot of buffered lines (oldest first), with the **unterminated
+    /// trailing line** included as the last element.
+    ///
+    /// Non-mutating: the partial is reported, never materialised into the ring
+    /// (see [`RingBuffer::lines_with_partial`] for the measured defect that
+    /// came from the alternative). A caller that must distinguish the trailing
+    /// partial from a terminated line — the streaming delta path, which indexes
+    /// by line number — uses [`Pane::ring_len`] for its bookkeeping.
     #[must_use]
     pub fn drain(&self) -> Vec<String> {
-        if let Ok(mut buf) = self.buffer.lock() {
-            buf.flush_partial();
-            buf.lines()
-        } else {
-            Vec::new()
-        }
+        self.buffer
+            .lock()
+            .map(|buf| buf.lines_with_partial())
+            .unwrap_or_default()
+    }
+
+    /// How many **terminated** lines the ring holds.
+    ///
+    /// The number a line-indexed reader may trust: a partial reported by
+    /// [`Pane::drain`] sits at index `ring_len()`, and stays there when the
+    /// program finishes writing it (the ring then holds it as its last line), so
+    /// a client that advances its cursor to `ring_len()` re-fetches it as a
+    /// normal new line instead of missing it.
+    #[must_use]
+    pub fn ring_len(&self) -> usize {
+        self.buffer.lock().map(|buf| buf.len()).unwrap_or(0)
     }
 
     /// Capture this pane's scrollback and raw journal **without mutating the

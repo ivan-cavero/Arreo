@@ -1,0 +1,111 @@
+T-0088 — the handoff pty-buffer test was not flaky: it was detecting a real defect
+===============================================================================
+
+THE SYMPTOM
+-----------
+`a_child_that_fills_the_terminal_buffer_while_paused_is_not_left_blocked` failed once
+inside `cargo test --workspace` (a parallel run of ~40 test binaries):
+
+  assertion `left == right` failed: every burst line arrived — 479 of 480
+    left: 479
+   right: 480
+
+It passed 3/3 in isolation and the next full run was 816/0, so it looked like load.
+It was not load. **One line was permanently split into two by the ring buffer.**
+
+REPRODUCTION (the part that made it a bug rather than a flake)
+-------------------------------------------------------------
+Synthetic CPU load alone did NOT reproduce it (6 busy loops, 6 runs, all green). What
+reproduced it was the *parallel test-binary* shape of a workspace run:
+
+  for round in 1..8; do
+    (cargo test -p arreo-server --test handoff) &      # x3 concurrently
+    (cargo test -p arreo-server --test relay_daemon) &
+    wait
+  done
+
+  PRE-FIX: 1 failure in 24 runs — "479 of 480", the exact original symptom
+  POST-FIX: 0 in 24 runs (and 0 in 18 earlier runs of the same shape)
+
+THE MECHANISM
+-------------
+`Pane::drain()` called `RingBuffer::flush_partial()`, which **took** the unterminated
+trailing line out of `pending` and pushed it into the lines ring. A poll (any
+`read`/`attach`/TUI poll/persist snapshot) that landed between two writes of one line
+therefore did this:
+
+  program writes "burst-2|aaaa…"   ring: [ ..., "burst-2|aaaa…" ]   pending: ""
+  program writes "bbbb…\n"         ring: [ ..., "burst-2|aaaa…", "bbbb…" ]
+
+One written line, two ring entries — permanently, for every reader.
+
+MEASURED THROUGH THE PRODUCT (not inferred)
+-------------------------------------------
+Before the fix, a real daemon and a real pane writing one line in two pieces with a poll
+between them:
+
+  $ arreo read slowline            # poll lands mid-line
+  burst-2|aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+  $ arreo read slowline            # after the line completes
+  burst-2|aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+  bbbbbbbbbbbbbbbbbbbb
+
+After the fix, the same sequence:
+
+  $ arreo read slowline
+  burst-2|aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+  $ arreo read slowline
+  burst-2|aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaabbbbbbbbbbbbbbbbbbbb
+  burst-3|done
+
+Every reader was affected: `arreo read`, `attach` (the ring is the source of its deltas),
+the TUI's pane view, the handoff manifest, and the persisted snapshot. The test caught it
+because it counts exact lines (480) and got 479 + 1 fragment.
+
+THE FIX
+-------
+1. **`RingBuffer::lines_with_partial()`** — the reader's view: the terminated lines plus
+   the unterminated trailing line as a trailing element. Non-mutating. The partial has to
+   be *visible* (a harness's question without a newline is the product's flagship signal)
+   but it must never *enter* the ring.
+2. **`Pane::drain()`** uses it. `RingBuffer::flush_partial` is deleted — with `drain` no
+   longer mutating, it had no production user, and the two must not disagree about what a
+   line is.
+3. **`Pane::ring_len()`** — the count of terminated lines, which is the number a
+   line-indexed reader may trust.
+4. **`stream_attach`'s cursor rule**: when the tail of a delta is a partial, the cursor
+   advances only past the terminated lines. The client is append-only and line-indexed, so
+   a partial sits at the index it will occupy once terminated — re-fetching that slot is
+   what lets the completion arrive whole instead of being skipped as "already delivered".
+
+THE PARTIAL IS NOT LOST, AND THE RING IS INTACT (both asserted)
+--------------------------------------------------------------
+- `unterminated_prompt_line_is_visible_to_a_reader_and_not_materialised` (ring unit test):
+  a reader sees `$ `; `lines()` holds only the terminated line; then the completion makes
+  ONE line, `$ echo hi`.
+- `a_poll_between_two_writes_of_one_line_does_not_split_it` (ring unit test): the measured
+  sequence, at the ring.
+- `a_line_written_in_two_pieces_arrives_once_and_whole` (real daemon, `crates/arreo-server/
+  tests/api.rs`): a pane writing in two pieces with a pause; a streaming client re-attaching
+  by cursor sees the joined line; a FRESH reader sees it once and whole, and never sees
+  `half-one|aaaa` as its own line.
+
+MUTATIONS (each reddens the test it should, run by the planner)
+---------------------------------------------------------------
+A. `ring_len` counting the partial as a line (the pre-fix bookkeeping) ->
+   `a_line_written_in_two_pieces_arrives_once_and_whole` FAILS
+   ("the client saw [half-one|aaaa]" — the completion never sent).
+B. `drain` materialising the partial into the ring (the pre-fix read) ->
+   the same test FAILS.
+C. The full pre-fix behaviour restored faithfully (drain takes the pending into the ring,
+   `ring_len` counts it): the handoff pty-buffer test fails again — "479 of 480",
+   reproduced once in 24 parallel-load runs.
+
+Tests that changed, and why that is not weakening
+-------------------------------------------------
+Four ring tests called `flush_partial()` as a settle step at the end of a run of
+*terminated* lines, where it was a no-op; the call is gone. The one that pinned the old
+contract (`unterminated_prompt_line_is_visible_after_flush`) asserted the materialisation
+itself — the defect — so it is replaced by the two tests above, which assert what a reader
+sees AND that the ring stays one-line-per-written-line. The chaos probe
+(`xtask/src/chaos/giant_line.rs`) used the same no-op call and no longer does.

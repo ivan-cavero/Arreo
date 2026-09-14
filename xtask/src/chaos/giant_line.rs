@@ -10,7 +10,6 @@ pub fn run() -> Result<String, String> {
     let mut ring = RingBuffer::new(512);
     ring.push_bytes(&vec![b'G'; 5 * 1024 * 1024]);
     ring.push_bytes(b"\n");
-    ring.flush_partial();
     let held = ring.bytes_held();
     if held > 3 * 1024 * 1024 {
         return Err(format!("ring over budget: {held} bytes"));

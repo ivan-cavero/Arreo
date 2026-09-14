@@ -343,3 +343,129 @@ async fn spawn_with_budget_attaches_guard_or_errors_loudly() {
         other => panic!("want Ok or enforce Error, got {other:?}"),
     }
 }
+
+/// **A line a program writes in two pieces arrives as one line, and never
+/// twice** (T-0088).
+///
+/// The delta path is line-indexed: the daemon slices what the pane reports and
+/// advances a cursor, and the client can only append what it is sent. The pane
+/// also has to report the *unterminated* trailing line, because a prompt without
+/// a newline is the product's flagship signal — so the two facts have to agree:
+/// a partial is delivered (the operator sees it), and its completion is
+/// delivered too (the operator is not shown half a line for ever). The old code
+/// materialised the partial into the ring, which gave one written line two
+/// entries; this drives the sequence through the real daemon and asserts the
+/// joined result.
+#[tokio::test]
+async fn a_line_written_in_two_pieces_arrives_once_and_whole() {
+    let socket = temp_socket("partial-line");
+    let _server = spawn_daemon(socket.clone()).await;
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    let mut control = Client::connect(&socket).await;
+    control
+        .send(&Message::Spawn {
+            v: VERSION,
+            id: "slow".to_string(),
+            program: "/bin/sh".to_string(),
+            // One line, written in two pieces with a pause between them — the
+            // shape any slow-writing program has, and the one that used to split.
+            args: vec![
+                "-c".to_string(),
+                "printf 'half-one|aaaa'; sleep 1; printf 'bbbb\\n'; sleep 30".to_string(),
+            ],
+            cols: 80,
+            rows: 24,
+            memory_max: None,
+            pids_max: None,
+            kill_on_breach: false,
+        })
+        .await;
+    assert!(matches!(control.recv().await, Message::Ok { .. }));
+
+    // A client that cannot tell a partial from a terminated line re-attaches
+    // from `cursor - 1` while the tail is a partial (the cursor rule
+    // `stream_attach` documents: a partial sits at the index it will occupy once
+    // terminated, so re-fetching it is what lets the completion arrive whole).
+    let mut cursor = 0usize;
+    let mut seen: Vec<String> = Vec::new();
+    for _ in 0..4 {
+        let mut attach = Client::connect(&socket).await;
+        attach
+            .send(&Message::Attach {
+                v: VERSION,
+                id: "slow".to_string(),
+                from_line: cursor,
+            })
+            .await;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(6);
+        loop {
+            if std::time::Instant::now() > deadline {
+                break;
+            }
+            match tokio::time::timeout(std::time::Duration::from_millis(700), attach.recv()).await {
+                Ok(Message::Delta { lines, .. }) | Ok(Message::Snapshot { lines, .. }) => {
+                    // Append is only sound for a line the client had already
+                    // fetched as a *partial*: drop it, then re-add the whole
+                    // slice (the daemon re-sends from `cursor`).
+                    if lines
+                        .first()
+                        .is_some_and(|line| line.contains("half-one") && !line.contains("bbbb"))
+                        && seen.last().is_some_and(|last| last == &lines[0])
+                    {
+                        seen.pop();
+                    }
+                    seen.extend(lines);
+                    cursor = seen.len();
+                }
+                Ok(Message::Exited { .. }) => break,
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
+        if seen.iter().any(|line| line.contains("half-one|aaaabbbb")) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    }
+
+    assert!(
+        seen.iter().any(|line| line == "half-one|aaaabbbb"),
+        "the two pieces arrived as one line; the client saw {seen:?}"
+    );
+    // The line the **ring** holds is one line: a fresh reader that never saw the
+    // partial gets the whole thing once. (The streaming client above fetches the
+    // partial and then the same slot again — that is the cursor rule, and it is
+    // why the completion is a replacement in the client's last slot rather than
+    // a second line appended beside it.)
+    let mut reader = Client::connect(&socket).await;
+    reader
+        .send(&Message::Attach {
+            v: VERSION,
+            id: "slow".to_string(),
+            from_line: 0,
+        })
+        .await;
+    let mut fresh: Vec<String> = Vec::new();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    while std::time::Instant::now() < deadline {
+        match tokio::time::timeout(std::time::Duration::from_millis(500), reader.recv()).await {
+            Ok(Message::Delta { lines, .. }) | Ok(Message::Snapshot { lines, .. }) => {
+                fresh.extend(lines)
+            }
+            Ok(_) => {}
+            Err(_) => break,
+        }
+    }
+    let half: Vec<&String> = fresh.iter().filter(|l| l.contains("half-one")).collect();
+    assert_eq!(
+        half,
+        vec![&"half-one|aaaabbbb".to_string()],
+        "a fresh reader sees the line once, whole: {fresh:?}"
+    );
+    // And never the materialised fragments the old ring held.
+    assert!(
+        !fresh.iter().any(|line| line == "half-one|aaaa"),
+        "the ring never held the half-line as its own line: {fresh:?}"
+    );
+}

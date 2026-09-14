@@ -86,7 +86,6 @@ fn ring_buffer_evicts_oldest_and_counts_dropped() {
     for i in 0..10 {
         buf.push_bytes(format!("line-{i}\n").as_bytes());
     }
-    buf.flush_partial();
     let lines = buf.lines();
     assert_eq!(lines.len(), 4, "capacity respected");
     assert_eq!(lines[0], "line-6", "oldest evicted first");
@@ -108,7 +107,6 @@ fn ring_buffer_memory_per_pane_within_budget() {
     let huge = "y".repeat(1024 * 1024);
     buf.push_bytes(huge.as_bytes());
     buf.push_bytes(b"\n");
-    buf.flush_partial();
     assert!(buf.len() <= HOT_LINES, "capacity respected under flood");
     assert!(
         buf.bytes_held() <= 3 * 1024 * 1024,
@@ -128,19 +126,59 @@ fn giant_output_flood_never_grows_unbounded() {
     for i in 0..200_000u32 {
         buf.push_bytes(format!("flood-line-{i:06}-padding-padding\n").as_bytes());
     }
-    buf.flush_partial();
     assert!(buf.len() <= HOT_LINES);
     assert_eq!(buf.dropped(), 200_000 - HOT_LINES as u64);
     assert!(buf.bytes_held() <= 3 * 1024 * 1024);
 }
 
+/// **A partial line is visible to a reader and never enters the ring**
+/// (T-0088). The prompt a harness prints without a trailing newline is the
+/// product's flagship signal, so a reader must see it — but materialising it in
+/// the ring made one written line two entries, permanently, on every surface
+/// (`arreo read`, `attach`, the TUI, the handoff manifest, the snapshot). Both
+/// halves are asserted here, and the second is the one that used to be a
+/// `flush_partial()` + append.
 #[test]
-fn unterminated_prompt_line_is_visible_after_flush() {
+fn unterminated_prompt_line_is_visible_to_a_reader_and_not_materialised() {
     let mut buf = RingBuffer::new(8);
     buf.push_bytes(b"output line\n$ ");
-    buf.flush_partial();
-    let lines = buf.lines();
-    assert_eq!(lines, vec!["output line".to_string(), "$ ".to_string()]);
+    assert_eq!(
+        buf.lines_with_partial(),
+        vec!["output line".to_string(), "$ ".to_string()],
+        "a reader sees the prompt"
+    );
+    assert_eq!(
+        buf.lines(),
+        vec!["output line".to_string()],
+        "and the ring holds only terminated lines"
+    );
+    assert_eq!(buf.pending_line(), "$ ");
+
+    // The program finishes the line: it becomes ONE line, not two.
+    buf.push_bytes(b"echo hi\n");
+    assert_eq!(
+        buf.lines(),
+        vec!["output line".to_string(), "$ echo hi".to_string()],
+        "one written line is one ring line"
+    );
+    assert_eq!(buf.lines_with_partial(), buf.lines());
+}
+
+/// The measured defect, at the ring: a poll between two writes of one line must
+/// not split it (T-0088).
+#[test]
+fn a_poll_between_two_writes_of_one_line_does_not_split_it() {
+    let mut buf = RingBuffer::new(8);
+    buf.push_bytes(b"burst-2|aaaa");
+    // A reader polls here — this is what `drain()` does, and it must not mutate.
+    let seen = buf.lines_with_partial();
+    assert_eq!(seen, vec!["burst-2|aaaa".to_string()]);
+    buf.push_bytes(b"bbbb\nburst-3|done\n");
+    assert_eq!(
+        buf.lines(),
+        vec!["burst-2|aaaabbbb".to_string(), "burst-3|done".to_string()],
+        "the ring holds the line the program wrote, whole"
+    );
 }
 
 #[test]

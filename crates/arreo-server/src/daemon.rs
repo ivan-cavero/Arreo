@@ -3718,6 +3718,12 @@ async fn stream_attach(
         }
         let lines = entry.pane.drain();
         if lines.len() > from_line {
+            // The carriage: the delta is a slice of what `drain` returned, which
+            // may end with the **unterminated trailing line** the program is
+            // still writing (T-0088 — the client is line-indexed, so it can only
+            // append, and a partial delivered as a line would be duplicated when
+            // it completes).
+            let terminated = entry.pane.ring_len();
             write_message(
                 writer,
                 &Message::Delta {
@@ -3729,7 +3735,16 @@ async fn stream_attach(
             )
             .await
             .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "client gone"))?;
-            from_line = lines.len();
+            // **Advance only past terminated lines when the tail is a partial.**
+            // The client's cursor is a line number, and the partial's index is
+            // `terminated`: claiming it as delivered would make the completion —
+            // which lands at that same index when the program writes the rest —
+            // look like a line the client already has, so it would never be sent.
+            from_line = if terminated < lines.len() {
+                terminated
+            } else {
+                lines.len()
+            };
         }
         match entry.pane.try_wait() {
             ExitState::Exited(code) => {
