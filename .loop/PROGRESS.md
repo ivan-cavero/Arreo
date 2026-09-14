@@ -1,32 +1,28 @@
 ## State snapshot          ← REWRITTEN (not appended) at every checkpoint
-Task: **T-0088 DONE** (`8ea5de2`) — the handoff pty-buffer "flake" was a real defect: a
-poll landing mid-line split one written line into two, permanently, for every reader. The
-partial is now visible but never materialised.
+Task: **T-0081 + T-0082 DONE** — both adapter batches closed with the scope note their own
+criteria allow; **T-0089 filed** as the single retry, gated on a credential. The blocker is
+proven, not assumed: the CLIs install and run, and none can drive a turn.
 Where you are: **818 tests / 0 failed / 67 targets**; clippy clean on both toolchains; fmt
-clean; **13/13 slices** (mesh 36+1, compat, handoff-abort 41, tui 80, update 27, persistence
-16); `xtask sync --check` 14/14; bench 6/6; vet 337, deny 4/4, audit 0, check-targets
-PASS/SKIP.
-Next step: **T-0039** (Windows deferred update) — the highest-priority unblocked task; then
-T-0081/T-0082 (adapter batches, gated on live CLIs), T-0085 (CI, blocked on the user's
-T-0063), T-0042's remaining CI half.
+clean; **13/13 slices**; `xtask sync --check` 14/14; bench 6/6; vet 337, deny 4/4, audit 0,
+check-targets PASS/SKIP; `xtask adapters --check` 24/24.
+Next step: **T-0039** (Windows deferred update) — the last unblocked task that is not the
+user's; it unblocks T-0042, which unblocks T-0085. Then T-0089 (gated on a credential).
 Open workers: (none)
 Known broken: T-0063 (CI never-green — the user's) · Parked: T-0048 needs-human
-**T-0088 — the flake was the product.** `Pane::drain()` called `RingBuffer::flush_partial()`,
-which *took* the unterminated trailing line into the lines ring. Any poll landing between two
-writes of one line therefore gave that line two ring entries — permanently, and every reader
-saw it: `arreo read`, `attach` (the ring is the source of its deltas), the TUI's pane view,
-the handoff manifest, the persisted snapshot. Measured through the product, not inferred:
-`arreo read` mid-line printed `burst-2|aaaa…`, and the completion came back as its own line
-`bbbb…`. The fix keeps the partial *visible* (a harness's question without a trailing newline
-is the product's flagship signal) but never *materialised*: `lines_with_partial()` is the
-reader's view, `ring_len()` is the terminated-line count a line-indexed cursor may trust,
-`flush_partial()` is deleted (with `drain` no longer mutating it had no production user, and
-the two must not disagree about what a line is), and `stream_attach` advances its cursor only
-past terminated lines so the completion is re-fetched at its own index instead of being
-skipped as already delivered. Three mutations verified: `ring_len` counting the partial and
-`drain` materialising it each redden the new daemon test; the full pre-fix behaviour restored
-reddens the handoff test with "479 of 480" again. Reproduction needed the *parallel
-test-binary* shape of a workspace run, not CPU load (6 busy loops × 6 runs, all green).
+**T-0081/T-0082 — the queue's phantoms cleared honestly.** Both asked for adapter TOMLs
+behind live recordings and both allow a scope note instead. Codex, [CC], Copilot, Qwen Code,
+Kimi Code and Kilo all install from npm into scratch and all run here — and every one refuses
+a turn for want of a credential (`codex doctor`: "no Codex credentials were found"; `claude
+-p`: "Not logged in"; `kilo run`: "You need to sign in"). No provider key is in the
+environment and `~/.codex`/`~/.claude` are empty. So N = 0, stated, with twelve per-harness
+lines naming the cause and the exact refusal text. `xtask adapters --check` is green at 24/24
+— unchanged, which is the evidence nothing was fabricated. Two npm names that look right are
+different tools (`grok-cli`, `cursor-agent`). The criterion-4 finding is confirmed against
+the real `config.toml` Orca writes: `hooks.state.*.trusted_hash` digests the *local*
+hooks.json, keyed by an absolute path, so it is never syncable — syncing it would re-prompt
+hook trust on every machine. The live facts (codex `resume [SESSION_ID] [PROMPT]`/`--last`;
+[CC] `--resume`/`--continue`/`--fork-session`; four verified versions) are recorded so T-0089
+starts warm, and its first step is a one-command re-probe rather than a rediscovery.
 ## Event log               ← append-only; newest last; never rewrite
 - 2026-09-10 [turn 1] ledger created; repo at e489fac (docs only); T-0001 + T-0022 (AGENTS.md gardened) done
 - 2026-09-10 [turn 2] T-0002 PTY manager done+pushed (342606c; 9 tests); PROMPT.md v2 synced + ADR 0001 (ef6c595)
@@ -201,3 +197,4 @@ test-binary* shape of a workspace run, not CPU load (6 busy loops × 6 runs, all
 
 - 2026-09-14 [turn 79] T-0086 done. The delegated worker died mid-edit (HTTP 400 from the harness) after landing the protocol, identity, engine, daemon and CLI changes; the planner took the unit over (per §7), finished the integration (proto re-exports, the CLI's `block_on` return shape, the sync slice's per-root device identities, `--name` vs `--machine`), then froze the code and delegated the two-machine proof. Verified independently: forged-identity mutation (accepted without the check — 2 checks red) and last-writer-wins mutation (3 checks red). A real clippy finding from the change: `SyncOutcome` is 120 bytes, which took `Message` to 128 and tripped `result_large_err` on two pre-existing functions — boxed, back to 112. ADR 0022 written. One flake observed and filed (T-0088, handoff pty-buffer test under parallel load: 1 failure in 3 full runs, 3/3 clean alone, 816/0 on the next full run). Battery: 816/67, both clippys, fmt, 14/14 slices, sync 14/14, bench 6/6, gates green.
 - 2026-09-14 [turn 80] T-0088 done + pushed (8ea5de2). Filed as a load-sensitive flake; it was a real defect. `Pane::drain()` called `RingBuffer::flush_partial()`, which took the unterminated trailing line into the ring, so a poll landing between two writes of one line split that line permanently for every reader (`arreo read`, `attach`, the TUI, the handoff manifest, the persisted snapshot). Fix: `RingBuffer::lines_with_partial()` (the reader view, non-mutating), `Pane::ring_len()` (the terminated-line count), `flush_partial()` deleted, and `stream_attach` advancing its cursor only past terminated lines so the completion is re-fetched at its own index. Reproduced with the parallel test-binary shape (3x `--test handoff` + `relay_daemon`, 8 rounds): 1 failure in 24 pre-fix, 0 in 24 post-fix; synthetic CPU load alone never reproduced it. Three mutations red. The test that pinned the materialisation asserted the defect and was replaced by two tests that assert what a reader sees and that the ring stays one-line-per-written-line. Battery on the fixed tree: 818 tests / 0 failed / 67 targets, clippy clean on both toolchains, fmt clean, vet 337, deny 4/4, audit 0, check-targets PASS/SKIP, 13/13 slices, `xtask sync --check` 14/14, bench 6/6.
+- 2026-09-14 [turn 81] T-0081 + T-0082 closed with the scope note each task allows; T-0089 filed as the single retry (gated on a credential, first step a one-command re-probe). The blocker is proven: Codex 0.154.0, [CC] 2.1.270, Copilot 1.0.83, Qwen Code 0.23.3, Kimi Code 0.42.0 and Kilo 7.6.2 all install from npm into scratch and all run, and every one refuses a turn for want of a credential; no provider key in the environment and `~/.codex`/`~/.claude` empty here. N = 0, stated; twelve per-harness lines with the exact refusal text; `xtask adapters --check` 24/24 unchanged (nothing fabricated). Two npm names that look right are different tools (`grok-cli`, `cursor-agent`). Criterion-4 finding confirmed against the real config.toml Orca writes: `hooks.state.*.trusted_hash` digests the local hooks.json, so it is never syncable.
