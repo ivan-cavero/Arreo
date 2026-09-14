@@ -27,5 +27,5 @@ pub use persist::{db_path_for, restore, snapshot, PersistError};
 pub use protocol::{AgentState, Message, PaneInfo, VERSION};
 pub use relay_client::{
     backoff_delay, load_config, own_identity, RelayContext, RelaySession, RelaySettings,
-    RelayStream, SessionError,
+    RelayStream, SessionError, WorktreeSettings,
 };

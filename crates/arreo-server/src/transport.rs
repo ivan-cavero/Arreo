@@ -22,7 +22,7 @@
 //!   replay cannot be re-established and one peer cannot make the daemon do
 //!   unbounded handshake work.
 
-use crate::daemon::{serve_session, Registry, SessionAuth, Sessions};
+use crate::daemon::{serve_session, ServeContext, SessionAuth};
 use crate::devices::DeviceAuthority;
 use arreo_core::identity::keys::{NoiseStatic, RootKey};
 use arreo_core::identity::{DeviceId, VerifyingKey};
@@ -80,9 +80,7 @@ pub async fn serve(
     local: NoiseStatic,
     authority: Arc<Mutex<DeviceAuthority>>,
     ledger: arreo_core::mesh::SharedLedger,
-    registry: Registry,
-    sessions: Sessions,
-    db: PathBuf,
+    context: ServeContext,
 ) -> Result<(), QuicError> {
     // Shared across connections: the limiter is the per-peer handshake budget,
     // the guard is the replay memory, and both only mean anything if they span
@@ -107,9 +105,7 @@ pub async fn serve(
         let guard = Arc::clone(&guard);
         let authority = Arc::clone(&authority);
         let ledger = ledger.clone();
-        let registry = Arc::clone(&registry);
-        let sessions = Arc::clone(&sessions);
-        let db = db.clone();
+        let context = context.clone();
         tokio::spawn(async move {
             let resolution = Arc::clone(&authority);
             let session = match accept_session(
@@ -151,8 +147,7 @@ pub async fn serve(
             eprintln!("arreo-server: remote session from {}", session.device);
 
             let (reader, writer) = tokio::io::split(session.channel);
-            if let Err(e) = serve_session(reader, writer, registry, sessions, db, Some(auth)).await
-            {
+            if let Err(e) = serve_session(reader, writer, context, Some(auth)).await {
                 eprintln!("daemon: remote connection error: {e}");
             }
         });
@@ -217,14 +212,12 @@ pub async fn listen_on(
     local: NoiseStatic,
     authority: Arc<Mutex<DeviceAuthority>>,
     ledger: arreo_core::mesh::SharedLedger,
-    registry: Registry,
-    sessions: Sessions,
-    db: PathBuf,
+    context: ServeContext,
 ) -> Result<SocketAddr, QuicError> {
     let endpoint = server_endpoint(addr)?;
     let bound = endpoint.local_addr().map_err(QuicError::Io)?;
     tokio::spawn(async move {
-        if let Err(e) = serve(endpoint, local, authority, ledger, registry, sessions, db).await {
+        if let Err(e) = serve(endpoint, local, authority, ledger, context).await {
             eprintln!("arreo-server: remote transport stopped: {e}");
         }
     });
@@ -234,7 +227,7 @@ pub async fn listen_on(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::daemon::PaneEntry;
+    use crate::daemon::{PaneEntry, Registry, ServeContext, Sessions};
     use arreo_core::identity::authority::sidecar_db;
     use arreo_core::identity::role::Role;
     use arreo_core::identity::DeviceKey;
@@ -345,9 +338,14 @@ mod tests {
             root.noise_static(),
             Arc::clone(&authority),
             ledger,
-            registry,
-            sessions,
-            scratch.layout.store.clone(),
+            ServeContext {
+                registry,
+                sessions,
+                db: scratch.layout.store.clone(),
+                // No `[worktree]` section in this test's world, which is the
+                // default the daemon itself runs with (T-0091).
+                worktree: arreo_core::relay::config::WorktreeSettings::default(),
+            },
         )
         .await
         .expect("the listener binds");

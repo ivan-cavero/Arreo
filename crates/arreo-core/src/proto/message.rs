@@ -175,6 +175,36 @@ pub enum Message {
         #[serde(default)]
         kill_on_breach: bool,
     },
+    /// Client → server: spawn a pane **in a git worktree** (T-0091).
+    ///
+    /// The same request as [`Message::Spawn`] with one more fact: the pane starts
+    /// in its own `git worktree`, so two agents on one machine cannot touch each
+    /// other's files. The daemon makes (or reuses) the worktree and uses its path
+    /// as the child's working directory.
+    ///
+    /// **A variant rather than a field on `Spawn`, and the reason is the codec.**
+    /// `rmp-serde` encodes a struct as a *positional array*: one more element is a
+    /// wire break in the direction `#[serde(default)]` cannot cover — a new
+    /// client's `Spawn` would be unreadable by an old server, which is precisely
+    /// the case the N−1 window (T-0028, ADR 0017) exists to keep working. An old
+    /// daemon answers an unknown request with a typed `Error` and keeps the
+    /// session open, so a client learns the daemon is too old to make worktrees
+    /// rather than silently spawning a pane in the wrong directory. [`PaneDetail`]
+    /// carries the same reasoning for the reply side.
+    ///
+    /// **The spawn payload is boxed** ([`SpawnSpec`]) for the same reason
+    /// [`Message::SyncReply`]'s outcome is: the enum is as large as its largest
+    /// variant and every frame copies it, so this variant may not add a field's
+    /// worth of width to the whole protocol (T-0091). The wire shape is
+    /// unchanged — `serde` delegates through a `Box` transparently.
+    SpawnWorktree {
+        v: u32,
+        id: String,
+        spec: Box<SpawnSpec>,
+        /// `None` or `Some("")` means "use the pane id".
+        #[serde(default)]
+        worktree: Option<String>,
+    },
     /// Server → client: pane list — id, liveness, alert. Unchanged from v0.
     Panes { v: u32, panes: Vec<PaneInfo> },
     /// Client → server: the same list **with every pane's derived detail**
@@ -377,6 +407,32 @@ pub enum Message {
         /// corpus test pins.
         outcome: Box<SyncOutcome>,
     },
+}
+
+/// The pane a [`Message::SpawnWorktree`] asks for: everything
+/// [`Message::Spawn`] carries, in one boxed struct.
+///
+/// **Boxed because the variant's size is the enum's size**, and the enum is
+/// copied per frame — the same reason [`SyncOutcome`] is boxed (T-0086). The
+/// fields are `Spawn`'s, with the same `#[serde(default)]` discipline: a
+/// `SpawnWorktree` from a peer of this build encodes as the same positional
+/// array it would have inline, so the box is a memory decision and not a wire
+/// one.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SpawnSpec {
+    pub program: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default = "default_cols")]
+    pub cols: u16,
+    #[serde(default = "default_rows")]
+    pub rows: u16,
+    #[serde(default)]
+    pub memory_max: Option<u64>,
+    #[serde(default)]
+    pub pids_max: Option<u32>,
+    #[serde(default)]
+    pub kill_on_breach: bool,
 }
 
 /// One file's payload, as the exchange carries it (T-0086).
@@ -812,5 +868,19 @@ mod tests {
 
         // 4. And it round-trips for a peer that does speak it.
         assert_eq!(codec::decode(&bytes).expect("decode"), detail);
+    }
+
+    /// The enum is copied per frame, so its size is a budget, not a detail: the
+    /// largest variant sets it. T-0086 boxed `SyncOutcome` to get from 128 to 112,
+    /// and T-0091 boxed `SpawnSpec` to get back to 112 from 136. If a future variant
+    /// makes this fail, box that variant's payload — do not raise the number.
+    #[test]
+    fn the_message_enum_stays_at_its_budget() {
+        assert_eq!(
+            std::mem::size_of::<Message>(),
+            112,
+            "the largest variant sets the enum's size and every frame copies it; \
+             box the payload of whatever variant grew, do not raise this number"
+        );
     }
 }

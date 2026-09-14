@@ -8,6 +8,7 @@
 use std::io::{Read, Write};
 #[cfg(unix)]
 use std::os::unix::io::{AsFd, BorrowedFd, OwnedFd};
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
@@ -78,6 +79,16 @@ pub enum PtyError {
     /// descriptor would leave the agent with the daemon that exits.
     #[error("the pane's master has no descriptor to transfer")]
     NoMasterFd,
+    /// [`Pane::spawn_in_dir`] was given a working directory that is not there.
+    ///
+    /// **Refused rather than passed on**, and this is a correction rather than a
+    /// nicety: `portable-pty`'s `CommandBuilder` drops a `cwd` that is not a
+    /// directory and falls back to the parent process's home. A spawn into a
+    /// worktree that had been deleted would therefore have put the agent in
+    /// `$HOME` — silently, and with the agent's own output naming a path nobody
+    /// chose. A spawn that cannot run where it was told does not run.
+    #[error("the working directory {0} does not exist")]
+    NoSuchDirectory(String),
 }
 
 /// Bounded line-oriented ring buffer.
@@ -674,6 +685,39 @@ impl Pane {
         rows: u16,
         env: &[(String, String)],
     ) -> Result<Self, PtyError> {
+        Self::spawn_in_dir(program, args, cols, rows, env, None)
+    }
+
+    /// The same spawn with the child's **working directory** set (T-0091).
+    ///
+    /// A third parameter on the one spawn rather than a third spawn: everything
+    /// above this line — the pty pair, the assembled reader, the pump — is
+    /// identical, and a second implementation is a second place for the two to
+    /// drift. `None` means the daemon's own directory, which is what every pane
+    /// before worktrees got.
+    ///
+    /// The directory is *not* created here: the caller owns it (the daemon makes
+    /// the worktree first, and refuses the spawn if it could not). A spawn that
+    /// silently made a directory would put an agent in a checkout nobody set up.
+    pub fn spawn_in_dir(
+        program: &str,
+        args: &[&str],
+        cols: u16,
+        rows: u16,
+        env: &[(String, String)],
+        cwd: Option<&Path>,
+    ) -> Result<Self, PtyError> {
+        // **Checked here, because the alternative is silent.** `portable-pty`'s
+        // `CommandBuilder` filters its `cwd` with `is_dir()` and falls back to
+        // the parent's home when it does not match: a spawn into a deleted
+        // worktree would have run the agent in `$HOME`, with no error anywhere
+        // and the agent's own output naming a directory nobody chose. A spawn
+        // that cannot run where it was told does not run.
+        if let Some(dir) = cwd {
+            if !dir.is_dir() {
+                return Err(PtyError::NoSuchDirectory(dir.display().to_string()));
+            }
+        }
         let pty_system = native_pty_system();
         let pair = pty_system.openpty(PtySize {
             rows,
@@ -683,6 +727,9 @@ impl Pane {
         })?;
         let mut cmd = CommandBuilder::new(program);
         cmd.args(args);
+        if let Some(dir) = cwd {
+            cmd.cwd(dir);
+        }
         for (name, value) in env {
             cmd.env(name, value);
         }

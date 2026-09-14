@@ -1,0 +1,151 @@
+T-0091 — worktree-per-task
+==========================
+
+One sentence: `arreo spawn <id> <program> --worktree [NAME]` gives a pane its own
+`git worktree` on its own branch (`arreo/<NAME>`), so two agents on one machine
+cannot touch each other's files — the collision every multi-agent harness hits
+first, and the first bullet of ROADMAP §6 Phase 4.
+
+WHAT WAS BUILT
+--------------
+- `arreo_core::worktree` (new): the whole of the git plumbing in one place —
+  `is_safe_pane_id`, `branch_for`, `path_for`, `default_root`, `repo_root`,
+  `list`/`find`, `status`/`is_dirty`, `ensure`, `remove`, `prune_clean`, and the
+  `--porcelain` parser as a pure function.
+- `Pane::spawn_in_dir` (new): the one spawn, with the child's working directory.
+  `spawn_with_env` delegates to it with `None`, so there is one spawn rather than
+  two that can drift.
+- `Message::SpawnWorktree` (new variant) — a variant and not a field on `Spawn`
+  because `rmp-serde` encodes a struct as a **positional array**: one more element
+  on `Spawn` would be unreadable by an older server, which the N−1 window
+  (T-0028/ADR 0017) forbids. Wire tag `spawn_worktree`, classified as a Request.
+- `[worktree] root` / `[worktree] repo` in the daemon's config file (the same
+  file the `[relay]` and `[tui]` sections live in — one parser).
+- Daemon: `SpawnWorktree` makes/reuses the worktree (in `spawn_blocking`) before
+  anything is forked, then spawns the pane there; killing a pane removes a clean
+  worktree and **keeps a dirty one**, printing the files it kept; a restored pane
+  comes back in its own worktree; `panes.worktree` (store schema **v10**) carries
+  the path so a restore does not have to re-derive a machine's decision.
+- CLI: `arreo spawn … --worktree [NAME]`, `arreo worktrees list [--json]` (works
+  with **no daemon**, reporting liveness as unknown), `arreo worktrees remove
+  <pane> [--force]` (refuses a live pane, then a dirty worktree, naming which).
+- `docs/worktrees.md`; `cargo xtask e2e --slice worktree` (9 checks).
+
+THE TWO RULES THAT ARE NOT NEGOTIABLE, AND HOW THEY ARE ENFORCED
+---------------------------------------------------------------
+1. **A dirty worktree is never deleted.** `remove` reads `git status --porcelain`
+   first and refuses, naming the files; the daemon's kill path calls it with
+   `force = false` and reports a refusal rather than failing the kill.
+2. **A pane id is a directory name, and is validated as one.** `is_safe_pane_id`
+   allows `[A-Za-z0-9._-]`, at most 64 bytes, and refuses `.`, `..` and a leading
+   `-`. `root.join("../../etc")` escapes the worktree root, and a silent
+   sanitisation would turn two panes named `a/b` and `a_b` into one directory.
+
+TWO DEFECTS FOUND WHILE WIRING, BOTH BY A WORKER, BOTH REAL
+-----------------------------------------------------------
+Both were in the *core* module the planner had frozen, and both were fixed there
+with tests:
+
+- **A worktree whose directory vanished was returned as if it were there.**
+  `git worktree list` keeps reporting a deleted worktree (marked `prunable`), so
+  `ensure`'s reuse branch handed back a path that did not exist. `ensure` now
+  prunes the stale registration and re-creates the checkout on the branch, which
+  is where the work is; `remove` clears a stale registration instead of calling
+  `git status` on a missing path.
+- **A spawn with a missing working directory was not an error at all.**
+  `portable-pty`'s `CommandBuilder` drops a `cwd` that is not a directory and
+  falls back to the process's home — so the pane above would have run in `$HOME`,
+  silently, with the agent's own output naming a directory nobody chose.
+  `Pane::spawn_in_dir` now refuses a `cwd` that is not a directory
+  (`PtyError::NoSuchDirectory`). This is the "never lie" rule applied to a
+  library's quiet fallback.
+
+PROOF 1 — the unit tests (`cargo test -p arreo-core --lib worktree` → 12 passed)
+------------------------------------------------------------------------------
+`a_pane_id_is_validated_as_a_directory_name` (including `../../etc/passwd`),
+`porcelain_parsing_handles_branches_and_prunable_entries`,
+`ensure_makes_a_worktree_and_reuses_it`,
+`two_worktrees_do_not_share_a_working_directory` (the same filename, different
+contents, in both), `a_dirty_worktree_is_refused_and_the_refusal_names_the_files`,
+`a_removed_worktree_can_be_recreated_on_its_branch`,
+`a_foreign_directory_at_the_worktree_path_is_refused`,
+`a_path_that_is_not_a_repository_is_refused_and_creates_nothing`,
+`a_worktree_whose_directory_vanished_is_recreated`,
+`removing_a_worktree_whose_directory_vanished_clears_the_registration`,
+`a_spawn_into_a_missing_directory_is_refused`,
+`prune_clean_keeps_a_dirty_worktree_and_removes_the_rest`.
+
+PROOF 2 — the daemon integration tests (`cargo test -p arreo-server --test worktree` → 4 passed)
+----------------------------------------------------------------------------------------------
+Real daemon, real `git`, real child processes:
+`two_panes_in_worktrees_cannot_see_each_others_files` (each child writes its own
+`pwd`, and the same filename with different contents lands in two checkouts while
+the main one is untouched), `an_escaping_worktree_name_is_refused_and_creates_nothing`
+(the refusal names `../../escape`, no directory is made anywhere, and no pane
+exists afterwards), `a_killed_pane_leaves_a_dirty_worktree_and_removes_a_clean_one`
+(both branches survive), `a_plain_spawn_is_unchanged`.
+
+PROOF 3 — the slice (`cargo xtask e2e --slice worktree` → 9 passed, 0 failed)
+---------------------------------------------------------------------------
+Run by the planner on the final tree: fixtures, two panes/two worktrees, disjoint
+file edits, the child's own cwd, the main checkout untouched, the dirty refusal
+naming the files, the live refusal (a different refusal, told apart from the dirty
+one), the clean remove with the branch kept, and `list --json` both with a daemon
+and with none (liveness `null`, exit 0, note on stderr so the JSON stays parseable).
+
+PROOF 4 — the product surface, by hand (transcript below)
+---------------------------------------------------------
+```
+$ arreo spawn fix /bin/sh -c "echo alpha > task.txt; sleep 300" --worktree --socket $S
+spawned fix (worktree fix)
+$ arreo spawn review /bin/sh -c "echo beta > task.txt; sleep 300" --worktree review --socket $S
+spawned review (worktree review)
+$ arreo worktrees list --repo $REPO --config $CFG --socket $S
+            PANE  STATE    LIVENESS  BRANCH                PATH
+             fix  dirty    live      arreo/fix             …/worktrees/fix
+          review  dirty    live      arreo/review          …/worktrees/review
+$ cat …/worktrees/fix/task.txt ; cat …/worktrees/review/task.txt
+alpha
+beta
+$ git -C $REPO status --porcelain          # the main checkout, untouched
+(empty)
+$ arreo worktrees remove fix --repo $REPO --config $CFG --socket $S
+worktrees remove: fix is live; that agent is working in this worktree (--force removes it anyway)
+exit=1
+$ arreo worktrees remove fix … --force
+removed …/worktrees/fix
+branch arreo/fix kept (the commits are on it; `git branch -D arreo/fix` deletes it)
+$ git -C $REPO branch --list "arreo/*"
+  arreo/fix
++ arreo/review
+```
+And with no daemon at all: `arreo worktrees list` prints
+`(no daemon: liveness unknown)` **on stderr** and still lists both worktrees with
+`live: null` in `--json` (verified: the JSON line parses under `jq`, exit 0).
+
+PROOF 5 — restore (the persistence criterion), by hand
+------------------------------------------------------
+```
+spawn agent (worktree agent)          # writes marker.txt in its worktree
+kill -9 <daemon> ; restart
+arreo panes          -> agent alive
+arreo worktrees list -> agent dirty live arreo/agent …/worktrees/agent
+```
+And the child's own proof, using a script that writes `pwd` to `where-$$.txt`:
+after a `kill -9` and a restart, **two** files are in the worktree —
+`where-1044550.txt` and `where-1044805.txt` (the original child and the restored
+one) — both containing the worktree path, and **no** `where-*.txt` outside it.
+Then, with the daemon down, `rm -rf` the worktree: the next start re-created it
+(README.md back from the branch, a new `where-1048530.txt` written by the new
+child), and the pane was alive rather than started in the daemon's directory.
+
+MUTATIONS (each reddens what it should; run by the planner)
+----------------------------------------------------------
+- `is_safe_pane_id` allowing `.`/`..` → `a_pane_id_is_validated_as_a_directory_name` red.
+- `remove` skipping the dirty check → the dirty-refusal test and the prune test red.
+- `ensure` returning a stale (prunable) registration → the vanished-worktree test red.
+- `Pane::spawn_in_dir` skipping the `is_dir` check → the missing-directory test red
+  (i.e. the silent `$HOME` fallback is real, and the check is what stops it).
+- The daemon ignoring the worktree path when spawning (`cwd: None`) → the **slice**
+  reddens 4 checks: disjoint file edits, the child's own cwd, the dirty refusal
+  and the live refusal.

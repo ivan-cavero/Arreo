@@ -64,6 +64,73 @@ struct ConfigFile {
     relay: Option<RelaySection>,
     #[serde(default)]
     tui: Option<TuiSection>,
+    #[serde(default)]
+    worktree: Option<WorktreeSection>,
+}
+
+/// The `[worktree]` section of a configuration file (T-0091).
+///
+/// Where worktree-per-task checkouts live, and which repository they come from.
+/// Both are optional: a machine that never passes `--worktree` reads neither, and
+/// the defaults (the state directory, and the daemon's own working directory) are
+/// what an operator who started the daemon in the repository they serve would
+/// have typed anyway.
+#[derive(Debug, Clone, Deserialize)]
+struct WorktreeSection {
+    /// The directory worktrees are made under. Default:
+    /// `<state>/worktrees` — see [`crate::worktree::default_root`].
+    #[serde(default)]
+    root: Option<String>,
+    /// The repository worktrees are made from. Default: the daemon's working
+    /// directory.
+    #[serde(default)]
+    repo: Option<String>,
+}
+
+/// The `[worktree]` section, resolved: what the file asks for, with `None` where
+/// it asks for nothing.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WorktreeSettings {
+    /// `Some(path)` = worktrees live under this directory.
+    pub root: Option<String>,
+    /// `Some(path)` = worktrees come from this repository.
+    pub repo: Option<String>,
+}
+
+impl WorktreeSettings {
+    /// Read the `[worktree]` section, if there is one.
+    ///
+    /// Same contract as [`TuiSettings::load`]: a missing file or a missing
+    /// section is the default, and a file that does not parse is an error rather
+    /// than a silent no-op — the user named this file.
+    pub fn load(path: &Path) -> Result<Self, ConfigError> {
+        let text = match std::fs::read_to_string(path) {
+            Ok(text) => text,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Self::default()),
+            Err(e) => {
+                return Err(ConfigError::Io {
+                    path: path.display().to_string(),
+                    detail: e.to_string(),
+                })
+            }
+        };
+        let parsed: ConfigFile = toml::from_str(&text).map_err(|e| ConfigError::Parse {
+            path: path.display().to_string(),
+            detail: e.to_string(),
+        })?;
+        Ok(Self {
+            root: parsed
+                .worktree
+                .as_ref()
+                .and_then(|section| section.root.clone())
+                .filter(|root| !root.trim().is_empty()),
+            repo: parsed
+                .worktree
+                .as_ref()
+                .and_then(|section| section.repo.clone())
+                .filter(|repo| !repo.trim().is_empty()),
+        })
+    }
 }
 
 /// The `[tui]` section, resolved: what the file asks for, with `None` where it

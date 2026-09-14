@@ -20,6 +20,7 @@ use arreo_core::proto::{
     AgentState, Message, PaneDetail, PaneInfo, SyncExchange, SyncOutcome, SyncStatus, VERSION,
 };
 use arreo_core::pty::{ExitState, Pane};
+use arreo_core::relay::config::WorktreeSettings;
 use arreo_core::state::{Adapter, AdapterRegistry, Confidence, Engine, State};
 use arreo_core::sync::engine::{ReceiveOutcome, SyncEngine, SyncPayload};
 use std::collections::HashMap;
@@ -97,6 +98,19 @@ pub struct PaneEntry {
     /// line — so a handoff that carried only the journal would lose the
     /// `Blocked` state an alert put the pane in. Kept for exactly that transfer.
     pub last_alert_line: Mutex<Option<String>>,
+    /// The pane's git worktree, when it has one (T-0091): the path the child was
+    /// started in, and the path a kill removes and a restore re-creates. `None`
+    /// for every pane that is not in a worktree — which is every pane a client
+    /// did not ask for one.
+    ///
+    /// A `Mutex` rather than a plain field for one reason: the three
+    /// [`PaneEntry::with_adapter`] call sites (spawn, split, restore) have to keep
+    /// their signature, and only the worktree spawn has a path to hand it at
+    /// construction time. The window between the insert and the `set_worktree`
+    /// that follows it is a kill arriving on the same id, which reads `None` and
+    /// removes nothing — the pane's own directory is left for `arreo worktree`
+    /// rather than deleted on a guess.
+    pub worktree: Mutex<Option<PathBuf>>,
 }
 
 impl PaneEntry {
@@ -168,6 +182,7 @@ impl PaneEntry {
             alert_state: Mutex::new(arreo_core::enforce::AlertState::default()),
             pending_alerts: Mutex::new(Vec::new()),
             last_alert_line: Mutex::new(None),
+            worktree: Mutex::new(None),
         }
     }
 
@@ -205,6 +220,23 @@ impl PaneEntry {
     /// process owns the pane for good.
     pub fn adopt_guard(&self, guard: arreo_core::enforce::Guard) {
         *self.guard.lock().unwrap_or_else(|e| e.into_inner()) = Some(guard);
+    }
+
+    /// Record the worktree this pane was started in (T-0091). Called by the one
+    /// path that made one, right after the registry insert: the entry has no
+    /// room for it at construction time (see the field).
+    pub fn set_worktree(&self, path: PathBuf) {
+        *self.worktree.lock().unwrap_or_else(|e| e.into_inner()) = Some(path);
+    }
+
+    /// This pane's worktree, if it has one: what a snapshot records and what a
+    /// kill removes.
+    #[must_use]
+    pub fn worktree(&self) -> Option<PathBuf> {
+        self.worktree
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// Whether this pane is under enforcement right now (T-0019/T-0038).
@@ -531,6 +563,22 @@ pub struct LiveSessions {
 /// Shared live-session registry (see [`LiveSessions`]).
 pub type Sessions = Arc<LiveSessions>;
 
+/// What every session needs that is not per-connection state: the pane
+/// registry, the live-session table, the store path, and this machine's
+/// worktree settings. One struct so that adding a shared setting does not
+/// lengthen every signature that carries it (T-0091).
+///
+/// Cloned per connection — every field is an `Arc` or a small path/settings
+/// value — and passed by value down the session loop, which destructures it
+/// once so the verb path reads exactly as it did when these were parameters.
+#[derive(Clone)]
+pub struct ServeContext {
+    pub registry: Registry,
+    pub sessions: Sessions,
+    pub db: PathBuf,
+    pub worktree: WorktreeSettings,
+}
+
 impl LiveSessions {
     /// Register one session for `device`; returns the guard that unregisters
     /// it. The guard is the cleanup: dropping it (session end, any reason)
@@ -610,6 +658,17 @@ pub struct Daemon {
     /// requires `'static`, so the session cannot borrow `self` — it holds a
     /// clone of this flag instead.
     stop_accepting: Arc<std::sync::atomic::AtomicBool>,
+    /// The `[worktree]` section of the daemon's configuration file (T-0091):
+    /// which repository a worktree comes from, and where checkouts live. Both
+    /// `None` — the default, and every daemon started without a configuration
+    /// file — means "the repository this daemon was started in, under the state
+    /// directory's `worktrees/`".
+    ///
+    /// Cloned into every session, because the verbs that use it (`SpawnWorktree`,
+    /// `Kill`, the boot restore) are handled per connection: one value, read at
+    /// the composition root, so a request can never see a different answer from
+    /// the one the daemon was started with.
+    worktree: WorktreeSettings,
 }
 
 impl Daemon {
@@ -623,7 +682,19 @@ impl Daemon {
             sessions: Arc::new(LiveSessions::default()),
             instance: std::sync::Mutex::new(None),
             stop_accepting: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            worktree: WorktreeSettings::default(),
         }
+    }
+
+    /// Run with the `[worktree]` settings from the daemon's configuration file
+    /// (T-0091). The binary calls this when it was started with
+    /// `--config`/`$ARREO_CONFIG`; without one the defaults stand (see the
+    /// field), which is a working daemon that makes worktrees in the repository
+    /// it was started in.
+    #[must_use]
+    pub fn with_worktree_settings(mut self, settings: WorktreeSettings) -> Self {
+        self.worktree = settings;
+        self
     }
 
     /// The socket this daemon serves. The handoff path needs it (the session
@@ -670,45 +741,71 @@ impl Daemon {
     /// serving). Failures restore partially (bad records skipped loudly) —
     /// a corrupt DB never blocks the daemon.
     async fn restore_boot(&self) {
-        match super::persist::restore(&self.db, arreo_core::state::AdapterRegistry::builtin()) {
-            Ok(restored) => {
-                if restored.is_empty() {
-                    return;
-                }
-                let mut registry = self.registry.write().await;
-                for pane in restored {
-                    if registry.contains_key(&pane.id) {
-                        continue;
-                    }
-                    // The record's own harness decides the adapter (falling
-                    // back to the program for a pre-v8 row); the session it
-                    // resumed is re-hung on the entry so the next snapshot
-                    // keeps it.
-                    let program = pane.pane.spawn_spec().program;
-                    let adapter = arreo_core::state::AdapterRegistry::builtin()
-                        .for_record(pane.harness.as_deref(), &program)
-                        .clone();
-                    registry.insert(
-                        pane.id,
-                        Arc::new(PaneEntry::with_adapter(
-                            pane.pane,
-                            None,
-                            false,
-                            adapter,
-                            pane.session_id,
-                        )),
-                    );
-                }
-                eprintln!(
-                    "daemon: restored {} pane(s) from {}",
-                    registry.len(),
-                    self.db.display()
-                );
+        // The whole restore blocks: it spawns children, waits out the resume
+        // grace a refused one needs, and (T-0091) shells out to `git` to re-make
+        // every worktree. It runs before the first client is served, so a
+        // blocking thread is where it belongs — not a runtime worker.
+        let db = self.db.clone();
+        let settings = self.worktree.clone();
+        let restored = tokio::task::spawn_blocking(move || {
+            super::persist::restore(
+                &db,
+                arreo_core::state::AdapterRegistry::builtin(),
+                |recorded: Option<String>| restore_worktree_dir(&settings, recorded.as_deref()),
+            )
+        })
+        .await;
+        let restored = match restored {
+            Ok(Ok(restored)) => restored,
+            Ok(Err(e)) => {
+                eprintln!("daemon: restore failed (starting empty): {e}");
+                return;
             }
             Err(e) => {
-                eprintln!("daemon: restore failed (starting empty): {e}");
+                eprintln!("daemon: restore task failed (starting empty): {e}");
+                return;
             }
+        };
+        if restored.is_empty() {
+            return;
         }
+        let mut registry = self.registry.write().await;
+        for restored in restored {
+            let super::persist::RestoredPane {
+                id,
+                pane,
+                harness,
+                session_id,
+                worktree,
+            } = restored;
+            if registry.contains_key(&id) {
+                continue;
+            }
+            // The record's own harness decides the adapter (falling
+            // back to the program for a pre-v8 row); the session it
+            // resumed is re-hung on the entry so the next snapshot
+            // keeps it.
+            let program = pane.spawn_spec().program;
+            let adapter = arreo_core::state::AdapterRegistry::builtin()
+                .for_record(harness.as_deref(), &program)
+                .clone();
+            let entry = Arc::new(PaneEntry::with_adapter(
+                pane, None, false, adapter, session_id,
+            ));
+            // T-0091: the pane came back in its worktree (the directory the
+            // resolver proved), so the *next* snapshot keeps it — a restored
+            // worktree pane must not forget, on its very first write, the fact
+            // it was restored with.
+            if let Some(dir) = worktree {
+                entry.set_worktree(dir);
+            }
+            registry.insert(id, entry);
+        }
+        eprintln!(
+            "daemon: restored {} pane(s) from {}",
+            registry.len(),
+            self.db.display()
+        );
     }
 
     /// Snapshot the registry to disk (spawn/kill/shutdown callers). Errors
@@ -721,8 +818,9 @@ impl Daemon {
         }
     }
 
-    /// The registry, as the record wants it: each pane plus the two facts only
-    /// the entry knows — the harness it runs under and the session it is on.
+    /// The registry, as the record wants it: each pane plus the facts only
+    /// the entry knows — the harness it runs under, the session it is on, and
+    /// (T-0091) the worktree it was started in.
     async fn snapshot_panes(&self) -> Vec<super::persist::SnapshotPane> {
         self.registry
             .read()
@@ -733,6 +831,7 @@ impl Daemon {
                 pane: Arc::clone(&entry.pane),
                 harness: entry.harness.clone(),
                 session_id: entry.session(),
+                worktree: entry.worktree(),
             })
             .collect()
     }
@@ -1119,11 +1218,18 @@ impl Daemon {
                 // The socket file stays either way.
                 return Ok(());
             }
-            let registry = Arc::clone(&self.registry);
-            let sessions = Arc::clone(&self.sessions);
-            let db = self.db.clone();
             let socket = self.socket.clone();
             let stop_accepting = Arc::clone(&self.stop_accepting);
+            // What every session needs that is not per-connection state, in one
+            // value: a shared setting costs no signature length (T-0091). The
+            // `[worktree]` settings travel per session because the spawn, the
+            // kill and the restore all need them.
+            let context = ServeContext {
+                registry: Arc::clone(&self.registry),
+                sessions: Arc::clone(&self.sessions),
+                db: self.db.clone(),
+                worktree: self.worktree.clone(),
+            };
             // Owned dups for the session: `send_fd` dups them into the peer, so
             // the loop keeps its own. A dup of a listener is itself a listener;
             // a dup of the lock shares the same open file description and
@@ -1156,7 +1262,7 @@ impl Daemon {
                     lock_fd,
                     stop_accepting,
                 });
-                if let Err(e) = handle(stream, registry, sessions, db, handoff).await {
+                if let Err(e) = handle(stream, context, handoff).await {
                     eprintln!("daemon: connection error: {e}");
                 }
             });
@@ -1379,9 +1485,7 @@ static GARBAGE_FRAMES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU
 /// Connection handler for the local Unix socket: Hello→Welcome, then verbs.
 async fn handle(
     stream: UnixStream,
-    registry: Registry,
-    sessions: Sessions,
-    db: PathBuf,
+    context: ServeContext,
     handoff: Option<HandoffCtx>,
 ) -> Result<(), DaemonError> {
     let (reader, writer) = stream.into_split();
@@ -1396,7 +1500,7 @@ async fn handle(
     // under `umask 022`) a same-**group** peer reaches every verb here, `Handoff`
     // included. The mode is the gate; narrowing it is T-0078's decision, and this
     // session's `auth: None` deliberately does not pretend otherwise.
-    serve_session_with_handoff(reader, writer, registry, sessions, db, None, handoff).await
+    serve_session_with_handoff(reader, writer, context, None, handoff).await
 }
 
 /// How long a finished session stays alive after closing its write half, so the
@@ -1605,9 +1709,7 @@ async fn cutoff_tick(auth: &Option<SessionAuth>) {
 pub(crate) async fn serve_session<R, W>(
     reader: R,
     writer: W,
-    registry: Registry,
-    sessions: Sessions,
-    db: PathBuf,
+    context: ServeContext,
     auth: Option<SessionAuth>,
 ) -> Result<(), DaemonError>
 where
@@ -1616,7 +1718,7 @@ where
 {
     // `serve_session` is the no-handoff path (remote transport, relay): the
     // local socket uses `serve_session_with_handoff` below.
-    serve_session_with_handoff(reader, writer, registry, sessions, db, auth, None).await
+    serve_session_with_handoff(reader, writer, context, auth, None).await
 }
 
 /// The local-socket entry point: like [`serve_session`], but the session may
@@ -1628,9 +1730,7 @@ where
 pub(crate) async fn serve_session_with_handoff<R, W>(
     reader: R,
     writer: W,
-    registry: Registry,
-    sessions: Sessions,
-    db: PathBuf,
+    context: ServeContext,
     auth: Option<SessionAuth>,
     handoff: Option<HandoffCtx>,
 ) -> Result<(), DaemonError>
@@ -1640,16 +1740,7 @@ where
 {
     let mut reader = reader;
     let mut writer = writer;
-    let result = serve_session_inner(
-        &mut reader,
-        &mut writer,
-        registry,
-        sessions,
-        db,
-        auth,
-        handoff,
-    )
-    .await;
+    let result = serve_session_inner(&mut reader, &mut writer, context, auth, handoff).await;
 
     // **The last frame must reach the peer, on *every* way out (T-0052, T-0046).**
     // Closing the write half signals the transport's pump to drain what the
@@ -1695,9 +1786,7 @@ async fn serve_session_inner<R, W>(
     // `&mut T` and the compiler needs a mutable binding to hand one out.
     reader: &mut R,
     mut writer: &mut W,
-    registry: Registry,
-    sessions: Sessions,
-    db: PathBuf,
+    context: ServeContext,
     auth: Option<SessionAuth>,
     handoff: Option<HandoffCtx>,
 ) -> Result<(), DaemonError>
@@ -1705,6 +1794,15 @@ where
     R: AsyncReadExt + Unpin,
     W: AsyncWriteExt + Unpin,
 {
+    // The context travels as one value so that a shared setting costs no
+    // signature length (T-0091); destructured once, so the body below reads
+    // exactly as it did when these were parameters.
+    let ServeContext {
+        registry,
+        sessions,
+        db,
+        worktree,
+    } = context;
     let mut buf = Vec::new();
     // The audit trail for this session: the identity comes from the gate, so a
     // remote action is attributed to the device that took it (T-0033) and a local
@@ -2018,7 +2116,7 @@ where
             }
             _ => {}
         }
-        let reply = dispatch(&message, &registry, &db).await;
+        let reply = dispatch(&message, &registry, &db, &worktree).await;
         // Persistence: spawn/kill/split mutate the registry — snapshot after
         // them so the DB always reflects the current topology. Async task
         // (never blocks the connection); failures logged, never fatal.
@@ -2028,7 +2126,11 @@ where
         // snapshot trigger of its own. The flag is consumed by the check, so
         // each learned id costs exactly one snapshot, and a dispatch that
         // already snapshots for another reason clears it with the same write.
+        //
+        // `SpawnWorktree` is a spawn: the registry gains a pane (T-0091), and
+        // the record it writes carries the worktree the pane is in.
         let mutated = matches!(message, Message::Spawn { .. })
+            || matches!(message, Message::SpawnWorktree { .. })
             || matches!(message, Message::Kill { .. })
             || matches!(message, Message::Split { .. });
         let learned = registry
@@ -2050,6 +2152,7 @@ where
                         pane: Arc::clone(&entry.pane),
                         harness: entry.harness.clone(),
                         session_id: entry.session(),
+                        worktree: entry.worktree(),
                     })
                     .collect();
                 if let Err(e) = super::persist::snapshot(&panes, &db) {
@@ -2097,6 +2200,14 @@ fn audited(message: &Message) -> Option<Audited> {
         agent: id.clone(),
         prompt: String::new(),
     };
+    // A worktree spawn is a spawn: the same row, because the action the trail
+    // records is "this pane was started", and which directory it was started in
+    // is not a different kind of action (T-0091).
+    let spawn = |id: &String, program: &String| Audited {
+        action: arreo_core::store::actions::SPAWN,
+        agent: id.clone(),
+        prompt: program.clone(),
+    };
     match message {
         Message::Attach { id, .. } | Message::Resume { id, .. } => Some(pane(id)),
         Message::Send { id, data, .. } => Some(Audited {
@@ -2104,11 +2215,8 @@ fn audited(message: &Message) -> Option<Audited> {
             agent: id.clone(),
             prompt: data.clone(),
         }),
-        Message::Spawn { id, program, .. } => Some(Audited {
-            action: arreo_core::store::actions::SPAWN,
-            agent: id.clone(),
-            prompt: program.clone(),
-        }),
+        Message::Spawn { id, program, .. } => Some(spawn(id, program)),
+        Message::SpawnWorktree { id, spec, .. } => Some(spawn(id, &spec.program)),
         Message::Split { id, new_id, .. } => Some(Audited {
             action: arreo_core::store::actions::SPLIT,
             agent: id.clone(),
@@ -2361,6 +2469,10 @@ fn verb_of(message: &Message) -> Verb {
         // separate name for it.
         Message::Send { .. } | Message::Resize { .. } => Verb::Send,
         Message::Spawn { .. } => Verb::Spawn,
+        // A worktree spawn is a spawn (T-0091): the same capability, because it
+        // is the same act — start an agent on this machine. Which directory it
+        // starts in is the request's detail, not a wider permission.
+        Message::SpawnWorktree { .. } => Verb::Spawn,
         Message::Split { .. } => Verb::Split,
         Message::Kill { .. } => Verb::Kill,
         // The handoff request drives the machine (it replaces the daemon), so
@@ -2401,6 +2513,7 @@ fn op_name(message: &Message) -> &'static str {
         Message::MetricsHistory { .. } => "metrics-history",
         Message::MetricsSeries { .. } => "metrics-series",
         Message::Spawn { .. } => "spawn",
+        Message::SpawnWorktree { .. } => "spawn-worktree",
         Message::Panes { .. } => "panes",
         Message::PanesDetail { .. } => "panes-detail",
         Message::Attach { .. } => "attach",
@@ -2452,9 +2565,302 @@ fn not_found(id: &str) -> Message {
     }
 }
 
+/// One spawn request, as either spawn verb states it (T-0091).
+///
+/// [`Message::Spawn`] and [`Message::SpawnWorktree`] differ in exactly one
+/// thing — the directory the child starts in — so everything else is one
+/// request, described once and handled once. The worktree is deliberately *not*
+/// a field here: it is resolved before the request is built (a worktree spawn
+/// that cannot get its directory is answered, never started), so by the time
+/// this struct exists the directory is a fact.
+struct SpawnRequest<'a> {
+    id: &'a str,
+    program: &'a str,
+    args: &'a [String],
+    cols: u16,
+    rows: u16,
+    memory_max: Option<u64>,
+    pids_max: Option<u32>,
+    kill_on_breach: bool,
+}
+
+/// The body both spawn verbs share: resolve the adapter (and the `pin` session
+/// it implies), fork the child — in `worktree` when it has one — and register
+/// the pane under its enforcement guard.
+///
+/// `worktree` is `Some` only on the path that has already made the directory, so
+/// this function never has to answer "there was nowhere to start it": that
+/// question belongs to the caller, before anything is forked.
+async fn spawn_pane(
+    registry: &Registry,
+    request: SpawnRequest<'_>,
+    worktree: Option<PathBuf>,
+) -> Message {
+    let SpawnRequest {
+        id,
+        program,
+        args,
+        cols,
+        rows,
+        memory_max,
+        pids_max,
+        kill_on_breach,
+    } = request;
+    // The adapter decides: its patterns feed the engine, and — for a
+    // harness whose strategy is `pin` — Arreo picks the session id
+    // here and hands it to the harness at spawn, so the session is
+    // named from the first byte rather than read back out of output.
+    let adapter = arreo_core::state::AdapterRegistry::builtin()
+        .for_program(program)
+        .clone();
+    let (session, args_owned) = match adapter.resume.as_ref() {
+        Some(resume) if resume.kind() == arreo_core::state::ResumeKind::Pin => {
+            let id = arreo_core::state::new_session_id();
+            let argv = resume
+                .resume_args(args, Some(&id))
+                .expect("a pin strategy always builds argv for an id");
+            (Some(id), argv)
+        }
+        _ => (None, args.to_vec()),
+    };
+    // Fork off the async worker (chaos-found, T-0009).
+    let program = program.to_string();
+    // The keychain bridge (T-0087): resolved here, applied in the child.
+    let env = PaneEntry::keychain_env(&adapter);
+    // The directory is cloned into the fork rather than moved: the registry
+    // entry below still needs it.
+    let cwd = worktree.clone();
+    let spawned = tokio::task::spawn_blocking(move || {
+        let args_ref: Vec<&str> = args_owned.iter().map(String::as_str).collect();
+        // `cwd: None` is exactly `spawn_with_env` (which delegates here), so the
+        // plain spawn is byte-identical to what it was; a worktree spawn is the
+        // same call with a directory.
+        Pane::spawn_in_dir(&program, &args_ref, cols, rows, &env, cwd.as_deref())
+    })
+    .await;
+    let pane = match spawned {
+        Ok(Ok(pane)) => Arc::new(pane),
+        Ok(Err(e)) => {
+            return Message::Error {
+                v: VERSION,
+                message: format!("spawn failed: {e}"),
+            };
+        }
+        Err(e) => {
+            return Message::Error {
+                v: VERSION,
+                message: format!("spawn task failed: {e}"),
+            };
+        }
+    };
+    let mut registry = registry.write().await;
+    if registry.contains_key(id) {
+        return Message::Error {
+            v: VERSION,
+            message: format!("pane {id:?} already exists"),
+        };
+    }
+    // Enforcement (T-0019): when the client sets a budget, create a
+    // cgroup guard and move the child into it. Guard creation failure
+    // is LOUD (Error) — silently running unbudgeted would lie about
+    // enforcement. No budget = no guard (yesterday's behavior).
+    let guard = match (memory_max, pids_max) {
+        (None, None) => None,
+        _ => {
+            let budget = arreo_core::enforce::Budget {
+                memory_max,
+                pids_max,
+            };
+            match arreo_core::enforce::Guard::create(id, budget) {
+                Ok(guard) => Some(guard),
+                Err(e) => {
+                    return Message::Error {
+                        v: VERSION,
+                        message: format!("enforce failed: {e}"),
+                    };
+                }
+            }
+        }
+    };
+    if let Some(guard) = &guard {
+        if let Some(pid) = pane.child_pid() {
+            if let Err(e) = guard.attach(pid) {
+                return Message::Error {
+                    v: VERSION,
+                    message: format!("enforce attach failed: {e}"),
+                };
+            }
+        }
+    }
+    let entry = Arc::new(PaneEntry::with_adapter(
+        pane,
+        guard,
+        kill_on_breach,
+        adapter,
+        session,
+    ));
+    registry.insert(id.to_string(), Arc::clone(&entry));
+    // T-0091: the entry remembers the directory the child was started in, so a
+    // kill can clean it up and the next snapshot can restore the pane into it.
+    if let Some(path) = worktree {
+        entry.set_worktree(path);
+    }
+    Message::Ok { v: VERSION }
+}
+
+/// The repository worktrees come from when the configuration does not say: the
+/// daemon's own working directory — where an operator who started the daemon in
+/// the repository they serve expects it to be.
+fn worktree_repo(settings: &WorktreeSettings) -> PathBuf {
+    settings
+        .repo
+        .clone()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
+}
+
+/// Where worktrees live when the configuration does not say.
+fn worktree_root(settings: &WorktreeSettings) -> PathBuf {
+    settings
+        .root
+        .clone()
+        .map(PathBuf::from)
+        .unwrap_or_else(arreo_core::worktree::default_root)
+}
+
+/// The answer a failed worktree request gets (T-0091): the module's own
+/// `Display` — already operator-facing prose that names the pane id, the path or
+/// the dirty files — behind the `worktree: ` prefix that says which part of the
+/// request refused it.
+fn worktree_error(error: &arreo_core::worktree::WorktreeError) -> Message {
+    Message::Error {
+        v: VERSION,
+        message: format!("worktree: {error}"),
+    }
+}
+
+/// Remove a killed pane's worktree, and tell the operator when it is kept
+/// (T-0091).
+///
+/// **The name and the root come out of the recorded path, not out of the
+/// configuration.** `<root>/<name>` is the shape the spawn wrote, so a
+/// `[worktree]` section edited between the spawn and the kill cannot make this
+/// remove a different directory — or quietly fail to find this one and leave a
+/// checkout behind. Only the repository comes from the settings, because a path
+/// cannot say which repository it belongs to.
+///
+/// A dirty checkout is **kept** and reported in one line naming the pane and the
+/// files: uncommitted work is the one thing this path could destroy and cannot
+/// bring back, so the refusal is the feature, and the kill has already
+/// succeeded — the pane is dead either way. A clean removal says nothing, which
+/// is what the operator asked for; an error that is neither (no `git`, the
+/// repository gone) prints too, because a checkout left behind in silence is the
+/// same surprise, only rarer.
+fn remove_worktree(settings: &WorktreeSettings, id: &str, path: &Path) {
+    let Some(name) = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+    else {
+        eprintln!(
+            "daemon: pane {id:?} kept its worktree {} (the path names no directory to remove)",
+            path.display()
+        );
+        return;
+    };
+    let root = path
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| path.to_path_buf());
+    let repo = worktree_repo(settings);
+    match arreo_core::worktree::remove(&repo, &root, &name, false) {
+        Ok(_) => {}
+        Err(arreo_core::worktree::WorktreeError::Dirty { files, .. }) => eprintln!(
+            "daemon: pane {id:?} kept its worktree {} — it has uncommitted changes: {files}",
+            path.display()
+        ),
+        Err(e) => eprintln!(
+            "daemon: pane {id:?} kept its worktree {} — {e}",
+            path.display()
+        ),
+    }
+}
+
+/// The directory a restored pane must come back in (T-0091), or `None` for a
+/// record that never had a worktree — every pane spawned without one, and every
+/// row written before v10 — which restores exactly as it did before.
+///
+/// The name and the root are read **out of the recorded path**: that is the
+/// checkout this pane worked in, and a `[worktree]` section edited while the
+/// daemon was down must not move a pane whose files are already somewhere else.
+/// The repository is the one thing the path cannot supply, so it comes from the
+/// settings — the same answer the spawn would have given.
+///
+/// What happens next is [`arreo_core::worktree::ensure`]'s rule, which is the
+/// rule the criterion asks for: a worktree that is still registered is reused, a
+/// directory deleted while the daemon was down is made again (a removed worktree
+/// keeps its branch, so the checkout comes back on the work the pane had
+/// committed), and a path that now holds a foreign directory is refused. The
+/// refusal comes back as prose and the caller skips the pane loudly — never a
+/// pane in the daemon's own directory, which is the one outcome this must not
+/// produce.
+fn restore_worktree_dir(
+    settings: &WorktreeSettings,
+    recorded: Option<&str>,
+) -> Result<Option<PathBuf>, String> {
+    let Some(recorded) = recorded else {
+        return Ok(None);
+    };
+    let path = Path::new(recorded);
+    let Some(name) = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+    else {
+        return Err(format!(
+            "its recorded worktree {recorded} names no directory to make"
+        ));
+    };
+    let root = path
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| worktree_root(settings));
+    let repo = worktree_repo(settings);
+    let path = arreo_core::worktree::ensure(&repo, &root, &name)
+        .map_err(|e| format!("its worktree {recorded} could not be re-made: {e}"))?;
+    require_checkout(&path)?;
+    Ok(Some(path))
+}
+
+/// The check **both** worktree paths make before anything is spawned: the
+/// directory `ensure` returned has to exist.
+///
+/// `ensure` reuses whatever worktree `git worktree list` reports, and that list
+/// keeps a worktree whose directory was deleted — it marks the entry `prunable`
+/// and reports the path anyway. A path that does not exist is not an error to
+/// `Pane::spawn_in_dir` either: portable-pty drops a non-directory `cwd` and
+/// starts the child in `$HOME`. So "the worktree is registered" and "the pane can
+/// start there" are two different questions, and this is the second one — asked
+/// on the spawn path and on the restore path, because a pane started in the
+/// wrong directory is the failure worktree-per-task exists to prevent, whichever
+/// way it arrives.
+fn require_checkout(path: &Path) -> Result<(), String> {
+    if path.is_dir() {
+        Ok(())
+    } else {
+        Err(format!(
+            "{} is not a directory: the worktree is registered but its checkout is gone",
+            path.display()
+        ))
+    }
+}
+
 /// One-shot verbs. Returns `None` when the verb streams instead (handled by
 /// the caller). Every arm checks the version first — loud, never silent.
-async fn dispatch(message: &Message, registry: &Registry, db: &std::path::Path) -> Option<Message> {
+async fn dispatch(
+    message: &Message,
+    registry: &Registry,
+    db: &std::path::Path,
+    worktree: &WorktreeSettings,
+) -> Option<Message> {
     match message {
         Message::Spawn {
             v,
@@ -2470,98 +2876,78 @@ async fn dispatch(message: &Message, registry: &Registry, db: &std::path::Path) 
             if let Err(reply) = check_version(*v) {
                 return Some(reply);
             }
-            // The adapter decides: its patterns feed the engine, and — for a
-            // harness whose strategy is `pin` — Arreo picks the session id
-            // here and hands it to the harness at spawn, so the session is
-            // named from the first byte rather than read back out of output.
-            let adapter = arreo_core::state::AdapterRegistry::builtin()
-                .for_program(program)
-                .clone();
-            let (session, args_owned) = match adapter.resume.as_ref() {
-                Some(resume) if resume.kind() == arreo_core::state::ResumeKind::Pin => {
-                    let id = arreo_core::state::new_session_id();
-                    let argv = resume
-                        .resume_args(args, Some(&id))
-                        .expect("a pin strategy always builds argv for an id");
-                    (Some(id), argv)
-                }
-                _ => (None, args.clone()),
+            let request = SpawnRequest {
+                id,
+                program,
+                args,
+                cols: *cols,
+                rows: *rows,
+                memory_max: *memory_max,
+                pids_max: *pids_max,
+                kill_on_breach: *kill_on_breach,
             };
-            // Fork off the async worker (chaos-found, T-0009).
-            let program = program.clone();
-            let (cols, rows) = (*cols, *rows);
-            // The keychain bridge (T-0087): resolved here, applied in the child.
-            let env = PaneEntry::keychain_env(&adapter);
-            let spawned = tokio::task::spawn_blocking(move || {
-                let args_ref: Vec<&str> = args_owned.iter().map(String::as_str).collect();
-                Pane::spawn_with_env(&program, &args_ref, cols, rows, &env)
+            Some(spawn_pane(registry, request, None).await)
+        }
+        // T-0091: the same request as `Spawn`, in a directory of its own.
+        Message::SpawnWorktree {
+            v,
+            id,
+            spec,
+            worktree: requested,
+        } => {
+            if let Err(reply) = check_version(*v) {
+                return Some(reply);
+            }
+            // `None` or the empty string means "the pane id" — the shape a
+            // client that wants one worktree per pane sends.
+            let name = match requested.as_deref() {
+                None | Some("") => id.clone(),
+                Some(name) => name.to_string(),
+            };
+            let repo = worktree_repo(worktree);
+            let root = worktree_root(worktree);
+            // **The directory first, and nothing is spawned until it exists.**
+            // `ensure` is where the refusals live — a name that is not a safe
+            // directory name, a path that is not a repository, a directory that
+            // belongs to somebody else — and each one is a typed error naming
+            // what it refused. A pane started "anyway" would be a pane in the
+            // daemon's own directory, working on the wrong files, which is the
+            // failure this whole path exists to make impossible.
+            let made = tokio::task::spawn_blocking(move || {
+                arreo_core::worktree::ensure(&repo, &root, &name)
             })
             .await;
-            let pane = match spawned {
-                Ok(Ok(pane)) => Arc::new(pane),
-                Ok(Err(e)) => {
-                    return Some(Message::Error {
-                        v: VERSION,
-                        message: format!("spawn failed: {e}"),
-                    });
-                }
+            let path = match made {
+                Ok(Ok(path)) => path,
+                Ok(Err(e)) => return Some(worktree_error(&e)),
                 Err(e) => {
                     return Some(Message::Error {
                         v: VERSION,
-                        message: format!("spawn task failed: {e}"),
+                        message: format!("worktree: {e}"),
                     });
                 }
             };
-            let mut registry = registry.write().await;
-            if registry.contains_key(id) {
+            // The same rule the restore makes: a registered worktree whose
+            // checkout is gone is refused rather than silently spawned in
+            // `$HOME` (see [`require_checkout`]). Nothing has been forked yet, so
+            // the refusal costs nothing but the answer.
+            if let Err(why) = require_checkout(&path) {
                 return Some(Message::Error {
                     v: VERSION,
-                    message: format!("pane {id:?} already exists"),
+                    message: format!("worktree: {why}"),
                 });
             }
-            // Enforcement (T-0019): when the client sets a budget, create a
-            // cgroup guard and move the child into it. Guard creation failure
-            // is LOUD (Error) — silently running unbudgeted would lie about
-            // enforcement. No budget = no guard (yesterday's behavior).
-            let guard = match (memory_max, pids_max) {
-                (None, None) => None,
-                _ => {
-                    let budget = arreo_core::enforce::Budget {
-                        memory_max: *memory_max,
-                        pids_max: *pids_max,
-                    };
-                    match arreo_core::enforce::Guard::create(id, budget) {
-                        Ok(guard) => Some(guard),
-                        Err(e) => {
-                            return Some(Message::Error {
-                                v: VERSION,
-                                message: format!("enforce failed: {e}"),
-                            });
-                        }
-                    }
-                }
+            let request = SpawnRequest {
+                id,
+                program: &spec.program,
+                args: &spec.args,
+                cols: spec.cols,
+                rows: spec.rows,
+                memory_max: spec.memory_max,
+                pids_max: spec.pids_max,
+                kill_on_breach: spec.kill_on_breach,
             };
-            if let Some(guard) = &guard {
-                if let Some(pid) = pane.child_pid() {
-                    if let Err(e) = guard.attach(pid) {
-                        return Some(Message::Error {
-                            v: VERSION,
-                            message: format!("enforce attach failed: {e}"),
-                        });
-                    }
-                }
-            }
-            registry.insert(
-                id.clone(),
-                Arc::new(PaneEntry::with_adapter(
-                    pane,
-                    guard,
-                    *kill_on_breach,
-                    adapter,
-                    session,
-                )),
-            );
-            Some(Message::Ok { v: VERSION })
+            Some(spawn_pane(registry, request, Some(path)).await)
         }
         Message::Panes { v, .. } => {
             if let Err(reply) = check_version(*v) {
@@ -2780,8 +3166,17 @@ async fn dispatch(message: &Message, registry: &Registry, db: &std::path::Path) 
                 Some(entry) => {
                     drop(registry);
                     let _ = entry.pane.kill_shared();
+                    let settings = worktree.clone();
+                    let id = id.clone();
                     tokio::task::spawn_blocking(move || {
                         let _ = entry.pane.wait_timeout(std::time::Duration::from_secs(5));
+                        // T-0091: the pane's worktree goes with the pane. The
+                        // child is dead by now — removing a checkout underneath a
+                        // live process would be asking for a dirty refusal the
+                        // operator has to read twice.
+                        if let Some(path) = entry.worktree() {
+                            remove_worktree(&settings, &id, &path);
+                        }
                     });
                     Some(Message::Ok { v: VERSION })
                 }

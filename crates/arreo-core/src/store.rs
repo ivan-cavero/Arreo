@@ -28,7 +28,12 @@
 //!   "put back what was there" (`arreo sync revert`). Content is stored as the
 //!   bytes that were on disk, because a re-rendered copy would restore
 //!   something the operator never wrote.
-//! - `open` runs `migrate()` (v1→…→v9 `CREATE TABLE IF NOT EXISTS`,
+//! - v10 (T-0091): `panes` gains `worktree` — the `git worktree` a pane runs
+//!   in, so a restore puts it back in its **own** checkout instead of the
+//!   daemon's directory (which would put two agents in one tree, the collision
+//!   worktree-per-task exists to prevent). Nullable and added by `ALTER TABLE`,
+//!   so a v9 row restores exactly as it did before.
+//! - `open` runs `migrate()` (v1→…→v10 `CREATE TABLE IF NOT EXISTS`,
 //!   `ALTER TABLE`, version bumps); future versions append a step. Data is
 //!   never dropped by a migration — the migration test pins a surviving rollup
 //!   row and a surviving v7 pane row.
@@ -73,7 +78,7 @@ pub enum SessionError {
     },
 }
 
-pub const SCHEMA_VERSION: u32 = 9;
+pub const SCHEMA_VERSION: u32 = 10;
 
 /// One pane's persisted record: how to respawn it + what it showed.
 #[derive(Debug, Clone, PartialEq)]
@@ -99,6 +104,15 @@ pub struct StoredPane {
     /// id known" — which for `continue` is normal (it resumes by continuation,
     /// with no id at all), and for `pin` means there is nothing to resume with.
     pub session_id: Option<String>,
+    /// The `git worktree` this pane runs in (T-0091), or `None` for a pane that
+    /// shares the daemon's working directory — which is every pane that was not
+    /// spawned with `--worktree`, and every row written before v10.
+    ///
+    /// A path rather than the pane's worktree *name*: the name is derivable from
+    /// the pane id, but the root is a machine's decision (`[worktree] root`), and
+    /// a record that re-derived the path would put a restored pane in a different
+    /// directory than the one it was working in.
+    pub worktree: Option<String>,
 }
 
 /// The outcome half of an audit row: what a review reads to tell an intention
@@ -816,6 +830,13 @@ impl SessionStore {
                  CREATE INDEX IF NOT EXISTS sync_revisions_file ON sync_revisions(file, id);",
             )?;
         }
+        // v10 (T-0091): the `git worktree` a pane runs in. Nullable, so every
+        // pane recorded before worktree-per-task existed restores exactly as it
+        // did — in the daemon's own directory — rather than being refused for
+        // missing a column it never had.
+        if version < 10 && !has_column(conn, "panes", "worktree")? {
+            conn.execute_batch("ALTER TABLE panes ADD COLUMN worktree TEXT;")?;
+        }
         conn.execute(
             "INSERT INTO meta(key, value) VALUES ('schema_version', ?1)
              ON CONFLICT(key) DO UPDATE SET value=excluded.value",
@@ -1288,8 +1309,8 @@ impl SessionStore {
         tx.execute("DELETE FROM panes", [])?;
         for pane in panes {
             tx.execute(
-                "INSERT INTO panes(id, program, args, cols, rows, harness, session_id)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                "INSERT INTO panes(id, program, args, cols, rows, harness, session_id, worktree)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                 params![
                     pane.id,
                     pane.program,
@@ -1298,6 +1319,7 @@ impl SessionStore {
                     pane.rows as i64,
                     pane.harness,
                     pane.session_id,
+                    pane.worktree,
                 ],
             )?;
             for (line_no, text) in pane.scrollback.iter().enumerate() {
@@ -1318,7 +1340,8 @@ impl SessionStore {
             .lock()
             .map_err(|_| SessionError::Sqlite(rusqlite::Error::InvalidQuery))?;
         let mut stmt = conn.prepare(
-            "SELECT id, program, args, cols, rows, harness, session_id FROM panes ORDER BY id ASC",
+            "SELECT id, program, args, cols, rows, harness, session_id, worktree FROM panes \
+             ORDER BY id ASC",
         )?;
         let panes = stmt.query_map([], |row| {
             Ok((
@@ -1329,11 +1352,12 @@ impl SessionStore {
                 row.get::<_, i64>(4)?,
                 row.get::<_, Option<String>>(5)?,
                 row.get::<_, Option<String>>(6)?,
+                row.get::<_, Option<String>>(7)?,
             ))
         })?;
         let mut out = Vec::new();
         for pane in panes {
-            let (id, program, args_json, cols, rows, harness, session_id) = pane?;
+            let (id, program, args_json, cols, rows, harness, session_id, worktree) = pane?;
             let args: Vec<String> = serde_json::from_str(&args_json).unwrap_or_default();
             let mut lines =
                 conn.prepare("SELECT text FROM scrollback WHERE pane = ?1 ORDER BY line_no ASC")?;
@@ -1349,6 +1373,7 @@ impl SessionStore {
                 scrollback,
                 harness,
                 session_id,
+                worktree,
             });
         }
         Ok(out)

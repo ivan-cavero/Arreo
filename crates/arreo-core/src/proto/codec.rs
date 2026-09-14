@@ -135,8 +135,10 @@ pub fn classify_op(bytes: &[u8]) -> Option<Direction> {
     let op = decode_op_tag(bytes)?;
     Some(match op.as_str() {
         // Client → server: the verbs a client asks the daemon to perform.
-        "hello" | "resume" | "spawn" | "attach" | "send" | "resize" | "kill" | "read" | "wait"
-        | "split" | "metrics_req" | "panes" | "handoff" | "sync" => Direction::Request,
+        "hello" | "resume" | "spawn" | "spawn_worktree" | "attach" | "send" | "resize" | "kill"
+        | "read" | "wait" | "split" | "metrics_req" | "panes" | "handoff" | "sync" => {
+            Direction::Request
+        }
         // Server → client: answers and news.
         "welcome" | "snapshot" | "delta" | "error" | "state_event" | "metrics"
         | "metrics_series" | "ok" | "exited" | "handoff_ready" | "sync_reply" => Direction::Event,

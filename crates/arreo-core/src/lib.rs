@@ -24,6 +24,7 @@ pub mod theme;
 pub mod transport;
 pub mod update;
 pub mod vt;
+pub mod worktree;
 
 /// Write bytes to an owner-only file (0600 on Unix, created before writing).
 /// Shared by identity key files and device certificates (T-0025).

@@ -22,6 +22,8 @@ fn panes(n: usize) -> Vec<StoredPane> {
             // harness columns get their own round-trip test below.
             harness: None,
             session_id: None,
+            // Not a worktree pane: it runs where the daemon does (T-0091).
+            worktree: None,
         })
         .collect()
 }

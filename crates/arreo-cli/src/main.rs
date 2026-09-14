@@ -43,8 +43,14 @@ fn usage() -> ExitCode {
     eprintln!("  arreo replay <fixture.pty> [--speed N]");
     eprintln!("  arreo metrics --pid <PID> [--samples N]");
     eprintln!("  arreo panes [--socket PATH]");
-    eprintln!("  arreo spawn <id> <program> [args...] [--socket PATH]");
+    eprintln!("  arreo spawn <id> <program> [args...] [--socket PATH] [--worktree [NAME]]");
+    eprintln!("      --worktree gives the pane its own `git worktree` on branch arreo/<NAME>");
+    eprintln!("      (NAME defaults to the pane id); see docs/worktrees.md");
     eprintln!("  arreo attach <id> [--socket PATH]   (stream; reconnects across daemon handoffs; Ctrl-C detaches, pane keeps running)");
+    eprintln!("  arreo worktrees list [--socket PATH] [--repo PATH] [--config PATH] [--json]");
+    eprintln!("  arreo worktrees remove <pane> [--force] [--repo PATH] [--config PATH]");
+    eprintln!("      the git worktrees `spawn --worktree` makes; `list` needs no daemon");
+    eprintln!("      (docs/worktrees.md)");
     eprintln!("  arreo send <id> <text...> [--socket PATH]");
     eprintln!("  arreo read <id> [--from N] [--socket PATH]   (one-shot snapshot)");
     eprintln!("  arreo wait <id> --state <state> [--timeout 5m] [--socket PATH]");
@@ -161,6 +167,7 @@ fn main() -> ExitCode {
         Some("split") => rt::block_on(cmd_split(&args[2..])),
         Some("panes") => rt::block_on(cmd_panes(&args[2..])),
         Some("spawn") => rt::block_on(cmd_spawn(&args[2..])),
+        Some("worktrees") => rt::block_on(cmd_worktrees(&args[2..])),
         Some("attach") => rt::block_on(cmd_attach(&args[2..])),
         Some("send") => rt::block_on(cmd_send(&args[2..])),
         Some("service") => cmd_service(&args[2..]),
@@ -235,6 +242,43 @@ fn take_socket(rest: &[String]) -> (PathBuf, Vec<String>) {
         }
     }
     (socket, kept)
+}
+
+/// `--worktree [NAME]` out of a verb's arguments: `Some(name)` when asked for,
+/// `None` when not.
+///
+/// Read out of the argument list **before** the `id program [args...]` split,
+/// the way [`take_socket`] does, because after the split there is no way to tell
+/// our flag from the spawned program's: `arreo spawn p1 omp --worktree` names
+/// this flag, and a program that takes `--worktree` itself has to be told apart
+/// by the operator (`--` would be the escape hatch; the ambiguity is documented
+/// rather than guessed at).
+///
+/// The value is optional, so a following argument that starts with `-` is left
+/// alone — it belongs to the program. `--worktree` alone is `Some("")`: the
+/// empty string is what the wire uses for "name it after the pane id".
+fn take_worktree(rest: &[String]) -> (Option<String>, Vec<String>) {
+    let mut worktree: Option<String> = None;
+    let mut kept = Vec::new();
+    let mut i = 0;
+    while i < rest.len() {
+        if rest[i] == "--worktree" {
+            match rest.get(i + 1) {
+                Some(name) if !name.starts_with('-') => {
+                    worktree = Some(name.clone());
+                    i += 2;
+                }
+                _ => {
+                    worktree = Some(String::new());
+                    i += 1;
+                }
+            }
+        } else {
+            kept.push(rest[i].clone());
+            i += 1;
+        }
+    }
+    (worktree, kept)
 }
 
 fn cmd_record(rest: &[String]) -> ExitCode {
@@ -655,6 +699,7 @@ async fn cmd_panes(rest: &[String]) -> ExitCode {
 
 async fn cmd_spawn(rest: &[String]) -> ExitCode {
     let (socket, kept) = take_socket(rest);
+    let (worktree, kept) = take_worktree(&kept);
     let (mut session, kept) = match connect(&socket, &kept).await {
         Ok(pair) => pair,
         Err((code, message)) => {
@@ -663,27 +708,66 @@ async fn cmd_spawn(rest: &[String]) -> ExitCode {
         }
     };
     if kept.len() < 2 {
-        eprintln!("usage: arreo spawn <id> <program> [args...] [--socket PATH]");
+        eprintln!(
+            "usage: arreo spawn <id> <program> [args...] [--socket PATH] [--worktree [NAME]]"
+        );
         return ExitCode::from(2);
     }
-    let req = Message::Spawn {
-        v: VERSION,
-        id: kept[0].clone(),
-        program: kept[1].clone(),
-        args: kept[2..].to_vec(),
-        cols: 80,
-        rows: 24,
-        memory_max: None,
-        pids_max: None,
-        kill_on_breach: false,
+    // The two requests are built rather than one being a field of the other: a
+    // new variant is the only shape an older server can refuse *by name*
+    // (ADR 0017), and a refusal is what tells this client the daemon predates
+    // worktrees. `Spawn` itself is byte-for-byte what it was.
+    let req = match &worktree {
+        Some(name) => Message::SpawnWorktree {
+            v: VERSION,
+            id: kept[0].clone(),
+            spec: Box::new(arreo_core::proto::SpawnSpec {
+                program: kept[1].clone(),
+                args: kept[2..].to_vec(),
+                cols: 80,
+                rows: 24,
+                memory_max: None,
+                pids_max: None,
+                kill_on_breach: false,
+            }),
+            worktree: Some(name.clone()),
+        },
+        None => Message::Spawn {
+            v: VERSION,
+            id: kept[0].clone(),
+            program: kept[1].clone(),
+            args: kept[2..].to_vec(),
+            cols: 80,
+            rows: 24,
+            memory_max: None,
+            pids_max: None,
+            kill_on_breach: false,
+        },
     };
     match session.call(&req).await {
         Ok(Message::Ok { .. }) => {
-            println!("spawned {}", kept[0]);
+            match &worktree {
+                // The daemon replies `Ok` without the path (the worktree is the
+                // daemon's business, not the wire's), so what is printed is what
+                // was asked for: the pane, and the name the worktree got.
+                Some(name) if !name.is_empty() => {
+                    println!("spawned {} (worktree {name})", kept[0]);
+                }
+                Some(_) => println!("spawned {} (worktree {})", kept[0], kept[0]),
+                None => println!("spawned {}", kept[0]),
+            }
             ExitCode::SUCCESS
         }
         Ok(Message::Error { message, .. }) => {
             eprintln!("spawn: {message}");
+            // An older daemon refuses the unknown op *by name* and keeps the
+            // connection open (ADR 0017), so this is the one refusal that is
+            // about the daemon rather than about this spawn. Only that one gets
+            // the advice: "update it" is wrong for a bad pane id or a name that
+            // cannot be a directory.
+            if worktree.is_some() && message.contains("unknown request") {
+                eprintln!("spawn: this daemon is older than the worktree feature; update it");
+            }
             ExitCode::FAILURE
         }
         Ok(other) => {
@@ -692,6 +776,450 @@ async fn cmd_spawn(rest: &[String]) -> ExitCode {
         }
         Err(e) => {
             eprintln!("spawn: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// `arreo worktrees …` (T-0091): the git worktrees `arreo spawn --worktree` makes.
+///
+/// `git` is run directly rather than through the daemon, because the worktrees
+/// are git's and not the daemon's: an operator has to be able to see and clean
+/// them with no daemon running, and that is exactly when a checkout left behind
+/// by a dead pane is most likely to be found. Liveness is the one question git
+/// cannot answer, so it is asked of a reachable daemon and reported as unknown
+/// otherwise — never guessed (the rule `arreo machines` follows, T-0044).
+async fn cmd_worktrees(rest: &[String]) -> ExitCode {
+    match rest.first().map(String::as_str) {
+        Some("list") => worktrees_list(&rest[1..]).await,
+        Some("remove") => worktrees_remove(&rest[1..]).await,
+        _ => {
+            worktrees_usage();
+            ExitCode::from(2)
+        }
+    }
+}
+
+fn worktrees_usage() {
+    eprintln!("usage: arreo worktrees list [--socket PATH] [--repo PATH] [--config PATH] [--json]");
+    eprintln!(
+        "       arreo worktrees remove <pane> [--force] [--repo PATH] [--config PATH] [--socket PATH]"
+    );
+    eprintln!("       --repo is the repository whose worktrees to show (default: this directory);");
+    eprintln!("       --config names the file with the [worktree] root (default: $ARREO_CONFIG,");
+    eprintln!("       else the state directory). See docs/worktrees.md");
+}
+
+/// The schema of `arreo worktrees list --json` — the script contract. The human
+/// table is not one and may change.
+const WORKTREES_SCHEMA: u32 = 1;
+
+/// One row of `arreo worktrees list`.
+struct WorktreeRow {
+    pane: String,
+    path: PathBuf,
+    branch: String,
+    dirty: bool,
+    missing: bool,
+    /// `Some(true)`/`Some(false)` when a daemon answered `Panes`, `None` when
+    /// none did — never a guess in either direction.
+    live: Option<bool>,
+}
+
+/// The flags both `worktrees` subcommands take, parsed once so the two cannot
+/// disagree about what `--repo` or `--config` means: a `remove` that resolved a
+/// different root from the `list` an operator just read would look for the
+/// pane's checkout in the wrong place and report that there was nothing there.
+struct WorktreesOptions {
+    repo: Option<PathBuf>,
+    config: Option<PathBuf>,
+    json: bool,
+    force: bool,
+    rest: Vec<String>,
+}
+
+fn parse_worktrees_options(sub: &str, args: &[String]) -> Result<WorktreesOptions, ExitCode> {
+    let mut options = WorktreesOptions {
+        repo: None,
+        config: None,
+        json: false,
+        force: false,
+        rest: Vec::new(),
+    };
+    let mut i = 0;
+    while i < args.len() {
+        let flag = args[i].as_str();
+        match flag {
+            "--repo" | "--config" => {
+                let Some(value) = args.get(i + 1) else {
+                    eprintln!("worktrees {sub}: {flag} needs a path");
+                    worktrees_usage();
+                    return Err(ExitCode::from(2));
+                };
+                if flag == "--repo" {
+                    options.repo = Some(PathBuf::from(value));
+                } else {
+                    options.config = Some(PathBuf::from(value));
+                }
+                i += 2;
+                continue;
+            }
+            "--json" => options.json = true,
+            "--force" => options.force = true,
+            other if other.starts_with('-') => {
+                eprintln!("worktrees {sub}: unknown argument {other:?}");
+                worktrees_usage();
+                return Err(ExitCode::from(2));
+            }
+            other => options.rest.push(other.to_string()),
+        }
+        i += 1;
+    }
+    Ok(options)
+}
+
+/// The repository to operate on: `--repo`, else the current directory, resolved
+/// through `git rev-parse --show-toplevel` — so a subdirectory of a checkout
+/// works, and a path that is not a repository is refused by name (exit 2)
+/// instead of surfacing as an empty listing.
+fn worktrees_repo(sub: &str, options: &WorktreesOptions) -> Result<PathBuf, ExitCode> {
+    let from = options.repo.clone().unwrap_or_else(|| PathBuf::from("."));
+    arreo_core::worktree::repo_root(&from).map_err(|e| {
+        eprintln!("worktrees {sub}: {e}");
+        ExitCode::from(2)
+    })
+}
+
+/// The worktree root: the `[worktree] root` of `--config`/`$ARREO_CONFIG` when
+/// one names a file, else the state-directory default.
+///
+/// Read by both subcommands on purpose — see [`WorktreesOptions`]. A named file
+/// that cannot be read is refused (exit 2) rather than falling back to the
+/// default: the operator named the file, and listing the wrong root is a worse
+/// answer than saying the configuration is broken.
+fn worktrees_root(sub: &str, options: &WorktreesOptions) -> Result<PathBuf, ExitCode> {
+    use arreo_core::relay::config::WorktreeSettings;
+    let path = options
+        .config
+        .clone()
+        .or_else(|| std::env::var_os("ARREO_CONFIG").map(PathBuf::from));
+    let Some(path) = path else {
+        return Ok(arreo_core::worktree::default_root());
+    };
+    match WorktreeSettings::load(&path) {
+        Ok(settings) => Ok(settings
+            .root
+            .map(PathBuf::from)
+            .unwrap_or_else(arreo_core::worktree::default_root)),
+        Err(e) => {
+            eprintln!(
+                "worktrees {sub}: the configuration at {} cannot be read: {e}",
+                path.display()
+            );
+            Err(ExitCode::from(2))
+        }
+    }
+}
+
+/// Every pane's liveness from the daemon, or `None` when no daemon answers.
+///
+/// `None` is not a failure: a listing is useful with the daemon down, so the
+/// caller reports "unknown" rather than an error. A reachable daemon that does
+/// not list the pane at all means nothing is running under that id — `exited`,
+/// which is what the daemon's own answer says.
+async fn daemon_liveness(socket: &PathBuf) -> Option<std::collections::HashMap<String, bool>> {
+    let conn = open_connection(socket).await.ok()?;
+    let mut session = Session::Local(conn);
+    let answer = session
+        .call(&Message::Panes {
+            v: VERSION,
+            panes: Vec::new(),
+        })
+        .await
+        .ok()?;
+    match answer {
+        Message::Panes { panes, .. } => Some(
+            panes
+                .into_iter()
+                .map(|pane| (pane.id, pane.alive))
+                .collect(),
+        ),
+        _ => None,
+    }
+}
+
+async fn worktrees_list(rest: &[String]) -> ExitCode {
+    use arreo_core::worktree;
+    let (socket, kept) = take_socket(rest);
+    let options = match parse_worktrees_options("list", &kept) {
+        Ok(options) => options,
+        Err(code) => return code,
+    };
+    if options.force {
+        eprintln!("worktrees list: --force belongs to `worktrees remove`");
+        worktrees_usage();
+        return ExitCode::from(2);
+    }
+    if let Some(other) = options.rest.first() {
+        eprintln!("worktrees list: unexpected argument {other:?}");
+        worktrees_usage();
+        return ExitCode::from(2);
+    }
+    let repo = match worktrees_repo("list", &options) {
+        Ok(repo) => repo,
+        Err(code) => return code,
+    };
+    let root = match worktrees_root("list", &options) {
+        Ok(root) => root,
+        Err(code) => return code,
+    };
+    let entries = match worktree::list(&repo) {
+        Ok(entries) => entries,
+        Err(e) => {
+            eprintln!("worktrees list: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    // Liveness is asked once, before the rows, so the table and the JSON carry
+    // the same answer and the "no daemon" note is printed exactly once.
+    let liveness = daemon_liveness(&socket).await;
+    if liveness.is_none() {
+        // stderr, and in both output modes: the listing on stdout stays the
+        // listing, and a script that wants liveness can see why it is null.
+        eprintln!("(no daemon: liveness unknown)");
+    }
+    let mut rows = Vec::new();
+    for entry in entries {
+        let Some(pane) = entry.pane() else { continue };
+        // A worktree git calls prunable has no directory left to inspect: there
+        // is no working tree to be dirty, and `missing` is the field that says
+        // so — the status call is skipped rather than failed.
+        let dirty = if entry.prunable {
+            false
+        } else {
+            match worktree::status(&entry.path) {
+                Ok(files) => !files.is_empty(),
+                Err(e) => {
+                    // Could not tell, so nothing is claimed: the listing would be
+                    // a lie about this pane either way, and a partial listing an
+                    // operator trusts is worse than a failure they can see.
+                    eprintln!("worktrees list: {pane}: {e}");
+                    return ExitCode::FAILURE;
+                }
+            }
+        };
+        rows.push(WorktreeRow {
+            pane: pane.to_string(),
+            path: entry.path.clone(),
+            branch: entry.branch.clone().unwrap_or_default(),
+            dirty,
+            missing: entry.prunable,
+            live: liveness
+                .as_ref()
+                .map(|panes| panes.get(pane).copied().unwrap_or(false)),
+        });
+    }
+    rows.sort_by(|a, b| a.pane.cmp(&b.pane));
+    if options.json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "schema": WORKTREES_SCHEMA,
+                "worktrees": rows
+                    .iter()
+                    .map(|row| serde_json::json!({
+                        "pane": row.pane,
+                        "path": row.path.display().to_string(),
+                        "branch": row.branch,
+                        "dirty": row.dirty,
+                        "missing": row.missing,
+                        "live": row.live,
+                    }))
+                    .collect::<Vec<_>>(),
+            })
+        );
+    } else {
+        println!("repo {}", repo.display());
+        println!("root {}", root.display());
+        if rows.is_empty() {
+            println!("(no worktrees)");
+        } else {
+            // The liveness column exists only when a daemon answered: with none
+            // reachable the note above already covers every row, and a column of
+            // "unknown" repeated down the page says it once too often.
+            let known = liveness.is_some();
+            if known {
+                println!(
+                    "{:>16}  {:<7}  {:<8}  {:<20}  PATH",
+                    "PANE", "STATE", "LIVENESS", "BRANCH"
+                );
+            } else {
+                println!("{:>16}  {:<7}  {:<20}  PATH", "PANE", "STATE", "BRANCH");
+            }
+            for row in &rows {
+                let state = if row.missing {
+                    // Never dropped, and never rendered as "clean": the
+                    // directory is gone, which is the thing to act on.
+                    "MISSING"
+                } else if row.dirty {
+                    "dirty"
+                } else {
+                    "clean"
+                };
+                if known {
+                    let live = match row.live {
+                        Some(true) => "live",
+                        Some(false) => "exited",
+                        None => "unknown",
+                    };
+                    println!(
+                        "{:>16}  {:<7}  {:<8}  {:<20}  {}",
+                        row.pane,
+                        state,
+                        live,
+                        row.branch,
+                        row.path.display()
+                    );
+                } else {
+                    println!(
+                        "{:>16}  {:<7}  {:<20}  {}",
+                        row.pane,
+                        state,
+                        row.branch,
+                        row.path.display()
+                    );
+                }
+            }
+        }
+    }
+    ExitCode::SUCCESS
+}
+
+async fn worktrees_remove(rest: &[String]) -> ExitCode {
+    use arreo_core::worktree;
+    let (socket, kept) = take_socket(rest);
+    let options = match parse_worktrees_options("remove", &kept) {
+        Ok(options) => options,
+        Err(code) => return code,
+    };
+    if options.json {
+        eprintln!("worktrees remove: --json belongs to `worktrees list`");
+        worktrees_usage();
+        return ExitCode::from(2);
+    }
+    if options.rest.len() != 1 {
+        worktrees_usage();
+        return ExitCode::from(2);
+    }
+    let pane = options.rest[0].clone();
+    let repo = match worktrees_repo("remove", &options) {
+        Ok(repo) => repo,
+        Err(code) => return code,
+    };
+    let root = match worktrees_root("remove", &options) {
+        Ok(root) => root,
+        Err(code) => return code,
+    };
+    // What is being removed, before why it might be refused: a live pane with no
+    // worktree of ours has nothing to refuse, and "removed <path>" has to be
+    // true when it is printed — `worktree::remove` returns the path it computed
+    // when nothing is registered there, which is not the same as a directory it
+    // deleted. Asking git first is what tells the two apart.
+    let path = worktree::path_for(&root, &pane);
+    match worktree::find(&repo, &path) {
+        Ok(Some(entry)) if entry.prunable => {
+            // The directory is gone — there is no working tree left to remove, and
+            // the core's `remove` would fail inside `git status` with a message
+            // about a missing directory rather than about this situation. Git's
+            // own bookkeeping is cleared with `prune`, which is the operator's
+            // next move; naming it is the whole value of this branch.
+            eprintln!(
+                "worktrees remove: {pane} is MISSING ({} no longer exists); nothing to remove — \
+                 `git worktree prune` in {} clears the stale entry",
+                entry.path.display(),
+                repo.display()
+            );
+            return ExitCode::FAILURE;
+        }
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            if path.exists() {
+                // A directory in the worktree root that is not this repository's
+                // worktree. Refused rather than removed: it may be another
+                // repository's checkout, or something an operator made by hand.
+                eprintln!(
+                    "worktrees remove: {} exists and is not a worktree of {}: refusing to touch it",
+                    path.display(),
+                    repo.display()
+                );
+                return ExitCode::FAILURE;
+            }
+            // The pane has a worktree, just not under this root — `[worktree]
+            // root` changed since it was made, which `list` still shows (it lists
+            // every Arreo worktree of the repository). `find` already answered
+            // that nothing is registered at `<root>/<pane>`, so any entry for this
+            // pane is elsewhere; saying "no worktree for pane-1" here would be
+            // false, and an operator would go looking for the wrong thing.
+            let elsewhere = worktree::list(&repo).ok().and_then(|entries| {
+                entries
+                    .into_iter()
+                    .find(|entry| entry.pane() == Some(&pane))
+            });
+            if let Some(entry) = elsewhere {
+                eprintln!(
+                    "worktrees remove: {pane}'s worktree is at {}, not under the configured root \
+                     {} — point --config (or [worktree] root) at the root it was made with",
+                    entry.path.display(),
+                    root.display()
+                );
+                return ExitCode::FAILURE;
+            }
+            println!("no Arreo worktree for {pane} at {}", path.display());
+            return ExitCode::SUCCESS;
+        }
+        Err(e) => {
+            eprintln!("worktrees remove: {e}");
+            return ExitCode::FAILURE;
+        }
+    }
+    // Liveness next: the refusal that matters most is "an agent is working there
+    // right now", and it is the one question git cannot answer. Without a daemon
+    // liveness is unknown and the removal proceeds — said out loud, because the
+    // operator is about to delete a directory on the strength of an answer
+    // nobody gave.
+    match daemon_liveness(&socket).await {
+        Some(panes) => {
+            if panes.get(&pane).copied().unwrap_or(false) {
+                if !options.force {
+                    eprintln!(
+                        "worktrees remove: {pane} is live; that agent is working in this worktree \
+                         (--force removes it anyway)"
+                    );
+                    return ExitCode::FAILURE;
+                }
+                eprintln!("worktrees remove: {pane} is live; removing anyway (--force)");
+            }
+        }
+        None => eprintln!(
+            "worktrees remove: no daemon is reachable, so liveness is unknown; removing anyway"
+        ),
+    }
+    match worktree::remove(&repo, &root, &pane, options.force) {
+        Ok(path) => {
+            // The branch stays: it holds the commits, and "stop working here" is
+            // a different decision from "throw the commits away". Saying where
+            // they are is the whole point of the line.
+            let branch = worktree::branch_for(&pane);
+            println!("removed {}", path.display());
+            println!(
+                "branch {branch} kept (the commits are on it; `git branch -D {branch}` deletes it)"
+            );
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            // `WorktreeError::Dirty`'s own Display is the refusal text: it names
+            // the files and what to do about them, so it is printed unmodified.
+            eprintln!("worktrees remove: {e}");
             ExitCode::FAILURE
         }
     }

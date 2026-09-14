@@ -27,6 +27,6 @@ pub use codec::{
     negotiate, CodecError, Direction, MAX_FRAME_BYTES, MIN_VERSION,
 };
 pub use message::{
-    AgentState, Message, MetricsPoint, PaneDetail, PaneInfo, SyncExchange, SyncOutcome, SyncStatus,
-    VERSION,
+    AgentState, Message, MetricsPoint, PaneDetail, PaneInfo, SpawnSpec, SyncExchange, SyncOutcome,
+    SyncStatus, VERSION,
 };

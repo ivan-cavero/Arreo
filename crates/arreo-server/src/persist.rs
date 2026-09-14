@@ -10,6 +10,13 @@
 //! command, so *history* is restored, while a resumed harness session
 //! continues where the old child left off).
 //!
+//! Since T-0091 a pane also records the `git worktree` it runs in, and a
+//! restored pane is started *there* — resolved before the spawn, so a pane whose
+//! checkout cannot be made again is skipped loudly instead of being restored in
+//! the daemon's own directory. Where that directory is stays the daemon's
+//! decision (it owns the worktree rules), which is why the resolver is passed
+//! in rather than derived here.
+//!
 //! Strategy (respawn+replay, NOT fd-passing): fd-passing cannot survive a
 //! machine reboot (the stated criterion); respawn+replay survives both crash
 //! and reboot with one mechanism. Since T-0072 the resume argv is built from
@@ -51,7 +58,8 @@ pub fn lock_path_for(socket: &Path) -> PathBuf {
 
 /// One pane's live state as the daemon knows it at snapshot time: the pane
 /// itself plus the record columns only the daemon knows (which harness it was
-/// started under, and the session it is on).
+/// started under, the session it is on, and — since T-0091 — the worktree it
+/// runs in).
 pub struct SnapshotPane {
     pub id: String,
     pub pane: Arc<Pane>,
@@ -62,6 +70,10 @@ pub struct SnapshotPane {
     /// the one captured from the harness's own output once it printed any
     /// (read from the entry's engine when it snapshots).
     pub session_id: Option<String>,
+    /// The `git worktree` this pane was started in (T-0091), read from the
+    /// entry's accessor. `None` for every pane that is not in one — which is
+    /// every pane a client did not ask for a worktree.
+    pub worktree: Option<PathBuf>,
 }
 
 /// Snapshot `panes` (id → pane + harness/session) into the DB at `socket`'s
@@ -103,6 +115,9 @@ pub fn snapshot(panes: &[SnapshotPane], db: &Path) -> Result<usize, PersistError
                 scrollback: p.pane.drain(),
                 harness: p.harness.clone(),
                 session_id: p.session_id.clone(),
+                // The path as the record keeps it: a string, because that is
+                // what the column holds and what `ensure` takes back.
+                worktree: p.worktree.as_ref().map(|path| path.display().to_string()),
             }
         })
         .collect();
@@ -121,6 +136,11 @@ pub struct RestoredPane {
     pub pane: Arc<Pane>,
     pub harness: Option<String>,
     pub session_id: Option<String>,
+    /// The directory this pane was actually started in (T-0091), for a record
+    /// that had a worktree: the path the resolver proved, which is the one the
+    /// entry records and the next snapshot writes. `None` for a pane restored
+    /// without one — the pre-T-0091 shape, unchanged.
+    pub worktree: Option<PathBuf>,
 }
 
 /// The grace a resumed child gets to refuse the resume before the restore
@@ -145,7 +165,21 @@ const RESUME_REFUSAL_GRACE: Duration = Duration::from_millis(400);
 /// What the messages never carry is the session id itself: an id identifies a
 /// session; an operator who needs one reads it from the harness, not from
 /// daemon stderr.
-pub fn restore(db: &Path, adapters: &AdapterRegistry) -> Result<Vec<RestoredPane>, PersistError> {
+///
+/// `worktree_dir` answers **where** a record has to come back (T-0091): the
+/// daemon owns the worktree rules — which repository, which root, and whether
+/// the checkout can be made again at all — so the record's recorded worktree is
+/// handed to it whole and an `Err` skips the pane loudly. Resolving it *before*
+/// the spawn is the point: a pane started in the daemon's own directory and
+/// moved afterwards ran in the wrong place, and no amount of moving fixes that.
+/// A record with no worktree (every row written before v10, and every pane
+/// spawned without one) resolves to `None` and restores exactly as it did
+/// before.
+pub fn restore(
+    db: &Path,
+    adapters: &AdapterRegistry,
+    worktree_dir: impl Fn(Option<String>) -> Result<Option<PathBuf>, String>,
+) -> Result<Vec<RestoredPane>, PersistError> {
     if !db.exists() {
         return Ok(Vec::new());
     }
@@ -156,6 +190,19 @@ pub fn restore(db: &Path, adapters: &AdapterRegistry) -> Result<Vec<RestoredPane
         // The adapter the record names (or its program implies); `None` plan
         // means "no resume possible from this record" — the plain path.
         let adapter = adapters.for_record(record.harness.as_deref(), &record.program);
+        // T-0091: where this pane has to come back. Resolved before anything is
+        // spawned, and a record whose worktree cannot be re-made skips the pane
+        // loudly rather than restoring it in the daemon's own directory. The
+        // recorded path is cloned into the resolver because the resolver is the
+        // daemon's and may keep it — one small string per restored pane, on a
+        // boot path that is already spawning children.
+        let cwd = match worktree_dir(record.worktree.clone()) {
+            Ok(cwd) => cwd,
+            Err(why) => {
+                skip_loudly(&record, adapter.harness_id(), &why);
+                continue;
+            }
+        };
         let plan = adapter.resume.as_ref().and_then(|resume| {
             // The record's args may already carry the resume argv (a `pin`
             // pane was spawned with it on purpose): strip it back to base so
@@ -190,17 +237,18 @@ pub fn restore(db: &Path, adapters: &AdapterRegistry) -> Result<Vec<RestoredPane
                 {
                     loud.push(reason);
                 }
-                spawn_plain(&record, adapter).map(|pane| (pane, None))
+                spawn_plain(&record, adapter, cwd.as_deref()).map(|pane| (pane, None))
             }
             Some((args, session)) => {
                 let args_ref: Vec<&str> = args.iter().map(String::as_str).collect();
                 let env = keychain_env(adapter);
-                match Pane::spawn_with_env(
+                match Pane::spawn_in_dir(
                     &record.program,
                     &args_ref,
                     record.cols,
                     record.rows,
                     &env,
+                    cwd.as_deref(),
                 ) {
                     Ok(pane) => {
                         let pane = Arc::new(pane);
@@ -219,14 +267,15 @@ pub fn restore(db: &Path, adapters: &AdapterRegistry) -> Result<Vec<RestoredPane
                                     "harness refused the resume (exit {code}); respawning plainly"
                                 ));
                                 drop(pane); // already reaped
-                                spawn_plain(&record, adapter).map(|pane| (pane, None))
+                                spawn_plain(&record, adapter, cwd.as_deref())
+                                    .map(|pane| (pane, None))
                             }
                             _ => Ok((pane, session)),
                         }
                     }
                     Err(e) => {
                         loud.push(format!("resume spawn failed: {e}; respawning plainly"));
-                        spawn_plain(&record, adapter).map(|pane| (pane, None))
+                        spawn_plain(&record, adapter, cwd.as_deref()).map(|pane| (pane, None))
                     }
                 }
             }
@@ -246,6 +295,7 @@ pub fn restore(db: &Path, adapters: &AdapterRegistry) -> Result<Vec<RestoredPane
                     pane,
                     harness: adapter.harness_id().map(str::to_string),
                     session_id: session,
+                    worktree: cwd,
                 });
             }
             Err(why) => {
@@ -263,10 +313,17 @@ pub fn restore(db: &Path, adapters: &AdapterRegistry) -> Result<Vec<RestoredPane
     Ok(out)
 }
 
-fn spawn_plain(record: &StoredPane, adapter: &Adapter) -> Result<Arc<Pane>, String> {
+/// Respawn a record's command, in `cwd` when the record has a worktree (T-0091)
+/// and in the daemon's own directory otherwise — the pre-T-0091 behaviour,
+/// which `spawn_in_dir`'s `None` is exactly.
+fn spawn_plain(
+    record: &StoredPane,
+    adapter: &Adapter,
+    cwd: Option<&Path>,
+) -> Result<Arc<Pane>, String> {
     let args: Vec<&str> = record.args.iter().map(String::as_str).collect();
     let env = keychain_env(adapter);
-    Pane::spawn_with_env(&record.program, &args, record.cols, record.rows, &env)
+    Pane::spawn_in_dir(&record.program, &args, record.cols, record.rows, &env, cwd)
         .map(Arc::new)
         .map_err(|e| format!("respawn failed: {e}"))
 }
@@ -351,6 +408,7 @@ mod tests {
             scrollback: Vec::new(),
             harness: Some("pi".to_string()),
             session_id: Some(SESSION.to_string()),
+            worktree: None,
         }
     }
 

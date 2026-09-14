@@ -18,7 +18,7 @@ use std::time::Duration;
 /// callers keep one import path while the one implementation lives in core
 /// (T-0044: the CLI reads the same file, and the dependency rule forbids it
 /// depending on this crate).
-pub use arreo_core::relay::config::{load_config, ConfigError, RelaySettings};
+pub use arreo_core::relay::config::{load_config, ConfigError, RelaySettings, WorktreeSettings};
 /// The session vocabulary, re-exported so this crate's callers keep one import
 /// path for "the relay session" while the implementation lives in core.
 pub use arreo_core::relay::session::{
@@ -76,6 +76,11 @@ pub struct RelayContext {
     /// may use it applies over the relay exactly as it does on a direct
     /// connection — the relay carries bytes and decides nothing.
     pub ledger: arreo_core::mesh::SharedLedger,
+    /// The `[worktree]` settings the daemon was started with (T-0091). A peer
+    /// runs the *same* session loop as the local socket, so a peer's
+    /// `spawn --worktree` has to land in the repository this machine configured —
+    /// otherwise one verb would mean two things depending on how it arrived.
+    pub worktree: arreo_core::relay::config::WorktreeSettings,
 }
 
 impl Clone for RelayContext {
@@ -89,6 +94,7 @@ impl Clone for RelayContext {
             cert: Arc::clone(&self.cert),
             machine_name: self.machine_name.clone(),
             ledger: self.ledger.clone(),
+            worktree: self.worktree.clone(),
         }
     }
 }
@@ -442,16 +448,16 @@ async fn serve_peer(stream: RelayStream, context: &RelayContext, announced: Devi
     auth.touch();
     eprintln!("arreo-server: relay peer {device} authenticated");
     let (reader, writer) = tokio::io::split(channel);
-    if let Err(e) = crate::daemon::serve_session(
-        reader,
-        writer,
-        Arc::clone(&context.registry),
-        Arc::clone(&context.sessions),
-        context.db.clone(),
-        Some(auth),
-    )
-    .await
-    {
+    // The same bundle the local socket and the direct transport hand the loop
+    // (T-0091): a relay peer runs the *same* session loop, so it arrives with
+    // the same per-serve context and no extra parameter on `serve_session`.
+    let serve_context = crate::daemon::ServeContext {
+        registry: Arc::clone(&context.registry),
+        sessions: Arc::clone(&context.sessions),
+        db: context.db.clone(),
+        worktree: context.worktree.clone(),
+    };
+    if let Err(e) = crate::daemon::serve_session(reader, writer, serve_context, Some(auth)).await {
         eprintln!("arreo-server: relay peer {device} session error: {e}");
     }
 }

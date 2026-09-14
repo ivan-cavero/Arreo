@@ -115,7 +115,28 @@ async fn main() {
         &authority.root_fingerprint()[..16],
         authority.devices().len()
     );
-    let daemon = arreo_server::Daemon::new(&socket);
+    // The configuration file, if the operator named one (`--config`, or
+    // `$ARREO_CONFIG`). Read here — before the daemon exists — because the
+    // daemon needs one section of it before it restores a pane or spawns one
+    // (T-0091's `[worktree]`), and because one file read once is one place a
+    // malformed file is reported. The relay block below uses the same path and
+    // the same parser.
+    let config_path = config.or_else(|| std::env::var_os("ARREO_CONFIG").map(PathBuf::from));
+    let worktree_settings = match &config_path {
+        Some(path) => match arreo_server::WorktreeSettings::load(path) {
+            Ok(settings) => settings,
+            Err(e) => {
+                eprintln!("arreo-server: worktree configuration is unusable: {e}");
+                std::process::exit(1);
+            }
+        },
+        // No configuration file: worktrees come from the directory this daemon
+        // was started in, under the state directory's `worktrees/`. A daemon
+        // that is never asked for one never reads either.
+        None => arreo_server::WorktreeSettings::default(),
+    };
+    let daemon =
+        arreo_server::Daemon::new(&socket).with_worktree_settings(worktree_settings.clone());
     let registry = daemon.registry();
     let sessions = daemon.sessions();
     let socket_path = socket.clone();
@@ -172,9 +193,8 @@ async fn main() {
     // Relay (T-0051). A configuration that enables the relay but is incomplete
     // is a loud exit rather than a silent no-op: an operator who asked for the
     // remote path and quietly did not get it has a bug they cannot see.
-    let config_path = config.or_else(|| std::env::var_os("ARREO_CONFIG").map(PathBuf::from));
-    if let Some(path) = config_path {
-        match arreo_server::load_config(&path) {
+    if let Some(path) = &config_path {
+        match arreo_server::load_config(path) {
             Ok(Some(settings)) => match arreo_server::own_identity() {
                 Ok((device, cert)) => {
                     let context = arreo_server::RelayContext {
@@ -190,6 +210,12 @@ async fn main() {
                         // and the join request cannot disagree.
                         machine_name: settings.name.clone(),
                         ledger: ledger.clone(),
+                        // A relay peer runs the *same* session loop, so it gets
+                        // the same worktree rules this daemon was started with
+                        // (T-0091) — a peer's `spawn --worktree` lands in the
+                        // repository the operator configured, not in whatever
+                        // the defaults happen to be.
+                        worktree: worktree_settings.clone(),
                     };
                     eprintln!(
                         "arreo-server: relay enabled for account {} via {}",
@@ -250,9 +276,12 @@ async fn main() {
                     local,
                     authority,
                     ledger.clone(),
-                    registry,
-                    std::sync::Arc::clone(&sessions),
-                    db,
+                    arreo_server::daemon::ServeContext {
+                        registry,
+                        sessions: std::sync::Arc::clone(&sessions),
+                        db,
+                        worktree: worktree_settings.clone(),
+                    },
                 )
                 .await
                 {
@@ -305,6 +334,7 @@ async fn main() {
                     pane: std::sync::Arc::clone(&entry.pane),
                     harness: entry.harness.clone(),
                     session_id: entry.session(),
+                    worktree: entry.worktree(),
                 })
                 .collect();
             let db = arreo_server::db_path_for(&socket_path);

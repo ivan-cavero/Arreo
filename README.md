@@ -260,6 +260,7 @@ Everything is in this repository; no external docs site exists yet.
 | [ROADMAP.md](ROADMAP.md) | The product's design and its phases (§6 phases, §7 licensing) |
 | [docs/audit.md](docs/audit.md) | What the audit log records, redacts, and refuses to record |
 | [docs/machines.md](docs/machines.md) | The machine directory, presence, per-machine trust |
+| [docs/worktrees.md](docs/worktrees.md) | One git worktree per pane: `spawn --worktree`, `arreo worktrees` |
 | [docs/relay-protocol.md](docs/relay-protocol.md) | The relay wire protocol, version 1 (normative) |
 | [docs/relay-deploy.md](docs/relay-deploy.md) | Running your own relay |
 | [docs/cross-os.md](docs/cross-os.md) | What each portability layer proves — and what it does not |

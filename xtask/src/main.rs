@@ -31,6 +31,7 @@ mod sync_check;
 mod theme_slice;
 mod tui_slice;
 mod update_slice;
+mod worktree_slice;
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -80,8 +81,9 @@ fn e2e(rest: &[String]) -> ExitCode {
         Some("handoff-abort") => handoff_abort_slice::run(rest),
         Some("update") => update_slice::run(rest),
         Some("release") => release_slice::run(rest),
+        Some("worktree") => worktree_slice::run(rest),
         Some(other) => {
-            eprintln!("xtask e2e: unknown slice {other:?} (have: chaos, api, compat, lifecycle, persistence, state, enforcement, tui, theme, relay, reattach, handoff-abort, mesh, update, release)");
+            eprintln!("xtask e2e: unknown slice {other:?} (have: chaos, api, compat, lifecycle, persistence, state, enforcement, tui, theme, relay, reattach, handoff-abort, mesh, update, release, worktree)");
             ExitCode::from(2)
         }
         None => stub("e2e", rest),

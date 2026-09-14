@@ -38,12 +38,14 @@ fn save_restore_round_trip_over_real_panes() {
             pane: Arc::clone(&a),
             harness: None,
             session_id: None,
+            worktree: None,
         },
         SnapshotPane {
             id: "beta".to_string(),
             pane: Arc::clone(&b),
             harness: None,
             session_id: None,
+            worktree: None,
         },
     ];
 
@@ -55,7 +57,7 @@ fn save_restore_round_trip_over_real_panes() {
     assert_eq!(saved, 2);
 
     // Fresh generation: restore respawns + replays scrollback.
-    let restored = restore(&db, registry()).expect("restore");
+    let restored = restore(&db, registry(), |_| Ok(None)).expect("restore");
     assert_eq!(restored.len(), 2);
     let alpha = restored
         .iter()
@@ -126,11 +128,12 @@ fn restore_never_executes_scrollback() {
                 scrollback: vec![trigger.to_string(), "done".to_string()],
                 harness: None,
                 session_id: None,
+                worktree: None,
             }])
             .unwrap();
     }
     let _ = std::fs::remove_file("/tmp/arreo-restore-PWNED-MARKER");
-    let restored = restore(&db, registry()).expect("restore");
+    let restored = restore(&db, registry(), |_| Ok(None)).expect("restore");
     std::thread::sleep(Duration::from_millis(1000));
     assert!(
         !std::path::Path::new("/tmp/arreo-restore-PWNED-MARKER").exists(),
@@ -204,10 +207,11 @@ fn a_pinned_record_is_resumed_on_its_resume_argv() {
                 scrollback: vec!["pinned-history".to_string()],
                 harness: Some("pi".to_string()),
                 session_id: Some(session.to_string()),
+                worktree: None,
             }])
             .unwrap();
     }
-    let restored = restore(&db, registry()).expect("restore");
+    let restored = restore(&db, registry(), |_| Ok(None)).expect("restore");
     assert_eq!(restored.len(), 1);
     let pinned = &restored[0];
     assert_eq!(pinned.harness.as_deref(), Some("pi"));
@@ -256,10 +260,11 @@ fn unknown_harness_records_take_the_plain_path() {
                 scrollback: vec!["bare-history".to_string()],
                 harness: None,
                 session_id: None,
+                worktree: None,
             }])
             .unwrap();
     }
-    let restored = restore(&db, registry()).expect("restore");
+    let restored = restore(&db, registry(), |_| Ok(None)).expect("restore");
     assert_eq!(restored.len(), 1);
     let bare = &restored[0];
     assert_eq!(bare.id, "bare");
@@ -363,6 +368,7 @@ fn a_resume_the_harness_refuses_falls_back_loudly_without_blocking_the_rest() {
                     scrollback: vec!["refuser-history".to_string()],
                     harness: Some("opencode".to_string()),
                     session_id: Some("ses_deadbeef".to_string()),
+                    worktree: None,
                 },
                 arreo_core::store::StoredPane {
                     id: "after".to_string(),
@@ -376,11 +382,12 @@ fn a_resume_the_harness_refuses_falls_back_loudly_without_blocking_the_rest() {
                     scrollback: vec!["after-history".to_string()],
                     harness: None,
                     session_id: None,
+                    worktree: None,
                 },
             ])
             .unwrap();
     }
-    let restored = restore(&db, registry()).expect("restore");
+    let restored = restore(&db, registry(), |_| Ok(None)).expect("restore");
     assert_eq!(
         restored.len(),
         2,
