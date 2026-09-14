@@ -1,18 +1,31 @@
 ## State snapshot          ← REWRITTEN (not appended) at every checkpoint
-Task: **T-0086** (the sync transport over the mesh) in flight on worker `SyncTransport`, with
-the planner's design decision recorded in the task file: an appended `Message::Sync` /
-`SyncReply` variant pair carrying the *same* payload the local form produces (so `receive`
-stays the one hardened code path), and **the counter key becomes the authenticated device
-id** — a self-declared machine name let any paired peer pin another machine's counter, and a
-rename would fork it.
-Where you are: **T-0087 DONE** (`71a383a`) — the keychain bridge reaches the pane. 814 tests /
-0 failed / 67 targets; clippy clean both toolchains; fmt clean; **14/14 slices**;
-`xtask sync --check` 14/14; bench 6/6; vet 337, deny 4/4, audit 0, check-targets PASS/SKIP.
-Next step: integrate `SyncTransport` (review + mutation-test the identity override and the
-conflict arm; `--slice compat` is the N−1 referee for the protocol change), then the battery,
-commit, push, ledger.
-Open workers: SyncTransport (T-0086)
-Known broken: (none) · T-0063 (CI never-green — the user's) · Parked: T-0048 needs-human
+Task: **T-0086 DONE** (`58f60e1`, `c7d778e`) — the sync transport: a peer's config over the
+mesh, counted under the **authenticated device id**; **T-0088 filed** (the handoff
+pty-buffer test is load-sensitive).
+Where you are: **816 tests / 0 failed / 67 targets**; clippy clean on both toolchains; fmt
+clean; **14/14 slices** (mesh 36+1, compat, handoff-abort 41, tui 80, update 27, persistence
+16); `xtask sync --check` 14/14; bench 6/6; vet 337, deny 4/4, audit 0, check-targets
+PASS/SKIP.
+Next step: **T-0088** (reproduce and fix the load-sensitive handoff test) or **T-0039**
+(windows deferred update); then T-0081/T-0082 (adapter batches, gated on live CLIs), T-0085
+(CI, blocked on the user's T-0063), T-0042's remaining CI half, T-0073's follow-ups.
+Open workers: (none)
+Known broken: T-0088 (one flake, filed with its reproduction as criterion 1)
+ · T-0063 (CI never-green — the user's) · Parked: T-0048 needs-human
+**T-0086 — the transport, and the identity decision that mattered.** The payload the local
+path produces travels unchanged (`SyncEngine::receive` is the one hardened door), but the
+counter key moved from a self-declared machine name to the **authenticated device id**: over
+a socket a paired peer could otherwise claim another machine's identity and pin its counter —
+the F2 attack class reopened one layer up. The daemon refuses a disagreement instead of
+correcting it. `Message` grew to 128 bytes (the reply's outcome is 120) and tripped
+`result_large_err` on two existing functions; boxing the outcome restored 112. Two mutations
+verified by the planner: identity check off → the forgery is accepted (2 checks red);
+conflict arm made last-writer-wins → 3 checks red. ADR 0022 records the decision and the four
+rejected alternatives.
+**The worker that built it died mid-edit** (harness 400, not a code failure) after landing
+core+server+CLI; the planner finished the integration (the missing proto re-exports, the
+CLI's `block_on` shape, the sync slice's identities and the `--name`/`--machine` split), then
+delegated the two-machine proof to a fresh worker with the code frozen.
 ## Event log               ← append-only; newest last; never rewrite
 - 2026-09-10 [turn 1] ledger created; repo at e489fac (docs only); T-0001 + T-0022 (AGENTS.md gardened) done
 - 2026-09-10 [turn 2] T-0002 PTY manager done+pushed (342606c; 9 tests); PROMPT.md v2 synced + ADR 0001 (ef6c595)
@@ -184,3 +197,5 @@ Known broken: (none) · T-0063 (CI never-green — the user's) · Parked: T-0048
 - 2026-09-14 [turn 78] T-0087 done + pushed. The keychain bridge now reaches the pane: `spawn_environment` (arreo-core) reads only the harness's SYNC files and resolves those names from the machine's store; the daemon applies it at Spawn and Split, `persist::restore` at the resume branch and the plain fallback. The rule is additive (daemon env wins; empty-presence pinned). Five tests in `crates/arreo-server/tests/keychain_spawn.rs` drive a real daemon with a fake `pi` on PATH writing what the child saw — 75 consecutive clean runs; four mutations verified (no injection; env-wins removed; whole-keychain leak; resume-branch removed). The adversarial pass found two *test* bugs: `${VAR:-UNSET}` cannot distinguish empty from missing (now `${VAR-UNSET}`), and the restore test raced the detached spawn snapshot (now waits for the record — the rule T-0072's slice learned). Battery: 814/67, both clippys, fmt, 14/14 slices, sync 14/14, bench 6/6, gates green. Next: T-0086 (sync over the mesh).
 
 - 2026-09-14 [turn 78] T-0087 done + pushed; T-0086 started with the design decided by the planner (the task file's Design section): one appended variant pair reusing the local payload, `Verb::Admin` gate, and the counter key moving to the **authenticated device id** — the F2 attack class reopened by the network, since `payload.machine` is self-declared and a paired peer could claim another machine's identity. Worker `SyncTransport` delegated with the decision as its contract; `--slice compat` is the acceptance test for the protocol change.
+
+- 2026-09-14 [turn 79] T-0086 done. The delegated worker died mid-edit (HTTP 400 from the harness) after landing the protocol, identity, engine, daemon and CLI changes; the planner took the unit over (per §7), finished the integration (proto re-exports, the CLI's `block_on` return shape, the sync slice's per-root device identities, `--name` vs `--machine`), then froze the code and delegated the two-machine proof. Verified independently: forged-identity mutation (accepted without the check — 2 checks red) and last-writer-wins mutation (3 checks red). A real clippy finding from the change: `SyncOutcome` is 120 bytes, which took `Message` to 128 and tripped `result_large_err` on two pre-existing functions — boxed, back to 112. ADR 0022 written. One flake observed and filed (T-0088, handoff pty-buffer test under parallel load: 1 failure in 3 full runs, 3/3 clean alone, 816/0 on the next full run). Battery: 816/67, both clippys, fmt, 14/14 slices, sync 14/14, bench 6/6, gates green.
