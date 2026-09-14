@@ -1,0 +1,106 @@
+T-0109 — the store refuses a newer schema, and that refusal touches nothing
+==========================================================================
+
+FOUND BY: the `security-reviewer` pass over T-0091 (`agent://T0091Security`,
+finding T-0091-04, CWE-1188), reproduced by simulating the two statements a v9
+binary executes against a v10 store. Reported as **pre-existing** store behaviour
+rather than a T-0091 regression — the review said so, and it is right: no
+minimum-version check has ever existed. It was filed because T-0091 is the first
+feature whose stored data **cannot be re-derived**: `program`/`args`/`scrollback`
+survive a downgrade because they are re-recorded on every snapshot, while a
+worktree path is machine state an older binary has nowhere to put.
+
+THE DEFECT
+----------
+`migrate()` read the store's version and then applied forward steps, ending with an
+**unconditional** write of the running binary's `SCHEMA_VERSION`. So an older binary
+opening a newer store rewrote the version to its own, and its next
+`save_topology` — whose INSERT names only the columns it knows — dropped the rest.
+No refusal, no log line, nothing in the file recording what was lost.
+
+THE FIX
+-------
+The version is now read **first, before any DDL or write**, and a store from the
+future is refused with a typed error naming both numbers and the remedy:
+
+```rust
+if version > SCHEMA_VERSION {
+    return Err(SessionError::SchemaTooNew { path, found: version, supported: SCHEMA_VERSION });
+}
+```
+
+Three decisions inside that:
+
+- **`>` and not `>=`** — a store at exactly this binary's version is not "newer",
+  or every restart of a current machine would refuse its own store. Pinned by the
+  test's boundary case.
+- **Read before the `CREATE TABLE IF NOT EXISTS` batch**, so the refusal is a
+  no-op rather than "mostly a no-op". The `meta` table may not exist yet (a fresh
+  store), which reads as version 0 and proceeds.
+- **A typed variant, deliberately *not* corruption.** `is_store_corruption` matches
+  only sqlite error codes, so `open` returns this straight through — no heal, no
+  quarantine. That matters more than it looks: quarantining renames the store
+  aside, and the store here is perfectly good while *the binary* is too old.
+  Renaming aside the newest data on a machine would be the worst possible response
+  to this error, and the test asserts no `.corrupt-*` file appears.
+
+PROOF 1 — the test (`cargo test -p arreo-core --test store` → 10 passed, was 9)
+-------------------------------------------------------------------------------
+`a_store_from_a_newer_binary_is_refused_and_left_untouched` asserts, in order:
+
+1. the refusal is `SchemaTooNew` with `found` = the stored version and `supported`
+   = this binary's, and the message names both numbers and the remedy;
+2. **the version was not rewritten** — read back from the file after the refusal;
+3. **nothing was quarantined** — no `.corrupt-*` file in the directory;
+4. the boundary: a store at exactly `SCHEMA_VERSION` opens (the `>` rule).
+
+PROOF 2 — a real daemon, end to end (verbatim)
+----------------------------------------------
+A store stamped `schema_version = 99` at a scratch socket path, then the real
+server binary started against it:
+
+```console
+$ arreo-server --socket …/arreo.sock
+arreo-server: device identity unavailable: store: the store at …/arreo.sock.db was written by a
+newer arreo (schema 99); this binary speaks 10 — run the newer arreo against it, or start from
+a fresh state directory
+arreo-server: refusing to serve without a device authority (fix or remove the identity
+directory, then start again)
+$ test -S …/arreo.sock
+no socket
+$ python3 -c "… SELECT value FROM meta WHERE key='schema_version'"
+('99',)
+```
+
+So the boot path is not merely "loud and then empty": the daemon **refuses to
+start** (the device authority loads from the same store), the message names both
+versions and the remedy, and the store is byte-unchanged. That is criterion 2
+satisfied more strongly than it asked for.
+
+MUTATIONS (run by the planner)
+------------------------------
+- **The guard removed** (the version read kept first, so only the check is gone):
+  the unit test fails with `a newer store must be refused`.
+- **The destructive half, reproduced end to end.** With the guard removed, the real
+  daemon against the same `99`-stamped store leaves the file at `('10',)` — the
+  version rewritten to the older binary's, which is the silent loss the finding
+  describes, and the mechanism by which the next snapshot drops every column that
+  binary does not know. With the guard in place the same run leaves `('99',)`.
+
+FINDING CONSIDERED AND DISMISSED WHILE WRITING
+----------------------------------------------
+`has_column(conn, "panes", …)` **errors** on a store with no `panes` table, so a
+hypothetical store stamped `v9` without that table fails to open with
+`no such table: panes`. Not filed and not fixed: no real store can be in that
+state (v2 creates `panes`, and every version since has it), so a guard for it would
+be defending a shape the migration itself makes impossible. It surfaced only because
+a first draft of the test built exactly that impossible store — which is how it was
+found, and why the test now asserts the boundary case instead of a synthetic one.
+
+VERIFICATION
+------------
+- `cargo test -p arreo-core --test store` → 10 passed.
+- `cargo test --workspace` → 869 passed, 0 failed.
+- `docs/release.md` gains "Rolling back: the store's window is forward-only",
+  beside the N−1 protocol window and the deferred update, with the operator's view
+  of the refusal and what `--rollback` may and may not cross.

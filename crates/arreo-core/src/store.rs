@@ -76,6 +76,28 @@ pub enum SessionError {
         quarantine: String,
         reason: String,
     },
+    /// The store was written by a **newer** arreo than this binary (T-0109).
+    ///
+    /// The schema migrates forward only, and there is no downgrade path, so an
+    /// older binary must refuse rather than open: it would rewrite the version to
+    /// its own, and the next snapshot — which knows only the columns *it* knows —
+    /// would drop the ones it does not understand. That is silent, permanent data
+    /// loss, and it became behaviour-changing the moment a column arrived whose
+    /// value cannot be re-derived (T-0091's `worktree`: the paths are machine
+    /// state, while `program`/`args`/`scrollback` are re-recorded every snapshot).
+    ///
+    /// Deliberately **not** corruption, and therefore never healed or quarantined:
+    /// the store is perfectly good, it is this binary that is too old. Renaming it
+    /// aside would destroy the newest data on the machine.
+    #[error(
+        "the store at {path} was written by a newer arreo (schema {found}); this binary speaks \
+         {supported} — run the newer arreo against it, or start from a fresh state directory"
+    )]
+    SchemaTooNew {
+        path: std::path::PathBuf,
+        found: u32,
+        supported: u32,
+    },
 }
 
 pub const SCHEMA_VERSION: u32 = 10;
@@ -653,14 +675,17 @@ impl SessionStore {
         Ok(())
     }
 
-    fn migrate(conn: &Connection) -> Result<(), SessionError> {
-        conn.execute_batch(
-            "PRAGMA journal_mode=WAL;
-             CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT);
-             CREATE TABLE IF NOT EXISTS rollups(pane TEXT NOT NULL, ts_ms INTEGER NOT NULL,
-               rss_bytes INTEGER NOT NULL, cpu REAL NOT NULL, pids INTEGER NOT NULL,
-               PRIMARY KEY (pane, ts_ms));",
-        )?;
+    fn migrate(conn: &Connection, path: &std::path::Path) -> Result<(), SessionError> {
+        // **The version is read first, and a store from the future is refused
+        // before anything is written** (T-0109). The steps below only ever move a
+        // store forward, and the version write at the end of this function is
+        // unconditional — so an older binary opening a newer store used to rewrite
+        // the version to its own and then drop, on its next snapshot, every column
+        // it did not know about. Silently and permanently: nothing in the file
+        // records what was lost.
+        //
+        // Reading first is what makes the refusal a no-op. The `meta` table may
+        // not exist yet (a fresh store), which reads as version 0 and proceeds.
         let version: u32 = conn
             .query_row(
                 "SELECT value FROM meta WHERE key='schema_version'",
@@ -669,6 +694,20 @@ impl SessionStore {
             )
             .map(|v| v.parse().unwrap_or(0))
             .unwrap_or(0);
+        if version > SCHEMA_VERSION {
+            return Err(SessionError::SchemaTooNew {
+                path: path.to_path_buf(),
+                found: version,
+                supported: SCHEMA_VERSION,
+            });
+        }
+        conn.execute_batch(
+            "PRAGMA journal_mode=WAL;
+             CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT);
+             CREATE TABLE IF NOT EXISTS rollups(pane TEXT NOT NULL, ts_ms INTEGER NOT NULL,
+               rss_bytes INTEGER NOT NULL, cpu REAL NOT NULL, pids INTEGER NOT NULL,
+               PRIMARY KEY (pane, ts_ms));",
+        )?;
         if version < 2 {
             conn.execute_batch(
                 "CREATE TABLE IF NOT EXISTS panes(
@@ -1256,7 +1295,7 @@ impl SessionStore {
     fn open_once(path: &std::path::Path) -> Result<Self, SessionError> {
         let conn = Connection::open(path)?;
         Self::prepare(&conn)?;
-        Self::migrate(&conn)?;
+        Self::migrate(&conn, path)?;
         // T-0078: the store's files are the operator's private state (pane
         // scrollback, the audit log, device records) — owner-only the moment
         // this open made them present. See `restrict_store_files` for the
@@ -1271,7 +1310,9 @@ impl SessionStore {
     pub fn open_memory() -> Result<Self, SessionError> {
         let conn = Connection::open_in_memory()?;
         Self::prepare(&conn)?;
-        Self::migrate(&conn)?;
+        // A memory store is always new, so the version check cannot fire; the
+        // path is carried for the error's sake and is never read.
+        Self::migrate(&conn, std::path::Path::new(":memory:"))?;
         Ok(Self {
             conn: std::sync::Mutex::new(conn),
         })

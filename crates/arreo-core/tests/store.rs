@@ -370,3 +370,102 @@ fn session_ids_are_not_secret_scanned_away() {
     );
     assert!(!rows[0].redacted, "neither id is secret-shaped");
 }
+
+/// **A store from a newer arreo is refused, and left exactly as it was**
+/// (T-0109).
+///
+/// The schema migrates forward only. An older binary opening a newer store used
+/// to rewrite the version to its own — and then drop, on its next snapshot, every
+/// column it did not know about: silent, permanent loss that became
+/// behaviour-changing when a column arrived whose value cannot be re-derived
+/// (T-0091's `worktree` is machine state, while `program`/`args`/`scrollback` are
+/// re-recorded every snapshot).
+///
+/// Two halves, and the second is the one that matters: the refusal must not
+/// *damage* anything. It is not corruption, so it must not be quarantined either —
+/// renaming the newest store aside would destroy the newest data on the machine.
+#[test]
+fn a_store_from_a_newer_binary_is_refused_and_left_untouched() {
+    let dir = std::env::temp_dir().join(format!(
+        "arreo-mig-newer-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("newer.db");
+    let future = arreo_core::store::SCHEMA_VERSION + 1;
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(&format!(
+            "PRAGMA journal_mode=WAL;
+             CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT);
+             INSERT INTO meta(key, value) VALUES ('schema_version', '{future}');"
+        ))
+        .unwrap();
+    }
+
+    // Refused, as a *typed* error naming both numbers — the variant exists so the
+    // daemon's boot path can report it in the same loud style as its other store
+    // failures instead of starting on an empty store.
+    let err = match SessionStore::open(&path) {
+        Ok(_) => panic!("a newer store must be refused"),
+        Err(e) => e,
+    };
+    match &err {
+        arreo_core::store::SessionError::SchemaTooNew {
+            found, supported, ..
+        } => {
+            assert_eq!(*found, future, "the stored version is named");
+            assert_eq!(*supported, arreo_core::store::SCHEMA_VERSION);
+        }
+        other => panic!("want SchemaTooNew, got {other:?}"),
+    }
+    let text = err.to_string();
+    assert!(text.contains(&future.to_string()), "{text}");
+    assert!(
+        text.contains(&arreo_core::store::SCHEMA_VERSION.to_string()),
+        "{text}"
+    );
+    assert!(
+        text.contains("newer arreo"),
+        "the remedy is in the message: {text}"
+    );
+
+    // 1. The version was not rewritten to this binary's.
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    let stored: String = conn
+        .query_row(
+            "SELECT value FROM meta WHERE key='schema_version'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(stored, future.to_string(), "the store was not rewritten");
+    drop(conn);
+
+    // 2. Nothing was quarantined: a not-corrupt store is not healed, because the
+    //    store is fine and this binary is the one that is too old.
+    let quarantined: Vec<String> = std::fs::read_dir(&dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.contains("corrupt"))
+        .collect();
+    assert!(
+        quarantined.is_empty(),
+        "a newer store must not be quarantined: {quarantined:?}"
+    );
+
+    // 3. The boundary itself: a store at **exactly** this binary's version is
+    //    not "newer" and must open. (`>` is the rule, not `>=` — otherwise every
+    //    restart of a current machine would refuse its own store.)
+    let current = dir.join("current.db");
+    drop(SessionStore::open(&current).expect("a fresh store opens"));
+    let reopened = SessionStore::open(&current).expect("a current store reopens");
+    assert_eq!(
+        reopened.schema_version().expect("version"),
+        arreo_core::store::SCHEMA_VERSION
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

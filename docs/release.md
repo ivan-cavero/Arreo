@@ -520,6 +520,48 @@ The last row is the honest gap, and it is a gap in *this* document's story rathe
 than a hidden one: the deferred path exists and is proven, and the Windows
 application point (which is what the platform difference actually is) is T-0090.
 
+### Rolling back: the store's window is forward-only
+
+The protocol has an **N−1 window** (ADR 0017): an older client and a newer daemon
+still speak to each other, so an update can never strand an attached client. The
+**store does not work that way**, and an operator has to know which side of the
+asymmetry they are on:
+
+- **Forward is supported, always.** A store written by an older arreo opens, is
+  migrated in place, and keeps every row. That is what makes an update safe: the
+  new binary reads the old file.
+- **Backward is refused, loudly.** A store written by a **newer** arreo (a
+  `schema_version` above this binary's) is not opened at all. `arreo-server`
+  reports both versions and the remedy and refuses to serve:
+
+  ```console
+  $ arreo-server --socket /run/user/1000/arreo.sock
+  arreo-server: device identity unavailable: store: the store at …/arreo.sock.db was written by
+  a newer arreo (schema 11); this binary speaks 10 — run the newer arreo against it, or start
+  from a fresh state directory
+  arreo-server: refusing to serve without a device authority (fix or remove the identity
+  directory, then start again)
+  ```
+
+  Nothing is written, nothing is quarantined: the store is fine, this binary is
+  the one that is too old. (A corrupt store is a different case and *is* renamed
+  aside — see the store's docs — but a newer one is not corruption, and renaming
+  aside the newest data on a machine would be the worst possible response.)
+
+**Why refusing beats opening.** The migration only ever moves forward, so an older
+binary would rewrite the version to its own — and then, on its first snapshot,
+drop every column it does not know about. Silently and permanently: nothing in the
+file records what was lost. That was harmless while every column could be
+re-derived, and stopped being harmless the moment one could not (T-0091's
+`worktree`: `program`/`args`/`scrollback` are re-recorded on every snapshot, while a
+checkout path is machine state an older binary has nowhere to put).
+
+**What this means for `--rollback`.** Rolling the **client** back is safe: the
+client keeps no store. Rolling the **server** back across a schema bump is not,
+and the honest procedure is `arreo update --server --rollback` *before* the new
+daemon has written anything, or a fresh state directory. The guard is what makes
+that a refusal at boot rather than a discovery three restarts later.
+
 ## Install URLs (reserved — none of these resolves today)
 
 | Channel | URL | State |
