@@ -1,42 +1,42 @@
 ## State snapshot          ← REWRITTEN (not appended) at every checkpoint
-Task: **T-0107, T-0108 and T-0109 DONE** — every finding from the T-0091 `security-reviewer`
-pass is now closed (T-0106 landed last turn).
-Where you are: **869 tests / 0 failed / 70 targets**; clippy clean on both toolchains; fmt
-clean; **14/14 slices** (tui 87, worktree 9, mesh 36+1, update 27, handoff-abort 41);
-`xtask sync --check` 14/14; bench 6/6; vet 337, deny 4/4, audit 0, check-targets PASS/SKIP.
-Next step: **T-0093** (notification rules — a pure decision function, quiet hours that count
-what they suppress); then T-0095 (approval gates), T-0105 (the deferred update's start path),
-T-0096 (adapter SDK linter), T-0098 (plugin host v0). All Phase-2 work is either done or
-blocked on the user's CI (T-0063/T-0085), a Windows runner (T-0090) or a credential (T-0089).
-Open workers: (none)
+Task: **T-0093 in progress** — the notification rules engine. Design done; the hook point is out
+with a scout; the pure rule module is next.
+Where you are: battery green at `43ae033` (869 tests / 0 failed / 70 targets, 14/14 slices, bench
+6/6, vet/deny/audit/check-targets PASS). Nothing written yet for T-0093.
+Next step: scout report → write `arreo_core::notify` (pure decision + policy + globs) with its
+unit tests → freeze → delegate the daemon wiring and the CLI verb to workers → slice.
+Open workers: `NotifyHook` (scout: where every transition can be observed — read-only).
 Known broken: T-0063 (CI never-green — the user's) · Parked: T-0048 needs-human
-**The review paid for itself four times over.** A single `security-reviewer` pass over T-0091
-(worktree-per-task) produced a high-severity defect on the **normal `arreo update` route** and
-three more that measuring either confirmed or re-scoped:
-- **T-0106** (last turn) — the live handoff carried no worktree, so an update silently
-  un-isolated every pane: the agent came back in the daemon's own directory after a restart,
-  the stored column was nulled, the checkout leaked on kill. Trailing `serde(default)` manifest
-  field + the config resolved before the handoff dispatch + `--config` forwarded to the child.
-- **T-0107** — the restore path took the worktree **root** out of the record and handed it to
-  `ensure`, which does `create_dir_all` + `git worktree add`: a store row could make the daemon
-  create a directory anywhere (reproduced) or start the agent in the main checkout (reproduced).
-  `pane_of_recorded` now requires the record to be `<configured root>/<pane>` and hands only the
-  *name* on, making containment structural. Two pieces of path math carry it — lexical `..`
-  resolution (a text comparison accepts `/root/../escape`) and canonicalize-first (or a
-  symlinked root refuses every pane). `check-targets` caught an ungated `std::os::unix` in my
-  own new test, which the Windows type-check is exactly for.
-- **T-0108** — the kill path discarded its 5 s wait and decided "dirty" from a read taken while
-  the child might be writing. **Measuring reframed it twice**: `git worktree remove` without
-  `--force` re-checks and refuses a dirty checkout by itself (so the predicted file loss cannot
-  happen — git is the guard, our pre-check is the message layer, now documented with the rule
-  that nothing may pass `force = true` where a live process could write), and `kill_shared`
-  sends **SIGKILL**, so the criterion's "child that ignores SIGTERM" is unreachable — recorded
-  as the one **unmet criterion, with its reason**, rather than faked.
-- **T-0109** — the store had no downgrade guard: an older binary rewrote a newer store's version
-  and its next snapshot dropped every column it did not know, silently. The version is now read
-  before any write and a newer store is refused, typed, untouched (no quarantine — the store is
-  good, the binary is old). Mutation end to end: pre-fix the file goes `99 → 10`; post-fix it
-  stays `99`.
+**T-0093 design (decided before writing a line, per §3).** Three questions had to be settled
+first, and two of them changed the shape of the task:
+
+1. **Where does a rule see every transition?** Today `PaneEntry::pump()` returns
+   `Vec<arreo_core::state::Event>` and every call site *discards* it except `Wait`, which only
+   looks for the state it was asked about — so there is no "on every transition" hook, and a
+   notification must fire whether or not a client is attached (the unwatched pane that becomes
+   blocked is exactly the case the feature exists for). The scout is finding the best host: an
+   existing background sweep (T-0040's writer, T-0052's 500 ms tick) or a new one beside them.
+   **The rule stays pure either way** — the hook is the caller.
+2. **Durable episode state, without a new table.** "A machine restart mid-episode" must not
+   re-notify, and "suppression is never silent" wants a queryable row. Both are the *audit log's*
+   job (T-0033), so the design reads history from it rather than adding a `notify_state` table:
+   one query per transition (transitions are rare — state changes, not output lines), no schema
+   bump, and the durable log is the single source of truth for "what have I already told them".
+3. **"local-time window" without a time dependency.** `quiet_hours` needs wall-clock time and
+   `std` has only UTC. `time` 0.3 is in the lock graph transitively but is **not** a direct
+   dependency of any workspace crate, and its `local_offset` API returns `None` in a
+   multi-threaded process unless the *unsound* feature is enabled — a trap, not a solution. So
+   quiet hours are configured as a **local wall-clock window plus an explicit
+   `utc_offset_minutes`**, defaulting to UTC, and the DST caveat is documented rather than hidden.
+   Zero new dependencies; the rejection reason recorded.
+
+One criterion is ambiguous and I am deciding it in the open rather than inventing silently:
+`coalesce_secs` says "one notification per pane per window, **the newest reason winning**". Two
+readings: (a) the first transition delivers and the rest are suppressed-and-counted, with the
+*record* carrying the newest reason; (b) the notification is debounced to the end of the window so
+the delivered one carries the newest reason. (b) needs a scheduler and a timer per pane; (a) needs
+nothing and still answers "why was I not told?". Taking (a), writing the choice and the alternative
+into the task file.
 ## Event log               ← append-only; newest last; never rewrite
 - 2026-09-10 [turn 1] ledger created; repo at e489fac (docs only); T-0001 + T-0022 (AGENTS.md gardened) done
 - 2026-09-10 [turn 2] T-0002 PTY manager done+pushed (342606c; 9 tests); PROMPT.md v2 synced + ADR 0001 (ef6c595)
