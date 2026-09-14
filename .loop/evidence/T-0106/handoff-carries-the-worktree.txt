@@ -1,0 +1,99 @@
+T-0106 — the live handoff lost the worktree binding, and now carries it
+======================================================================
+
+FOUND BY: a `security-reviewer` pass over T-0091 (`agent://T0091Security`,
+finding T-0091-01, severity **high**, CWE-670/CWE-1188). Reproduced end to end
+by the reviewer, on the **normal `arreo update --server` route** — that command
+hands the daemon over by spawning `arreo-server --handoff-from <socket>`.
+
+THE DEFECT, IN THREE PARTS
+--------------------------
+A pane adopted across a live cut lost its checkout, because three pieces of the
+handoff carried nothing about it:
+
+1. `HandoffPane` (the manifest) had no worktree field, and `handoff_pane()` never
+   copied the entry's — so the incoming daemon never learned it.
+2. `PaneEntry::adopted()` did not set one on the adopted entry, so the pane
+   claimed the daemon's own directory.
+3. `run_handoff()` built its daemon with `Daemon::new(socket)` — no
+   `.with_worktree_settings(…)`, and `main` resolved `[worktree]` *after* the
+   handoff dispatch (which never returns), so the handed-over daemon also ran on
+   defaulted settings.
+
+Consequences the reviewer reproduced, in order of how bad they are:
+
+- after a `kill -9` and restart, the pane came back in the **daemon's own working
+  directory** (observed cwd `/home/dev`) while its named worktree was still
+  registered — the worktree isolation silently off, which is the collision
+  T-0091 exists to prevent;
+- the next snapshot wrote `worktree = NULL` for the adopted pane — the record
+  was gone;
+- killing it removed nothing (the kill path reads `entry.worktree()`, `None`), so
+  the checkout leaked with no daemon that would ever clean it;
+- a *new* `spawn --worktree` on the handed-over daemon created its checkout under
+  the default `<state>/worktrees` instead of the configured root.
+
+THE FIX
+-------
+- `HandoffPane.worktree: Option<String>`, **`#[serde(default)]` and last** — the
+  handoff is old→new (the sender is the running daemon), so a sender that predates
+  the field must still decode; a missing trailing element takes its default. The
+  reverse direction cannot arise: `check_incoming_protocol` refuses a newer
+  outgoing daemon before a manifest is sent.
+- `handoff_pane()` copies it; `PaneEntry::adopted()` takes it and calls
+  `set_worktree`, so the binding reaches the snapshot, the kill path and a later
+  restore.
+- `main` resolves `[worktree]` **before** the handoff branch (the placement *is*
+  the fix: the branch never returns), and both the handoff daemon and the fresh
+  boot get the same settings.
+- `arreo update --server` gains `--config`, forwarded to the handoff child. The
+  child is a different process from the daemon being replaced, so it does not
+  inherit a flag the daemon was started with; `$ARREO_CONFIG` needs no flag
+  (inherited environment). Without this, an operator who configured the daemon
+  with a flag got a candidate on default settings.
+
+PROOF — the regression test
+---------------------------
+`crates/arreo-server/tests/handoff.rs::the_worktree_binding_survives_the_cut`
+(real daemon, real handoff, real git, a configured root that is **not** the
+default — a defaulted daemon cannot pass it):
+
+```
+running 1 test
+test the_worktree_binding_survives_the_cut ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 40 filtered out; finished in 1.00s
+```
+
+Three assertions, one per half of the fix: the adopted pane's **row** still names
+its checkout; a **new** `--worktree` spawn after the cut lands under the
+*configured* root; **killing** the adopted pane removes its clean checkout (so
+nothing leaks).
+
+MUTATIONS (each reddens the criterion it defends; run by the planner)
+--------------------------------------------------------------------
+- M1 `handoff_pane` sends `worktree: None` → FAIL at the row assertion (15.9 s).
+- M2 `adopted()` ignores the transferred path → FAIL at the row assertion (16.3 s).
+- M3 `run_handoff` builds `Daemon::new(socket)` with no settings → FAIL at the
+  configured-root assertion (11.6 s).
+
+One test bug found and fixed in the writing: the first version ended with
+`new.wait()` — but the handed-over daemon **keeps serving**, so it never exits
+and the test hung for 1200 s. It now drops the guard (which kills and reaps),
+which is what the neighbouring tests do for the incoming side.
+
+ALSO — the compat pin T-0091's review found missing
+---------------------------------------------------
+`crates/arreo-core/tests/compat.rs::the_worktree_verb_and_its_manifest_field_follow_the_n_1_rules`
+pins two facts: `spawn_worktree` classifies as a `Request` (nothing did), and a
+`HandoffPane` **encoded in the older 16-element shape still decodes** with
+`worktree: None`. Mutation: removing `#[serde(default)]` from the new field makes
+it fail with `invalid length 16, expected struct HandoffPane with 17 elements` —
+i.e. the pin is load-bearing, not decorative.
+
+VERIFIED
+--------
+- `cargo test -p arreo-core --test compat` → 11 passed (was 10).
+- `cargo test -p arreo-server --test handoff the_worktree_binding_survives_the_cut`
+  → 1 passed, and no leaked process afterwards (`pgrep -fa target/test-scratch`
+  empty).
+- `cargo check -p arreo-server` / `-p arreo-cli` clean.

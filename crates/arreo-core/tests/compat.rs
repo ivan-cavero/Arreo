@@ -428,6 +428,74 @@ fn the_sync_pair_classifies_by_the_same_rule() {
     );
 }
 
+/// **The worktree verb classifies by the same rule, and the handoff manifest
+/// still decodes without it** (T-0091/T-0106).
+///
+/// Two facts, one test, because they are the same fact from two directions — a
+/// field or a verb added to a struct that travels as a positional array is safe
+/// exactly when it is *trailing and defaulted*, and unsafe otherwise:
+///
+/// - `SpawnWorktree` is a client→server request, learned from the map head, so a
+///   v0 peer refuses it typed instead of decoding it. Nothing pinned this before
+///   (the T-0091 security review found the gap).
+/// - `HandoffPane` is a **positional array**, and a handoff is **old→new** — the
+///   sender is the running daemon — so the new `worktree` field must decode from
+///   a manifest that does not carry it. A missing trailing element takes its
+///   `#[serde(default)]` value, which is why the field is both trailing and
+///   defaulted.
+#[test]
+fn the_worktree_verb_and_its_manifest_field_follow_the_n_1_rules() {
+    let request = body_of(&Message::SpawnWorktree {
+        v: VERSION,
+        id: "p".into(),
+        spec: Box::new(arreo_core::proto::SpawnSpec {
+            program: "/bin/sh".into(),
+            args: vec![],
+            cols: 80,
+            rows: 24,
+            memory_max: None,
+            pids_max: None,
+            kill_on_breach: false,
+        }),
+        worktree: Some("fix".into()),
+    });
+    assert_eq!(
+        classify_op(&request),
+        Some(Direction::Request),
+        "spawning in a worktree asks the daemon to do work"
+    );
+
+    // The manifest an *older* sender would write: every field of `HandoffPane`
+    // except the last. Encoded by hand as a positional array, then decoded by
+    // this build — the direction a cut actually travels.
+    let older = rmp_serde::to_vec(&(
+        "pane-1",
+        "/bin/sh",
+        Vec::<String>::new(),
+        80u16,
+        24u16,
+        None::<u32>,
+        Vec::<String>::new(),
+        String::new(),
+        Vec::<u8>::new(),
+        false,
+        0u64,
+        0u64,
+        None::<String>,
+        false,
+        None::<String>,
+        None::<String>,
+    ))
+    .expect("encode the older shape");
+    let decoded: arreo_core::proto::message::HandoffPane =
+        rmp_serde::from_slice(&older).expect("an older manifest still decodes");
+    assert_eq!(decoded.id, "pane-1");
+    assert_eq!(
+        decoded.worktree, None,
+        "a manifest from before worktrees carries none, and that is a value — not a decode failure"
+    );
+}
+
 /// An unknown `op` is a request until a newer server says otherwise: a client
 /// that sent something unknown asked for work, and work is refused rather than
 /// ignored. A state-mutating message silently discarded is the one outcome the

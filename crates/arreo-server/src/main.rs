@@ -93,8 +93,34 @@ async fn main() {
         eprintln!("arreo-server: --socket and --handoff-from are exclusive (the handoff takes the socket it is given)");
         std::process::exit(2);
     }
+    // The configuration file, if the operator named one (`--config`, or
+    // `$ARREO_CONFIG`). Read here — before anything is served **and before the
+    // handoff branch below**, which never returns — because the daemon needs one
+    // section of it before it restores a pane or spawns one (T-0091's
+    // `[worktree]`), and because one file read once is one place a malformed file
+    // is reported. The relay block below uses the same path and the same parser.
+    //
+    // **The placement is the fix for T-0106, not a tidy-up.** This resolution used
+    // to sit after the handoff dispatch, so the incoming daemon of a live cut
+    // started with defaulted settings: a new `spawn --worktree` on the
+    // handed-over daemon created its checkout under `<state>/worktrees` instead of
+    // the configured root.
+    let config_path = config.or_else(|| std::env::var_os("ARREO_CONFIG").map(PathBuf::from));
+    let worktree_settings = match &config_path {
+        Some(path) => match arreo_server::WorktreeSettings::load(path) {
+            Ok(settings) => settings,
+            Err(e) => {
+                eprintln!("arreo-server: worktree configuration is unusable: {e}");
+                std::process::exit(1);
+            }
+        },
+        // No configuration file: worktrees come from the directory this daemon
+        // was started in, under the state directory's `worktrees/`. A daemon
+        // that is never asked for one never reads either.
+        None => arreo_server::WorktreeSettings::default(),
+    };
     if let Some(from) = handoff_from {
-        run_handoff(from, handoff_timeout).await;
+        run_handoff(from, handoff_timeout, worktree_settings).await;
     }
     let socket = socket.unwrap_or_else(default_socket);
     // Bootstrap the device authority before serving: a device-gated session
@@ -115,26 +141,6 @@ async fn main() {
         &authority.root_fingerprint()[..16],
         authority.devices().len()
     );
-    // The configuration file, if the operator named one (`--config`, or
-    // `$ARREO_CONFIG`). Read here — before the daemon exists — because the
-    // daemon needs one section of it before it restores a pane or spawns one
-    // (T-0091's `[worktree]`), and because one file read once is one place a
-    // malformed file is reported. The relay block below uses the same path and
-    // the same parser.
-    let config_path = config.or_else(|| std::env::var_os("ARREO_CONFIG").map(PathBuf::from));
-    let worktree_settings = match &config_path {
-        Some(path) => match arreo_server::WorktreeSettings::load(path) {
-            Ok(settings) => settings,
-            Err(e) => {
-                eprintln!("arreo-server: worktree configuration is unusable: {e}");
-                std::process::exit(1);
-            }
-        },
-        // No configuration file: worktrees come from the directory this daemon
-        // was started in, under the state directory's `worktrees/`. A daemon
-        // that is never asked for one never reads either.
-        None => arreo_server::WorktreeSettings::default(),
-    };
     let daemon =
         arreo_server::Daemon::new(&socket).with_worktree_settings(worktree_settings.clone());
     let registry = daemon.registry();
@@ -470,8 +476,12 @@ impl HandoffFailure {
 ///    a probe was rejected. Then keep serving: this process is the daemon now,
 ///    and it exits 0 only when a *later* handoff hands the socket on again. A
 ///    child that exits non-zero is the failure signal the launcher polls for.
-async fn run_handoff(socket: PathBuf, timeout: std::time::Duration) -> ! {
-    let failure = run_handoff_inner(&socket, timeout).await;
+async fn run_handoff(
+    socket: PathBuf,
+    timeout: std::time::Duration,
+    worktree_settings: arreo_server::WorktreeSettings,
+) -> ! {
+    let failure = run_handoff_inner(&socket, timeout, worktree_settings).await;
     eprintln!("arreo-server: handoff failed: {}", failure.detail());
     eprintln!(
         "arreo-server: the old daemon is still serving {}",
@@ -483,6 +493,7 @@ async fn run_handoff(socket: PathBuf, timeout: std::time::Duration) -> ! {
 async fn run_handoff_inner(
     socket: &std::path::Path,
     timeout: std::time::Duration,
+    worktree_settings: arreo_server::WorktreeSettings,
 ) -> HandoffFailure {
     use arreo_core::proto::{codec, Message, VERSION};
     use std::io::Write;
@@ -763,6 +774,7 @@ async fn run_handoff_inner(
                 entry.alert.as_deref(),
                 entry.alert_line.as_deref(),
                 entry.kill_on_breach,
+                entry.worktree.as_deref(),
             )),
         ));
     }
@@ -785,7 +797,7 @@ async fn run_handoff_inner(
     // there is a failure**: committing on it would exit the outgoing daemon
     // with nobody serving, which is the half-dead state this whole mechanism
     // exists to prevent.
-    let daemon = arreo_server::Daemon::new(socket);
+    let daemon = arreo_server::Daemon::new(socket).with_worktree_settings(worktree_settings);
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
     // The entries are cloned into the serving task (an `Arc` clone each) and
     // kept here too: this thread is the one that starts the pumps, and it may

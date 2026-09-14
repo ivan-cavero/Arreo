@@ -283,6 +283,7 @@ impl PaneEntry {
         alert: Option<&str>,
         alert_line: Option<&str>,
         kill_on_breach: bool,
+        worktree: Option<&str>,
     ) -> Self {
         let (journal, _) = pane.raw_snapshot();
         // T-0072: the adapter and the session are also derived, not
@@ -332,6 +333,17 @@ impl PaneEntry {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .check(Some(level.threshold()));
+        }
+        // **The checkout the pane was working in** (T-0106). Everything else on
+        // this entry is derived — the engine's state from the journal, the
+        // sampler from nothing, the session from the spec — but the worktree is
+        // not: it is this machine's decision about where the agent's files live,
+        // and the adopted pane has no way to recompute it. A cut that dropped it
+        // left the pane claiming the daemon's own directory, nulled the stored
+        // column on the next snapshot, and leaked the checkout when the pane was
+        // killed.
+        if let Some(path) = worktree {
+            entry.set_worktree(std::path::PathBuf::from(path));
         }
         entry
     }
@@ -1347,6 +1359,12 @@ fn handoff_pane(id: &str, entry: &PaneEntry) -> arreo_core::proto::message::Hand
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone(),
+        // T-0106: the pane's checkout travels with the pane. Without it the
+        // adopted entry claims the daemon's own directory and the cut silently
+        // un-isolates the agent.
+        worktree: entry
+            .worktree()
+            .map(|path| path.to_string_lossy().into_owned()),
     }
 }
 

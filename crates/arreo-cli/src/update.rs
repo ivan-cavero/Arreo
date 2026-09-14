@@ -1141,9 +1141,14 @@ fn wait_for_takeover(
     } else {
         Stdio::null()
     };
-    let mut child = command
-        .arg("--handoff-from")
-        .arg(socket)
+    let child = command.arg("--handoff-from").arg(socket);
+    // T-0106: the configuration file the operator gave, so the handed-over daemon
+    // serves with the same settings (notably `[worktree]`) as the one it
+    // replaced. `$ARREO_CONFIG` needs nothing here — the child inherits it.
+    if let Some(config) = &args.config {
+        child.arg("--config").arg(config);
+    }
+    let mut child = child
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(stderr)
@@ -1329,6 +1334,16 @@ fn usage() {
     eprintln!(
         "       arreo update --server --from <path> [--json] [--socket PATH] [--timeout-secs N]"
     );
+    eprintln!(
+        "                        [--config PATH]   the daemon's configuration file, forwarded to"
+    );
+    eprintln!(
+        "                                          the handoff child so the handed-over daemon"
+    );
+    eprintln!(
+        "                                          keeps its settings (e.g. [worktree]); $ARREO_CONFIG"
+    );
+    eprintln!("                                          is inherited and needs no flag");
     eprintln!("       arreo update --status [--json]");
     eprintln!("       arreo update --apply-now [--json] [--socket PATH]");
     eprintln!(
@@ -1377,6 +1392,14 @@ struct Args {
     no_reexec: bool,
     reattach_pane: Option<String>,
     socket: Option<String>,
+    /// The daemon's configuration file, forwarded to the handoff child
+    /// (T-0106). The child is a **different process** from the daemon being
+    /// replaced, so it does not inherit a `--config` the running daemon was
+    /// started with — and without it the handed-over daemon serves with
+    /// defaulted `[worktree]` settings, which is how a cut used to silently
+    /// change where agents' files live. `$ARREO_CONFIG` needs no flag: the child
+    /// inherits the environment.
+    config: Option<String>,
     /// Where the anonymous update reads from. `None` means `ARREO_CHANNEL_URL`,
     /// else the built-in default — see `configured_channel`.
     channel: Option<String>,
@@ -1418,6 +1441,10 @@ fn parse(rest: &[String]) -> Result<Args, String> {
             }
             "--socket" => {
                 args.socket = Some(value()?);
+                i += 2;
+            }
+            "--config" => {
+                args.config = Some(value()?);
                 i += 2;
             }
             "--channel" => {
@@ -1500,6 +1527,18 @@ fn parse(rest: &[String]) -> Result<Args, String> {
                 .into(),
         );
     }
+    if args.config.is_some() && !args.server {
+        // `--config` is the daemon's configuration file, forwarded to the
+        // handoff child (T-0106). The client half reads no configuration — it
+        // resolves its channel from `--channel`/`$ARREO_CHANNEL_URL` — so
+        // accepting it here would let an operator believe a file was consulted
+        // when nothing opened it.
+        return Err(
+            "--config names the daemon's configuration file; it is read by --server, which \
+             forwards it to the handoff child"
+                .into(),
+        );
+    }
     if args.status || args.apply_now {
         // Both act on the update that is *already staged* (T-0039), so a flag
         // that describes a new install would be ignored while looking obeyed.
@@ -1512,6 +1551,7 @@ fn parse(rest: &[String]) -> Result<Args, String> {
             (args.reattach_pane.is_some(), "--reattach-pane"),
             (args.channel.is_some(), "--channel"),
             (args.timeout_secs.is_some(), "--timeout-secs"),
+            (args.config.is_some(), "--config"),
         ]
         .into_iter()
         .find(|(present, _)| *present)

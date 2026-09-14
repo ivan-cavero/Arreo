@@ -574,6 +574,28 @@ pub struct HandoffPane {
     /// arrive `Unknown`.
     #[serde(default)]
     pub alert_line: Option<String>,
+    /// The `git worktree` this pane runs in (T-0091), as the outgoing daemon had
+    /// it — `None` for a pane that shares the daemon's working directory.
+    ///
+    /// **Carried, not derived, and the reason is T-0106.** The path is machine
+    /// state the incoming daemon cannot recompute: the pane's *directory* is not
+    /// in its spawn spec, the worktree's name is only derivable if you already
+    /// know the root, and a cut that dropped it left the adopted pane claiming
+    /// the daemon's own directory — so the next snapshot wrote the column null,
+    /// a kill leaked the checkout, and a restart put the agent in the shared tree
+    /// the feature exists to keep agents out of.
+    ///
+    /// **`#[serde(default)]` and last, because the handoff is old→new**: the
+    /// outgoing daemon is the binary that is already running and the incoming one
+    /// is the candidate, so the sender may be a version that has no such field.
+    /// A missing trailing element decodes to `None` (the same N−1 rule the rest of
+    /// this struct follows), and the *reverse* direction cannot arise — a newer
+    /// outgoing daemon is refused by [`check_incoming_protocol`] before any
+    /// manifest is sent.
+    ///
+    /// [`check_incoming_protocol`]: ../../arreo_server/handoff/fn.check_incoming_protocol.html
+    #[serde(default)]
+    pub worktree: Option<String>,
 }
 
 /// The largest encoded manifest the transfer will carry.

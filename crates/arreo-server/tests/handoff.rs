@@ -819,6 +819,183 @@ fn the_cut_replaces_the_process_on_the_same_path() {
     let _ = old.wait();
 }
 
+/// **The worktree binding survives a live cut** (T-0106).
+///
+/// The cut is `arreo update --server`'s normal route, and it used to lose three
+/// things at once: the adopted pane's worktree (the manifest carried none), the
+/// handed-over daemon's `[worktree]` settings (`run_handoff` built its daemon
+/// with `Daemon::new`), and therefore the cleanup on kill. The consequence was
+/// not cosmetic — a later restart put the agent back in the daemon's own working
+/// directory, i.e. the worktree isolation silently off, which is the collision
+/// worktree-per-task exists to prevent.
+///
+/// Three assertions, one per half of the fix, all on real processes and a real
+/// git repository:
+///
+/// 1. the **adopted** pane's row still names its checkout (the manifest carries
+///    it, and `PaneEntry::adopted` sets it);
+/// 2. a **new** `--worktree` spawn on the handed-over daemon lands under the
+///    *configured* root, not the default `<state>/worktrees` (the incoming
+///    daemon resolved `[worktree]` before serving);
+/// 3. killing the adopted pane removes its clean checkout (the binding reached
+///    the kill path, so nothing is leaked).
+///
+/// What removal turns red: drop `worktree` from `HandoffPane` and (1) fails with
+/// the row `NULL`; build the daemon with `Daemon::new` and (2) fails with the
+/// checkout under the state directory; skip `set_worktree` in `adopted` and both
+/// (1) and (3) fail — (3) by leaving the directory behind.
+#[test]
+fn the_worktree_binding_survives_the_cut() {
+    let scratch = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../target/test-scratch/T-0106/handoff");
+    let _ = std::fs::remove_dir_all(&scratch);
+    std::fs::create_dir_all(&scratch).expect("scratch");
+    // Canonical from here on: the daemon resolves the root it is given and
+    // records the canonical spelling, so a `..`-spelled expectation would be
+    // comparing spellings rather than the fact under test.
+    let scratch = std::fs::canonicalize(&scratch).expect("canonical");
+
+    // A repository with one commit, and a worktree root that is **not** the
+    // default one — the default would let a defaulted daemon pass the test.
+    let repo = scratch.join("repo");
+    std::fs::create_dir_all(&repo).expect("repo");
+    let git = |args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(args)
+            .output()
+            .expect("git runs");
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    git(&["init", "-q", "-b", "main"]);
+    git(&["config", "user.name", "arreo test"]);
+    git(&["config", "user.email", "test@arreo.invalid"]);
+    std::fs::write(repo.join("README.md"), "hello\n").expect("write");
+    git(&["add", "."]);
+    git(&["commit", "-q", "-m", "base"]);
+    let root = scratch.join("cfgroot");
+    let config = scratch.join("arreo.toml");
+    std::fs::write(
+        &config,
+        format!(
+            "[worktree]\nroot = \"{}\"\nrepo = \"{}\"\n",
+            root.display(),
+            repo.display()
+        ),
+    )
+    .expect("config");
+    let cfg = config.display().to_string();
+
+    let socket = temp_socket("worktree-bind");
+    cleanup(&socket);
+    let db = arreo_server::persist::db_path_for(&socket);
+    let stored = |id: &str| -> Option<String> {
+        let store = arreo_core::store::SessionStore::open(&db).expect("store");
+        store
+            .load_topology()
+            .expect("topology")
+            .into_iter()
+            .find(|pane| pane.id == id)
+            .and_then(|pane| pane.worktree)
+    };
+
+    let mut old = spawn_daemon(&socket, &["--config", &cfg], std::process::Stdio::null());
+    wait_serving(&mut old, &socket, Duration::from_secs(10));
+
+    let spec = |id: &str, what: Option<&str>| Message::SpawnWorktree {
+        v: VERSION,
+        id: id.to_string(),
+        spec: Box::new(arreo_core::proto::SpawnSpec {
+            program: "/bin/sh".to_string(),
+            args: vec!["-c".to_string(), "sleep 60".to_string()],
+            cols: 80,
+            rows: 24,
+            memory_max: None,
+            pids_max: None,
+            kill_on_breach: false,
+        }),
+        worktree: what.map(str::to_string),
+    };
+
+    let reply = raw_request(&socket, &spec("fix", None));
+    assert!(matches!(reply, Message::Ok { .. }), "spawn: {reply:?}");
+    let fix_root = root.join("fix");
+    assert!(
+        until(Duration::from_secs(10), || fix_root.is_dir()),
+        "the checkout was made under the configured root"
+    );
+    // A mutation forces the snapshot that writes the row.
+    let _ = raw_request(
+        &socket,
+        &Message::Panes {
+            v: VERSION,
+            panes: vec![],
+        },
+    );
+
+    // ---- the cut ------------------------------------------------------------
+    let mut new = spawn_handoff(&socket, &["--config", &cfg], std::process::Stdio::null());
+    assert!(
+        until(Duration::from_secs(30), || {
+            matches!(old.try_wait(), Ok(Some(_)))
+        }),
+        "the outgoing daemon exits after the cut"
+    );
+    let _ = old.wait();
+    wait_serving(&mut new, &socket, Duration::from_secs(10));
+
+    // (1) the adopted pane's checkout is still recorded.
+    let _ = raw_request(
+        &socket,
+        &Message::Panes {
+            v: VERSION,
+            panes: vec![],
+        },
+    );
+    assert_eq!(
+        stored("fix").as_deref(),
+        Some(fix_root.display().to_string().as_str()),
+        "the adopted pane keeps its worktree across the cut"
+    );
+
+    // (2) the handed-over daemon serves with the configured root.
+    let reply = raw_request(&socket, &spec("after", None));
+    assert!(matches!(reply, Message::Ok { .. }), "spawn: {reply:?}");
+    let after_root = root.join("after");
+    assert!(
+        until(Duration::from_secs(10), || after_root.is_dir()),
+        "a spawn after the cut uses the configured root ({}), not the default",
+        root.display()
+    );
+
+    // (3) killing the adopted pane removes its clean checkout.
+    let reply = raw_request(
+        &socket,
+        &Message::Kill {
+            v: VERSION,
+            id: "fix".to_string(),
+        },
+    );
+    assert!(matches!(reply, Message::Ok { .. }), "kill: {reply:?}");
+    assert!(
+        until(Duration::from_secs(15), || !fix_root.exists()),
+        "the adopted pane's checkout is cleaned up on kill, so nothing is leaked"
+    );
+
+    // Do **not** wait on `new`: the handed-over daemon keeps serving and exits
+    // only when a later cut replaces it, so `wait()` here would hang for ever.
+    // `Guard`'s `Drop` kills and reaps it, which is what the other tests in this
+    // file do for the incoming side.
+    drop(new);
+    cleanup(&socket);
+    let _ = std::fs::remove_dir_all(&scratch);
+}
+
 /// Criterion 3: the lock survives the handoff — immediately after the cut, a
 /// third daemon on the same socket is refused.
 ///
@@ -3103,6 +3280,8 @@ fn a_guard_survives_the_cut() {
         kill_on_breach: false,
         alert: None,
         alert_line: None,
+        // Not a worktree pane: these fixtures predate T-0091 and carry no checkout.
+        worktree: None,
     }];
     fake.panes = vec![std::sync::Arc::clone(&pane)];
     let mut incoming = start_incoming_quiet(&mut fake);
@@ -3252,6 +3431,8 @@ fn a_guard_that_cannot_be_re_opened_refuses_the_handoff() {
         kill_on_breach: true,
         alert: None,
         alert_line: None,
+        // Not a worktree pane: these fixtures predate T-0091 and carry no checkout.
+        worktree: None,
     }];
     fake.panes = vec![std::sync::Arc::clone(&pane)];
     let mut incoming = start_incoming(&mut fake);
@@ -3434,6 +3615,8 @@ fn pane_description(
         kill_on_breach: false,
         alert: None,
         alert_line: None,
+        // Not a worktree pane: these fixtures predate T-0091 and carry no checkout.
+        worktree: None,
     }
 }
 
