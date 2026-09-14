@@ -1,42 +1,39 @@
 ## State snapshot          ← REWRITTEN (not appended) at every checkpoint
-Task: **T-0093 in progress** — the notification rules engine. Design done; the hook point is out
-with a scout; the pure rule module is next.
-Where you are: battery green at `43ae033` (869 tests / 0 failed / 70 targets, 14/14 slices, bench
-6/6, vet/deny/audit/check-targets PASS). Nothing written yet for T-0093.
-Next step: scout report → write `arreo_core::notify` (pure decision + policy + globs) with its
-unit tests → freeze → delegate the daemon wiring and the CLI verb to workers → slice.
-Open workers: `NotifyHook` (scout: where every transition can be observed — read-only).
+Task: **T-0093 in progress** — the notification rules engine. The **pure core is done and
+frozen** (`arreo_core::notify`, 21 tests green); the daemon tick and the CLI verb are out with
+workers on disjoint crates.
+Where you are: core rule + quiet hours + policy loader + row format written and tested; the two
+audit actions (`notify.sent` / `notify.suppressed`) added to `store::actions`. Battery last run
+green at `43ae033` (869 tests, 14/14 slices, bench 6/6).
+Next step: workers land → I run a reviewer over the daemon diff → extend the api slice with the
+notified/coalesced/suppressed paths → full battery → commit + push.
+Open workers: `NotifyDaemon` (the 1 s tick + rows + `tests/notify.rs`), `NotifyCli`
+(`arreo notify --why|--policy` + `docs/notifications.md`).
 Known broken: T-0063 (CI never-green — the user's) · Parked: T-0048 needs-human
-**T-0093 design (decided before writing a line, per §3).** Three questions had to be settled
-first, and two of them changed the shape of the task:
-
-1. **Where does a rule see every transition?** Today `PaneEntry::pump()` returns
-   `Vec<arreo_core::state::Event>` and every call site *discards* it except `Wait`, which only
-   looks for the state it was asked about — so there is no "on every transition" hook, and a
-   notification must fire whether or not a client is attached (the unwatched pane that becomes
-   blocked is exactly the case the feature exists for). The scout is finding the best host: an
-   existing background sweep (T-0040's writer, T-0052's 500 ms tick) or a new one beside them.
-   **The rule stays pure either way** — the hook is the caller.
-2. **Durable episode state, without a new table.** "A machine restart mid-episode" must not
-   re-notify, and "suppression is never silent" wants a queryable row. Both are the *audit log's*
-   job (T-0033), so the design reads history from it rather than adding a `notify_state` table:
-   one query per transition (transitions are rare — state changes, not output lines), no schema
-   bump, and the durable log is the single source of truth for "what have I already told them".
-3. **"local-time window" without a time dependency.** `quiet_hours` needs wall-clock time and
-   `std` has only UTC. `time` 0.3 is in the lock graph transitively but is **not** a direct
-   dependency of any workspace crate, and its `local_offset` API returns `None` in a
-   multi-threaded process unless the *unsound* feature is enabled — a trap, not a solution. So
-   quiet hours are configured as a **local wall-clock window plus an explicit
-   `utc_offset_minutes`**, defaulting to UTC, and the DST caveat is documented rather than hidden.
-   Zero new dependencies; the rejection reason recorded.
-
-One criterion is ambiguous and I am deciding it in the open rather than inventing silently:
-`coalesce_secs` says "one notification per pane per window, **the newest reason winning**". Two
-readings: (a) the first transition delivers and the rest are suppressed-and-counted, with the
-*record* carrying the newest reason; (b) the notification is debounced to the end of the window so
-the delivered one carries the newest reason. (b) needs a scheduler and a timer per pane; (a) needs
-nothing and still answers "why was I not told?". Taking (a), writing the choice and the alternative
-into the task file.
+**T-0093 — the rule, and the three design decisions that shaped it.** The pure half is
+`arreo_core::notify`: `Policy::decide(transition, history) -> Decision`, with quiet hours, a
+coalescing window, the once-per-episode rule, pane globs and machine scoping — no clock, no I/O,
+no interior mutability, so every boundary is a test. Twenty-one of them: both edges of a quiet
+window, both edges of the coalesce window, the episode rule's two halves, the documented order of
+the four questions, the one-wildcard glob including the backtracking case, and the config
+loader's every refusal.
+Three decisions were made before writing a line, and two changed the task's shape:
+1. **The scout found that no background loop pumps the state engine** — `PaneEntry::pump` is
+   called only from client-driven paths, so a pane that becomes blocked **with nobody attached is
+   never classified at all**. That is precisely the case a notification exists for, so the tick
+   has to pump as well as judge; the pump is not gated on the policy.
+2. **The audit log is the memory.** Episode and coalescing state are reconstructed from the
+   `notify.sent` rows rather than a new table: durable across a restart by construction, queryable
+   (which the "why was I not told?" criterion needs anyway), and no second source of truth. One
+   bounded scan per transition.
+3. **Quiet hours are local wall-clock plus an explicit `utc_offset_minutes`**, not a time zone:
+   `std` has no local time, and the `time` crate's `local_offset` returns an error in a
+   multithreaded process unless an unsound feature is enabled — a trap, not a solution. The DST
+   caveat is documented rather than hidden.
+The one ambiguous criterion (`coalesce_secs`'s "the newest reason winning") is decided in the
+open: the first transition delivers and the rest are suppressed-and-counted with the reason
+recorded, because the alternative — debouncing to the end of the window — needs a timer per pane
+to deliver a notification the operator has already waited for. Written into the task file.
 ## Event log               ← append-only; newest last; never rewrite
 - 2026-09-10 [turn 1] ledger created; repo at e489fac (docs only); T-0001 + T-0022 (AGENTS.md gardened) done
 - 2026-09-10 [turn 2] T-0002 PTY manager done+pushed (342606c; 9 tests); PROMPT.md v2 synced + ADR 0001 (ef6c595)
