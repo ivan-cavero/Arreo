@@ -1,29 +1,32 @@
 ## State snapshot          ← REWRITTEN (not appended) at every checkpoint
-Task: **T-0039 DONE** (`arreo_core::update::deferred` + the CLI surfaces + the `--case
-deferred` slice case + the release-doc evidence). **T-0090 filed** for the half that needs a
-Windows runner; **T-0042 now depends on it**.
-Where you are: battery running on the final tree (818/0 before this change); the deferred
-module's 7 unit tests and `xtask e2e --slice update --case deferred` (7 checks) are green.
-Next step: T-0090 is gated on the Windows runner, T-0089 on a credential, T-0085 on the
-user's CI — so the next unit is **queue gardening**: draft the next phase's tasks from
-`ROADMAP.md` (the loop's rule when nothing unblocked is left), not another work-unit.
+Task: **T-0091 DONE** (`e3c8a11`) — worktree-per-task: a pane owns its own `git worktree` on
+its own branch. The Phase 4 queue is filed (T-0091..T-0105).
+Where you are: **842 tests / 0 failed / 68 targets**; clippy clean on both toolchains; fmt
+clean; **14/14 slices** (worktree 9, mesh 36+1, tui 80, update 27, handoff-abort 41);
+`xtask sync --check` 14/14; bench 6/6; vet 337, deny 4/4, audit 0, check-targets PASS/SKIP.
+Next step: **T-0092** (diff review over a worktree, the road this one opens) — then T-0093
+(notification rules), T-0095 (approval gates), T-0096 (adapter SDK linter), T-0105 (the
+deferred update's start path), T-0098 (plugin host v0).
 Open workers: (none)
 Known broken: T-0063 (CI never-green — the user's) · Parked: T-0048 needs-human
-**T-0039 — the deferral, and the honest split.** The task as filed could not be finished on
-this box, and that is measured: `cargo check --target x86_64-pc-windows-msvc -p arreo-server`
-dies in cc-rs (`lib.exe` missing), there is no clang/wine here, and `check-targets` SKIPs
-Windows for exactly that reason. So the task was **re-scoped by what this machine can prove**,
-with the reason written into the file: T-0039 keeps the deferred update itself —
-`window_is_open` as the *one* rule (`live_panes == 0`), `panes_block` naming each pane,
-`stage_next`/`promote`/`clear_after_confirm`, every marker function in an `_in(state_dir)`
-form so tests never touch the real state directory — plus `arreo update --status` and
-`--apply-now` (exit 3, panes named), the deferral on a failed cut (the verified artifact used
-to be `remove_file`d, so a refused cut threw away the download), and the new slice case.
-T-0090 takes the Windows application point: service control codes, promotion before the socket
-is bound, the automatic promotion at start, `.prev` cleanup, and the Windows case.
-Three mutations, each red where it should be: `window_is_open` always true → 3 slice checks
-and 2 unit tests red; `clear_after_confirm` ignoring the version → the confirm test red;
-`promote` not discarding an unpromotable stage → the no-retry-loop test red.
+**T-0091 — the collision, and the two defects found on the way to it.** Every pane shared one
+working directory, so two agents editing one checkout overwrote each other. `arreo spawn
+--worktree [NAME]` now gives a pane its own `git worktree` (`arreo/<NAME>`), with the git
+plumbing in one core module: the pane-id gate (a pane id is a *directory name* — `../../etc`
+escapes the root, and silent sanitising would merge two panes into one), `ensure` (make or
+reuse), `remove` (never a dirty checkout unless forced), `prune_clean`, and the porcelain
+parser as a pure function. The request is a **new wire variant**, not a field on `Spawn`,
+because `rmp-serde` encodes a struct as a positional array and one more element would be
+unreadable by an older server — the N−1 window's whole point. Store v10 carries the path so a
+restore brings the pane back in its own checkout.
+A worker found two real defects while wiring, both in core, both fixed there with tests:
+(a) `git worktree list` keeps reporting a **deleted** worktree (`prunable`), so `ensure`'s
+reuse branch returned a path that was not there; (b) worse, `portable-pty` **drops a `cwd` that
+is not a directory and falls back to the process's home** — so the pane above would have run
+in `$HOME`, silently. `Pane::spawn_in_dir` now refuses it. Five mutations red, one of them at
+the slice (the daemon ignoring the worktree path → 4 checks red). `Message` is 112 bytes and
+now **pinned by a test**: the first cut of the variant took it to 136, and the payload is boxed
+(`SpawnSpec`) the way T-0086 boxed `SyncOutcome`.
 ## Event log               ← append-only; newest last; never rewrite
 - 2026-09-10 [turn 1] ledger created; repo at e489fac (docs only); T-0001 + T-0022 (AGENTS.md gardened) done
 - 2026-09-10 [turn 2] T-0002 PTY manager done+pushed (342606c; 9 tests); PROMPT.md v2 synced + ADR 0001 (ef6c595)
@@ -200,3 +203,4 @@ and 2 unit tests red; `clear_after_confirm` ignoring the version → the confirm
 - 2026-09-14 [turn 80] T-0088 done + pushed (8ea5de2). Filed as a load-sensitive flake; it was a real defect. `Pane::drain()` called `RingBuffer::flush_partial()`, which took the unterminated trailing line into the ring, so a poll landing between two writes of one line split that line permanently for every reader (`arreo read`, `attach`, the TUI, the handoff manifest, the persisted snapshot). Fix: `RingBuffer::lines_with_partial()` (the reader view, non-mutating), `Pane::ring_len()` (the terminated-line count), `flush_partial()` deleted, and `stream_attach` advancing its cursor only past terminated lines so the completion is re-fetched at its own index. Reproduced with the parallel test-binary shape (3x `--test handoff` + `relay_daemon`, 8 rounds): 1 failure in 24 pre-fix, 0 in 24 post-fix; synthetic CPU load alone never reproduced it. Three mutations red. The test that pinned the materialisation asserted the defect and was replaced by two tests that assert what a reader sees and that the ring stays one-line-per-written-line. Battery on the fixed tree: 818 tests / 0 failed / 67 targets, clippy clean on both toolchains, fmt clean, vet 337, deny 4/4, audit 0, check-targets PASS/SKIP, 13/13 slices, `xtask sync --check` 14/14, bench 6/6.
 - 2026-09-14 [turn 81] T-0081 + T-0082 closed with the scope note each task allows; T-0089 filed as the single retry (gated on a credential, first step a one-command re-probe). The blocker is proven: Codex 0.154.0, [CC] 2.1.270, Copilot 1.0.83, Qwen Code 0.23.3, Kimi Code 0.42.0 and Kilo 7.6.2 all install from npm into scratch and all run, and every one refuses a turn for want of a credential; no provider key in the environment and `~/.codex`/`~/.claude` empty here. N = 0, stated; twelve per-harness lines with the exact refusal text; `xtask adapters --check` 24/24 unchanged (nothing fabricated). Two npm names that look right are different tools (`grok-cli`, `cursor-agent`). Criterion-4 finding confirmed against the real config.toml Orca writes: `hooks.state.*.trusted_hash` digests the local hooks.json, so it is never syncable.
 - 2026-09-14 [turn 82] T-0039 done + pushed (15aa539). The deferred update: `arreo_core::update::deferred` (one window rule `live_panes == 0`, `stage_next`/`promote`/`clear_after_confirm`, every marker fn in an `_in(state_dir)` form), `arreo update --status`/`--apply-now`, the deferral on a failed cut (the verified artifact used to be `remove_file`d), and `xtask e2e --slice update --case deferred` (7 checks, new `--case` flag whose default is the whole slice). Re-scoped: the Windows half is T-0090, because `cargo check --target x86_64-pc-windows-msvc -p arreo-server` dies in cc-rs (lib.exe missing), there is no clang/wine here, and check-targets SKIPs Windows for that reason; T-0042 now depends on T-0090. Three mutations red: `window_is_open` always true → 3 slice checks + 2 unit tests; `clear_after_confirm` ignoring the version → the confirm test; `promote` not discarding → the no-retry-loop test. Battery: 825 tests / 0 failed, clippy clean on both toolchains, fmt clean, vet 337, deny 4/4, audit 0, check-targets PASS/SKIP, 13/13 slices, sync --check 14/14, bench 6/6.
+- 2026-09-14 [turn 83] T-0091 done + pushed (e3c8a11). Worktree-per-task: `arreo_core::worktree` (pane-id gate, `ensure`/`remove`/`prune_clean`, porcelain parser), `Message::SpawnWorktree` (a variant, not a field on `Spawn` — rmp-serde positional arrays would break N−1), `Pane::spawn_in_dir`, store schema v10 carrying the worktree path, `[worktree] root`/`repo` in the one config parser, daemon spawn/kill/restore wiring, CLI `spawn --worktree` + `worktrees list|remove`, docs/worktrees.md, and `xtask e2e --slice worktree` (9 checks). Two real defects found by a worker while wiring, both in core, both fixed with tests: `git worktree list` keeps reporting a DELETED worktree (prunable) so `ensure` returned a path that was not there; and `portable-pty` drops a `cwd` that is not a directory and falls back to `$HOME`, so a pane whose worktree vanished would have run in the wrong place silently — `Pane::spawn_in_dir` now refuses it. Five mutations red (one at the slice: the daemon ignoring the worktree path reddens 4 checks). `Message` was 136 bytes after the first cut and is back to 112 with `the_message_enum_stays_at_its_budget` pinning it. Battery: 842 tests / 0 failed / 68 targets, clippy clean on both toolchains, fmt clean, vet 337, deny 4/4, audit 0, check-targets PASS/SKIP, 14/14 slices, sync --check 14/14, bench 6/6.
