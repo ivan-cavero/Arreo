@@ -1,0 +1,110 @@
+daemon: pid 742404, socket present
+
+=== 1. a cut that cannot happen defers instead of discarding ===
+$ arreo update --server --from new-server --socket daemon.sock
+update: the new daemon exited (exit status: 0) before taking over — it was refused, or the handoff failed (run `arreo-server --handoff-from /home/dev/dev/Arreo/target/test-scratch/T-0039/e2e/daemon.sock` by hand for the reason)
+update: nothing was installed; the daemon serving /home/dev/dev/Arreo/target/test-scratch/T-0039/e2e/daemon.sock is still running (pid 742404)
+update pending arreo-server 0.2.0 → arreo-server 0.3.0 (applies at next restart)
+staged at /home/dev/dev/Arreo/target/test-scratch/T-0039/e2e/bin/arreo-server.next
+the daemon serving /home/dev/dev/Arreo/target/test-scratch/T-0039/e2e/daemon.sock keeps the binary it started with until its next start
+`arreo update --apply-now` promotes it in the window where no pane is running, and `arreo update --status` clears this once the new version has taken over
+exit=1  (1: the cut did not happen — and the verified artifact was kept)
+on disk: arreo arreo-server arreo-server.next arreo-server.update.lock arreo.update.lock 
+marker:  {  "staged": "/home/dev/dev/Arreo/target/test-scratch/T-0039/e2e/bin/arreo-server.next",  "current": "/home/dev/dev/Arreo/target/test-scratch/T-0039/e2e/bin/arreo-server",  "from_version": "arreo-server 0.2.0",  "version": "arreo-server 0.3.0"}
+
+=== 2. --status reports it, and does not claim it was applied ===
+$ arreo update --status
+update pending arreo-server 0.2.0 → arreo-server 0.3.0 (applies at next restart)
+staged at /home/dev/dev/Arreo/target/test-scratch/T-0039/e2e/bin/arreo-server.next
+/home/dev/dev/Arreo/target/test-scratch/T-0039/e2e/bin/arreo-server reports: arreo-server 0.2.0
+not applied yet: the running binary does not report the new version
+exit=0
+
+=== 3. a live pane shuts the window: --apply-now refuses and names it ===
+$ arreo spawn agent /bin/sleep 300 --socket daemon.sock
+spawned agent
+$ arreo update --apply-now --socket daemon.sock
+update: 1 live pane (agent) — a pane is a running agent, so the update waits for the window where none is running
+update: /home/dev/dev/Arreo/target/test-scratch/T-0039/e2e/bin/arreo-server.next is staged and waiting; stop those panes, or let the next start promote it
+exit=3  (3: the update is waiting, not broken)
+stage still present: yes
+
+=== 4. the agent finishes: the window opens and the promotion happens ===
+$ arreo panes --socket daemon.sock
+              ID  STATE    ALERT
+           agent  exited   
+$ arreo update --apply-now --socket daemon.sock
+installed /home/dev/dev/Arreo/target/test-scratch/T-0039/e2e/bin/arreo-server (arreo-server 0.2.0 → arreo-server 0.3.0)
+previous kept at /home/dev/dev/Arreo/target/test-scratch/T-0039/e2e/bin/arreo-server.prev
+the daemon serving /home/dev/dev/Arreo/target/test-scratch/T-0039/e2e/daemon.sock keeps the binary it started with until its next start
+`arreo update --status` clears the pending marker once the installed binary reports arreo-server 0.3.0
+exit=0
+arreo-server now reports: arreo-server 0.3.0
+arreo-server.prev reports: arreo-server 0.2.0
+
+=== 5. the marker clears only on the version confirmation ===
+$ arreo update --status
+update pending arreo-server 0.2.0 → arreo-server 0.3.0 (applies at next restart)
+staged at /home/dev/dev/Arreo/target/test-scratch/T-0039/e2e/bin/arreo-server.next
+/home/dev/dev/Arreo/target/test-scratch/T-0039/e2e/bin/arreo-server reports: arreo-server 0.3.0
+the new version has taken over; the pending marker is cleared
+exit=0
+
+=== 6. nothing pending is not a failure ===
+$ arreo update --apply-now --socket daemon.sock
+no update is pending
+exit=0
+
+=== 7. the flags that describe a new install are refused, not ignored ===
+$ arreo update --status --from new-server
+update: --status and --apply-now act on the update that is already staged; they take no --from
+usage: arreo update [--channel URL | ARREO_CHANNEL_URL=URL] [--json] [--no-reexec] [--reattach-pane ID] [--socket PATH]
+       arreo update --from <path> [--json] [--no-reexec] [--reattach-pane ID] [--socket PATH]
+       arreo update --rollback [--json]
+       arreo update --check [--channel URL] [--json]
+       arreo update verify <path> [--sig <path>] [--manifest <path>] [--json]
+       arreo update --server --from <path> [--json] [--socket PATH] [--timeout-secs N]
+       arreo update --status [--json]
+       arreo update --apply-now [--json] [--socket PATH]
+  --status    report the update waiting for a restart (if any) and whether the installed
+              binary reports the new version; clears the marker only on that confirmation
+  --apply-now promote a waiting update — but only in the one safe window, where no pane
+              is running; exits 3 and names each pane when one is (T-0039)
+  --from      a binary to install in place of this one (already on disk)
+  --channel   the release channel to fetch from (a URL): file:// for a mirror or a test,
+              https:// for the default (ARREO_CHANNEL_URL, else this repository's
+              GitHub Releases `latest` URL). Only read by --check and the anonymous update
+  --rollback  put the previous binary back
+  --check     report the version and artifact the channel publishes, verifying the index
+              first; an empty channel is "no releases yet", and the verifier's refusal
+              (exit 1) is what an unsigned or altered index gets
+  verify      check an artifact's minisign signature against the key compiled into this binary; prints the key id and digest, and refuses (exit 1) with no bypass
+  --server    with --from: replace the `arreo-server` beside this binary and hand the running daemon over to it, without killing an agent
+  exit codes: 0 ok · 1 failed · 2 usage · 3 update in progress · 4 path not writable
+exit=2  (2: usage)
+$ arreo update --apply-now --check
+update: --status and --apply-now act on the update that is already staged; they take no --check
+usage: arreo update [--channel URL | ARREO_CHANNEL_URL=URL] [--json] [--no-reexec] [--reattach-pane ID] [--socket PATH]
+       arreo update --from <path> [--json] [--no-reexec] [--reattach-pane ID] [--socket PATH]
+       arreo update --rollback [--json]
+       arreo update --check [--channel URL] [--json]
+       arreo update verify <path> [--sig <path>] [--manifest <path>] [--json]
+       arreo update --server --from <path> [--json] [--socket PATH] [--timeout-secs N]
+       arreo update --status [--json]
+       arreo update --apply-now [--json] [--socket PATH]
+  --status    report the update waiting for a restart (if any) and whether the installed
+              binary reports the new version; clears the marker only on that confirmation
+  --apply-now promote a waiting update — but only in the one safe window, where no pane
+              is running; exits 3 and names each pane when one is (T-0039)
+  --from      a binary to install in place of this one (already on disk)
+  --channel   the release channel to fetch from (a URL): file:// for a mirror or a test,
+              https:// for the default (ARREO_CHANNEL_URL, else this repository's
+              GitHub Releases `latest` URL). Only read by --check and the anonymous update
+  --rollback  put the previous binary back
+  --check     report the version and artifact the channel publishes, verifying the index
+              first; an empty channel is "no releases yet", and the verifier's refusal
+              (exit 1) is what an unsigned or altered index gets
+  verify      check an artifact's minisign signature against the key compiled into this binary; prints the key id and digest, and refuses (exit 1) with no bypass
+  --server    with --from: replace the `arreo-server` beside this binary and hand the running daemon over to it, without killing an agent
+  exit codes: 0 ok · 1 failed · 2 usage · 3 update in progress · 4 path not writable
+exit=2  (2: usage)

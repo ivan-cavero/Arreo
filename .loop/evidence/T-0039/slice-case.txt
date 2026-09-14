@@ -1,0 +1,13 @@
+   Compiling xtask v0.1.0 (/home/dev/dev/Arreo/xtask)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 2.73s
+     Running `target/debug/xtask e2e --slice update --case deferred`
+deferred: a real daemon (pid 742787) serves /tmp/arreo-e2e-update-742450/arreo.sock; the server beside the client is a stand-in reporting arreo-server 0.2.0
+deferred: `update --server --from server-new` exited Some(1): update pending arreo-server 0.2.0 → arreo-server 0.3.0 (applies at next restart)
+[PASS] update: a cut that cannot happen keeps the verified artifact instead of discarding it
+[PASS] update: the pending update is reported, and not as applied
+[PASS] update: a live pane refuses the promotion, and the refusal names the pane
+[PASS] update: the pane exits, so the window opens
+[PASS] update: at zero panes the promotion happens, and `.prev` holds what it replaced
+[PASS] update: the marker clears only once the installed binary reports the new version
+[PASS] update: --status refuses a flag that describes a new install
+update: 7 passed, 0 skipped, 0 failed

@@ -40,6 +40,7 @@
 
 use crate::ExitCode;
 use arreo_core::update::channel::{self, Channel};
+use arreo_core::update::deferred::{self, NotNow};
 use arreo_core::update::verify::TrustSet;
 use arreo_core::update::{self, resume, UpdateError};
 
@@ -77,6 +78,14 @@ pub fn run(rest: &[String]) -> ExitCode {
     // impossible instead of merely harmless. The lock is an OS lock held by
     // this open file, so a killed updater cannot leave it stale — see
     // `arreo_core::update`.
+    // `--status` is a *report*, so it takes no lock: an operator asking "is an
+    // update waiting?" must get an answer even while another update holds the
+    // lock. It is the surface that confirms a version too (T-0039), which is
+    // why it reads the running binary rather than only the marker.
+    if args.status {
+        return pending_status(&args);
+    }
+
     let current = match update::current_binary() {
         Ok(path) => path,
         Err(e) => {
@@ -98,6 +107,12 @@ pub fn run(rest: &[String]) -> ExitCode {
 
     if args.check {
         return check(&args);
+    }
+
+    // `--apply-now` promotes the staged update, so it takes the lock like any
+    // other install.
+    if args.apply_now {
+        return apply_now(&args);
     }
 
     if args.server {
@@ -464,6 +479,322 @@ fn verify_usage() {
     eprintln!("  exit codes: 0 verified · 1 refused · 2 usage — there is no bypass flag");
 }
 
+/// `arreo update --status` — what is waiting, and whether it has taken effect
+/// (T-0039).
+///
+/// Two facts, in this order, because the second one is what an operator is
+/// really asking: *is an update waiting*, and *has the one I promoted actually
+/// taken over*. The second is answered by running the **installed binary the
+/// marker names** and comparing its `--version` with the version recorded at
+/// stage time — a file that was renamed into place is not an update until a
+/// process reports it, and this is where that distinction is decided.
+///
+/// It is also the surface that **clears** the marker, and it clears it only on
+/// that confirmation. A report that cleared it because the swap happened would
+/// claim success for a machine still serving the old code.
+fn pending_status(args: &Args) -> ExitCode {
+    let pending = match deferred::read_marker() {
+        Ok(pending) => pending,
+        Err(e) => {
+            eprintln!("update: {e}");
+            return ExitCode::from(FAILED);
+        }
+    };
+
+    let Some(pending) = pending else {
+        if args.json {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "pending": false,
+                    "running": running_version(),
+                })
+            );
+        } else {
+            println!("no update pending");
+            println!("running: {}", running_version());
+        }
+        return OK.into();
+    };
+
+    // What the binary the marker names reports *now*. For a server update that
+    // is the daemon's binary, not this client — the marker records the path for
+    // exactly this reason.
+    let installed = update::verify_runs(&pending.current_path())
+        .unwrap_or_else(|e| format!("(will not run: {e})"));
+    let confirmed = deferred::clear_after_confirm(&installed).unwrap_or(false);
+
+    if args.json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "pending": true,
+                "from_version": pending.from_version,
+                "version": pending.version,
+                "staged": pending.staged,
+                "installed": pending.current,
+                "installed_reports": installed,
+                "confirmed": confirmed,
+            })
+        );
+    } else {
+        println!("{}", pending.line());
+        println!("staged at {}", pending.staged);
+        println!("{} reports: {installed}", pending.current);
+        if confirmed {
+            println!("the new version has taken over; the pending marker is cleared");
+        } else {
+            println!("not applied yet: the running binary does not report the new version");
+        }
+    }
+    OK.into()
+}
+
+/// `arreo update --apply-now` — promote the staged update (T-0039).
+///
+/// The window is the whole policy: **no live pane**. `--apply-now` is how an
+/// operator says "my agents are done, do it now", and the refusal when they are
+/// not names each pane so they can decide rather than guess.
+///
+/// The promotion moves the file. It does **not** clear the pending marker — see
+/// `arreo_core::update::deferred` — and it does not pretend the daemon has
+/// changed: a running daemon keeps the image it started with, so the report says
+/// exactly that instead of implying a cut that did not happen.
+fn apply_now(args: &Args) -> ExitCode {
+    let pending = match deferred::read_marker() {
+        Ok(Some(pending)) => pending,
+        Ok(None) => {
+            println!("no update is pending");
+            return OK.into();
+        }
+        Err(e) => {
+            eprintln!("update: {e}");
+            return ExitCode::from(FAILED);
+        }
+    };
+
+    let socket = args
+        .socket
+        .clone()
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(crate::default_socket);
+    let panes = match live_panes(&socket) {
+        Ok(panes) => panes,
+        Err(e) => {
+            // The window cannot be *verified*, so it is not open: refusing is
+            // the only safe answer, and the reason is the socket's.
+            eprintln!(
+                "update: cannot read the live panes from {}: {e}",
+                socket.display()
+            );
+            eprintln!(
+                "update: the window is `no live pane`, and that cannot be checked right now, so \
+                 nothing was promoted"
+            );
+            return ExitCode::from(IN_PROGRESS);
+        }
+    };
+
+    match deferred::promote(&panes) {
+        Ok(deferred::Outcome::Promoted {
+            from_version,
+            version,
+            previous,
+        }) => {
+            if args.json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "applied": true,
+                        "from_version": from_version,
+                        "version": version,
+                        "previous": previous.display().to_string(),
+                    })
+                );
+            } else {
+                println!("installed {} ({from_version} → {version})", pending.current);
+                println!("previous kept at {}", previous.display());
+                println!(
+                    "the daemon serving {} keeps the binary it started with until its next start",
+                    socket.display()
+                );
+                println!(
+                    "`arreo update --status` clears the pending marker once the installed binary \
+                     reports {version}"
+                );
+            }
+            OK.into()
+        }
+        Ok(deferred::Outcome::AlreadyInstalled { version }) => {
+            println!("already installed: {} reports {version}", pending.current);
+            OK.into()
+        }
+        Ok(deferred::Outcome::NothingPending) => {
+            // The marker vanished between the read and the promotion (another
+            // process promoted it). Nothing to report but the fact.
+            println!("no update is pending");
+            OK.into()
+        }
+        Err(NotNow::PanesLive { panes }) => {
+            eprintln!("update: {}", deferred::panes_block(&panes));
+            eprintln!(
+                "update: {} is staged and waiting; stop those panes, or let the next start \
+                 promote it",
+                pending.staged
+            );
+            // The project's "in progress" code: the update is not broken, it is
+            // waiting — the same code a busy handoff produces.
+            ExitCode::from(IN_PROGRESS)
+        }
+        Err(NotNow::NotPromotable { reason }) => {
+            eprintln!("update: {reason}");
+            ExitCode::from(FAILED)
+        }
+    }
+}
+
+/// The version this client reports, for the no-update-pending report.
+fn running_version() -> String {
+    match update::current_binary().and_then(|path| update::verify_runs(&path)) {
+        Ok(version) => version,
+        Err(e) => format!("(unknown: {e})"),
+    }
+}
+
+/// The panes the daemon is serving right now, by id — the input to the one
+/// window rule.
+///
+/// **No socket is not the same answer as an unreachable socket.** A machine with
+/// no daemon has no panes, so the window is open. A socket that exists and does
+/// not answer means the pane list is *unknown*, and an unknown window is a shut
+/// one — the caller refuses. Collapsing the two would promote an update on a
+/// machine whose daemon is merely slow, which is exactly the mistake the rule
+/// exists to prevent.
+fn live_panes(socket: &std::path::Path) -> Result<Vec<String>, String> {
+    use arreo_core::proto::{Message, VERSION};
+    if !socket.exists() {
+        return Ok(Vec::new());
+    }
+    block_on(async {
+        let mut session =
+            crate::Session::Local(crate::open_connection(&socket.to_path_buf()).await?);
+        match session
+            .call(&Message::Panes {
+                v: VERSION,
+                panes: vec![],
+            })
+            .await?
+        {
+            Message::Panes { panes, .. } => Ok(panes
+                .into_iter()
+                .filter(|pane| pane.alive)
+                .map(|pane| pane.id)
+                .collect()),
+            other => Err(format!("the daemon answered {other:?}")),
+        }
+    })
+}
+
+/// A current-thread runtime for the one socket read above.
+///
+/// Local rather than `crate::rt::block_on`, which is shaped for a future that
+/// *is* the verb's exit status; this one needs the answer.
+fn block_on<T>(future: impl std::future::Future<Output = T>) -> T {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("a current-thread runtime")
+        .block_on(future)
+}
+
+/// Keep a verified artifact for the next start instead of discarding it
+/// (T-0039).
+///
+/// The one writer of the deferred state, called from **both** the Unix failure
+/// path and the platform that cannot cut at all — one function rather than two
+/// branches, because two would be two answers to "what does deferring mean".
+///
+/// Failure to defer is reported and swallowed: the caller is already reporting a
+/// failed update, and a machine that cannot stage must not also lose the reason
+/// it could not cut.
+fn defer_install(
+    staged: &std::path::Path,
+    current: &std::path::Path,
+    from_version: &str,
+    version: &str,
+) -> Option<deferred::Pending> {
+    match deferred::stage_next(staged, current, from_version, version) {
+        Ok(pending) => {
+            let _ = std::fs::remove_file(staged);
+            Some(pending)
+        }
+        Err(e) => {
+            eprintln!("update: the update could not be kept for the next start: {e}");
+            let _ = std::fs::remove_file(staged);
+            None
+        }
+    }
+}
+
+/// Report a deferred update — the artifact is kept, and it takes effect at the
+/// next start (T-0039).
+///
+/// Deliberately **not** `#[cfg]`-gated: the body compiles on every platform, so
+/// the one path no Linux test can execute is still type-checked here. Only its
+/// call site is platform-specific.
+fn report_deferred(
+    pending: Option<deferred::Pending>,
+    socket: &std::path::Path,
+    args: &Args,
+) -> ExitCode {
+    let Some(pending) = pending else {
+        // `defer_install` already said why, and nothing was installed.
+        return ExitCode::from(FAILED);
+    };
+    if args.json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "changed": false,
+                "pending": true,
+                "from_version": pending.from_version,
+                "version": pending.version,
+                "staged": pending.staged,
+            })
+        );
+    } else {
+        println!("{}", pending.line());
+        println!("staged at {}", pending.staged);
+        println!(
+            "the daemon serving {} keeps the binary it started with until its next start",
+            socket.display()
+        );
+        println!(
+            "`arreo update --apply-now` promotes it in the window where no pane is running, \
+             and `arreo update --status` clears this once the new version has taken over"
+        );
+    }
+    OK.into()
+}
+
+/// Drop a pending update that a successful install has just superseded.
+///
+/// Without this, an operator who retried a failed cut and succeeded would leave a
+/// marker behind, and `arreo update --status` would go on reporting a pending
+/// update that is already installed — a status surface that lies is worse than no
+/// status surface. It only touches a marker naming *this* binary, so an install
+/// of one binary cannot clear another's pending update.
+fn clear_superseded_pending(current: &std::path::Path) {
+    let Ok(Some(pending)) = deferred::read_marker() else {
+        return;
+    };
+    if pending.current_path() != current {
+        return;
+    }
+    let _ = std::fs::remove_file(pending.staged_path());
+    let _ = deferred::clear_marker();
+}
+
 /// `arreo update --server --from <path>` — the daemon half of the update (T-0038).
 ///
 /// ## The order, and why it is this order
@@ -539,6 +870,9 @@ fn server(args: &Args) -> ExitCode {
     if args.rollback {
         return match update::rollback(&current) {
             Ok(()) => {
+                // Rolling back supersedes a pending update for this binary too:
+                // the operator has decided against it.
+                clear_superseded_pending(&current);
                 println!("rolled back {}", current.display());
                 println!(
                     "the running daemon is unchanged; it takes effect when the daemon \
@@ -619,10 +953,17 @@ fn server(args: &Args) -> ExitCode {
     #[cfg(not(unix))]
     let handoff = {
         if crate::find_daemon_pid(&socket).is_some() {
-            Handoff::Deferred
-        } else {
-            Handoff::NoDaemon
+            // **The platform that cannot cut.** A running daemon keeps the image
+            // it started with, so the verified artifact is *kept* for the next
+            // start instead of being swapped under a process that would go on
+            // serving the old code (T-0039). `defer_install` is the one writer of
+            // that state, shared with the Unix failure path below.
+            let from_version =
+                update::verify_runs(&current).unwrap_or_else(|_| "unknown".to_string());
+            let pending = defer_install(&staged, &current, &from_version, &version);
+            return report_deferred(pending, &socket, args);
         }
+        Handoff::NoDaemon
     };
     #[cfg(unix)]
     let handoff = match crate::find_daemon_pid(&socket) {
@@ -633,16 +974,26 @@ fn server(args: &Args) -> ExitCode {
                 to: new_pid,
             },
             Err(HandoffError { code, message }) => {
-                // The handoff failed, so nothing is installed and nothing
-                // changed: the staged copy is dropped and the daemon that was
-                // serving keeps serving the binary it was already running.
-                let _ = std::fs::remove_file(&staged);
                 eprintln!("update: {message}");
                 eprintln!(
                     "update: nothing was installed; the daemon serving {} is still running \
                      (pid {pid})",
                     socket.display()
                 );
+                // **The cut failed; the artifact is not what was wrong with it.**
+                // A failed handoff used to drop a verified, downloaded release on
+                // the floor. It is now kept for the next start (T-0039) — except
+                // when the refusal was the one-handoff lock, because there
+                // another updater is cutting *right now* and a deferred artifact
+                // of ours would be promoted over theirs at the next start.
+                if code == IN_PROGRESS {
+                    let _ = std::fs::remove_file(&staged);
+                } else {
+                    let from_version =
+                        update::verify_runs(&current).unwrap_or_else(|_| "unknown".to_string());
+                    let pending = defer_install(&staged, &current, &from_version, &version);
+                    report_deferred(pending, &socket, args);
+                }
                 return ExitCode::from(code);
             }
         },
@@ -652,7 +1003,13 @@ fn server(args: &Args) -> ExitCode {
     // binary, so a failure here must say that plainly rather than implying the
     // update did not happen.
     let previous = match update::swap(&staged, &current) {
-        Ok(()) => update::prev_path(&current).display().to_string(),
+        Ok(()) => {
+            // A successful install supersedes anything that was waiting for this
+            // binary (T-0039): the pending marker must not outlive the update it
+            // describes.
+            clear_superseded_pending(&current);
+            update::prev_path(&current).display().to_string()
+        }
         Err(e) => {
             eprintln!(
                 "update: the handoff succeeded but installing over {} failed: {e}",
@@ -673,8 +1030,6 @@ fn server(args: &Args) -> ExitCode {
             Handoff::TookOver { from, to } => {
                 serde_json::json!({"daemon": {"from_pid": from, "to_pid": to}})
             }
-            #[cfg(not(unix))]
-            Handoff::Deferred => serde_json::json!({"daemon": {"deferred": true}}),
         };
         println!(
             "{}",
@@ -702,12 +1057,6 @@ fn server(args: &Args) -> ExitCode {
                 );
                 println!("no agent was restarted: the PTYs and their processes were untouched");
             }
-            #[cfg(not(unix))]
-            Handoff::Deferred => println!(
-                "update pending: a daemon is serving {} and this platform cannot hand it over \
-                 without a restart; the new binary takes effect when it next starts",
-                socket.display()
-            ),
         }
     }
     OK.into()
@@ -730,9 +1079,6 @@ enum Handoff {
     NoDaemon,
     /// The daemon was handed over to the new binary without a restart.
     TookOver { from: u32, to: u32 },
-    /// Windows: installed, and it takes effect at the next daemon start.
-    #[cfg(not(unix))]
-    Deferred,
 }
 
 /// Spawn the staged server binary in handoff mode and wait until it is the
@@ -983,6 +1329,18 @@ fn usage() {
     eprintln!(
         "       arreo update --server --from <path> [--json] [--socket PATH] [--timeout-secs N]"
     );
+    eprintln!("       arreo update --status [--json]");
+    eprintln!("       arreo update --apply-now [--json] [--socket PATH]");
+    eprintln!(
+        "  --status    report the update waiting for a restart (if any) and whether the installed"
+    );
+    eprintln!(
+        "              binary reports the new version; clears the marker only on that confirmation"
+    );
+    eprintln!(
+        "  --apply-now promote a waiting update — but only in the one safe window, where no pane"
+    );
+    eprintln!("              is running; exits 3 and names each pane when one is (T-0039)");
     eprintln!("  --from      a binary to install in place of this one (already on disk)");
     eprintln!(
         "  --channel   the release channel to fetch from (a URL): file:// for a mirror or a test,"
@@ -1031,6 +1389,12 @@ struct Args {
     /// How long to wait for the handoff to complete. Only meaningful with
     /// `--server`.
     timeout_secs: Option<u64>,
+    /// Report a deferred update and confirm the version that would clear it
+    /// (T-0039). Read-only, so it takes no lock and installs nothing.
+    status: bool,
+    /// Promote a deferred update in the one window where that is safe — no live
+    /// pane (T-0039).
+    apply_now: bool,
 }
 
 fn parse(rest: &[String]) -> Result<Args, String> {
@@ -1087,6 +1451,14 @@ fn parse(rest: &[String]) -> Result<Args, String> {
                 args.no_reexec = true;
                 i += 1;
             }
+            "--status" => {
+                args.status = true;
+                i += 1;
+            }
+            "--apply-now" => {
+                args.apply_now = true;
+                i += 1;
+            }
             other => return Err(format!("unknown flag {other}")),
         }
     }
@@ -1127,6 +1499,34 @@ fn parse(rest: &[String]) -> Result<Args, String> {
             "--reattach-pane and --no-reexec describe this client; --server swaps the daemon"
                 .into(),
         );
+    }
+    if args.status || args.apply_now {
+        // Both act on the update that is *already staged* (T-0039), so a flag
+        // that describes a new install would be ignored while looking obeyed.
+        let other = [
+            (args.from.is_some(), "--from"),
+            (args.check, "--check"),
+            (args.rollback, "--rollback"),
+            (args.server, "--server"),
+            (args.no_reexec, "--no-reexec"),
+            (args.reattach_pane.is_some(), "--reattach-pane"),
+            (args.channel.is_some(), "--channel"),
+            (args.timeout_secs.is_some(), "--timeout-secs"),
+        ]
+        .into_iter()
+        .find(|(present, _)| *present)
+        .map(|(_, name)| name);
+        if let Some(name) = other {
+            return Err(format!(
+                "--status and --apply-now act on the update that is already staged; they take no \
+                 {name}"
+            ));
+        }
+        if args.status && args.apply_now {
+            return Err(
+                "--status reports and --apply-now promotes; they are different operations".into(),
+            );
+        }
     }
     Ok(args)
 }

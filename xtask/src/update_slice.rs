@@ -101,6 +101,14 @@ pub(crate) fn pane_id(n: usize) -> String {
 
 pub fn run(rest: &[String]) -> ExitCode {
     let evidence = rest.iter().any(|a| a == "--interactive-evidence");
+    // `--case <name>` runs one named case instead of the whole slice (T-0039).
+    // The default is the whole slice, so every existing invocation — the CI step,
+    // the docs, an operator — is unchanged.
+    let case = rest
+        .iter()
+        .position(|a| a == "--case")
+        .and_then(|i| rest.get(i + 1))
+        .cloned();
     let evidence_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("xtask lives one level below the workspace root")
@@ -112,9 +120,17 @@ pub fn run(rest: &[String]) -> ExitCode {
     }
 
     let mut report = Report::default();
-    slice(&mut report);
+    match case.as_deref() {
+        None => slice(&mut report),
+        Some("deferred") => deferred_case(&mut report),
+        Some(other) => report.check(
+            "the named case exists",
+            false,
+            &format!("unknown case {other:?} (this slice has: deferred)"),
+        ),
+    }
 
-    if evidence {
+    if evidence && case.is_none() {
         let _ = fs::write(evidence_dir.join("transcript.txt"), report.transcript());
         for (name, body) in [
             ("panes-before.txt", &report.panes_before),
@@ -126,6 +142,271 @@ pub fn run(rest: &[String]) -> ExitCode {
         }
     }
     report.finish()
+}
+
+/// `--case deferred` (T-0039) — the deferred update, end to end, on the real
+/// binaries.
+///
+/// The whole story in one run: a cut that cannot happen **keeps** the verified
+/// artifact instead of discarding it; the pending state is reported and does not
+/// claim to be applied; `--apply-now` refuses while a pane is live and *names*
+/// it; at zero panes the promotion happens and `.prev` holds what it replaced;
+/// and the marker clears only once the installed binary reports the new version.
+///
+/// Unix-only, and honestly so: the proof needs a **stand-in** server that answers
+/// `--version` and nothing else, which is a shell script — a real `arreo-server`
+/// cannot be asked to report a version it does not have. Windows cannot execute
+/// that stand-in, so the case reports the skip there rather than pretending; the
+/// Windows deferred case (service control codes, promotion before the socket is
+/// bound) is T-0090's and runs on the Windows runner.
+fn deferred_case(report: &mut Report) {
+    #[cfg(not(unix))]
+    report.skip(
+        "the deferred update runs on this platform",
+        "the stand-in server is a shell script; the Windows case is T-0090's",
+    );
+    #[cfg(unix)]
+    deferred_case_unix(report);
+}
+
+#[cfg(unix)]
+fn deferred_case_unix(report: &mut Report) {
+    let (server_bin, cli_bin, _tui) = bins();
+    for bin in [&server_bin, &cli_bin] {
+        if !bin.exists() {
+            report.check(
+                "the binaries under test are built",
+                false,
+                &format!(
+                    "{} does not exist; build first (`cargo build -p arreo-cli -p arreo-server`)",
+                    bin.display()
+                ),
+            );
+            return;
+        }
+    }
+    let root = match scratch_root() {
+        Ok(root) => root,
+        Err(e) => {
+            report.check("the scratch directory can be made", false, &e);
+            return;
+        }
+    };
+    let _scratch = Scratch(root.clone());
+    let sandbox = match Sandbox::new(root.clone()) {
+        Ok(sandbox) => sandbox,
+        Err(e) => {
+            report.check("the scratch environment can be made", false, &e);
+            return;
+        }
+    };
+    let socket = root.join("arreo.sock");
+    let sock = socket.display().to_string();
+
+    // The client under test is a **copy** (never the build tree — the trap the
+    // main slice documents), and the server beside it is the stand-in.
+    let installed = root.join("arreo");
+    let installed_server = root.join("arreo-server");
+    let candidate = root.join("server-new");
+    if let Err(e) = copy_with_tail(&cli_bin, &installed, b"") {
+        report.check(
+            "the fixture binaries are copies of the real one",
+            false,
+            &format!("{}: {e}", installed.display()),
+        );
+        return;
+    }
+    for (path, version) in [(&installed_server, "0.2.0"), (&candidate, "0.3.0")] {
+        if let Err(e) = write_stand_in_server(path, version) {
+            report.check(
+                "the stand-in server answers --version",
+                false,
+                &format!("{}: {e}", path.display()),
+            );
+            return;
+        }
+    }
+    let installed_path = installed.display().to_string();
+    let candidate_path = candidate.display().to_string();
+    let staged = root.join("arreo-server.next");
+    let marker = root.join("arreo-state").join("update-pending.json");
+
+    let daemon = match Daemon::spawn(&sandbox, &server_bin, &cli_bin, &socket) {
+        Ok(daemon) => daemon,
+        Err(e) => {
+            report.check("the daemon starts and binds its socket", false, &e);
+            return;
+        }
+    };
+    report.say(format!(
+        "deferred: a real daemon (pid {}) serves {sock}; the server beside the client is a \
+         stand-in reporting {}",
+        daemon.id,
+        run_cli(&sandbox, &installed_server, &["--version"], CLI_DEADLINE)
+            .output
+            .trim()
+    ));
+
+    // ---- 1. a cut that cannot happen keeps the artifact ---------------------
+    let r = run_cli(
+        &sandbox,
+        &installed,
+        &[
+            "update",
+            "--server",
+            "--from",
+            &candidate_path,
+            "--socket",
+            &sock,
+        ],
+        CLI_DEADLINE,
+    );
+    report.say(format!(
+        "deferred: `update --server --from server-new` exited {:?}: {}",
+        r.code,
+        first_line(&r.output)
+    ));
+    report.check(
+        "a cut that cannot happen keeps the verified artifact instead of discarding it",
+        r.code == Some(1) && staged.exists() && marker.exists(),
+        &format!(
+            "exit={:?} staged={} marker={}",
+            r.code,
+            staged.exists(),
+            marker.exists()
+        ),
+    );
+    if !(staged.exists() && marker.exists()) {
+        return;
+    }
+
+    // ---- 2. it is reported, and not as applied ------------------------------
+    let r = run_cli(&sandbox, &installed, &["update", "--status"], CLI_DEADLINE);
+    report.check(
+        "the pending update is reported, and not as applied",
+        r.output.contains(
+            "update pending arreo-server 0.2.0 → arreo-server 0.3.0 (applies at next restart)",
+        ) && r.output.contains("not applied yet"),
+        &first_line(&r.output),
+    );
+
+    // ---- 3. a live pane shuts the window ------------------------------------
+    let r = run_cli(
+        &sandbox,
+        &installed,
+        &[
+            "spawn", "pane-1", "/bin/sh", "-c", "sleep 3", "--socket", &sock,
+        ],
+        CLI_DEADLINE,
+    );
+    if !r.ok() {
+        report.check(
+            "a pane is spawned, so the window has something to shut it",
+            false,
+            &format!("{r}"),
+        );
+        return;
+    }
+    let r = run_cli(
+        &sandbox,
+        &installed,
+        &["update", "--apply-now", "--socket", &sock],
+        CLI_DEADLINE,
+    );
+    report.check(
+        "a live pane refuses the promotion, and the refusal names the pane",
+        r.code == Some(3) && r.output.contains("pane-1") && staged.exists(),
+        &format!(
+            "exit={:?} names_pane={} stage_kept={}",
+            r.code,
+            r.output.contains("pane-1"),
+            staged.exists()
+        ),
+    );
+
+    // ---- 4. the pane finishes, the window opens, the promotion happens ------
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut gone = false;
+    while Instant::now() < deadline {
+        let r = run_cli(
+            &sandbox,
+            &installed,
+            &["panes", "--socket", &sock],
+            CLI_DEADLINE,
+        );
+        if r.output.contains("pane-1") && r.output.contains("exited") {
+            gone = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    report.check(
+        "the pane exits, so the window opens",
+        gone,
+        "waited 20 s for pane-1 to show as exited",
+    );
+    if !gone {
+        return;
+    }
+    let r = run_cli(
+        &sandbox,
+        &installed,
+        &["update", "--apply-now", "--socket", &sock],
+        CLI_DEADLINE,
+    );
+    let now = run_cli(&sandbox, &installed_server, &["--version"], CLI_DEADLINE);
+    let prev = run_cli(
+        &sandbox,
+        &root.join("arreo-server.prev"),
+        &["--version"],
+        CLI_DEADLINE,
+    );
+    report.check(
+        "at zero panes the promotion happens, and `.prev` holds what it replaced",
+        r.code == Some(0) && now.output.contains("0.3.0") && prev.output.contains("0.2.0"),
+        &format!(
+            "exit={:?} installed={:?} prev={:?}",
+            r.code,
+            now.output.trim(),
+            prev.output.trim()
+        ),
+    );
+
+    // ---- 5. the marker clears only on the version confirmation -------------
+    let r = run_cli(&sandbox, &installed, &["update", "--status"], CLI_DEADLINE);
+    report.check(
+        "the marker clears only once the installed binary reports the new version",
+        r.output.contains("the new version has taken over") && !marker.exists(),
+        &first_line(&r.output),
+    );
+
+    // ---- 6. a flag that describes a new install is refused, not ignored -----
+    let r = run_cli(
+        &sandbox,
+        &installed,
+        &["update", "--status", "--from", &candidate_path],
+        CLI_DEADLINE,
+    );
+    report.check(
+        "--status refuses a flag that describes a new install",
+        r.code == Some(2),
+        &first_line(&r.output),
+    );
+
+    let _ = installed_path;
+}
+
+/// A stand-in `arreo-server` that answers `--version` with `version` and exits.
+///
+/// Enough for every state the deferred path is about, and deliberately not more:
+/// the alternative is a real daemon build per version, which would make the case
+/// about building rather than about the state machine.
+#[cfg(unix)]
+fn write_stand_in_server(path: &Path, version: &str) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+    let body = format!("#!/bin/sh\ncase \"$1\" in\n  --version) echo \"arreo-server {version}\" ;;\nesac\nexit 0\n");
+    fs::write(path, body).map_err(|e| e.to_string())?;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o755)).map_err(|e| e.to_string())
 }
 
 /// The checks, in the order the task lists them.

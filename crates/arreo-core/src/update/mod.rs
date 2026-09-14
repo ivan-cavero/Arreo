@@ -54,6 +54,11 @@
 /// that comes out of it — the anonymous `arreo update` half.
 pub mod channel;
 
+/// The **deferred** update (T-0039): a verified artifact staged beside the
+/// running binary, the one window in which it may be promoted, and the marker
+/// that reports it until the version confirms.
+pub mod deferred;
+
 /// The `https://` transport of [`channel`] (T-0037): one GET, over the TLS stack
 /// this workspace already ships. Private: what a caller names is a channel URL,
 /// not a transport.

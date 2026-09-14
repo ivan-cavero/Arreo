@@ -4,7 +4,7 @@ title: Release/update e2e slice — one command, three OSes, real artifacts
 phase: 2
 priority: 3
 status: proposed
-depends_on: [T-0036, T-0037, T-0038, T-0039, T-0040, T-0041]
+depends_on: [T-0036, T-0037, T-0038, T-0039, T-0040, T-0041, T-0090]
 scope:
   - xtask/src/release_slice.rs
   - xtask/src/main.rs

@@ -436,6 +436,90 @@ them: a path it cannot write produces the command that does the job
 (`brew upgrade arreo`, `cargo install --force arreo`) instead of a partial write or
 a `sudo` over the package manager's files.
 
+### When the cut cannot happen: the deferred update
+
+A client update never touches a PTY-bearing process, so it is always a single
+atomic rename (above). A **server** update is different: the daemon owns the
+PTYs, so replacing its binary has to account for the process that is running it.
+
+On Unix that is the live handoff (T-0038): a new daemon inherits the listener,
+the lock and the pane descriptors, and the socket never goes dead. **On Windows
+there is no such cut, and the deferral is on evidence rather than on taste:**
+
+- **The handles are not the problem.** ConPTY pseudoconsole handles *are*
+  inheritable (`PROC_THREAD_ATTRIBUTE_HANDLE_LIST`), so "Windows cannot pass the
+  handle" would be the wrong reason.
+- **The process state is.** The read loop, the conduit pipes and the child
+  bookkeeping that make a pane a pane are process-local: there is nothing in a
+  Windows daemon that a second process could adopt the way the Unix handoff
+  adopts a master fd and a listener.
+- **And a running image cannot be replaced, only renamed.** So even with the
+  process state transferred, the swap itself would need the daemon to stop.
+
+Both halves point at the same conclusion: on Windows the swap has to happen
+where nothing is running, which is a restart. **Revisit condition:** if a future
+Windows daemon keeps its pane state in a form another process can adopt (a
+per-pane handle list and an inheritable read loop), the deferral is no longer
+forced and this section is the place to say so.
+
+#### The one window
+
+The window is not a policy with thresholds — it is **`live_panes == 0`**, and it
+is one function (`arreo_core::update::deferred::window_is_open`) so that no
+second place can answer the question differently. A live pane is a running
+agent, and no update is worth an agent's work. The caller reads the pane list
+under the daemon's own lock, immediately before the swap, so that "no panes"
+cannot be true of a moment that has already passed.
+
+#### What an operator sees
+
+An update that cannot be cut is **kept, not discarded** — a verified, downloaded
+release used to be thrown away when the cut was refused:
+
+```console
+$ arreo update --server --from arreo-server-0.3.0
+update pending arreo-server 0.2.0 → arreo-server 0.3.0 (applies at next restart)
+staged at /usr/local/bin/arreo-server.next
+$ arreo update --status
+update pending arreo-server 0.2.0 → arreo-server 0.3.0 (applies at next restart)
+/usr/local/bin/arreo-server reports: arreo-server 0.2.0
+not applied yet: the running binary does not report the new version
+$ arreo update --apply-now          # while an agent is running
+update: 1 live pane (build) — a pane is a running agent, so the update waits for
+the window where none is running
+$ arreo update --apply-now          # once the agents are done
+installed /usr/local/bin/arreo-server (arreo-server 0.2.0 → arreo-server 0.3.0)
+```
+
+The state is three facts, and each is written down rather than implied:
+
+- **The marker** (`$XDG_STATE_HOME/arreo/update-pending.json`) says what is
+  waiting, what it will replace, and the version each reports. A marker that
+  cannot be parsed is a **loud error**, never "nothing pending".
+- **The marker outlives the swap.** The swap moves a file; the version is what a
+  *running* process reports. `arreo update --status` clears the marker only once
+  the installed binary reports the new version — a marker cleared by the rename
+  would report success for a machine still serving the old code.
+- **`.prev`** holds what was replaced, for `--rollback`, until a start succeeds.
+
+**A stage that cannot be promoted is discarded, with its marker.** A truncated
+artifact, or one that no longer reports the version it was recorded with, is
+refused *and removed* — keeping it would mean the same failure on every boot,
+which is a loop dressed as persistence. The refusal says so and asks for
+`arreo update` again.
+
+#### What is proven where
+
+| Part | Proven by |
+| --- | --- |
+| The window rule, the marker, the refusals, `.prev` | `cargo test -p arreo-core update` (unit, all platforms) |
+| The whole path end to end on the real binaries | `cargo xtask e2e --slice update --case deferred` (Unix; the Windows runner reports the skip) |
+| Windows service stop/start through control codes, promotion before the socket is bound, the `windows-deferred` case | **not yet** — T-0090, and it can only be proven on the Windows runner |
+
+The last row is the honest gap, and it is a gap in *this* document's story rather
+than a hidden one: the deferred path exists and is proven, and the Windows
+application point (which is what the platform difference actually is) is T-0090.
+
 ## Install URLs (reserved — none of these resolves today)
 
 | Channel | URL | State |
