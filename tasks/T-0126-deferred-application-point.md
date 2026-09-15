@@ -13,7 +13,7 @@ scope:
   - xtask/src/update_slice.rs
   - .github/workflows/ci.yml
   - docs/release.md
-  - .loop/evidence/T-0090/**
+  - .loop/evidence/T-0126/**
 verify:
   - cargo xtask e2e --slice update --case windows-deferred   # Windows runner
   - cargo test -p arreo-core update
