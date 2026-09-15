@@ -1,41 +1,45 @@
 ## State snapshot          ← REWRITTEN (not appended) at every checkpoint
 
-Task: **T-0105 done** — the deferred update's start path: a daemon cold start promotes a
-pending update by itself, re-execs into it, and releases `.prev` once the new version confirms.
-Where you are: committed and pushed. Promotion runs inside `Daemon::serve()` under the socket
-lock and before the bind (pane list read from the registry; `window_is_open` is the only rule);
-`serve_inherited` never promotes; the re-exec is `execv`; the loop guard is the version
-confirmation; `.prev` is released only by the confirming start. 9 unit tests + 1 integration
-test + a 7-check restart story in the update slice + docs/release.md.
-**An independent review found one p1, and it was real**: step 1 keyed off the *file the marker
-names*, so a daemon running from a different path than the marker records announced the new
-version, cleared the marker and deleted `.prev` while itself serving the old bytes (reproduced
-against the real binary: a 0.1.0 daemon announced 9.9.9 and destroyed the rollback slot). Fixed
-— the confirmation now requires the marker to name *this* process's own image (canonicalized)
-and that image to report the pending version. Two regression tests; 6 mutations each redden
-exactly their test. Battery: **925 tests, 0 failed; 14/14 slices; sync 14/14; vet 337; deny
-4/4; audit 0; check-targets PASS/SKIP; bench 6/6; clippy 0 on both toolchains; fmt clean.**
-Next step: **T-0104** (uniffi core bindings, p2, larger) or **T-0111** (p3, the notify tick's
-cost — the last T-0093 follow-up). T-0095 (approval gates, p3) is also unblocked.
+Task: **T-0104 done** — UniFFI core bindings. Phase 3 is open (it had 0 of 60 tasks).
+Where you are: committing. `crates/arreo-core-ffi` (leaf, cdylib+staticlib+lib) exports the
+client surface — 85 symbols: pairing both sides, identity + fingerprint, the relay session,
+the machine directory, the codec, the theme tokens — with 8 flat typed error enums and no
+`Result<_, String>`. `cargo xtask ffi --check` builds, generates Swift+Kotlin, asserts the
+generated surface against the golden list **both ways**, and compiles Kotlin where `kotlinc`
+exists (not here) while SKIPping Swift with its reason. 10 contract tests drive the exported
+items, not the core beneath them. `docs/mobile.md` records the surface, the SKIPs, what a UI
+still brings, and the measured weight.
+**The task's premise was corrected before delegating** (a JDK cannot compile Kotlin — no
+`kotlinc` on this box), and **an independent review returned ship-with-follow-ups**: nine of
+ten findings fixed, including a security one — `device_cert_issue` bypassed the core's
+weak-key refusal, so a malicious phone could push a small-order ed25519 point (forgeable
+signatures) through the only issuing door a mobile UI has. Fixed with the core's own
+predicate and its own sentence, regression-tested with a control. One finding **filed, not
+fixed**: the shipped library still carries SQLite (53 symbols) and PTY (197) no export can
+reach — the obvious fix does not compile (`mesh::resolve` calls `store::rfc3339_ms` while
+`store` is gated), and that is a core change outside the fence, so it is **T-0113**.
+Battery: **935 tests, 0 failed; 14/14 slices; sync 14/14; vet 375; deny 4/4; audit 0;
+check-targets PASS/SKIP; workspace_deps 8/8; bench 6/6; clippy 0 on both toolchains; fmt clean.**
+Next step: **T-0095** (approval gates, p3, unblocked) or **T-0111** (p3, the notify tick's
+cost — the last T-0093 follow-up). Phase 3's mobile-UI tasks are now draftable (T-0104's notes
+say so) but every one needs Xcode/Android SDK — a different machine, the T-0090 class of gate.
 Open workers: none.
 Known broken: T-0063 (CI never-green — the user's, untouched) · Parked: T-0048 needs-human
-**T-0105 — what the review changed, and the three dispositions.** (1) The p1 above. (2) `.prev`
-is now released only when the marker was *actually* cleared — a read-only state dir leaves the
-update pending and the rollback slot intact, and the line says so. (3) The unreachable
-`#[cfg(not(unix))]` re-exec arm was deleted rather than kept claiming a type-check it never got
-(`daemon.rs` cannot compile off Unix today; the Windows application point is T-0090's).
-(4) The older in-process test helpers now isolate `ARREO_STATE_DIR` — and the evidence records
-honestly that its removal does *not* redden anything, because the identity fix already subsumes
-the live hazard: it is hermeticity, not the guard. Verified sound by the reviewer: the
-lock-across-`exec` argument (O_CLOEXEC releases the flock at exec; on exec failure the fd stays
-open so the fall-through unlink+bind is still the lock holder's) and the handoff exclusion.
+**T-0105 (done) — the review's p1 was real.** The deferred start path keyed "has the update
+taken over?" off the *file the marker names* rather than this process's own image, so a daemon
+running from a different path announced the new version, cleared the marker and deleted
+`.prev` while serving the old bytes (reproduced against the real binary). Fixed: the marker
+must name *this* process's own image **and** that image must report the pending version.
+Also `.prev` released only when the marker was actually cleared; the unreachable
+`#[cfg(not(unix))]` arm deleted; test helpers isolate `ARREO_STATE_DIR` (recorded as
+hermeticity, not a guard). Six mutations, each reddening exactly its test.
 **This session's units.** T-0093 (notification rules engine, then corrected by review), T-0112
-(a persistence-slice marker outlived by its own waits), T-0110 (the wait-provenance regression),
-T-0094 (quick actions), T-0105 (this one), plus RUSTSEC-2026-0285 (rustls 0.23.45).
+(a persistence-slice marker outlived by its own waits), T-0110 (the wait-provenance
+regression), T-0094 (quick actions), T-0105 (the deferred start path), T-0104 (UniFFI
+bindings), plus RUSTSEC-2026-0285 (rustls 0.23.45). Filed: T-0113 (core separability).
 **Slice failures during verification, all attributed.** `handoff-abort` 2/41 in the run right
-after the 13-slice batch, 41/41 in three consecutive runs alone — load-sensitive, not the
-change. Earlier in the session: the persistence recall check (the harness's own model answering
-empty, now a skip) and batch contention on tui/mesh (green alone).
+after a 13-slice batch and 41/41 alone (load-sensitive). Earlier: the persistence recall check
+(the harness's own model answering empty, now a skip) and batch contention on tui/mesh.
 ## Event log               ← append-only; newest last; never rewrite
 - 2026-09-10 [turn 1] ledger created; repo at e489fac (docs only); T-0001 + T-0022 (AGENTS.md gardened) done
 - 2026-09-10 [turn 2] T-0002 PTY manager done+pushed (342606c; 9 tests); PROMPT.md v2 synced + ADR 0001 (ef6c595)
@@ -259,3 +263,7 @@ empty, now a skip) and batch contention on tui/mesh (green alone).
 - 2026-09-15 [turn 27] Persistence slice: the pi-recall check (asks the harness's own model for the codeword) failed twice on an empty model answer — the model's behaviour, not the restore. Softened to a skip that says so; the restore stays proven by the transcript + session-file checks. Slice now 12 passed + skip, 0 failed.
 - 2026-09-15 [turn 28] **T-0105 done** — the deferred update's start path. Promotion inside `Daemon::serve()` (under the socket lock, before the bind, pane list read from the registry, `window_is_open` the only rule); `serve_inherited` never promotes (structural, behaviourally proven); `execv` re-exec on Unix; the loop guard is the version confirmation; `.prev` released only by the confirming start. 9 unit tests (`start_update_tests`), `tests/deferred_start.rs`, 7 new slice checks (the deferred case is 13), docs/release.md. An independent review found **one p1**: step 1 keyed off the *file the marker names*, so a daemon running from a different path announced the new version, cleared the marker and deleted `.prev` while itself serving the old bytes — reproduced against the real binary (a 0.1.0 daemon announced 9.9.9 and destroyed the rollback slot). Fixed by requiring the marker to name *this* process's own image (`same_file`, canonicalized) **and** that image to report the pending version; a marker for another binary is left alone with one honest line. Also fixed: `.prev` released only when the marker was actually cleared; the unreachable `#[cfg(not(unix))]` arm deleted; the older test helpers isolate `ARREO_STATE_DIR` (with the honest note that this is hermeticity, not the guard — the identity fix subsumes the live hazard). 6 mutations, each reddening exactly its test (incl. the env-gated "promotion disabled at start" reddening 3 slice checks). Battery: 925/0, 14/14 slices, sync 14/14, vet 337, deny 4/4, audit 0, check-targets PASS/SKIP, bench 6/6, clippy 0/0, fmt clean. Evidence `.loop/evidence/T-0105/start-path.txt`.
 - 2026-09-15 [turn 28] `handoff-abort` 2/41 in the run immediately after the 13-slice batch, 41/41 in three consecutive runs alone (load-sensitive — it SIGKILLs daemons at sub-second deadlines). Attributed, not a product defect.
+- 2026-09-15 [turn 28] **T-0104 started** (p2, UniFFI core bindings — the one Phase-3 task provable on this box, and the one the rest of Phase 3 waits on). Planner wrote the Design section into the task file as the contract: `uniffi` 0.32 chosen over a hand-written C ABI / `cbindgen` / `flutter_rust_bridge` (rationale + rejection reasons recorded, per the task's Notes and the dependency rule); a leaf `crates/arreo-core-ffi` (cdylib+staticlib+lib, no PTY/daemon/store); a `uniffi-bindgen` bin behind a `cli` feature; `cargo xtask ffi --check` (build → generate both languages → golden-symbol assertion → kotlinc probe/compile or SKIP → Swift SKIP); typed errors carrying the CLI's sentences. **Probed before delegating**: JDK 25 present, no `kotlinc`/`swift` — the task's parenthetical that a JDK suffices to compile Kotlin is wrong, so the criterion was corrected in the file rather than left to fail. Delegated to `FfiBindings`.
+- 2026-09-15 [turn 29] **T-0104 done** — UniFFI core bindings, the one Phase-3 task provable on this box. `crates/arreo-core-ffi` (leaf, cdylib+staticlib+lib) exports the client surface (85 symbols: pairing both sides, identity+fingerprint, relay session, machine directory, codec, theme tokens) with 8 flat typed error enums and no `Result<_, String>`. `cargo xtask ffi --check`: build → generate Swift+Kotlin → golden-symbol assertion **both directions** → kotlinc probe/compile or SKIP → Swift SKIP; reports 5 pass, 2 skip. 10 contract tests drive the exported items, not the core beneath them. `docs/mobile.md` records the surface, the SKIPs, what a UI still brings, and the measured weight. Dependency decision recorded before coding: `uniffi` 0.32 over a hand-written C ABI / `cbindgen` / `flutter_rust_bridge` (ROADMAP §3.5 rejects a Flutter runtime).
+- 2026-09-15 [turn 29] T-0104: **the task's own premise was wrong and was corrected before delegating** — a JDK cannot compile Kotlin (`kotlinc` is separate; none on this box), so that criterion became a probe-and-report instead of a claim that would have failed. An independent review returned ship-with-follow-ups: nine of ten findings fixed, including a **security** one — `device_cert_issue` bypassed the core's weak-key refusal, so a malicious phone could push a small-order ed25519 point (a key whose signatures are forgeable for almost any message) through the only issuing door a mobile UI has, pinning an identity the CLI refuses. Fixed with the core's own predicate and its own sentence (carried, not restated) + a regression test with a control. Also: the gate's cdylib name was Linux-literal (so it could not run on the macOS runner that lifts the Swift SKIP); the Kotlin classpath lacked `kotlinx-coroutines-core` (so the one non-SKIP compile path could not PASS even with everything the SKIP named); a swallowed scratch-removal could let a stale file satisfy the golden check; the summary's pass count was derived rather than counted; the unused `RootKeyHandle::sign` (an arbitrary-signing oracle for the trust anchor) deleted — and the gate caught its stale golden entry unprompted, which is the check working in the real direction. Three doc corrections.
+- 2026-09-15 [turn 29] T-0104's tenth finding **filed, not fixed**: the shipped library carries SQLite (53 defined symbols) and PTY (197) that no export can reach. The obvious fix (`arreo-core = { default-features = false, features = ["transport"] }`) **does not compile** — `arreo-core::mesh::resolve` calls `crate::store::rfc3339_ms` while `store` is gated behind `sqlite`. A core change outside T-0104's fence, so it was reverted with the reason in the manifest and filed as **T-0113** (whose fix is measured by symbol count, not asserted). `docs/mobile.md` carries my own measurements with the exact command (they differ from the reviewer's 15; 53 is what `nm … | grep -ci sqlite` prints).
