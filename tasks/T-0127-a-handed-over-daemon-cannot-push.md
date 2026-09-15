@@ -1,5 +1,5 @@
 ---
-id: T-0126
+id: T-0127
 title: A handed-over daemon cannot push — it has no relay session
 phase: 3
 priority: 3
@@ -11,7 +11,7 @@ scope:
   - crates/arreo-server/src/relay_client.rs
   - crates/arreo-server/tests/notify_push.rs
   - docs/notifications.md
-  - .loop/evidence/T-0126/**
+  - .loop/evidence/T-0127/**
 verify:
   - cargo test --workspace
   - cargo test -p arreo-server --test notify_push
