@@ -3,7 +3,7 @@ id: T-0125
 title: A real-daemon FFI slice — the check the battery cannot fake
 phase: 3
 priority: 2
-status: proposed
+status: done
 depends_on: [T-0114]
 scope:
   - xtask/src/ffi_slice.rs
@@ -11,6 +11,8 @@ scope:
   - crates/arreo-core-ffi/tests/**
   - docs/mobile.md
   - .loop/evidence/T-0125/**
+evidence:
+  - .loop/evidence/T-0125/ffi-slice.txt
 verify:
   - cargo xtask e2e --slice ffi
   - cargo test --workspace
@@ -46,28 +48,28 @@ in a fixture.
 
 ## Acceptance criteria
 
-- [ ] `cargo xtask e2e --slice ffi` exists, registered in `xtask/src/main.rs`, and drives the
+- [x] `cargo xtask e2e --slice ffi` exists, registered in `xtask/src/main.rs`, and drives the
       **real binaries**: spawn `arreo-relay serve` and `arreo-server`, pair a device as a viewer
       through the real CLI, spawn a pane, dial through the exported FFI surface, and read metrics
       **at least twice on one session**. The probe in `.loop/evidence/T-0114/real-daemon-probe.rs`
       is the reference implementation — reuse its scaffolding rather than re-deriving it (the
       relay's account registration wants the *public* root key hex, and the certificate file is
       MessagePack bytes, not text).
-- [ ] It **fails on the pre-fix shape**: reverting the conversation cache to a per-call handshake
+- [x] It **fails on the pre-fix shape**: reverting the conversation cache to a per-call handshake
       must redden it (T-0114's M1' was exactly this, on real processes —
       `read #2 FAIL — the SECOND read failed: handshake took longer than 10s`). Paste that red in
       the evidence.
-- [ ] A **wrong-but-valid** pinned key is refused, and the check is load-bearing: ignoring
+- [x] A **wrong-but-valid** pinned key is refused, and the check is load-bearing: ignoring
       `server_key` must redden it. (T-0114's M2 showed the first version of that assertion was
       weak — a served read also fails later on a dead channel — so assert on the *positive*
       symptom: the pane's data must not come back.)
-- [ ] An **empty window is an answer**: a pane with no history yet returns an empty series with
+- [x] An **empty window is an answer**: a pane with no history yet returns an empty series with
       `downshifted`, not an error, asserted against the real daemon.
-- [ ] The slice SKIPs rather than fails when the binaries or the relay cannot run, naming what is
+- [x] The slice SKIPs rather than fails when the binaries or the relay cannot run, naming what is
       missing — the `check-targets` pattern. It must never report PASS without having read real
       metrics (assert the rows are non-empty and the step is the tier the machine served).
-- [ ] `docs/mobile.md` points at the slice, and `AGENTS.md`'s command list gains it.
-- [ ] No `arreo-server`/`arreo-relay` code is linked into the harness (AGPL — spawn the binaries,
+- [x] `docs/mobile.md` points at the slice, and `AGENTS.md`'s command list gains it.
+- [x] No `arreo-server`/`arreo-relay` code is linked into the harness (AGPL — spawn the binaries,
       as the CLI's own real-process tests do).
 
 ## Notes
@@ -77,3 +79,29 @@ in a fixture.
   the marginal cost is a few lines.
 - The probe's rough edges are recorded in `.loop/evidence/T-0114/` so the slice does not rediscover
   them.
+
+## Outcome
+
+Done. `cargo xtask e2e --slice ffi` spawns real `arreo-relay` + `arreo-server` processes, pins a
+viewer **and** an owner through the real CLI, spawns panes, and drives the exported FFI surface:
+three metrics reads on one viewer session, the viewer's act refused by the machine's own gate, a
+wrong-but-valid key refused, an empty window answered as a state, then an owner acting over the
+same conversation and killing the panes. `PASS reads=5 rows_min=1 tier_ms=10000 empty_rows=0
+acts=2 kills=3`.
+
+It grew beyond the criterion in the ways that mattered: the act door (T-0115) is covered on the
+same conversation, and the runner **re-checks the driver's numbers before calling a run a PASS**
+(`reads>=2`, `rows_min>=1`, the tier is one the store serves) — proven by faking `rows_min=0` and
+watching it refuse, so a slice that reports PASS without real metrics cannot exist.
+
+**The pre-fix red, reproduced by the integrator**: disabling the conversation cache in
+`relay.rs::daemon_call` gives `read #2 FAIL — the SECOND read failed: handshake took longer than
+10s` — the named check and the criterion's own text, with read #1 green first. The wrong-key check
+reddens on the **positive symptom** (`the pane's data came back under a key the machine does not
+hold (rows=1)`), which is the T-0114 M2 lesson applied. Three SKIP shapes (missing binary, the
+driver's own skip, the relay exiting) and `--enforce` turns each into a failure; a relay that is
+alive but silent past 20 s is a **FAIL**, because that is drift rather than an absent toolchain.
+
+This slice exists because T-0114 shipped a green, wrong tree: every check the battery had was a
+unit test or a fixture, and the fixture was not a daemon. The class of defect it catches — "the
+daemon keeps its session open after a verb" — is now covered by a real process.

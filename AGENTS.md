@@ -29,6 +29,8 @@ cargo fmt --all -- --check               # must be clean
 cargo xtask e2e                          # e2e battery (stubs until wired per task)
 cargo xtask e2e --slice tui              # TUI: sidebar/wall/mouse on a real pty
 cargo xtask e2e --slice theme            # theming: depth fallback + shared tokens
+cargo xtask e2e --slice ffi              # the real relay + daemon behind the exported FFI surface
+                                         # (SKIPs, naming what is missing, when the binaries cannot run)
 cargo test -p arreo-cli --test pairing   # pairing: three real processes (needs arreo-relay built)
 cargo xtask bench                        # benchmarks vs perf-budget.toml
 cargo xtask conpty-smoke                 # Windows ConPTY smoke (T-0007)

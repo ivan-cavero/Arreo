@@ -294,6 +294,32 @@ reconnect after a failed read. They call the
 mailbox and relay need to speak the shipped protocol. A boundary that cannot be
 crossed fails there, on this box, rather than in an Xcode build.
 
+It does not prove the boundary against a **real** machine, either — and that gap
+is not hypothetical. `cargo test -p arreo-core-ffi` stands up a test-local relay
+and mailbox: a *model* of a daemon, and T-0114 is the story of a model and a
+daemon disagreeing. The fixture closed its session after each answer, while a
+real daemon keeps its session open after a verb, so a one-shot implementation
+passed the whole battery — 936 tests, 14/14 slices, bench 6/6 — and failed on a
+phone's second read. The check that cannot be faked is
+
+```console
+cargo xtask e2e --slice ffi      # the real binaries, through this surface
+```
+
+which spawns the product's own `arreo-relay serve` and `arreo-server` as
+processes (**never linked**: the relay is AGPL, and the daemon is the machine
+under test), writes the machine's identity the way `arreo pair` leaves it, pins
+a **viewer** and an **owner** through the real `arreo devices issue`, spawns
+panes, and then drives exactly this surface: `relay_session_dial`, `machines`,
+three metrics reads on one conversation, a wrong-but-valid pinned key, an empty
+window, and the act door on both sessions — a viewer's act refused with the
+machine's own sentence, an owner's reply landing in the pane's transcript. It
+**SKIPs**, naming what is missing, when the binaries or the relay cannot run,
+and it never reports PASS without having read real rows at the tier the machine
+served. Its driver is `crates/arreo-core-ffi/tests/real_daemon.rs` (an
+`#[ignore]`d test, so `cargo test --workspace` stays a unit suite); the slice is
+what runs it and what decides what the run means.
+
 ## What a mobile UI still has to bring
 
 The honest split between this crate and the toolchains it does not have.
@@ -352,6 +378,7 @@ The honest split between this crate and the toolchains it does not have.
 
 ```console
 cargo xtask ffi --check          # build + generate + assert + compile where possible
+cargo xtask e2e --slice ffi      # this surface against the real relay + daemon (see above)
 ```
 
 The generated artifacts land in `target/test-scratch/T-0104/ffi/{swift,kotlin}`:

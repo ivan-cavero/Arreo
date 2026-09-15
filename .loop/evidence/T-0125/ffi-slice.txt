@@ -1,0 +1,240 @@
+T-0125 — a real-daemon FFI slice: the check the battery cannot fake
+===================================================================
+
+`cargo xtask e2e --slice ffi` drives the product's own binaries — `arreo-relay
+serve`, `arreo-server` and the `arreo` CLI — and reads a pane's metrics through
+the **exported FFI surface**, twice on one session, against a machine whose
+daemon keeps its session open after a verb. That property is what T-0114's
+fixture could not see: the tree was green and wrong, and the proof lived in a
+scratch crate under `target/` that nothing ran. This slice is that proof made
+durable.
+
+WHAT SHIPPED
+------------
+crates/arreo-core-ffi/tests/real_daemon.rs
+    The driver: an `#[ignore]`d integration test of the FFI crate (so the check
+    lives beside the boundary it drives, and `cargo test --workspace` stays a
+    unit suite). It spawns the three binaries, writes the machine's identity the
+    way `arreo pair` leaves it, issues the machine's certificate through the
+    boundary, pins a **viewer** and an **owner** through the real
+    `arreo devices issue`, spawns panes, and drives `relay_session_dial`,
+    `machines`, `metrics_history` (three times on one session), `notify_act`,
+    a wrong-but-valid pinned key, and an empty window.
+xtask/src/ffi_slice.rs
+    The slice: checks the binaries (SKIP, naming what is missing), runs the
+    driver, echoes its evidence, and re-checks the numbers before it will call a
+    run a PASS.
+xtask/src/main.rs                       `Some("ffi") => ffi_slice::run(rest)`
+docs/mobile.md                          the slice, under "What the gate does not prove"
+AGENTS.md                               the command, beside the other slices
+
+No `arreo-server`/`arreo-relay` code is linked anywhere in the harness: both are
+spawned processes, and the driver is a test of the FFI crate, whose only
+first-party dependency is `arreo-core` (the license-boundary gate in
+`xtask/tests/workspace_deps.rs` keeps it that way).
+
+THE RUN — `cargo xtask e2e --slice ffi` (verbatim, exit 0)
+---------------------------------------------------------
+    Running `target/debug/xtask e2e --slice ffi`
+    ffi: ffi-slice: viewer dev_1325b850c2871916eae203f0efc3c898 dialed account=acct-t0125 (session device_id=dev_1325b850c2871916eae203f0efc3c898)
+    ffi: ffi-slice: machine up; waiting for the metrics writer (a 10000 ms tier)
+    ffi: ffi-slice: read #1 ok step_ms=10000 downshifted=true rows=1
+    ffi: ffi-slice: read #2 ok step_ms=10000 downshifted=true rows=1 (the conversation was reused)
+    ffi: ffi-slice: viewer act refused: device dev_1325b850c2871916eae203f0efc3c898 (viewer) denied: viewer may not Send (needs Control)
+    ffi: ffi-slice: read #3 ok rows=1 (a refusal is an answer: the conversation survived it)
+    ffi: ffi-slice: wrong key refused: the conversation with dev_b14705888f4a68391a09aa5968dd25d1 was opened under the pinned key for dev_b14705888f4a68391a09aa5968dd25d1, not dev_6c8f8607dbe87077a62a2990ce07d94a: one conversation per peer, and it carries the key it was proven with — dial a new session to read that machine under another key
+    ffi: ffi-slice: empty window ok step_ms=10000 downshifted=true rows=0 (a state, not an error)
+    ffi: ffi-slice: owner dev_b4c1ece898ece24e24e601232f95c6a1 dialed account=acct-t0125 (session device_id=dev_b4c1ece898ece24e24e601232f95c6a1)
+    ffi: ffi-slice: owner reply taken on the same conversation
+    ffi: ffi-slice: owner read #2 ok rows=1 (the act did not disturb the conversation)
+    ffi: ffi-slice: the pane read the answer back (ANSWER=y) — the act reached the pane
+    ffi: ffi-slice: the owner ended all three panes through the act door
+    ffi: ffi-slice: PASS reads=5 rows_min=1 tier_ms=10000 empty_rows=0 acts=2 kills=3
+    ffi: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 16.87s
+    ffi: PASS — reads=5 rows_min=1 tier_ms=10000 empty_rows=0 acts=2 kills=3
+
+Every number is real: the rows come from the daemon's own 10 s metrics writer,
+`step_ms=10000` is the tier it served (`downshifted=true`, because the phone
+asked for the finest tier it could name), and the device ids are the fingerprints
+of the fixed seeds, so two runs name the same three devices.
+
+THE PRE-FIX RED — the cache reverted to a per-call handshake
+-----------------------------------------------------------
+Mutation: one line in `crates/arreo-core-ffi/src/relay.rs::daemon_call` —
+`daemons.remove(&peer.device);` before the lookup, so every verb handshakes into
+the session the daemon is still holding. That is T-0114's pre-fix shape exactly.
+
+    ffi: ffi-slice: read #1 ok step_ms=10000 downshifted=true rows=1
+    ffi: thread 'two_reads_and_an_act_against_a_real_daemon' (3529109) panicked at crates/arreo-core-ffi/tests/real_daemon.rs:169:41:
+    ffi: ffi-slice: read #2 FAIL — the SECOND read failed: handshake took longer than 10s
+    ffi: test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 26.52s
+    ffi: --- end of the driver's output ---
+    ffi: FAIL — ffi-slice: read #2 FAIL — the SECOND read failed: handshake took longer than 10s
+    slice-exit=1
+
+The named check fails, with T-0114's M1' sentence on real processes — and read #1
+passed first, so the red is about the *second* read rather than about the run.
+`git checkout -- crates/arreo-core-ffi/src/relay.rs` restored the file (verified:
+`git status` clean for it, the mutation marker gone).
+
+MUTATION — `server_key` ignored (the pin check deleted)
+------------------------------------------------------
+    ffi: ffi-slice: read #1 ok step_ms=10000 downshifted=true rows=1
+    ffi: ffi-slice: read #2 ok step_ms=10000 downshifted=true rows=1 (the conversation was reused)
+    ffi: ffi-slice: viewer act refused: device dev_1325b850c2871916eae203f0efc3c898 (viewer) denied: viewer may not Send (needs Control)
+    ffi: ffi-slice: read #3 ok rows=1 (a refusal is an answer: the conversation survived it)
+    ffi: ffi-slice: wrong key FAIL — the pane's data came back under a key the machine does not hold (rows=1): the pin is advisory
+    slice-exit=1
+
+**The positive symptom, not "an error happened".** T-0114's M2 is the cautionary
+tale — its first wrong-key assertion expected only `Peer(_)` and stayed green
+under a mutation that served the read under the wrong key. Here reads #1–#3 and
+the viewer's act all stay green, and the failure is the pane's own data arriving
+under a stranger's key.
+
+THE EVIDENCE GATE — a PASS without metrics is not a PASS
+--------------------------------------------------------
+Mutation: `Summary::line()` reports `rows_min=0` while the check itself passes.
+
+    ffi: ffi-slice: PASS reads=5 rows_min=0 tier_ms=10000 empty_rows=0 acts=2 kills=3
+    ffi: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 17.99s
+    ffi: FAIL — the driver reported a pass without the evidence: a read returned no rows: the metrics were not real (reads=5 rows_min=0 tier_ms=10000 empty_rows=0 acts=2 kills=3)
+    slice-exit=1
+
+The driver's test exited 0 and the slice still refused the PASS, naming why: the
+numbers are re-checked (≥2 reads, `rows_min` ≥ 1, `tier_ms` one of the store's
+three tiers, `empty_rows` = 0, ≥2 acts), so "the check ran and found nothing to
+read" cannot cross as a green.
+
+SKIP — three shapes, none of them a fabricated PASS
+---------------------------------------------------
+Missing binary (the runner, one second after moving `target/debug/arreo-relay`
+aside):
+
+    ffi: SKIP (missing /home/dev/dev/Arreo/target/debug/arreo-relay — build them first: `cargo build -p arreo-cli -p arreo-server -p arreo-relay`)
+    exit=0
+    ffi: SKIP (missing /home/dev/dev/Arreo/target/debug/arreo-relay — build them first: `cargo build -p arreo-cli -p arreo-server -p arreo-relay`)
+    ffi: --enforce given, but the real-daemon check did not run
+    exit=1
+
+The driver's own SKIP (for a direct `cargo test … -- --ignored` run):
+
+    ffi-slice: SKIP (/home/dev/dev/Arreo/target/debug/arreo-relay is missing — build it first: `cargo build -p arreo-cli -p arreo-server -p arreo-relay`)
+
+The relay cannot run (its binary temporarily replaced by `#!/bin/sh\nexit 1`):
+
+    ffi-slice: SKIP (`arreo-relay serve` exited (exit status: 1) without announcing a listener; log tail: (no output))
+
+A relay that is *alive but silent* past 20 s is a FAIL, not a SKIP: an exited
+process is "this machine cannot run it", a hung one is drift from the line the
+driver reads. Same split for the daemon.
+
+THE UNIT SUITE IS UNTOUCHED
+---------------------------
+    test two_reads_and_an_act_against_a_real_daemon ... ignored, spawns the real binaries; `cargo xtask e2e --slice ffi` runs it
+    test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+WHERE THE TASK MET REALITY (the bends)
+--------------------------------------
+1. **The act door needs an owner, and the criterion pins a viewer.** The metrics
+   session is a viewer's (that is what a phone is, and `Observe` is what a read
+   needs). But `reply`/`skip` gate as `Verb::Send` and `kill` as `Verb::Kill`,
+   and both need `Capability::Control` — owner only — so no viewer can *take* an
+   act. The slice therefore pins **two** devices through the same real CLI: the
+   viewer (whose session carries the p1, the pinning check, the empty window and
+   the viewer's refusal) and an owner (whose session takes the reply). The act is
+   one more verb on a session already held in both cases — on the owner's, read →
+   act → read on one conversation; on the viewer's, the act arrives and the
+   machine refuses it in its own words, which is itself the proof that the verb
+   rode the reused conversation rather than a fresh handshake.
+2. **"The gate's sentence" is the denial *record*, not the gate's sentence.**
+   `docs/mobile.md` and T-0115's contract test say a viewer's act crosses as the
+   gate's sentence. Against a real daemon it is `VerbDenial::Role`'s record:
+   `device dev_… (viewer) denied: viewer may not Send (needs Control)`. The first
+   run of this driver reddened on exactly that (it compared against
+   `RoleError::Denied`'s `Display`). The fixture-based contract test never saw
+   the wrapper, because the fixture answers with whatever it was told to answer —
+   a small, sharp illustration of why this slice exists. The driver now builds
+   the expected sentence from the core's own rules (`VerbDenial::Role` wrapping
+   `role::check`), so both halves move with the core.
+3. **The empty window has to be deterministic.** A pane spawned and read
+   immediately races the daemon's 10 s sampler. The slice ends the window at the
+   pane's own birth (`until_ms = spawned_ms`), which no tick can have sampled,
+   and asserts the *history* path's answer: `step_ms = 10000` with
+   `downshifted = true`. The unknown-pane path answers the ask back
+   (`step_ms` = the ask, `downshifted = false`), so the pair is what
+   distinguishes "no rows yet" from "no such pane".
+4. **`xtask` depends on `arreo-server`, so a sibling's in-flight edit blocks
+   `cargo xtask …` itself.** T-0117 was mid-flight in `arreo-core`/`arreo-server`
+   for parts of this task (the `Message::NotifyPush` variant and its match arms),
+   and `cargo xtask e2e --slice ffi` cannot build then — exit 101 from cargo, not
+   from the slice. Two of the mutation captures therefore ran through the
+   already-built `target/debug/xtask` (same source). The slice itself needs
+   nothing but `target/debug/{arreo,arreo-server,arreo-relay}`; the driver is a
+   test of the FFI crate, which does not depend on `arreo-server` at all, so
+   `cargo test -p arreo-core-ffi --test real_daemon -- --ignored --nocapture`
+   keeps working while `arreo-server` is red.
+5. **`xtask` already links `arreo-server`** (the chaos slice does, and
+   `workspace_deps.rs` exempts `xtask` as dev tooling). Nothing in *this* slice
+   links either binary: the driver is a test of the FFI crate, which cannot link
+   them, and the slice spawns them.
+
+WHAT THIS SLICE DOES NOT PROVE
+------------------------------
+It proves the boundary against one real machine on loopback: protocol, the
+conversation's lifetime, the pin, the empty window, the act door. It does not
+prove WAN/NAT behaviour, a relay under load, or anything about the generated
+Swift/Kotlin (that is `cargo xtask ffi --check`, whose SKIPs `docs/mobile.md`
+records). It also runs only on unix, and says so rather than pretending: the
+driver is `#![cfg(unix)]` and the runner SKIPs by name on other targets.
+
+================================================================================
+INTEGRATOR VERIFICATION (run by the planner on the final integrated tree)
+================================================================================
+
+The planner re-ran the slice itself rather than trusting the report, and ran the
+pre-fix mutation that is this slice's whole reason to exist.
+
+$ cargo xtask e2e --slice ffi     (exit 0)
+
+    ffi: ffi-slice: viewer dev_1325b850c2871916eae203f0efc3c898 dialed account=acct-t0125
+    ffi: ffi-slice: machine up; waiting for the metrics writer (a 10000 ms tier)
+    ffi: ffi-slice: read #1 ok step_ms=10000 downshifted=true rows=1
+    ffi: ffi-slice: read #2 ok step_ms=10000 downshifted=true rows=1 (the conversation was reused)
+    ffi: ffi-slice: viewer act refused: device dev_1325b850… (viewer) denied: viewer may not Send (needs Control)
+    ffi: ffi-slice: read #3 ok rows=1 (a refusal is an answer: the conversation survived it)
+    ffi: ffi-slice: wrong key refused: … one conversation per peer, and it carries the key it was proven with …
+    ffi: ffi-slice: empty window ok step_ms=10000 downshifted=true rows=0 (a state, not an error)
+    ffi: ffi-slice: owner dev_b4c1ece898ece24e24e601232f95c6a1 dialed account=acct-t0125
+    ffi: ffi-slice: owner reply taken on the same conversation
+    ffi: ffi-slice: owner read #2 ok rows=1 (the act did not disturb the conversation)
+    ffi: ffi-slice: the pane read the answer back (ANSWER=y) — the act reached the pane
+    ffi: ffi-slice: the owner ended all three panes through the act door
+    ffi: ffi-slice: PASS reads=5 rows_min=1 tier_ms=10000 empty_rows=0 acts=2 kills=3
+
+**The pre-fix red, reproduced by the planner.** The conversation cache in
+`crates/arreo-core-ffi/src/relay.rs::daemon_call` was disabled in place
+(`daemons.clear()` before the lookup — the per-call-handshake shape T-0114 shipped)
+and the slice re-run:
+
+    ffi: test two_reads_and_an_act_against_a_real_daemon ... FAILED
+    ffi: ffi-slice: read #2 FAIL — the SECOND read failed: handshake took longer than 10s
+    ffi: FAIL — ffi-slice: read #2 FAIL — the SECOND read failed: handshake took longer than 10s
+
+The check is **named** and its message is the criterion's, not a vague "the slice
+failed" — read #1 passed first, so the red is specifically the reused conversation.
+`relay.rs` was restored byte-identical afterwards (`git diff` empty).
+
+Also verified by the planner on the final tree: 969 workspace tests / 0 failed;
+clippy 0 on both toolchains; fmt clean; **15/15 slices** (this one now among them);
+sync 14/14; vet 375; deny 4/4; audit 0; check-targets PASS/SKIP; workspace_deps 8/8;
+bench 6/6.
+
+**One integration failure this task caused, and the fix.** `check-targets` went RED:
+`x86_64-pc-windows-msvc FAIL (no method named noise_static found for DeviceKey)`.
+The cause was T-0117's new `notify/push.rs`, not this slice: its `#[cfg(test)]`
+module called `noise_static`/`seal_to`/`open_from`, all gated
+`#[cfg(feature = "transport")]`, so the pure-Rust `--no-default-features` check could
+not compile the tests. Fixed by gating the four sealing tests individually rather than
+the module, so the pure build still exercises the framing and the bound — the half a
+no-transport check can actually prove. Back to PASS/SKIP.

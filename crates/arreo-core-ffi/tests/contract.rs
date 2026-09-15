@@ -57,7 +57,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use arreo_core_ffi::codec::{
     codec_decode, codec_encode, codec_encode_frame, codec_max_frame_bytes, codec_protocol_version,
-    WireAgentState, WireCursor, WireMessage, WireMetricsPoint, WireNotifyAction, WireThemeTokens,
+    WireAgentState, WireCursor, WireMessage, WireMetricsPoint, WireNotifyAction,
 };
 use arreo_core_ffi::directory::{directory_cache_new, FfiPresence, MachineRowInfo};
 use arreo_core_ffi::errors::{CodecFfiError, PairingFfiError, SessionFfiError};
@@ -70,7 +70,7 @@ use arreo_core_ffi::pairing::{
     pairing_phone_join, pairing_server_begin,
 };
 use arreo_core_ffi::relay::{relay_peer_parse, relay_session_dial};
-use arreo_core_ffi::theme::{theme_builtin, FfiColor, FfiDepth, FfiVariant, ThemeToken};
+use arreo_core_ffi::theme::{theme_builtin, FfiColor, FfiDepth, FfiVariant};
 
 // ---------------------------------------------------------------------------
 // A mailbox that speaks the shipped pairing protocol.
