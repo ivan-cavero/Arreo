@@ -1,0 +1,10 @@
+     Running `target/release/ffi-real-daemon-probe`
+probe: machine up, pane pane-a spawned
+probe: machine pinned the phone as a viewer
+probe: phone dev_1325b850c2871916eae203f0efc3c898
+probe: session device_id=dev_1325b850c2871916eae203f0efc3c898 account=acct-t0114
+probe: directory row workbox peer=dev_b14705888f4a68391a09aa5968dd25d1 key=d759793bbc13a2819a827c76adb6fba8a49aee007f49f2d0992d99b825ad2c48
+probe: read #1 ok step_ms=10000 downshifted=true rows=1
+probe: read #2 ok step_ms=10000 downshifted=true rows=1
+probe: wrong key refused: the conversation with dev_b14705888f4a68391a09aa5968dd25d1 was opened under the pinned key for dev_b14705888f4a68391a09aa5968dd25d1, not dev_6c8f8607dbe87077a62a2990ce07d94a: one conversation per peer, and it carries the key it was proven with — dial a new session to read that machine under another key
+probe: PASS — two reads on one conversation, and the wrong key refused

@@ -41,20 +41,25 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use arreo_core::identity::{DeviceCert, DeviceId, DeviceKey, VerifyingKey};
 use arreo_core::mesh::{MachineId, MachineRow, Name, Presence};
 use arreo_core::pairing::{MailboxRequest, MailboxResponse, Slot};
+use arreo_core::proto::{codec, Message, MetricsPoint, VERSION};
+use arreo_core::relay::session::RelaySession;
 use arreo_core::relay::{
     decode_message, encode_message, encode_payload, read_envelope, read_frame, verify_auth,
     write_frame, Auth, AuthReply, DirectoryReply, DrainReport, Hello, HelloReply, Outcome,
     RelayEnvelope, RelayHeader, RelayKind, MAX_HANDSHAKE_BYTES, RELAY_SENDER, RELAY_VERSION,
 };
+use arreo_core::transport::{FlightGuard, SecureChannel};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use arreo_core_ffi::codec::{
-    codec_decode, codec_encode, codec_encode_frame, codec_protocol_version, WireAgentState,
-    WireCursor, WireMessage,
+    codec_decode, codec_encode, codec_encode_frame, codec_max_frame_bytes, codec_protocol_version,
+    WireAgentState, WireCursor, WireMessage, WireMetricsPoint,
 };
 use arreo_core_ffi::directory::{directory_cache_new, FfiPresence, MachineRowInfo};
-use arreo_core_ffi::errors::{CodecFfiError, PairingFfiError};
+use arreo_core_ffi::errors::{CodecFfiError, PairingFfiError, SessionFfiError};
 use arreo_core_ffi::identity::{
     device_cert_issue, device_key_from_seed, fingerprint_of_public_key, identity_verify, role_word,
     root_key_from_seed, FfiRole,
@@ -247,6 +252,22 @@ impl TestRelay {
         root: Arc<arreo_core::identity::RootKey>,
         rows: Vec<MachineRow>,
     ) -> Self {
+        Self::start_declaring(account, root, rows, None).await
+    }
+
+    /// The same relay, with one thing changed: the device id it confirms in
+    /// `AuthReply::Welcome`, whatever it actually verified.
+    ///
+    /// A relay is a carrier, and this is the one lie it can tell about a device
+    /// to that device's face — the identity it names. Everything else is
+    /// unchanged (the proof is verified, routes are keyed by the real id), so a
+    /// test using this is testing exactly "whose word is this device's identity".
+    async fn start_declaring(
+        account: String,
+        root: Arc<arreo_core::identity::RootKey>,
+        rows: Vec<MachineRow>,
+        declares: Option<String>,
+    ) -> Self {
         let endpoint = arreo_core::transport::server_endpoint("127.0.0.1:0".parse().unwrap())
             .expect("the relay binds");
         let addr = endpoint.local_addr().expect("a bound address");
@@ -265,8 +286,10 @@ impl TestRelay {
                     let rows = Arc::clone(&rows);
                     let root = Arc::clone(&root);
                     let account = account.clone();
+                    let declares = declares.clone();
                     tokio::spawn(async move {
-                        serve_relay_connection(connection, account, root, routes, rows).await;
+                        serve_relay_connection(connection, account, root, routes, rows, declares)
+                            .await;
                     });
                 }
             }
@@ -299,12 +322,16 @@ impl Drop for TestRelay {
 
 /// The relay's half of one connection: Hello → Challenge → Auth → Welcome, then
 /// route envelopes until the peer goes away.
+///
+/// `declares` is the id to *confirm* in `Welcome`; `None` is the honest relay,
+/// which confirms the id it verified. Routing always uses the verified id.
 async fn serve_relay_connection(
     connection: arreo_core::transport::Connection,
     account: String,
     root: Arc<arreo_core::identity::RootKey>,
     routes: Arc<Mutex<HashMap<String, tokio::sync::mpsc::UnboundedSender<Vec<u8>>>>>,
     rows: Arc<Mutex<Vec<MachineRow>>>,
+    declares: Option<String>,
 ) {
     let Ok((mut send, mut recv)) = connection.accept_bi().await else {
         return;
@@ -373,7 +400,9 @@ async fn serve_relay_connection(
     let welcome = AuthReply::Welcome {
         v: RELAY_VERSION,
         account_id: hello.account_id.clone(),
-        device_id: device.device_id.display_id(),
+        device_id: declares
+            .clone()
+            .unwrap_or_else(|| device.device_id.display_id()),
     };
     if write_frame(&mut send, &encode_message(&welcome).expect("encode"))
         .await
@@ -472,6 +501,167 @@ async fn serve_relay_connection(
 }
 
 // ---------------------------------------------------------------------------
+// A machine's daemon, behind the relay
+// ---------------------------------------------------------------------------
+
+/// The machine's half of a metrics read: the same two steps the daemon's relay
+/// peer path runs — accept the Noise channel over the relay stream, answer the
+/// daemon handshake, then answer the verbs — with the daemon's own session loop
+/// replaced by the answers this test needs.
+///
+/// **One conversation, N verbs, which is what a real daemon does.** The daemon's
+/// relay peer runs `serve_session` behind `serve_peer`, and that loop *stays
+/// open after a verb*: it reads the next one on the same channel. The first
+/// version of this fixture closed the write half after every single answer — the
+/// shape `serve_session_with_handoff` uses on its way *out* — which made the
+/// phone's next call reconnect. That is the one path a real daemon does not take,
+/// and the reason the two reads below "passed" while a real daemon broke on the
+/// second one (T-0114's p1).
+///
+/// That path lives in `arreo-server` (`relay_client.rs::serve_peer`), which this
+/// crate may not link (AGPL), so the fixture is built out of the shipped
+/// vocabulary instead: the transport is the product's own [`SecureChannel`], the
+/// frames are the product's own [`Message`]s, and the accept-then-open order is
+/// the core's. What it is not is a shortcut around the boundary: the phone's half
+/// is the exported surface, and nothing here is reachable from it.
+///
+/// The *ending* is the daemon's own (`serve_session_with_handoff`): write the
+/// last frame, close the write half, and give the pump [`FINAL_FRAME_GRACE`] to
+/// put it on the wire — so the client reads its answer rather than a bare close.
+/// Once a conversation, at the end, instead of once per verb.
+async fn serve_metrics_daemon(
+    mut session: RelaySession,
+    key: DeviceKey,
+    phone: VerifyingKey,
+    answers: Vec<Message>,
+) -> Vec<Message> {
+    let local = key.noise_static();
+    let peer = tokio::time::timeout(Duration::from_secs(10), session.next_peer())
+        .await
+        .expect("the phone's bytes reach the daemon")
+        .expect("the session stays open");
+    let stream = session.stream_to(&peer);
+    let guard = FlightGuard::default();
+    let (channel, device) = SecureChannel::accept(stream, &local, &guard, move |_| Some(phone))
+        .await
+        .expect("the phone's Noise handshake completes");
+    assert_eq!(
+        device,
+        DeviceId::from_key(&phone),
+        "the daemon is told which device dialed"
+    );
+    let (mut reader, mut writer) = tokio::io::split(channel);
+
+    let mut buf = Vec::new();
+    assert!(
+        matches!(
+            read_daemon_message(&mut reader, &mut buf).await,
+            Message::Hello { .. }
+        ),
+        "the daemon protocol opens with Hello"
+    );
+    write_daemon_message(
+        &mut writer,
+        &Message::Welcome {
+            v: VERSION,
+            server: "arreo-server-test".to_string(),
+        },
+    )
+    .await;
+
+    // The verbs, all on the one channel the handshake opened — no close in
+    // between, because that is what the daemon does.
+    let mut seen = Vec::new();
+    for answer in answers {
+        seen.push(read_daemon_message(&mut reader, &mut buf).await);
+        write_daemon_message(&mut writer, &answer).await;
+    }
+    let _ = writer.shutdown().await;
+    tokio::time::sleep(FINAL_FRAME_GRACE).await;
+    seen
+}
+
+/// A machine whose answer is not a frame: the daemon half of the fail-fast case.
+///
+/// A daemon can produce this — a truncated write, a version skew that mis-frames,
+/// a hostile peer — and the client must refuse it *now* rather than treat the
+/// undecodable length as a frame that is still arriving. That distinction is the
+/// codec's own (`Truncated` means "keep reading"; every other error means the
+/// bytes will never be readable), and this fixture is what holds the boundary to
+/// it: it answers the handshake and one verb, then writes four bytes that name a
+/// body no client can accept.
+async fn serve_a_frame_no_client_can_read(
+    mut session: RelaySession,
+    key: DeviceKey,
+    phone: VerifyingKey,
+    declared: [u8; 4],
+) -> Message {
+    let local = key.noise_static();
+    let peer = tokio::time::timeout(Duration::from_secs(10), session.next_peer())
+        .await
+        .expect("the phone's bytes reach the daemon")
+        .expect("the session stays open");
+    let stream = session.stream_to(&peer);
+    let guard = FlightGuard::default();
+    let (channel, _) = SecureChannel::accept(stream, &local, &guard, move |_| Some(phone))
+        .await
+        .expect("the phone's Noise handshake completes");
+    let (mut reader, mut writer) = tokio::io::split(channel);
+    let mut buf = Vec::new();
+    assert!(
+        matches!(
+            read_daemon_message(&mut reader, &mut buf).await,
+            Message::Hello { .. }
+        ),
+        "the daemon protocol opens with Hello"
+    );
+    write_daemon_message(
+        &mut writer,
+        &Message::Welcome {
+            v: VERSION,
+            server: "arreo-server-test".to_string(),
+        },
+    )
+    .await;
+    let asked = read_daemon_message(&mut reader, &mut buf).await;
+    writer
+        .write_all(&declared)
+        .await
+        .expect("the bytes leave the daemon");
+    writer.flush().await.expect("the bytes flush");
+    let _ = writer.shutdown().await;
+    tokio::time::sleep(FINAL_FRAME_GRACE).await;
+    asked
+}
+
+/// One framed [`Message`] off the daemon's channel, reading as needed.
+async fn read_daemon_message<R: AsyncRead + Unpin>(reader: &mut R, buf: &mut Vec<u8>) -> Message {
+    loop {
+        if let Ok((message, consumed)) = codec::decode_frame(buf) {
+            buf.drain(..consumed);
+            return message;
+        }
+        let mut chunk = [0u8; 8192];
+        let read = reader
+            .read(&mut chunk)
+            .await
+            .expect("the phone's bytes arrive");
+        assert!(read > 0, "the phone's stream ended mid-frame");
+        buf.extend_from_slice(&chunk[..read]);
+    }
+}
+
+/// One framed [`Message`] onto the daemon's channel.
+async fn write_daemon_message<W: AsyncWrite + Unpin>(writer: &mut W, message: &Message) {
+    let frame = codec::encode_frame(message).expect("the frame encodes");
+    writer
+        .write_all(&frame)
+        .await
+        .expect("the frame leaves the daemon");
+    writer.flush().await.expect("the frame flushes");
+}
+
+// ---------------------------------------------------------------------------
 // Fixtures
 // ---------------------------------------------------------------------------
 
@@ -479,6 +669,18 @@ const ACCOUNT: &str = "acct-contract-test";
 const SERVER_SEED: [u8; 32] = [0x11; 32];
 const PHONE_SEED: [u8; 32] = [0x22; 32];
 const OTHER_DEVICE_SEED: [u8; 32] = [0x33; 32];
+const DAEMON_SEED: [u8; 32] = [0x44; 32];
+
+/// How long a finished conversation stays alive after its write half closes, so
+/// the pump can put the final frame on the wire.
+///
+/// The daemon's own value and reason (`arreo-server/src/daemon.rs`,
+/// `FINAL_FRAME_GRACE`, T-0052): closing the write half is the pump's signal to
+/// drain what the session already wrote, and without the bounded pause the bytes
+/// are written into the duplex and discarded with the channel — a client that
+/// sees a bare close instead of its answer. `arreo-server` is AGPL and this test
+/// may not link it, so the number is repeated here rather than imported.
+const FINAL_FRAME_GRACE: Duration = Duration::from_millis(300);
 
 fn row_for(seed: &[u8; 32], name: &str, presence: Presence) -> MachineRow {
     let key = device_key_from_seed(seed.to_vec()).expect("a key from a 32-byte seed");
@@ -716,7 +918,11 @@ fn the_session_dials_drains_acks_and_reads_the_directory() {
         .await
         .expect("the relay accepts the session");
 
-        // The identity is what the *relay* confirmed, not what was announced.
+        // The identity is derived from the key this device dialed with, and the
+        // relay's `Welcome` was checked against it at dial time — an honest relay
+        // confirms the id the certificate names, which is this one. See
+        // `a_relay_that_confirms_someone_elses_identity_is_refused` for the other
+        // half of that rule.
         assert_eq!(session.device_id(), format!("dev_{}", device.fingerprint()));
         assert_eq!(session.account(), ACCOUNT);
         assert_eq!(
@@ -799,6 +1005,758 @@ fn the_session_dials_drains_acks_and_reads_the_directory() {
         assert!(
             cache.lookup("Not A Name".to_string()).is_err(),
             "a name that cannot exist is refused by the directory's own rule"
+        );
+    });
+}
+
+/// A relay's word is not this device's identity.
+///
+/// `AuthReply::Welcome` carries the id the relay verified; this session derives
+/// its id from the key it dialed with, and checks the echo against it — so a
+/// relay that confirms *someone else's* id is refused rather than trusted. That
+/// matters because the id is used as an assertion, not as a display string: it
+/// is the hint that opens a peer stream ("this is who is dialing") and what
+/// [`arreo_core_ffi::relay::RelaySessionHandle::device_id`] reports about the
+/// phone itself.
+///
+/// The relay here does everything else an honest relay does — it verifies the
+/// proof, and routes by the id it verified — and lies only in the confirmation.
+#[test]
+fn a_relay_that_confirms_someone_elses_identity_is_refused() {
+    let runtime = tokio::runtime::Runtime::new().expect("a runtime");
+    runtime.block_on(async {
+        let root = Arc::new(arreo_core::identity::RootKey::from_seed(SERVER_SEED));
+        let other = device_key_from_seed(OTHER_DEVICE_SEED.to_vec()).expect("a key");
+        let relay = TestRelay::start_declaring(
+            ACCOUNT.to_string(),
+            Arc::clone(&root),
+            Vec::new(),
+            Some(other.display_id()),
+        )
+        .await;
+
+        let device = device_key_from_seed(PHONE_SEED.to_vec()).expect("a key");
+        let cert = device_cert_issue(
+            root_key_from_seed(SERVER_SEED.to_vec()).expect("a root"),
+            device.public_hex(),
+            "pixel-7".to_string(),
+            FfiRole::Viewer,
+            1_760_000_000_000,
+            1,
+        )
+        .expect("a certificate");
+
+        let refusal = match relay_session_dial(
+            relay.address(),
+            ACCOUNT.to_string(),
+            Arc::clone(&device),
+            cert,
+        )
+        .await
+        {
+            Ok(_) => panic!("a relay that confirms another identity must be refused"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            refusal,
+            SessionFfiError::RelayIdentityMismatch {
+                confirmed: other.display_id(),
+                derived: device.display_id(),
+            },
+            "the refusal carries both: the relay's claim and this device's own key"
+        );
+        assert_eq!(
+            format!("{refusal}"),
+            format!(
+                "the relay confirmed {} for a device whose own key names {}",
+                other.display_id(),
+                device.display_id()
+            ),
+            "the sentence a phone shows names what was claimed and what is true"
+        );
+    });
+}
+
+/// The metrics read a RAM meter needs: a pane's durable series crosses the
+/// boundary as a typed record, the tier the machine *actually served* travels
+/// with it, and an empty window is an empty list rather than a failure.
+///
+/// The phone is the exported surface; the machine is a daemon on the far side of
+/// the test relay, speaking the same Noise + Hello/Welcome + verb path the real
+/// daemon's relay peer runs.
+#[test]
+fn the_session_reads_a_panes_metrics_series() {
+    let runtime = tokio::runtime::Runtime::new().expect("a runtime");
+    runtime.block_on(async {
+        let root = Arc::new(arreo_core::identity::RootKey::from_seed(SERVER_SEED));
+        let relay = TestRelay::start(ACCOUNT.to_string(), Arc::clone(&root), Vec::new()).await;
+        let root_handle = root_key_from_seed(SERVER_SEED.to_vec()).expect("a root");
+
+        // The phone: a viewer, which is what a phone is, dialed through the
+        // exported surface.
+        let phone = device_key_from_seed(PHONE_SEED.to_vec()).expect("a key");
+        let phone_cert = device_cert_issue(
+            Arc::clone(&root_handle),
+            phone.public_hex(),
+            "pixel-7".to_string(),
+            FfiRole::Viewer,
+            1_760_000_000_000,
+            1,
+        )
+        .expect("a certificate");
+        let session = relay_session_dial(
+            relay.address(),
+            ACCOUNT.to_string(),
+            Arc::clone(&phone),
+            phone_cert,
+        )
+        .await
+        .expect("the relay accepts the phone");
+        relay.await_route(&phone.fingerprint()).await;
+
+        // The machine: a daemon on the far side of the relay. Its half is the
+        // core's own session, because the *daemon* half of the relay peer path
+        // is a server and `arreo-server` is AGPL.
+        let daemon_key = DeviceKey::from_seed(DAEMON_SEED);
+        let daemon_id = DeviceId::from_key(&daemon_key.public());
+        let daemon_cert = device_cert_issue(
+            Arc::clone(&root_handle),
+            daemon_key.public_hex(),
+            "server-box".to_string(),
+            FfiRole::Owner,
+            1_760_000_000_000,
+            2,
+        )
+        .expect("a certificate");
+        // The certificate the boundary issued, back as the core's own type: the
+        // daemon dials with it exactly as the real one dials with the file
+        // pairing wrote.
+        let daemon_cert =
+            DeviceCert::decode(&daemon_cert.encode().expect("the certificate encodes"))
+                .expect("the core reads its own certificate");
+        let daemon = RelaySession::dial(relay.addr, ACCOUNT, &daemon_key, &daemon_cert)
+            .await
+            .expect("the relay accepts the daemon");
+        relay.await_route(daemon_id.as_str()).await;
+
+        let answers = vec![
+            // A window the machine answered with a coarser tier than the ask.
+            Message::MetricsSeries {
+                v: VERSION,
+                id: "pane-1".to_string(),
+                step_ms: 60_000,
+                downshifted: true,
+                rows: vec![
+                    MetricsPoint {
+                        ts_ms: 1_760_000_000_000,
+                        rss_avg: 4 * 1024 * 1024,
+                        rss_peak: 9 * 1024 * 1024,
+                        cpu_avg: 1.5,
+                        cpu_peak: 7.25,
+                        pids: 12,
+                    },
+                    MetricsPoint {
+                        ts_ms: 1_760_000_060_000,
+                        rss_avg: 5 * 1024 * 1024,
+                        rss_peak: 10 * 1024 * 1024,
+                        cpu_avg: 2.5,
+                        cpu_peak: 8.5,
+                        pids: 13,
+                    },
+                ],
+            },
+            // A refusal — the machine *answered*, in its own words. The session
+            // is still in step with the next verb, so the reads after it must run
+            // on this same conversation: a client that dropped it on any failure
+            // would hand its next handshake to a daemon that is still reading
+            // verbs, which is the failure the whole cache exists to prevent.
+            Message::Error {
+                v: VERSION,
+                message: "no history for that pane in this window".to_string(),
+            },
+            // A pane that just started: no rows in this window, which is what
+            // the daemon answers for a pane it has no history for.
+            Message::MetricsSeries {
+                v: VERSION,
+                id: "pane-2".to_string(),
+                step_ms: 10_000,
+                downshifted: false,
+                rows: Vec::new(),
+            },
+            // The last answer, and it is here to be *unclaimed*: the read after
+            // the wrong-key refusal takes it, which is only possible if that
+            // refusal never reached the machine.
+            Message::MetricsSeries {
+                v: VERSION,
+                id: "pane-3".to_string(),
+                step_ms: 1_000,
+                downshifted: false,
+                rows: vec![MetricsPoint {
+                    ts_ms: 1_760_000_120_000,
+                    rss_avg: 6 * 1024 * 1024,
+                    rss_peak: 11 * 1024 * 1024,
+                    cpu_avg: 3.5,
+                    cpu_peak: 9.0,
+                    pids: 14,
+                }],
+            },
+        ];
+        // One conversation for both reads: the machine accepts the phone's
+        // handshake once and answers every verb on that channel, which is what
+        // the daemon's own `serve_session` loop does.
+        let daemon_key_hex = daemon_key.public_hex();
+        let phone_key =
+            arreo_core::identity::verifying_key_from_hex(&phone.public_hex()).expect("hex");
+        let machine = tokio::spawn(serve_metrics_daemon(daemon, daemon_key, phone_key, answers));
+
+        // The peer, named the way a phone names it: the device id of the key the
+        // machine publishes as its dial key (`daemon_key`), which is the id it
+        // dialed the relay with. Not the row's `machine_id` — that is the
+        // machine's directory identity, and the relay routes by the dialing id.
+        let peer = relay_peer_parse(daemon_id.display_id()).expect("a device id");
+
+        let series = session
+            .metrics_history(
+                Arc::clone(&peer),
+                daemon_key_hex.clone(),
+                "pane-1".to_string(),
+                1_759_999_784_000,
+                u64::MAX,
+                1_000,
+            )
+            .await
+            .expect("the machine answers");
+
+        assert_eq!(
+            series.v,
+            codec_protocol_version(),
+            "the answer carries the protocol version it speaks"
+        );
+        assert_eq!(
+            series.step_ms, 60_000,
+            "the tier the machine served, not the tier that was asked for"
+        );
+        assert!(
+            series.downshifted,
+            "a coarser tier than the ask must say so: the meter draws what it is told"
+        );
+        assert_eq!(series.rows.len(), 2);
+        assert_eq!(
+            series.rows[0],
+            WireMetricsPoint {
+                ts_ms: 1_760_000_000_000,
+                rss_avg: 4 * 1024 * 1024,
+                rss_peak: 9 * 1024 * 1024,
+                cpu_avg: 1.5,
+                cpu_peak: 7.25,
+                pids: 12,
+            },
+            "the point crosses field for field"
+        );
+        assert!(
+            series.rows[1].ts_ms > series.rows[0].ts_ms,
+            "the series arrives oldest first, the order the daemon sends"
+        );
+        assert_eq!(series.rows[1].rss_peak, 10 * 1024 * 1024);
+
+        // A refusal is an answer, and it does not cost the conversation: the
+        // machine read the verb and said no, so the channel is still in step and
+        // the reads below stay on it (the fixture accepts exactly one handshake,
+        // so a client that reconnected here would stall rather than pass).
+        let refusal = session
+            .metrics_history(
+                Arc::clone(&peer),
+                daemon_key_hex.clone(),
+                "pane-refused".to_string(),
+                1_759_999_784_000,
+                u64::MAX,
+                1_000,
+            )
+            .await
+            .expect_err("a refusal is not an answer");
+        assert!(
+            matches!(refusal, SessionFfiError::Daemon(_)),
+            "the machine's own sentence, not a session failure: {refusal:?}"
+        );
+        assert_eq!(
+            format!("{refusal}"),
+            "no history for that pane in this window"
+        );
+
+        // The second read, on the conversation the first one opened: a pane with
+        // no history in the window is an empty list, which is a state a meter
+        // renders. This is the case a real daemon breaks if the client hands the
+        // verb to a *new* conversation — the daemon is still holding the first
+        // one, so the new handshake lands in the stale stream and the read fails
+        // (T-0114's p1).
+        let empty = session
+            .metrics_history(
+                Arc::clone(&peer),
+                daemon_key_hex.clone(),
+                "pane-2".to_string(),
+                1_759_999_784_000,
+                u64::MAX,
+                10_000,
+            )
+            .await
+            .expect("an empty window is an answer, not a failure");
+        assert!(
+            empty.rows.is_empty(),
+            "a pane that just started has no history, and that is an empty list"
+        );
+        assert_eq!(empty.step_ms, 10_000);
+        assert!(
+            !empty.downshifted,
+            "nothing was downshifted, so nothing claims to have been"
+        );
+
+        // The question is the CLI's own, field for field: the same verb, the
+        // same "to now" sentinel, and the tier *asked for* — which is what lets
+        // the reply report the downshift. (The machine is still answering, so
+        // `seen` is read once it has finished — below, after the third read.)
+        // **The pin, falsified where it can actually fail.** A *valid* public
+        // key that is not this machine's — another device's — must be refused.
+        // The malformed-key case below cannot prove this: `verifying_key_from_hex`
+        // rejects it before any stream exists, so it would pass unchanged if the
+        // read ignored `server_key` entirely and trusted whatever the relay's
+        // directory said. This one names a key the machine does not hold, and the
+        // refusal is a `Peer` failure — the conversation that exists with this
+        // peer was proven under the machine's key, and a call naming another
+        // key cannot be served on it.
+        //
+        // *Refused*, not merely failed: the read below with the pinned key still
+        // works and takes the machine's third answer, which is only possible if
+        // this call never reached the machine. A check that let it through would
+        // consume that answer here and leave the next read with nothing.
+        let stranger = device_key_from_seed(OTHER_DEVICE_SEED.to_vec()).expect("a key");
+        let refusal = session
+            .metrics_history(
+                Arc::clone(&peer),
+                stranger.public_hex(),
+                "pane-1".to_string(),
+                0,
+                u64::MAX,
+                0,
+            )
+            .await
+            .expect_err("a key the machine does not hold is refused");
+        assert!(
+            matches!(refusal, SessionFfiError::Peer(_)),
+            "a wrong-but-valid pinned key is a peer failure, not a served read: {refusal:?}"
+        );
+
+        let after = session
+            .metrics_history(
+                Arc::clone(&peer),
+                daemon_key_hex.clone(),
+                "pane-3".to_string(),
+                1_759_999_784_000,
+                u64::MAX,
+                1_000,
+            )
+            .await
+            .expect("the conversation survives a refused key");
+        assert_eq!(
+            after.rows.len(),
+            1,
+            "the machine's third answer is still there to be taken"
+        );
+        assert_eq!(after.rows[0].pids, 14);
+
+        // What the machine saw, read once it has finished answering: four
+        // questions, in order, and never the refused key's. `pane-3` arriving at
+        // all is the proof that the wrong-key call was refused on this side — a
+        // read that reached the machine would have taken this answer.
+        let seen = machine.await.expect("the machine task finishes");
+        match &seen[0] {
+            Message::MetricsHistory {
+                v,
+                id,
+                since_ms,
+                until_ms,
+                step_ms,
+            } => {
+                assert_eq!(*v, codec_protocol_version());
+                assert_eq!(id, "pane-1");
+                assert_eq!(*since_ms, 1_759_999_784_000);
+                assert_eq!(*until_ms, u64::MAX, "the CLI's open-ended \"to now\"");
+                assert_eq!(*step_ms, 1_000);
+            }
+            other => panic!("the boundary must ask MetricsHistory, got {other:?}"),
+        }
+        assert!(
+            matches!(&seen[1], Message::MetricsHistory { id, .. } if id == "pane-refused"),
+            "the refused verb went to the machine and no further: {:?}",
+            seen[1]
+        );
+        assert_eq!(
+            seen.len(),
+            4,
+            "one question per read and none from the refused key: {seen:?}"
+        );
+        assert!(
+            matches!(&seen[3], Message::MetricsHistory { id, .. } if id == "pane-3"),
+            "the last question is the one the pinned key asked: {:?}",
+            seen[3]
+        );
+
+        // A pinned key that is not a public key is refused by name, and by the
+        // core's own sentence — before any stream exists (the machine above is
+        // gone, and this still answers). The words are compared against the
+        // core's rendering rather than a copy, so the two cannot drift.
+        let refusal = session
+            .metrics_history(
+                Arc::clone(&peer),
+                "not a key".to_string(),
+                "pane-1".to_string(),
+                0,
+                u64::MAX,
+                0,
+            )
+            .await
+            .expect_err("a malformed pinned key is refused");
+        assert!(
+            matches!(refusal, SessionFfiError::BadPeerKey(_)),
+            "the boundary's own precondition, not a session failure: {refusal:?}"
+        );
+        assert_eq!(
+            format!("{refusal}"),
+            arreo_core::identity::verifying_key_from_hex("not a key")
+                .expect_err("the core refuses it")
+                .to_string()
+        );
+    });
+}
+
+/// One side of an accepted conversation: the read half, the write half, and the
+/// bytes already read off the wire.
+type Conversation = (
+    tokio::io::ReadHalf<SecureChannel>,
+    tokio::io::WriteHalf<SecureChannel>,
+    Vec<u8>,
+);
+
+/// One accepted conversation: the handshake, and the channel it opened.
+///
+/// The daemon half of every fixture here, factored out because the recovery case
+/// needs it twice on one session.
+async fn accept_conversation(
+    session: &mut RelaySession,
+    key: &DeviceKey,
+    phone: VerifyingKey,
+) -> Conversation {
+    let peer = tokio::time::timeout(Duration::from_secs(10), session.next_peer())
+        .await
+        .expect("the phone's bytes reach the daemon")
+        .expect("the session stays open");
+    let stream = session.stream_to(&peer);
+    let guard = FlightGuard::default();
+    let local = key.noise_static();
+    let (channel, device) = SecureChannel::accept(stream, &local, &guard, move |_| Some(phone))
+        .await
+        .expect("the phone's Noise handshake completes");
+    assert_eq!(
+        device,
+        DeviceId::from_key(&phone),
+        "the daemon is told which device dialed"
+    );
+    let (mut reader, mut writer) = tokio::io::split(channel);
+    let mut buf = Vec::new();
+    assert!(
+        matches!(
+            read_daemon_message(&mut reader, &mut buf).await,
+            Message::Hello { .. }
+        ),
+        "the daemon protocol opens with Hello"
+    );
+    write_daemon_message(
+        &mut writer,
+        &Message::Welcome {
+            v: VERSION,
+            server: "arreo-server-test".to_string(),
+        },
+    )
+    .await;
+    (reader, writer, buf)
+}
+
+/// The machine's half of a *recovered* conversation: one session that ends
+/// badly, then the one the phone opens next.
+///
+/// This is what the daemon's own accept loop does once a session ends: its stream
+/// is dropped, the relay session's read pump parks whatever arrives next and
+/// announces the peer again, and `serve_peer` runs a handshake over a fresh
+/// stream. The client's half is what the test asserts — the call *after* a failed
+/// one must arrive as a new conversation, not as another verb on a channel that is
+/// already dead.
+///
+/// Phase one answers the handshake and one verb, then writes a frame the codec
+/// refuses (which is what fails the client's read), then lets the stream go.
+/// Phase two is an ordinary conversation, and the verb it is asked is returned.
+async fn serve_recovered_daemon(
+    mut session: RelaySession,
+    key: DeviceKey,
+    phone: VerifyingKey,
+) -> Message {
+    let (mut reader, mut writer, mut buf) = accept_conversation(&mut session, &key, phone).await;
+    let _ = read_daemon_message(&mut reader, &mut buf).await;
+    let declared = ((codec::MAX_FRAME_BYTES + 1) as u32).to_le_bytes();
+    writer
+        .write_all(&declared)
+        .await
+        .expect("the bytes leave the daemon");
+    writer.flush().await.expect("the bytes flush");
+    let _ = writer.shutdown().await;
+    tokio::time::sleep(FINAL_FRAME_GRACE).await;
+    drop((reader, writer, buf));
+
+    // The next conversation, which only exists if the client came back with a
+    // handshake rather than another verb on the dead channel.
+    let (mut reader, mut writer, mut buf) = accept_conversation(&mut session, &key, phone).await;
+    let asked = read_daemon_message(&mut reader, &mut buf).await;
+    write_daemon_message(
+        &mut writer,
+        &Message::MetricsSeries {
+            v: VERSION,
+            id: "pane-1".to_string(),
+            step_ms: 10_000,
+            downshifted: false,
+            rows: vec![MetricsPoint {
+                ts_ms: 1_760_000_180_000,
+                rss_avg: 7 * 1024 * 1024,
+                rss_peak: 12 * 1024 * 1024,
+                cpu_avg: 4.0,
+                cpu_peak: 9.5,
+                pids: 15,
+            }],
+        },
+    )
+    .await;
+    let _ = writer.shutdown().await;
+    tokio::time::sleep(FINAL_FRAME_GRACE).await;
+    asked
+}
+
+/// A failed read does not leave the conversation dead: the next one reconnects.
+///
+/// The rule the cache carries (T-0114's decided fix, point 3): a call that fails
+/// drops the conversation, so the *next* call opens a fresh one instead of writing
+/// another verb into a channel the machine has already let go of. Without it a
+/// phone's meter would never recover — every later poll would fail the same way,
+/// on the same dead conversation — which is why the recovery is "drop and
+/// reconnect", not "retry inside the call".
+///
+/// The machine here ends its first session the way a daemon does when its loop
+/// returns, and accepts a second one. The client is given the pause a poll's
+/// cadence gives for free: a daemon needs its old stream to be gone before the
+/// next handshake reaches its accept door (the stale-stream race T-0054 records).
+#[test]
+fn a_failed_read_reconnects_rather_than_reusing_the_dead_conversation() {
+    let runtime = tokio::runtime::Runtime::new().expect("a runtime");
+    runtime.block_on(async {
+        let root = Arc::new(arreo_core::identity::RootKey::from_seed(SERVER_SEED));
+        let relay = TestRelay::start(ACCOUNT.to_string(), Arc::clone(&root), Vec::new()).await;
+        let root_handle = root_key_from_seed(SERVER_SEED.to_vec()).expect("a root");
+
+        let phone = device_key_from_seed(PHONE_SEED.to_vec()).expect("a key");
+        let phone_cert = device_cert_issue(
+            Arc::clone(&root_handle),
+            phone.public_hex(),
+            "pixel-7".to_string(),
+            FfiRole::Viewer,
+            1_760_000_000_000,
+            1,
+        )
+        .expect("a certificate");
+        let session = relay_session_dial(
+            relay.address(),
+            ACCOUNT.to_string(),
+            Arc::clone(&phone),
+            phone_cert,
+        )
+        .await
+        .expect("the relay accepts the phone");
+        relay.await_route(&phone.fingerprint()).await;
+
+        let daemon_key = DeviceKey::from_seed(DAEMON_SEED);
+        let daemon_id = DeviceId::from_key(&daemon_key.public());
+        let daemon_cert = device_cert_issue(
+            Arc::clone(&root_handle),
+            daemon_key.public_hex(),
+            "server-box".to_string(),
+            FfiRole::Owner,
+            1_760_000_000_000,
+            2,
+        )
+        .expect("a certificate");
+        let daemon_cert =
+            DeviceCert::decode(&daemon_cert.encode().expect("the certificate encodes"))
+                .expect("the core reads its own certificate");
+        let daemon = RelaySession::dial(relay.addr, ACCOUNT, &daemon_key, &daemon_cert)
+            .await
+            .expect("the relay accepts the daemon");
+        relay.await_route(daemon_id.as_str()).await;
+
+        let daemon_key_hex = daemon_key.public_hex();
+        let phone_key =
+            arreo_core::identity::verifying_key_from_hex(&phone.public_hex()).expect("hex");
+        let machine = tokio::spawn(serve_recovered_daemon(daemon, daemon_key, phone_key));
+        let peer = relay_peer_parse(daemon_id.display_id()).expect("a device id");
+
+        // The first read fails on the machine's own answer: a frame the codec
+        // refuses. The machine's session ends with it.
+        let first = session
+            .metrics_history(
+                Arc::clone(&peer),
+                daemon_key_hex.clone(),
+                "pane-1".to_string(),
+                0,
+                u64::MAX,
+                0,
+            )
+            .await
+            .expect_err("a frame the codec refuses is not an answer");
+        assert!(
+            matches!(first, SessionFfiError::Peer(_)),
+            "the channel's failure, not the machine's: {first:?}"
+        );
+
+        // The client's pause, and a daemon's own timing: its stream has to be
+        // gone before the next handshake reaches its accept door.
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        let second = session
+            .metrics_history(
+                Arc::clone(&peer),
+                daemon_key_hex.clone(),
+                "pane-1".to_string(),
+                0,
+                u64::MAX,
+                0,
+            )
+            .await
+            .expect("the read after a failure opens a fresh conversation");
+        assert_eq!(second.rows.len(), 1);
+        assert_eq!(second.rows[0].pids, 15);
+
+        assert!(
+            matches!(
+                machine.await.expect("the machine task finishes"),
+                Message::MetricsHistory { .. }
+            ),
+            "the second read was a verb on a conversation the machine accepted"
+        );
+    });
+}
+
+/// A frame that cannot be read is refused, not waited out.
+///
+/// The machine's length prefix names a body over the codec's budget, so the codec
+/// says exactly that (`frame declares N bytes, over the M-byte budget`) instead of
+/// "truncated" — and the read must answer with that sentence, the one the CLI's own
+/// client renders for the same bytes, rather than appending whatever arrives next
+/// until the reply bound expires. A client that waited would spend five seconds of
+/// a phone's spinner on an answer that can never become readable; the corruption
+/// and the slow frame are different facts and the codec already draws the line
+/// between them.
+///
+/// The bound in the assertion is the reply bound itself, not a stopwatch reading:
+/// the point is that the refusal comes from the codec rather than from a timeout.
+#[test]
+fn an_over_budget_frame_is_refused_rather_than_waited_out() {
+    let runtime = tokio::runtime::Runtime::new().expect("a runtime");
+    runtime.block_on(async {
+        let root = Arc::new(arreo_core::identity::RootKey::from_seed(SERVER_SEED));
+        let relay = TestRelay::start(ACCOUNT.to_string(), Arc::clone(&root), Vec::new()).await;
+        let root_handle = root_key_from_seed(SERVER_SEED.to_vec()).expect("a root");
+
+        let phone = device_key_from_seed(PHONE_SEED.to_vec()).expect("a key");
+        let phone_cert = device_cert_issue(
+            Arc::clone(&root_handle),
+            phone.public_hex(),
+            "pixel-7".to_string(),
+            FfiRole::Viewer,
+            1_760_000_000_000,
+            1,
+        )
+        .expect("a certificate");
+        let session = relay_session_dial(
+            relay.address(),
+            ACCOUNT.to_string(),
+            Arc::clone(&phone),
+            phone_cert,
+        )
+        .await
+        .expect("the relay accepts the phone");
+        relay.await_route(&phone.fingerprint()).await;
+
+        let daemon_key = DeviceKey::from_seed(DAEMON_SEED);
+        let daemon_id = DeviceId::from_key(&daemon_key.public());
+        let daemon_cert = device_cert_issue(
+            Arc::clone(&root_handle),
+            daemon_key.public_hex(),
+            "server-box".to_string(),
+            FfiRole::Owner,
+            1_760_000_000_000,
+            2,
+        )
+        .expect("a certificate");
+        let daemon_cert =
+            DeviceCert::decode(&daemon_cert.encode().expect("the certificate encodes"))
+                .expect("the core reads its own certificate");
+        let daemon = RelaySession::dial(relay.addr, ACCOUNT, &daemon_key, &daemon_cert)
+            .await
+            .expect("the relay accepts the daemon");
+        relay.await_route(daemon_id.as_str()).await;
+
+        // One byte more than the codec will ever read.
+        let declared = ((codec_max_frame_bytes() + 1) as u32).to_le_bytes();
+        let daemon_key_hex = daemon_key.public_hex();
+        let machine = tokio::spawn(serve_a_frame_no_client_can_read(
+            daemon,
+            daemon_key,
+            arreo_core::identity::verifying_key_from_hex(&phone.public_hex()).expect("hex"),
+            declared,
+        ));
+
+        let peer = relay_peer_parse(daemon_id.display_id()).expect("a device id");
+        let started = std::time::Instant::now();
+        let refusal = session
+            .metrics_history(
+                Arc::clone(&peer),
+                daemon_key_hex,
+                "pane-1".to_string(),
+                0,
+                u64::MAX,
+                0,
+            )
+            .await
+            .expect_err("an unreadable frame is not an answer");
+        assert!(
+            matches!(refusal, SessionFfiError::Peer(_)),
+            "a frame the codec refuses is a peer failure: {refusal:?}"
+        );
+        assert_eq!(
+            format!("{refusal}"),
+            arreo_core::mesh::MeshClientError::Codec(
+                codec::frame_body_len(&declared)
+                    .expect_err("the codec refuses the declared length")
+                    .to_string()
+            )
+            .to_string(),
+            "the codec's own sentence, not the reply bound's"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the refusal is the codec's, so it does not wait out the reply bound (took {:?})",
+            started.elapsed()
+        );
+        assert!(
+            matches!(
+                machine.await.expect("the machine task finishes"),
+                Message::MetricsHistory { .. }
+            ),
+            "the verb was asked once, before the answer was refused"
         );
     });
 }

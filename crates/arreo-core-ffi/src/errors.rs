@@ -236,6 +236,38 @@ pub enum SessionFfiError {
     /// that failed here, before any socket existed.
     #[error("the relay address {text:?} is not an IP:PORT address: {detail}")]
     BadAddress { text: String, detail: String },
+    /// The boundary's own precondition: the relay confirmed an identity that is
+    /// not the one this device's own key names.
+    ///
+    /// The relay authenticates a device from its certificate and answers
+    /// `AuthReply::Welcome` with the id it verified. This crate derives that id
+    /// from the key it dialed with and compares the two, because the id a phone
+    /// reports and asserts over a peer stream is a claim about *itself*: a relay
+    /// that names a different device is broken or lying, and its word is not
+    /// this device's identity. Unreachable with an honest relay — the id it
+    /// echoes is derived from the certificate it just verified, and that
+    /// certificate's key is the one the proof was signed with.
+    #[error("the relay confirmed {confirmed} for a device whose own key names {derived}")]
+    RelayIdentityMismatch { confirmed: String, derived: String },
+    /// The boundary's own precondition: the pinned machine key is not a public
+    /// key. The sentence is `arreo_core::identity::KeyError`'s own `Display` —
+    /// the key parser is the core's, so the words a phone shows are the words
+    /// the CLI shows for the same bad hex.
+    #[error("{0}")]
+    BadPeerKey(String),
+    /// Talking to a machine's daemon failed: the secure channel could not be
+    /// established, it broke mid-answer, or the frame could not be built for it.
+    /// The sentence is the core's own — `TransportError`'s for the Noise
+    /// handshake, `mesh::ClientError`'s for a channel or a codec that failed
+    /// under a client — so the words are the ones the CLI's remote client
+    /// renders for the same state.
+    #[error("{0}")]
+    Peer(String),
+    /// The machine's daemon answered a request with a refusal, in its own
+    /// sentence — which is what the CLI prints for the same answer
+    /// (`metrics history: {message}`).
+    #[error("{0}")]
+    Daemon(String),
 }
 
 impl From<SessionError> for SessionFfiError {

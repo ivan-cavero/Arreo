@@ -52,15 +52,80 @@ Swift and Kotlin alike).
 | Rust | Foreign | Notes |
 |---|---|---|
 | `relay_session_dial(addr, account, device, cert)` | `relaySessionDial` | **Async.** `addr` is `IP:PORT`. One attempt; a refusal comes back with the relay's own reason. |
-| `RelaySessionHandle::device_id()` / `::account()` / `::nonce()` | `deviceId` / `account` / `nonce` | What the *relay* confirmed, plus this session's 32-byte challenge. |
+| `RelaySessionHandle::device_id()` / `::account()` / `::nonce()` | `deviceId` / `account` / `nonce` | `device_id` is **this device's own**, derived from the key the session dialed with (`DeviceId::from_key`) rather than from the relay's `AuthReply::Welcome`; `dial` checks the relay's confirmation against that derivation and refuses the session when they disagree (`RelayIdentityMismatch`). Plus this session's 32-byte challenge. |
 | `RelaySessionHandle::drain(from_seq)` / `::ack(seq)` / `::heartbeat()` | `drain` / `ack` / `heartbeat` | **Async.** The durable inbox cursor, and the presence beat. |
 | `RelaySessionHandle::machines(all)` | `machines` | **Async.** The account's machine directory. `refused` is an *answer*, not an error. |
+| `RelaySessionHandle::metrics_history(peer, server_key, pane, since_ms, until_ms, step_ms)` | `metricsHistory` | **Async.** One pane's durable series (T-0040), from the machine's **daemon** over a peer stream, on a conversation reused per peer. `server_key` is the machine's pinned key, hex. `until_ms = u64::MAX` means "to now". See "A RAM meter" below. |
 | `RelaySessionHandle::next_peer()` | `nextPeer` | **Async.** The accept door: who has written to you and has no stream yet. |
 | `RelaySessionHandle::stream_to(peer)` | `streamTo` | Opens (or reuses) the byte stream to a peer. Lock-free. |
 | `RelaySessionHandle::closed()` | `closed` | **Async.** Wait until the session ends. Lock-free, so a UI can always notice. |
 | `relay_peer_parse(device_id)` | `relayPeerParse` | `dev_<hex>` or bare hex. |
 | `RelayPeerHandle::device_id()` / `::fingerprint()` | `deviceId` / `fingerprint` | |
 | `RelayStreamHandle::peer()` / `::read(max)` / `::write(bytes)` / `::close()` | `peer` / `read` / `write` / `close` | **Async** (except `peer`). An empty `read` means the peer closed; a broken stream fails with the reason. |
+
+### A RAM meter: the metrics reads
+
+Two `Message` verbs, both T-0040's, and the boundary adds no third: the client
+asks **`MetricsHistory`** (pane, window, tier) and the daemon answers
+**`MetricsSeries`**. `RelaySessionHandle::metrics_history` is that pair, and it is
+the CLI's question field for field — so `arreo metrics history` and a phone's
+graph cannot disagree about what was asked. The reply crosses as
+`MetricsSeriesInfo` (a version, the tier served, the downshift flag) plus one
+`WireMetricsPoint` per row: `ts_ms`, `rss_avg`, `rss_peak`, `cpu_avg`,
+`cpu_peak`, `pids`.
+
+**What a meter must do about the step: draw the tier the reply names, not the
+tier it asked for.** `step_ms` is what the machine actually served and
+`downshifted` says whether that differs from the ask — a pane with 10 s rows
+cannot answer a 1 s ask, and the daemon answers with the nearest real tier rather
+than an empty graph. A meter that labelled its axis with the ask would draw a
+graph that is wrong in the one direction nobody re-checks.
+
+**An empty `rows` is a state, not a failure.** A pane that just started has no
+history, and the read returns an empty list — the CLI prints "no history for …
+in this window" and exits 0. Only a session that could not be reached, or a
+machine that hung up mid-answer, is an `Err`.
+
+Two facts the read needs, and the UI supplies:
+
+- **The peer and the pinned key.** The machine's *pinned* key, never the one the
+  relay's directory reports: the relay routes by device id and is not trusted for
+  identity, so the handshake proves the machine holds the key this phone pinned
+  at pairing. A phone has both by the time it draws a meter — the pinned key is
+  what it stored at pairing, and **the peer is that key's device id**:
+  `relay_peer_parse(fingerprint_of_public_key(pinned_key_hex))`.
+  *Not* the row's `machine_id`, which is the machine's directory identity (its
+  root key, T-0043 — the thing that outlives re-pairing): the relay routes by the
+  id a device dialed with, so a stream opened to `machine_id` reaches no device
+  ("the relay does not know that device"). The core's own resolver draws the same
+  line (`DeviceId::from_key(&server_key)`).
+- **The cadence.** A read reuses the peer's conversation (below), so a poll costs
+  one round trip rather than a handshake — but the tier it draws is what makes a
+  faster poll useful: do not poll faster than the tier is worth.
+
+**The conversation is per peer, and every read reuses it.** One Noise handshake,
+then as many verbs as the meter asks for: a machine's daemon keeps its session
+open after a verb (that is `serve_session`, the same loop the local socket and the
+direct transport run), so a client that handshakes per call writes its next
+handshake into the conversation the daemon is still holding and the read never
+arrives — the failure T-0114's first implementation shipped. `RelaySessionHandle`
+keeps one conversation per peer and drops it when a verb fails, so the next read
+opens a fresh one: recovery without a retry loop inside a call.
+
+Two consequences a UI must know:
+
+- **The pinned key is checked when the conversation is opened, and only then.** A
+  read naming a *different* key for a peer already being read is a `Peer` refusal,
+  not a served read: the conversation carries the key it was proven with, and
+  changing the pin means dialing a new session.
+- **Two concurrent reads are serialized.** The conversations sit behind one lock,
+  because two of them for one peer would write into the same wire channel while
+  only the newer could ever read a reply. Two meters polling at once queue; they
+  do not interleave. A poll still does not queue behind a caller parked in
+  `next_peer`.
+
+Nothing here charts, smooths or formats: that is the UI's, and this crate carries
+data, not presentation.
 
 ### The machine directory
 
@@ -119,15 +184,27 @@ only place a UI reads it. A flat error crosses as a variant tag plus the Rust
 Each enum's `From` impl is exhaustive over its core enum, so a new core variant
 is a **compile error here** rather than a silently-unmapped state.
 
-Four variants are the boundary's own, and each is marked as such in the source
+Six variants are the boundary's own, and each is marked as such in the source
 and here — they exist because a phone can supply something the CLI cannot:
 
 | Variant | Why the CLI has no equivalent |
 |---|---|
 | `KeyFfiError::BadSeed` / `PairingFfiError::BadSeed` | "a device seed is exactly 32 bytes, got N". The CLI never takes a seed from outside; a phone supplies its own. |
 | `SessionFfiError::BadAddress` | The relay address is not `IP:PORT`. The CLI's equivalent sentence is the CLI's own (`machines: cannot reach the relay at …`); this names the *parse*, before any socket exists. |
+| `SessionFfiError::RelayIdentityMismatch` | The relay confirmed an identity that is not the one this device's key names. The CLI's relay session reports the same echo without checking it; a phone asserts its identity over a peer stream, so a lie about *it* is refused rather than carried. |
+| `SessionFfiError::BadPeerKey` | A pinned machine key that is not a hex public key. Same shape as `CertFfiError::BadPublicKey`: the CLI parses those at its own argument layer, with its own words, and the *sentence* here is the core's `KeyError` `Display`. |
 | `CertFfiError::BadPublicKey` | A hex public key that is not 64 hex characters. The CLI parses those at its own argument layer, with its own words. |
 | `CodecFfiError::OutOfRange` | A wire `u64` this platform cannot address. Unreachable on the 64-bit targets the product ships. |
+
+Two more session variants carry *core* sentences rather than preconditions, so
+they are not in that table: `SessionFfiError::Peer` is talking to a machine's
+daemon that failed — the channel could not be established, it broke mid-answer,
+the frame could not be built (the transport's own `TransportError` /
+`mesh::ClientError` wording), or the read named a pinned key the open conversation
+was not proven with (this crate's own sentence, and the one `Peer` payload that is
+not a core error's) — and `SessionFfiError::Daemon` is a machine's daemon
+refusing a request in its own words, the sentence the CLI prints after its verb
+name (`metrics history: {message}`).
 
 `SessionFfiError::Refused` is split out of `Client` deliberately: it is the one
 distinction the product itself acts on. The daemon's reconnect loop retries a
@@ -166,10 +243,14 @@ toolchains is the authority for the SKIPs.
 ### What the gate does *not* prove
 
 It does not prove the API works. That is
-`crates/arreo-core-ffi/tests/contract.rs` — nine tests that drive pairing (both
-sides), a wrong code, the codec's round trip and its garbage handling, the theme
-tokens, the directory cache, a live relay session (dial → drain → ack →
-heartbeat → directory read), and bytes between two devices. They call the
+`crates/arreo-core-ffi/tests/contract.rs` — fourteen tests that drive pairing
+(both sides), a wrong code, the codec's round trip and its garbage handling, the
+theme tokens, the directory cache, a live relay session (dial → drain → ack →
+heartbeat → directory read), a relay that confirms someone else's identity, bytes
+between two devices, and the metrics reads answered by a daemon standing behind
+the relay: two reads on one conversation, a refusal that keeps it, an empty
+window, a key the machine does not hold, a frame the codec refuses, and the
+reconnect after a failed read. They call the
 **exported surface**, never `arreo-core`'s client API underneath: the only
 `arreo-core` imports in that file are the *server-side* types a test-local
 mailbox and relay need to speak the shipped protocol. A boundary that cannot be
@@ -215,11 +296,15 @@ The honest split between this crate and the toolchains it does not have.
    is where this is executed.
 6. **A "one operation at a time" discipline.** `next_peer` needs `&mut` on the
    session, so the handle holds it behind a lock. Everything that *can* avoid
-   that lock does — `stream_to`, `closed`, `heartbeat`, and the identity
-   accessors are cached at dial time — but a directory read issued while another
-   caller sits in `next_peer` will queue behind it. A UI should run its accept
-   loop and its directory refreshes as separate tasks and accept that
-   serialization, rather than expecting the two to interleave.
+   that lock does — `stream_to`, `closed`, `heartbeat`, the identity accessors
+   (cached at dial time) and `metrics_history` (it opens its stream through the
+   same cached factory) — but a directory read issued while another caller sits
+   in `next_peer` will queue behind it. A UI should run its accept loop and its
+   directory refreshes as separate tasks and accept that serialization, rather
+   than expecting the two to interleave. Metrics reads are a *second* serial
+   point, on purpose: they share the per-peer conversation (see "A RAM meter"),
+   so two polls of the same session queue behind each other rather than opening
+   two conversations on one peer's channel.
 7. **The UI itself**, which is the whole point: both platforms render the same
    `ThemeHandle` token table the TUI does, read the same `WireMessage` enum, and
    pair with the same mailbox the CLI pairs with — so the duplicated work is

@@ -1,0 +1,166 @@
+T-0114 — FFI: the metrics reads a RAM meter needs
+=================================================
+
+The phone can read a pane's metrics over the boundary, using the two verbs that already
+existed on the wire (`Message::MetricsHistory` / `MetricSeries`, T-0040) — no new protocol.
+
+WHAT SHIPPED
+------------
+crates/arreo-core-ffi/src/relay.rs
+  RelaySessionHandle::metrics_history(peer, server_key, pane, since_ms, until_ms, step_ms)
+    -> MetricsSeriesInfo { v, step_ms, downshifted, rows: Vec<WireMetricsPoint> }
+  PeerSession { pinned, channel, buf }        one daemon conversation
+  RelaySessionHandle.daemons                  Mutex<HashMap<DeviceId, PeerSession>> — the cache
+  daemon_call                                 cache + pin check + unconditional drop-on-error
+  daemon_to                                   the handshake (stores the key it was proven with)
+crates/arreo-core-ffi/src/errors.rs
+  SessionFfiError::{BadPeerKey, Peer, Daemon, RelayIdentityMismatch}
+crates/arreo-core-ffi/tests/contract.rs       14 tests (11 -> 14)
+docs/mobile.md                                the metrics row, the RAM-meter section, the two facts
+xtask/src/ffi.rs                              unchanged (the surface is 86 symbols before and after)
+
+**THE REVIEW'S p1, AND WHY THE WHOLE BATTERY COULD NOT SEE IT**
+--------------------------------------------------------------
+The first implementation passed the entire battery — 936 tests, 14/14 slices, bench 6/6, vet,
+deny, audit, check-targets — and was **broken against a real daemon**: the read worked once and
+failed from then on.
+
+Root cause. `metrics_history` opened a fresh stream and a fresh Noise handshake **per call**, and
+"closed" by dropping the `PeerSession`. Nothing goes on the wire when it drops: the relay protocol
+has no per-stream close (`PeerGone` exists only for a device's *relay session* ending), and the
+daemon's `serve_session` **keeps its session open after a verb**. So the second call's bytes — a
+32-byte cleartext identity hint plus a new handshake flight — arrive in the *stale* session, whose
+pump reads the hint as a u16-BE frame length (`'d','e'` ≈ 25,701 bytes, under the 60,018 budget)
+and waits for bytes that never come. The phone's single unretried 10 s attempt fails, and keeps
+failing until the stale pump finally accumulates enough to error.
+
+Why the contract test passed anyway: **its fixture was not a real daemon.** It did
+`writer.shutdown()` + `FINAL_FRAME_GRACE` after each answer, which orphans the daemon-side sender
+and forces the *reconnect* path for the next call — the client's expectation rather than a
+daemon's behaviour. The two sequential reads that "proved" the feature were exactly the one case a
+real daemon breaks.
+
+Attribution: **a fixture-fidelity defect, not a flaky test.** The tree was green and wrong.
+
+Independently verified before acting (both, not just read): the fixture's shutdown-after-each-answer
+is real, and the core's own client retries on fresh streams with the comment *"the peer may still
+be holding an earlier stream — the far end needs its next read to fail before it will accept a new
+stream for this peer"* (`mesh/session.rs`) — the same failure mode, worked around in the core and
+absent here.
+
+**WHAT THE REVIEW ESTABLISHED THAT THE DESIGN RESTS ON** (both TRUE, verified by trace)
+- **The peer key is genuinely pinned.** `SecureChannel::connect` sets
+  `expected_remote = noise_public_key(server)` and feeds it to Noise-KK as the remote static, so a
+  peer that does not hold the pinned key's secret cannot decrypt the first flight. A relay that
+  substituted its own key, or a relay directory that reported a different one, cannot complete the
+  handshake. (I checked this myself as well: `noise.rs:179` → `handshake_state(local,
+  &expected_remote, …)` → `finish(…, expected_remote)`.)
+- **The per-verb gate and role semantics apply.** A relay peer runs the *same* `serve_session`
+  behind the same `check_verb` + trust ledger as the direct transport; `Message::MetricsHistory` →
+  `Verb::Metrics` → `Capability::Observe`, which a Viewer holds. So a viewer **may** read metrics
+  — the intended rule, identical to the CLI's remote path. Not a finding.
+
+THE FIX (the decided shape, pinned in the task file before dispatch)
+-------------------------------------------------------------------
+1. One **cached, long-lived conversation per peer**, under one mutex, reused by every verb: one
+   handshake, many verbs. The same lock serialises concurrent reads — `stream_to` *replaces* the
+   live peer's routing (`stream_for` inserts over it), so two conversations on one channel would
+   interleave and the older stream would never see its reply. The comment claiming the opposite
+   is corrected. (Findings A, B.)
+2. **Unconditional invalidation on error**: a failed call drops the conversation so the next call
+   reconnects. The originally-sketched predicate (`conversation_survives`) proved to be
+   unreachable — a refusal arrives as an answered `Message::Error`, turned into `Err` *after* the
+   call — so it was deleted rather than kept as a branch that always evaluates the same way.
+   Mutation M6 is what exposed it. (Finding A.)
+3. **The send is bounded** like the read (the write half was unbounded: a peer that stops reading
+   stalls `write_all` once the 64 KB duplex fills), and **a non-truncated frame error fails fast**
+   instead of being treated as "keep reading" — an over-budget declared length was
+   indistinguishable from an incomplete frame, so the loop appended until the timeout. (C, D.)
+4. **The Noise identity hint is derived from this device's own key**, not from the relay's
+   `AuthReply::Welcome` echo, and dial time asserts the two agree
+   (`SessionFfiError::RelayIdentityMismatch`). The failure mode was fail-closed, but a lying relay
+   must not be able to make this device announce another identity — and `device_id()` was
+   reporting the relay's value as if it were the phone's own. (E.)
+5. **The fixture now models a real daemon**: one conversation, N verbs over it (the per-answer
+   `ready`/`FINAL_FRAME_GRACE` reconnect path is gone).
+6. **The pinning claim is falsified by a wrong-but-valid key** (another device's public key), not
+   only by a malformed one — the old negative case was rejected at parse time before any stream
+   existed, so the test would have passed unchanged if the code ignored `server_key` and trusted
+   the relay's directory. (F.)
+
+MUTATIONS — and one honest GREEN
+--------------------------------
+M1  cache reverted to per-call handshakes, against the new one-conversation fixture
+      → RED: `an empty window is an answer, not a failure: Peer("handshake took longer than 10s")`
+M1' the same mutation against **real processes** (probe below)
+      → RED: `read #1 ok … read #2 FAIL — the SECOND read failed: handshake took longer than 10s`
+M2  the pin check disabled → RED *after the test was strengthened*. The first run was **GREEN**:
+    the initial test only asserted `Peer(_)`, and a read served under the wrong key also fails
+    (Peer) later on a dead channel — a weak test. The worker added the unclaimed last answer and
+    a third pane, and the mutation is red now. Reported as it happened, not tidied up.
+M3  the dial-time identity assertion disabled → RED (a lying relay was accepted)
+M4  the accessor's source swapped back to the relay's echo, with the assertion in place
+      → **GREEN, and reported as GREEN**: the failure mode is fail-closed, so with an honest relay
+    and the assertion in place the swap is behaviourally invisible. The end that matters is M3.
+M5  every decode error treated as "keep reading" (finding D reverted)
+      → RED: the over-budget frame was waited out to the 5 s bound instead of refused by name
+M6  invalidate on every failure → GREEN, and it exposed **dead code** (see fix 2)
+M7  never drop a failed conversation → RED: the second call re-read the dead channel
+
+REAL-DAEMON PROOF (the check the battery does not have)
+-------------------------------------------------------
+A scratch probe (`.loop/evidence/T-0114/real-daemon-probe.rs`, also captured with its
+`Cargo.toml`) drives the **exported surface** against real processes: it spawns `arreo-relay serve`
+and `arreo-server`, writes the machine's identity the way `arreo pair` leaves it, issues the
+machine's certificate through the boundary, pins the phone as a VIEWER through the real
+`arreo devices issue`, spawns a real pane so the daemon's metrics writer has something to sample,
+dials through `relay_session_dial`, waits for the directory row through the exported `machines()`,
+then reads metrics twice on one session and once with a wrong-but-valid pinned key. No
+`arreo-server`/`arreo-relay` code is linked (AGPL) — they are spawned binaries.
+
+Re-run by the integrator on the final tree (`real-daemon-run.txt`):
+
+    probe: machine up, pane pane-a spawned
+    probe: machine pinned the phone as a viewer
+    probe: phone dev_1325b850c2871916eae203f0efc3c898
+    probe: session device_id=dev_1325b850c2871916eae203f0efc3c898 account=acct-t0114
+    probe: directory row workbox peer=dev_b14705888f4a68391a09aa5968dd25d1 key=d759793b…
+    probe: read #1 ok step_ms=10000 downshifted=true rows=1
+    probe: read #2 ok step_ms=10000 downshifted=true rows=1
+    probe: wrong key refused: the conversation with dev_b147… was opened under the pinned key for
+           dev_b147…, not dev_6c8f…: one conversation per peer, and it carries the key it was
+           proven with — dial a new session to read that machine under another key
+    probe: PASS — two reads on one conversation, and the wrong key refused
+
+Both reads are real data from the daemon's own metrics writer (step 10 s, downshifted from the
+finest ask), not fixture values. **Read #2 is the p1's proof**: two verbs on one conversation,
+against the daemon that keeps its session open.
+
+A REAL DEFECT THE RETEST FOUND IN THE DOCS
+------------------------------------------
+The peer a client must open a stream to is **not** the directory row's `machine_id` (that is the
+machine's *directory* identity, its root key — T-0043); it is the device id **of the published
+`daemon_key`**. The relay routes by the id a device dialed with, so the first probe attempt got
+`the relay does not know that device`. The core's resolver already draws this line
+(`DeviceId::from_key(&server_key)`); the FFI's docs said the opposite. Corrected in `relay.rs`
+(two doc comments) and `docs/mobile.md`. Documentation, not behaviour — the parameter was always
+`server_key`.
+
+SCOPE NOTES
+-----------
+- The identity assertion touches `relay_session_dial`, inside T-0114's fence
+  (`crates/arreo-core-ffi/**`), and its only Rust callers are the contract tests, which needed no
+  change. Kept rather than filed: there was no second caller to migrate.
+- **The probe is scratch, and that is a gap**: it lives under `target/` (gitignored), so the
+  real-daemon proof would evaporate with the build directory. Its source and this run are captured
+  here, and a durable home for it — an xtask slice, since the fixture-is-not-a-daemon lesson is
+  exactly what the fixture cannot reteach — is filed as **T-0125**.
+
+BATTERY (integrated tree)
+-------------------------
+cargo test --workspace: 939 passed / 0 failed.
+clippy --workspace --all-targets: 0 findings (pinned + stable). fmt clean.
+14/14 slices (api = 2 suites; tui 103; update 27; persistence 16; mesh 36+1; handoff-abort 41;
+worktree 9; compat both directions; lifecycle 2; reattach 11; enforcement; relay 20; chaos 8;
+theme 33). sync 14/14. vet 375. deny 4/4. audit 0. check-targets PASS/SKIP.
+bench 6/6 (19 MB RSS, 211 KB/pane, 0 ms detect, 62 ms sweep).

@@ -118,6 +118,9 @@ const GOLDEN_SYMBOLS: &[&str] = &[
     "uniffi_arreo_core_ffi_fn_method_relaysessionhandle_heartbeat",
     "uniffi_arreo_core_ffi_fn_method_relaysessionhandle_machines",
     "uniffi_arreo_core_ffi_fn_method_relaysessionhandle_next_peer",
+    // The metrics read a RAM meter draws (T-0114): the daemon's own
+    // MetricsHistory verb over a peer stream, answered by MetricsSeries.
+    "uniffi_arreo_core_ffi_fn_method_relaysessionhandle_metrics_history",
     "uniffi_arreo_core_ffi_fn_method_relaysessionhandle_stream_to",
     "uniffi_arreo_core_ffi_fn_method_relaysessionhandle_closed",
     "uniffi_arreo_core_ffi_fn_method_relaypeerhandle_device_id",

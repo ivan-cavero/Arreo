@@ -209,6 +209,21 @@ pub struct WireMetricsPoint {
     pub pids: u64,
 }
 
+impl WireMetricsPoint {
+    /// The core's point as the boundary's record — one mapping, so the codec and
+    /// the metrics read cannot disagree about which field is which.
+    pub(crate) fn from_point(point: &MetricsPoint) -> Self {
+        Self {
+            ts_ms: point.ts_ms,
+            rss_avg: point.rss_avg,
+            rss_peak: point.rss_peak,
+            cpu_avg: point.cpu_avg,
+            cpu_peak: point.cpu_peak,
+            pids: point.pids,
+        }
+    }
+}
+
 /// One file's payload, as a sync exchange carries it.
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
 pub struct WireSyncExchange {
@@ -989,17 +1004,7 @@ fn from_core(message: &Message) -> WireMessage {
             id: id.clone(),
             step_ms: *step_ms,
             downshifted: *downshifted,
-            rows: rows
-                .iter()
-                .map(|point| WireMetricsPoint {
-                    ts_ms: point.ts_ms,
-                    rss_avg: point.rss_avg,
-                    rss_peak: point.rss_peak,
-                    cpu_avg: point.cpu_avg,
-                    cpu_peak: point.cpu_peak,
-                    pids: point.pids,
-                })
-                .collect(),
+            rows: rows.iter().map(WireMetricsPoint::from_point).collect(),
         },
         Message::Handoff { v, protocol, build } => WireMessage::Handoff {
             v: *v,

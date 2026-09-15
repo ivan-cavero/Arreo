@@ -1,0 +1,18 @@
+# T-0114's real-daemon retest. A scratch crate, deliberately *outside* the
+# workspace: it drives the exported UniFFI surface against a real `arreo-server`
+# behind a real `arreo-relay`, both spawned as binaries (the AGPL crate is never
+# linked — the same rule the CLI's own real-process tests follow). Nothing here
+# is part of the repo's build; `target/` is where scratch lives.
+[package]
+name = "ffi-real-daemon-probe"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[dependencies]
+arreo-core-ffi = { path = "../../../../crates/arreo-core-ffi" }
+# The exported session calls are async: this is the reactor they run on, and the
+# contract test uses the same one.
+tokio = { version = "1", features = ["rt-multi-thread"] }

@@ -3,7 +3,7 @@ id: T-0114
 title: FFI: the metrics reads a RAM meter needs
 phase: 3
 priority: 2
-status: proposed
+status: done
 depends_on: [T-0104, T-0040]
 scope:
   - crates/arreo-core-ffi/**
@@ -12,6 +12,9 @@ scope:
 verify:
   - cargo test -p arreo-core-ffi
   - cargo xtask ffi --check
+evidence:
+  - .loop/evidence/T-0114/ffi-metrics-reads.txt
+  - .loop/evidence/T-0114/real-daemon-run.txt
 ---
 
 ## Goal
@@ -23,16 +26,16 @@ handle can dial, drain, ack, heartbeat and read the directory, but it cannot ask
 
 ## Acceptance criteria
 
-- [ ] `RelaySessionHandle` gains the two reads the meter needs: a history request (pane, step,
+- [x] `RelaySessionHandle` gains the two reads the meter needs: a history request (pane, step,
       window) and a series request — **the same two verbs the CLI uses**, no new protocol.
-- [ ] The reply crosses as a typed record (`WireMetricsPoint`-shaped: ts, avg/peak RSS, cpu,
+- [x] The reply crosses as a typed record (`WireMetricsPoint`-shaped: ts, avg/peak RSS, cpu,
       pids), and the downshift note T-0040's verbs carry crosses too — a UI that silently shows
       a coarser step than it asked for is showing the wrong graph.
-- [ ] An empty series is an empty list, never an error: a pane that just started has no
+- [x] An empty series is an empty list, never an error: a pane that just started has no
       history, and that is a state a meter renders (T-0040's own rule).
-- [ ] The contract test drives the exported reads through a real session against a test relay,
+- [x] The contract test drives the exported reads through a real session against a test relay,
       as `the_session_dials_drains_acks_and_reads_the_directory` does for the directory.
-- [ ] `docs/mobile.md` gains the two reads and what a meter must do about the step.
+- [x] `docs/mobile.md` gains the two reads and what a meter must do about the step.
 
 ## Notes
 
@@ -116,3 +119,46 @@ retry-and-pause loop with that comment is real.
   (snow returns the static the builder was given); pinning is enforced by the KK DH, not that
   comparison. The comment overstates what it adds — noted, and the transport file is outside this
   task's fence.
+
+## Outcome
+
+Done — and the first implementation was **green and wrong**, which is the part worth reading.
+
+It passed the whole battery (936 tests, 14/14 slices, bench 6/6, vet, deny, audit, check-targets)
+and was broken against a real daemon: the read worked once and failed from then on. It opened a
+fresh Noise handshake per call and "closed" by dropping the session, but nothing goes on the wire
+when it drops — the relay has no per-stream close, and a daemon keeps its session open after a
+verb — so the second call's bytes landed in the stale session, whose pump read the 32-byte
+identity hint as a ~25 KB frame length and waited. The contract test passed because its fixture
+closed after each answer: the client's expectation, not a daemon's behaviour.
+
+A security review found it, and established the two things the design rests on: the peer key **is**
+genuinely pinned (it becomes Noise-KK's remote static, so a substituted key cannot complete the
+handshake) and the per-verb gate **does** apply (a Viewer may read metrics — the intended
+`Capability::Observe`).
+
+The fix, pinned in this file before dispatch and implemented against it: one cached long-lived
+conversation per peer under one mutex (one handshake, many verbs; the lock also stops concurrent
+reads interleaving two conversations on one channel), unconditional invalidation on error so
+recovery needs no retry loop, a bounded send, fail-fast on a non-truncated frame error, the Noise
+identity hint derived from this device's own key with a dial-time assertion, the fixture rewritten
+to keep its session open across verbs, and a wrong-but-valid key asserted as the pinning
+falsification.
+
+Seven mutations, each with its result in the evidence — including two that are **not** red and are
+reported as such: M4 (the accessor's source swapped back, behaviourally invisible while the
+assertion stands) and M6, which came back green and exposed **dead code** (the `conversation_survives`
+predicate was unreachable, because a refusal arrives as an answered `Message::Error` rather than an
+`Err`) — deleted rather than kept as a branch that always evaluates the same way. M2 was green on
+its first run and the test was **strengthened** until it was red: the first version asserted only
+`Peer(_)`, and a read served under the wrong key also fails later on a dead channel.
+
+The **real-daemon probe** in `.loop/evidence/T-0114/` reproduced the p1 on real processes and shows
+the fix stopping it (two reads on one conversation, real metrics, wrong key refused); it is
+re-run by the integrator on the final tree. It also found a real defect in the shipped docs — the
+peer to dial is the device id of the published `daemon_key`, not the directory row's `machine_id`
+— corrected in `relay.rs` and `docs/mobile.md`.
+
+The probe is scratch (under gitignored `target/`), so the durable home for this check is filed as
+**T-0125**: an `xtask e2e --slice ffi` that drives real binaries, with the pre-fix red as its
+acceptance evidence.
