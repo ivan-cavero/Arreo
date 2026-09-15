@@ -692,6 +692,70 @@ fn a_v0_reader_refuses_notify_act_rather_than_misreading_it() {
     );
 }
 
+/// **The theme pair follows the N−1 rules** (T-0116). `theme` is a
+/// client→server request (it reads the machine's theme) and `theme_reply` an
+/// event (it answers one), both learned from the map head rather than by a
+/// version bump — so a peer that has never heard of the verb refuses it typed
+/// instead of decoding it. And the request's `variant` is `#[serde(default)]`,
+/// which is the N−1 mechanism for the field: a peer from before it still
+/// decodes, and an absent variant means the engine's own default (dark).
+#[test]
+fn the_theme_pair_follows_the_n_1_rules() {
+    let request = body_of(&Message::Theme {
+        v: VERSION,
+        name: "arreo".into(),
+        variant: arreo_core::theme::Variant::Light,
+    });
+    assert_eq!(
+        classify_op(&request),
+        Some(Direction::Request),
+        "asking for a theme asks the daemon for something"
+    );
+
+    // The same op with no `variant` at all — the shape a client written before
+    // the field would send — still decodes, and means the default variant.
+    let mut older = vec![0x83u8]; // fixmap(3)
+    for (key, value) in [
+        (rmp_encode_str("op"), rmp_encode_str("theme")),
+        (rmp_encode_str("v"), vec![0x00]),
+        (rmp_encode_str("name"), rmp_encode_str("arreo")),
+    ] {
+        older.extend(key);
+        older.extend(value);
+    }
+    assert_eq!(
+        codec::decode(&older).expect("a missing defaulted field still decodes"),
+        Message::Theme {
+            v: 0,
+            name: "arreo".into(),
+            variant: arreo_core::theme::Variant::Dark,
+        },
+        "the absent variant takes the engine's default, not a decode failure"
+    );
+
+    let reply = body_of(&Message::ThemeReply {
+        v: VERSION,
+        theme: arreo_core::theme::ThemeTokens {
+            name: "arreo".into(),
+            variant: arreo_core::theme::Variant::Dark,
+            tokens: std::collections::BTreeMap::from([(
+                "question".to_string(),
+                "#e8b45a".to_string(),
+            )]),
+        },
+    });
+    assert_eq!(
+        classify_op(&reply),
+        Some(Direction::Event),
+        "the resolved tokens answer one"
+    );
+    assert!(
+        reply.len() < 128,
+        "a theme reply is a token table, not a document dump ({} bytes)",
+        reply.len()
+    );
+}
+
 fn rmp_encode_str(text: &str) -> Vec<u8> {
     let bytes = text.as_bytes();
     assert!(bytes.len() < 32, "test strings are short");

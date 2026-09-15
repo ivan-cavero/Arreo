@@ -9,7 +9,7 @@
 
 use crate::theme::color::{Color, Depth};
 use crate::theme::schema::{self, RawTheme, SchemaError, Variant};
-use crate::theme::{Theme, BASE_THEME};
+use crate::theme::{Theme, ThemeTokens, BASE_THEME};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -232,6 +232,24 @@ impl Catalog {
         }
         Ok(Theme::new(name, variant, depth, colors))
     }
+
+    /// This theme's resolved tokens, as the wire carries them (T-0116).
+    ///
+    /// The same resolution [`Catalog::theme_with_depth`] performs — validation,
+    /// `defs`, the base theme's inheritance, with the schema's own error when the
+    /// file cannot be resolved — but **without quantization**: the colors are the
+    /// theme file's own, and the receiving surface applies its depth
+    /// (`ThemeTokens::to_theme`). The `Depth::Truecolor` below therefore means
+    /// "the unquantized spelling", not a claim about this machine's terminal; a
+    /// document quantized here would make the same theme render differently on
+    /// two surfaces.
+    ///
+    /// An unknown name is [`LoadError::NotFound`], whose sentence names the name
+    /// and lists the built-ins — the typed refusal the verb answers with.
+    pub fn tokens(&self, name: &str, variant: Variant) -> Result<ThemeTokens, LoadError> {
+        self.theme_with_depth(name, variant, Depth::Truecolor)
+            .map(|theme| ThemeTokens::from_theme(&theme))
+    }
 }
 
 fn validate(
@@ -410,6 +428,51 @@ mod tests {
             }
             other => panic!("expected NotFound, got {other:?}"),
         }
+    }
+
+    /// **A file's `defs` are resolved before the tokens travel** (T-0116): the
+    /// wire shape is what a surface with no resolver can use, and an unknown
+    /// name is the loader's own refusal, naming the name.
+    #[test]
+    fn the_wire_shape_is_the_resolved_map() {
+        let dir = tempdir("wire");
+        std::fs::write(
+            dir.join("mine.json"),
+            r##"{
+                "defs": { "ink": "#123456" },
+                "theme": { "primary": "ink", "question": "#abcdef" }
+            }"##,
+        )
+        .expect("write");
+        let catalog = Catalog::discover(std::slice::from_ref(&dir));
+        let tokens = catalog.tokens("mine", Variant::Dark).expect("resolves");
+        assert_eq!(tokens.name, "mine");
+        assert_eq!(
+            tokens.color("primary"),
+            Some("#123456"),
+            "the def, resolved"
+        );
+        assert_eq!(tokens.color("question"), Some("#abcdef"));
+        assert!(
+            !tokens.tokens.values().any(|value| value == "ink"),
+            "a def reference reached the wire"
+        );
+        // A partial theme inherits the base look, and that inheritance is the
+        // *server's* resolution too — the client gets one flat table.
+        let base_done = Theme::arreo(Depth::Truecolor).color("done").to_string();
+        assert_eq!(
+            tokens.color("done"),
+            Some(base_done.as_str()),
+            "the inherited base token is resolved here, not by the client"
+        );
+
+        // An unknown name is refused by name.
+        let error = catalog
+            .tokens("nope", Variant::Dark)
+            .expect_err("unknown name");
+        assert!(error.to_string().contains("nope"), "{error}");
+        assert!(error.to_string().contains("tokyonight"), "{error}");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

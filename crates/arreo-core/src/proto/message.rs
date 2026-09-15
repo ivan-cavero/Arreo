@@ -20,6 +20,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::theme::{ThemeTokens, Variant};
+
 /// Protocol version we speak.
 ///
 /// Bumped exactly when a change cannot honor the append-only discipline below;
@@ -445,6 +447,50 @@ pub enum Message {
     /// Refusals are the pane's or the role's, never the notifier's, so the
     /// detail is always a sentence whose authority lives elsewhere.
     NotifyActReply { v: u32, ok: bool, detail: String },
+    /// Client → server: ask this machine for a theme, as **resolved tokens**
+    /// (T-0116), so one theme reaches every surface — the TUI, a phone, and
+    /// (Phase 4) a browser — without a theme file on any of them.
+    ///
+    /// **Why the resolved map and not the theme file.** The theme engine has two
+    /// JSON shapes and neither is what a client should receive: `schema::RawTheme`
+    /// is the *on-disk* file (`defs`, named references, per-token per-variant
+    /// values, `Deserialize` only) and `brand` parses the brand document, a design
+    /// artifact. Sending the file would push `defs` resolution, token-name
+    /// validation and variant unwrapping onto every client — a phone and a browser
+    /// would each carry the resolver, and each would be a place the resolution
+    /// could diverge. `schema::resolve` already produces exactly the flat table
+    /// `Theme::new` takes, so [`crate::theme::ThemeTokens`] carries *that*: a
+    /// surface builds its theme from the reply with no resolver at all.
+    ///
+    /// **Depth is not on the wire.** The tokens are the file's own colors and the
+    /// receiving surface quantizes for its own terminal
+    /// (`ThemeTokens::to_theme`), which is what makes one document correct on a
+    /// 16-colour phone and a truecolor one.
+    ///
+    /// `name` is `#[serde(default)]` so its absence decodes (N−1, ADR 0017), and
+    /// an empty name is a *question*, not a typo: "what is this machine's theme?"
+    /// — which an unconfigured machine answers with the built-in default, a
+    /// working answer rather than an error. A non-empty name the machine does not
+    /// have is refused with the loader's own sentence, which names the name.
+    /// `variant` is defaulted for the same reason (absent = the dark variant,
+    /// the engine's own default).
+    Theme {
+        v: u32,
+        #[serde(default)]
+        name: String,
+        #[serde(default)]
+        variant: Variant,
+    },
+    /// Server → client: the theme [`Message::Theme`] asked for, resolved.
+    ///
+    /// **A new shape behind a new variant, not fields on an old one** (T-0079):
+    /// `rmp-serde` writes a struct as a positional array, so an extended shape is
+    /// fatal to an older reader — and this reply only ever answers a
+    /// [`Message::Theme`], a request an older peer cannot send. `ThemeTokens` is
+    /// inlined rather than boxed because it does not raise the enum's size budget
+    /// (the largest variant still sets it; see
+    /// `the_message_enum_stays_at_its_budget`).
+    ThemeReply { v: u32, theme: ThemeTokens },
 }
 
 /// The pane a [`Message::SpawnWorktree`] asks for: everything

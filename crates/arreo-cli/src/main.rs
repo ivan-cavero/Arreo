@@ -7,6 +7,7 @@ use arreo_core::proto::codec;
 use arreo_core::proto::{client_versions, AgentState, Message, VERSION};
 use arreo_core::relay::session::backoff_delay;
 use arreo_core::store::{audit_json, AuditQuery, ExportFormat, SessionStore, StoredAudit};
+use arreo_core::theme::{ThemeTokens, Variant};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -95,6 +96,11 @@ fn usage() -> ExitCode {
     eprintln!("      no IP, no port, no SSH target, and nothing dialed from argv.");
     eprintln!("      The same `--machine <name> [--config PATH]` works on panes, read, send,");
     eprintln!("      wait, split and metrics: one set of verbs, whichever machine holds the pane");
+    eprintln!("  arreo theme export [<name>] [--variant dark|light] [--json] [--socket PATH]");
+    eprintln!("      the theme this machine serves, as resolved tokens: what a phone or a");
+    eprintln!("      browser receives (name, variant, token → color). No name = the machine's");
+    eprintln!("      own theme (the built-in default when it has none); an unknown name is");
+    eprintln!("      refused naming it. --json is the wire shape (token → color)");
     eprintln!("  arreo devices <id|list|issue|rotate|revoke|authorize> [--json] [--socket PATH]");
     eprintln!("      list --revoked|--all   (live devices by default; tombstones with --revoked)");
     eprintln!("      revoke <name|id> [--machine <name>]");
@@ -190,6 +196,7 @@ fn main() -> ExitCode {
         Some("panes") => rt::block_on(cmd_panes(&args[2..])),
         Some("spawn") => rt::block_on(cmd_spawn(&args[2..])),
         Some("worktrees") => rt::block_on(cmd_worktrees(&args[2..])),
+        Some("theme") => rt::block_on(cmd_theme(&args[2..])),
         Some("diff") => cmd_diff(&args[2..]),
         Some("attach") => rt::block_on(cmd_attach(&args[2..])),
         Some("send") => rt::block_on(cmd_send(&args[2..])),
@@ -718,6 +725,130 @@ async fn cmd_panes(rest: &[String]) -> ExitCode {
             eprintln!("panes: {e}");
             ExitCode::FAILURE
         }
+    }
+}
+
+/// `arreo theme [export] [<name>] [--variant dark|light] [--json] [--socket
+/// PATH] [--machine NAME]`: print the theme **this machine serves**, in exactly
+/// the shape the socket verb returns (T-0116).
+///
+/// The shape is the theme's *resolved* tokens, not the file: the machine
+/// resolves `defs`, validates the tokens and merges the base look, and the reply
+/// is one flat `token -> color` table — so this prints what a phone or a browser
+/// receives, which is what makes the round trip inspectable without one.
+///
+/// Omitting the name asks for the machine's own theme; an unconfigured machine
+/// answers with the built-in default, which is a working answer rather than an
+/// error. A name the machine does not have is refused with the loader's own
+/// sentence, which names it.
+async fn cmd_theme(rest: &[String]) -> ExitCode {
+    let (socket, kept) = take_socket(rest);
+    let (mut session, kept) = match connect(&socket, &kept).await {
+        Ok(pair) => pair,
+        Err((code, message)) => {
+            eprintln!("theme: {message}");
+            return ExitCode::from(code);
+        }
+    };
+    let mut name = String::new();
+    let mut variant = Variant::Dark;
+    let mut json = false;
+    let mut i = 0;
+    while i < kept.len() {
+        match kept[i].as_str() {
+            // The only verb there is, and the one the criterion names: spelled
+            // out for a script that reads the usage, optional because `arreo
+            // theme` says the same thing.
+            "export" => i += 1,
+            "--variant" if i + 1 < kept.len() => {
+                match kept[i + 1].to_ascii_lowercase().as_str() {
+                    "dark" => variant = Variant::Dark,
+                    "light" => variant = Variant::Light,
+                    other => {
+                        eprintln!("theme: unknown variant {other:?} (dark|light)");
+                        return ExitCode::from(2);
+                    }
+                }
+                i += 2;
+            }
+            "--json" => {
+                json = true;
+                i += 1;
+            }
+            // The name is positional and optional: `arreo theme` asks for the
+            // machine's own theme (`--machine` arrives already peeled off by
+            // `connect`, so a remote machine's theme is one flag away).
+            other if name.is_empty() && !other.starts_with('-') => {
+                name = other.to_string();
+                i += 1;
+            }
+            other => {
+                eprintln!("theme: unknown argument {other:?}");
+                eprintln!(
+                    "usage: arreo theme export [<name>] [--variant dark|light] [--json] \
+                     [--socket PATH]"
+                );
+                return ExitCode::from(2);
+            }
+        }
+    }
+    match session
+        .call(&Message::Theme {
+            v: VERSION,
+            name,
+            variant,
+        })
+        .await
+    {
+        Ok(Message::ThemeReply { theme, .. }) => {
+            print_theme(&theme, json);
+            ExitCode::SUCCESS
+        }
+        // The refusal names the theme (the loader's sentence), so it is worth
+        // printing verbatim rather than rephrasing.
+        Ok(Message::Error { message, .. }) => {
+            eprintln!("theme: {message}");
+            ExitCode::FAILURE
+        }
+        Ok(other) => {
+            eprintln!("theme: unexpected {other:?}");
+            ExitCode::FAILURE
+        }
+        Err(e) => {
+            eprintln!("theme: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Print a theme's resolved tokens: the table a human reads, or the wire shape
+/// itself (`--json`), which is the script contract — the same names and the same
+/// color spellings a client receives, so `arreo theme export | jq` and a phone
+/// read one shape.
+fn print_theme(theme: &ThemeTokens, json: bool) {
+    if json {
+        let tokens: serde_json::Map<String, serde_json::Value> = theme
+            .tokens
+            .iter()
+            .map(|(token, color)| (token.clone(), serde_json::Value::from(color.clone())))
+            .collect();
+        let value = serde_json::json!({
+            "name": theme.name,
+            "variant": theme.variant.as_str(),
+            "tokens": tokens,
+        });
+        println!("{value}");
+        return;
+    }
+    println!(
+        "theme: {} ({}) · {} tokens",
+        theme.name,
+        theme.variant.as_str(),
+        theme.tokens.len()
+    );
+    println!("{:>24}  COLOR", "TOKEN");
+    for (token, color) in &theme.tokens {
+        println!("{token:>24}  {color}");
     }
 }
 

@@ -83,7 +83,13 @@ pub const COLOR_TOKENS: &[&str] = &[
 pub const NUMERIC_TOKENS: &[&str] = &["thinkingOpacity"];
 
 /// The two theme variants every token may carry.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+///
+/// `Serialize`/`Deserialize` because the variant travels on the wire with a
+/// theme's tokens (T-0116): a surface that asked for the light variant gets
+/// light back, and the spelling is the one the files and the CLI already use
+/// (`dark`/`light`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Variant {
     #[default]
     Dark,

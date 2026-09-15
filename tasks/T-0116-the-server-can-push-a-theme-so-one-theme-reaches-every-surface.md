@@ -3,7 +3,7 @@ id: T-0116
 title: The server can push a theme, so one theme reaches every surface
 phase: 3
 priority: 2
-status: proposed
+status: done
 depends_on: [T-0016, T-0104]
 scope:
   - crates/arreo-core/src/theme/**
@@ -12,6 +12,8 @@ scope:
   - crates/arreo-cli/src/main.rs
   - docs/themes.md
   - .loop/evidence/T-0116/**
+evidence:
+  - .loop/evidence/T-0116/theme-push.txt
 verify:
   - cargo test --workspace
   - cargo xtask e2e --slice theme
@@ -29,21 +31,21 @@ reaches the TUI, the phone and (later) the browser without a file on any of them
 
 ## Acceptance criteria
 
-- [ ] A socket verb asks for a theme by name (and variant), and the reply carries the theme
+- [x] A socket verb asks for a theme by name (and variant), and the reply carries the theme
       **as the resolved token map** — see the Design note below for why that and not the
       on-disk document.
-- [ ] The client applies it: the TUI can render a theme it received rather than only one it
+- [x] The client applies it: the TUI can render a theme it received rather than only one it
       found on disk, and `arreo theme export <name>` prints exactly what the verb returns, so
       the round trip is inspectable from the CLI.
-- [ ] An unknown theme name is a typed refusal naming the name; a machine with no theme
+- [x] An unknown theme name is a typed refusal naming the name; a machine with no theme
       configured answers with the built-in default rather than an error (the default is a
       working answer, not a failure).
-- [ ] **Depth fallback survives the wire** (T-0016's property): a phone on a 16-colour terminal
+- [x] **Depth fallback survives the wire** (T-0016's property): a phone on a 16-colour terminal
       and one on truecolor must get the right degradation from the same document, asserted at
       both depths.
-- [ ] N−1 per T-0028: the new fields are serde-defaulted, and the compat slice still passes in
+- [x] N−1 per T-0028: the new fields are serde-defaulted, and the compat slice still passes in
       both directions.
-- [ ] `docs/themes.md` records the wire shape and the one-document rule.
+- [x] `docs/themes.md` records the wire shape and the one-document rule.
 
 ## Design (decided by the planner — the contract)
 
@@ -84,3 +86,29 @@ inspectable from the CLI and the wire shape is testable without a phone.
   worker.
 - If the resolved-map shape turns out to be insufficient for some surface, the finding is
   recorded in the task file rather than a second format being added beside it.
+
+## Outcome
+
+Done. `Message::Theme { v, name, variant }` → `Message::ThemeReply { v, theme: ThemeTokens }`,
+where `ThemeTokens { name, variant, tokens }` carries **every value a literal color in the
+theme file's own spelling** — resolved, never a `defs` reference, never the on-disk document.
+The Design section above pinned that shape before dispatch, and the worker's third mutation is
+the proof it matters: shipping the document's own values reddens three server tests and both
+TUI received-theme checks, because **the client has no resolver** — which is the whole point.
+
+An unknown name is a typed refusal naming it and listing the built-ins; an unconfigured machine
+answers with the built-in default; the verb gates as `Verb::Read` and writes no audit row (reads
+are deliberately unaudited); `size_of::<Message>() == 112` still holds. The TUI renders a theme
+it *received* (fetching on a fresh connection, applying in the UI loop), `arreo theme export`
+prints exactly what the verb returns, and the slice grew from 33 to 43 checks with a
+pushed-theme fixture at both depths. Three mutations, all RED, none left green.
+
+**Integration the planner did:** the FFI's `WireMessage` mirrors `Message` variant for variant
+with an exhaustive match, so T-0116's two new variants were a compile error in
+`crates/arreo-core-ffi/src/codec.rs`. That tripwire is a feature — it forces a decision rather
+than letting the mirror fall behind — so it was honoured: `WireThemeTokens`, both variants,
+both match arms, and a round-trip test in `tests/theme_mirror.rs` (the exhaustive match catches
+a *missing* variant, not a *wrong* mapping; a mutation that drops the variant reddens it). Also
+three clippy findings the workers were correctly told not to chase.
+
+Full report, the wire shape, the three mutations and the pre-fix red: `.loop/evidence/T-0116/`.

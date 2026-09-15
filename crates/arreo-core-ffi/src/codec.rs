@@ -27,8 +27,10 @@ use arreo_core::proto::{
     AgentState, Message, MetricsPoint, PaneDetail, PaneInfo, SpawnSpec, SyncExchange, SyncOutcome,
     SyncStatus, MAX_FRAME_BYTES, MIN_VERSION, VERSION,
 };
+use arreo_core::theme::{Color, ThemeTokens, Variant};
 
 use crate::errors::CodecFfiError;
+use crate::theme::{color_parse, FfiVariant, ThemeToken};
 
 /// The protocol version this build speaks.
 #[uniffi::export]
@@ -340,6 +342,31 @@ impl From<WireNotifyAction> for NotifyAction {
     }
 }
 
+/// A theme's resolved tokens, as `Message::ThemeReply` carries them (T-0116).
+///
+/// **Resolved, not raw**: every value is a literal color the theme file's own
+/// spelling round-trips (`#rrggbb`, a 0–255 index, `none`) — never a `defs`
+/// reference, because the *server* resolves the file and the receiving surface owns
+/// depth. A mirror that carried the document would make every client carry the
+/// resolver, and each would be a place the resolution could diverge.
+#[derive(Debug, Clone, PartialEq, uniffi::Record)]
+pub struct WireThemeTokens {
+    pub name: String,
+    pub variant: FfiVariant,
+    /// `token -> color`, every value a literal.
+    pub tokens: Vec<ThemeToken>,
+}
+
+impl ThemeToken {
+    /// This token's color in the theme file's own spelling (`#rrggbb`, a 0–255
+    /// index, `none`) — the core's `Display`, so a caller that wants the text does
+    /// not re-invent the format.
+    #[must_use]
+    pub fn color_as_text(&self) -> String {
+        Color::from(self.color).to_string()
+    }
+}
+
 /// The one message enum, mirroring `arreo_core::proto::Message` variant for
 /// variant. Every variant carries `v`, the protocol version, exactly as the wire
 /// does.
@@ -520,6 +547,15 @@ pub enum WireMessage {
     },
     /// Server → client: the outcome of a `NotifyAct`.
     NotifyActReply { v: u32, ok: bool, detail: String },
+    /// Client → server: ask for a theme's resolved tokens (T-0116). An empty
+    /// `name` is "this machine's own theme".
+    Theme {
+        v: u32,
+        name: String,
+        variant: FfiVariant,
+    },
+    /// Server → client: the resolved tokens.
+    ThemeReply { v: u32, theme: WireThemeTokens },
 }
 
 /// `WireMessage` → the core's `Message`.
@@ -780,7 +816,52 @@ fn to_core(message: WireMessage) -> Result<Message, CodecFfiError> {
             text,
         },
         WireMessage::NotifyActReply { v, ok, detail } => Message::NotifyActReply { v, ok, detail },
+        WireMessage::Theme { v, name, variant } => Message::Theme {
+            v,
+            name,
+            variant: Variant::from(variant),
+        },
+        WireMessage::ThemeReply { v, theme } => Message::ThemeReply {
+            v,
+            theme: theme_from_wire(&theme),
+        },
     })
+}
+
+/// The wire's theme → the core's. A token whose color does not parse is dropped
+/// rather than guessed at: this direction decodes bytes a peer sent, and a theme
+/// with a missing token renders as the base default (the loader's own rule) while a
+/// color invented here would be a rendering nobody chose.
+fn theme_from_wire(wire: &WireThemeTokens) -> ThemeTokens {
+    ThemeTokens {
+        name: wire.name.clone(),
+        variant: Variant::from(wire.variant),
+        tokens: wire
+            .tokens
+            .iter()
+            // The theme file's own spelling, from the core's `Display` — never a
+            // format string written here.
+            .map(|token| (token.name.clone(), Color::from(token.color).to_string()))
+            .collect(),
+    }
+}
+
+/// The core's theme → the wire's.
+fn theme_to_wire(theme: &ThemeTokens) -> WireThemeTokens {
+    WireThemeTokens {
+        name: theme.name.clone(),
+        variant: FfiVariant::from(theme.variant),
+        tokens: theme
+            .tokens
+            .iter()
+            .filter_map(|(name, text)| {
+                color_parse(text.clone()).ok().map(|color| ThemeToken {
+                    name: name.clone(),
+                    color,
+                })
+            })
+            .collect(),
+    }
 }
 
 /// The core's `Message` → `WireMessage`. Infallible: `usize` widens to `u64`.
@@ -1059,6 +1140,15 @@ fn from_core(message: &Message) -> WireMessage {
             pane: pane.clone(),
             action: WireNotifyAction::from(*action),
             text: text.clone(),
+        },
+        Message::Theme { v, name, variant } => WireMessage::Theme {
+            v: *v,
+            name: name.clone(),
+            variant: FfiVariant::from(*variant),
+        },
+        Message::ThemeReply { v, theme } => WireMessage::ThemeReply {
+            v: *v,
+            theme: theme_to_wire(theme),
         },
         Message::NotifyActReply { v, ok, detail } => WireMessage::NotifyActReply {
             v: *v,

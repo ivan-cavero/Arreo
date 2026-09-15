@@ -23,6 +23,7 @@ use arreo_core::pty::{ExitState, Pane};
 use arreo_core::relay::config::WorktreeSettings;
 use arreo_core::state::{Adapter, AdapterRegistry, Confidence, Engine, Provenance, State};
 use arreo_core::sync::engine::{ReceiveOutcome, SyncEngine, SyncPayload};
+use arreo_core::theme::{Catalog, Variant, BASE_THEME};
 use std::collections::HashMap;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -3144,6 +3145,10 @@ fn verb_of(message: &Message) -> Verb {
         | Message::Snapshot { .. }
         | Message::Delta { .. } => Verb::Panes,
         Message::Read { .. } => Verb::Read,
+        // Reading the machine's theme is reading, exactly like a pane's text:
+        // a viewer-role device may be told what the machine looks like, and
+        // telling it is the whole point of the verb (T-0116).
+        Message::Theme { .. } => Verb::Read,
         Message::Attach { .. } | Message::Resume { .. } => Verb::Attach,
         Message::Wait { .. } => Verb::Wait,
         Message::Metrics { .. }
@@ -3191,6 +3196,10 @@ fn verb_of(message: &Message) -> Verb {
         // treatment as the other server→client shapes below.
         Message::Sync { .. } => Verb::Sync,
         Message::SyncReply { .. } => Verb::Admin,
+        // The resolved tokens are a server→client shape: a peer never sends
+        // one, so if it arrives the gate answers with the most privileged verb
+        // rather than guessing (the same rule as the other replies).
+        Message::ThemeReply { .. } => Verb::Admin,
         Message::Welcome { .. }
         | Message::Error { .. }
         | Message::Ok { .. }
@@ -3238,6 +3247,8 @@ fn op_name(message: &Message) -> &'static str {
         Message::MetricsReq { .. } => "metrics-req",
         Message::NotifyAct { .. } => "notify_act",
         Message::NotifyActReply { .. } => "notify_act_reply",
+        Message::Theme { .. } => "theme",
+        Message::ThemeReply { .. } => "theme_reply",
     }
 }
 
@@ -4090,6 +4101,17 @@ async fn dispatch(
             }
             Some(Message::PanesDetail { v: VERSION, panes })
         }
+        // The machine's theme, as resolved tokens (T-0116). A read-only verb
+        // like `Panes`, and handled here rather than in the session loop
+        // because nothing about it needs an identity: the discovery is
+        // filesystem work (`serve_theme` moves it off the async task), and the
+        // reply is the same `Option<Message>` the loop already writes.
+        Message::Theme { v, name, variant } => {
+            if let Err(reply) = check_version(*v) {
+                return Some(reply);
+            }
+            Some(serve_theme(name, *variant).await)
+        }
         Message::Send { v, id, data } => {
             if let Err(reply) = check_version(*v) {
                 return Some(reply);
@@ -4357,11 +4379,61 @@ async fn dispatch(
         | Message::SyncReply { .. }
         | Message::NotifyAct { .. }
         | Message::NotifyActReply { .. }
+        // `Theme` has a real arm above; `ThemeReply` is a server→client shape
+        // and reaches here only if a peer sends a reply as a request.
+        | Message::ThemeReply { .. }
         | Message::Ok { .. }
         | Message::Exited { .. } => Some(Message::Error {
             v: VERSION,
             message: format!("unexpected {} here", op_name(message)),
         }),
+    }
+}
+
+/// The theme a client asked this machine for (T-0116), as resolved tokens.
+///
+/// The whole point of the verb: the *machine* resolves the theme, on its own
+/// filesystem — a phone has no theme directory and a browser will not, so the
+/// catalog is discovered here (`Catalog::default_dirs`, the same hierarchy the
+/// TUI reads) and only the flat `token -> color` table crosses the socket. The
+/// work is `spawn_blocking`: discovery is a `read_dir` plus a read per file, and
+/// that has no business on a session's async task.
+///
+/// The two answers that are not a theme:
+///
+/// - **An empty name is a question, not a typo.** "What is this machine's
+///   theme?" is what a surface with no theme of its own asks, and it is answered
+///   with the built-in default: the machine has no *configured* theme (there is
+///   no such setting), so the look that ships in the binary is the honest
+///   answer — a working answer, never an error.
+/// - **A name this machine does not have is a typed refusal naming the name**,
+///   with the loader's own sentence (which also lists the built-ins) rather than
+///   a substitute theme: a client that asked for `solarized` and silently got
+///   `arreo` would have no way to learn its theme is not the one it asked for.
+async fn serve_theme(name: &str, variant: Variant) -> Message {
+    let wanted = name.to_string();
+    let resolved = tokio::task::spawn_blocking(move || {
+        if wanted.is_empty() {
+            return Catalog::builtin().tokens(BASE_THEME, variant);
+        }
+        Catalog::discover(&Catalog::default_dirs()).tokens(&wanted, variant)
+    })
+    .await;
+    match resolved {
+        Ok(Ok(tokens)) => Message::ThemeReply {
+            v: VERSION,
+            theme: tokens,
+        },
+        // The loader's sentence names the theme (`theme "solarized" not found
+        // (built-ins: …)`) or the file and the schema error it hit.
+        Ok(Err(e)) => Message::Error {
+            v: VERSION,
+            message: e.to_string(),
+        },
+        Err(e) => Message::Error {
+            v: VERSION,
+            message: format!("theme {name:?}: {e}"),
+        },
     }
 }
 

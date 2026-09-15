@@ -1,0 +1,101 @@
+T-0116 — The server can push a theme, so one theme reaches every surface
+========================================================================
+
+ROADMAP §3.5's "themes from the server's JSON (one theme, every surface)". Until now a
+theme reached a client only by *discovering files in a directory* — a filesystem, which a
+phone does not have and a browser will not. The server can now send one.
+
+WHAT SHIPPED
+------------
+crates/arreo-core/src/theme/mod.rs      ThemeTokens + TokenError (+4 tests)
+crates/arreo-core/src/theme/schema.rs   Variant gains Serialize/Deserialize (snake_case)
+crates/arreo-core/src/theme/loader.rs   Catalog::tokens (+1 test)
+crates/arreo-core/src/proto/message.rs  Message::Theme { v, name, variant } /
+                                        Message::ThemeReply { v, theme: ThemeTokens }
+crates/arreo-core/src/proto/codec.rs    classify_op: theme=Request, theme_reply=Event
+crates/arreo-core/tests/compat.rs       the_theme_pair_follows_the_n_1_rules
+crates/arreo-server/src/daemon.rs       serve_theme, dispatch arm, verb_of/op_name/fallback
+crates/arreo-server/tests/theme_push.rs 5 live-daemon tests
+crates/arreo-cli/src/main.rs            cmd_theme/print_theme, dispatch, usage
+crates/arreo-tui/src/theme.rs           ThemeState::apply_received (+1 test)
+crates/arreo-tui/src/main.rs            Poll::Theme, WantedTheme, fetch on fresh connection
+xtask/src/theme_slice.rs                pushed-theme fixture + 11 new checks (33 -> 43)
+docs/themes.md                          the wire shape and the one-document rule
+crates/arreo-core-ffi/src/codec.rs      the mirror arms (integrator — see below)
+crates/arreo-core-ffi/tests/theme_mirror.rs  the mirror's round trip (integrator)
+
+THE WIRE SHAPE — THE DESIGN PINNED BEFORE DISPATCH, AND WHY
+-----------------------------------------------------------
+`theme` → `theme_reply`. The reply carries `ThemeTokens { name, variant, tokens }` with
+every value a **literal color in the theme file's own spelling** (`#rrggbb`, a 0–255
+index, `none`) — resolved, never a `defs` reference, and never the on-disk document.
+
+The first draft of this task's criterion said "the same shape `brand.rs` already parses".
+Probing the engine showed that names the wrong format, and the difference decides the
+design: there are two JSON formats and neither is the right payload. `theme/schema.rs`'s
+`RawTheme` is the on-disk file (`$schema`, `defs` with named references, per-token
+per-variant values), and `theme/brand.rs` parses the brand document, which is a design
+artifact rather than a user theme. Sending either would push the `defs` resolution, the
+token-name validation and the per-variant unwrapping onto every client — so a phone and a
+browser would each carry the resolver and each be a place it could diverge. The engine
+already separates those steps (`schema::resolve` → `BTreeMap<String, Color>` →
+`Theme::new`), and **that resolved map is what crosses**.
+
+It is also what makes depth fallback a *client-side* property, which is the criterion that
+would otherwise be lost by moving resolution to the server: the same document degrades
+differently on a 16-colour terminal and a truecolor one.
+
+Answers, per the criteria: an unknown name is a **typed refusal naming the name** and
+listing the built-ins; an unconfigured machine answers with the built-in default (the
+default is a working answer, not a failure); the verb gates as `Verb::Read` and writes no
+audit row (reads are deliberately unaudited); `size_of::<Message>() == 112` still holds
+(the pinned budget — `ThemeReply` carries `ThemeTokens` inline).
+
+TESTS AND THE PRE-FIX RED
+-------------------------
+The 5 live-daemon tests were run against the daemon with the verb unimplemented and all 5
+failed loudly (`want a ThemeReply, got Error { message: "unexpected theme here" }`).
+
+MUTATIONS — three, all RED, none left green
+-------------------------------------------
+A  depth fallback broken (`to_theme` ignores `depth`, always Truecolor)
+     → core unit RED ("a 16-colour client must get a palette index, got Rgb(232, 180, 90)")
+     → slice RED: 36 passed / 7 failed, including "legacy-16color renders the theme it
+       received: Ansi(10) never reached the pty"
+B  an unknown name falls back to the built-in instead of refusing
+     → server test RED; slice RED: "an unknown theme is refused, naming it: theme: arreo
+       (dark) · 58 tokens"
+C  the reply ships the document's own values (defs unresolved)
+     → 3 server tests RED; slice RED: "every token on the wire is a literal color…:
+       unresolved: \"text=pushedPaper\"", and both TUI received-theme checks fail —
+       **the client has no resolver**, which is exactly the design's point
+
+INTEGRATION WORK THE PLANNER DID (not the worker's)
+---------------------------------------------------
+1. **The FFI codec mirror.** `WireMessage` mirrors `Message` variant for variant and
+   `from_core`'s match is exhaustive, so T-0116's two new variants were a **compile error**
+   in `crates/arreo-core-ffi/src/codec.rs`. That tripwire is a feature — it forces a
+   decision instead of letting the mirror fall behind — so it was honoured rather than
+   worked around: `WireThemeTokens` + the two variants + both match arms, with the theme
+   spelled through the core's own `Color`/`Display` (never a format string written in the
+   FFI). `ThemeToken::color_as_text` gives callers that spelling without re-inventing it.
+2. **`tests/theme_mirror.rs`** — the exhaustive match catches a *missing* variant, not a
+   *wrong* mapping, so the round trip is asserted: request and reply encode → decode
+   unchanged, every token present with its color, and the values are the file's own
+   spelling (`["#121418", "10", "none"]`). Mutation: the mirror drops the variant
+   (`variant: Variant::Dark` unconditionally) → RED with
+   `left: Theme { … variant: Dark }, right: Theme { … variant: Light }`. The test was kept
+   in its own file so the two units could be committed as separate deliverables.
+3. **Three clippy findings** the workers were (correctly) told not to chase: `&PathBuf` in
+   `theme_push.rs`, a `filter_map` that had become a `map` in the mirror, and a
+   single-pattern `match` in `theme_slice.rs`.
+
+BATTERY (integrated tree — both units and the integration work)
+---------------------------------------------------------------
+cargo test --workspace: 954 passed / 0 failed.
+clippy --workspace --all-targets: 0 findings (pinned + stable). fmt clean.
+14/14 slices — **theme 43** (was 33: the pushed-theme fixture and its 11 checks), api 2
+suites, tui 103, update 27, persistence 6, mesh 36+1, handoff-abort 41, worktree 9, compat
+both directions, lifecycle 2, reattach 11, enforcement, relay 20, chaos 8.
+sync 14/14. vet 375. deny 4/4. audit 0. check-targets PASS/SKIP.
+bench 6/6 (19 MB RSS, 211 KB/pane, 0 ms detect, 65 ms sweep).

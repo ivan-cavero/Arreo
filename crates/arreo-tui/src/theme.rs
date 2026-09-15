@@ -7,7 +7,9 @@
 //! [`arreo_core::theme::Theme`] — every widget goes through it, so switching
 //! themes (or depths) is a data swap, not a re-render rewrite.
 
-use arreo_core::theme::{Catalog, Color, Depth, LoadError, Theme, Variant};
+use arreo_core::theme::{
+    Catalog, Color, Depth, LoadError, Theme, ThemeTokens, TokenError, Variant,
+};
 use ratatui::style::{Color as UiColor, Modifier, Style};
 
 /// A resolved theme plus the catalog it came from (the picker's data).
@@ -117,6 +119,23 @@ impl ThemeState {
         let theme = self
             .catalog
             .theme_with_depth(name, self.variant, self.depth)?;
+        self.theme = theme;
+        Ok(())
+    }
+
+    /// Install a theme that arrived over the wire (T-0116), quantized for **this
+    /// surface's** depth.
+    ///
+    /// The point of the verb: a phone has no theme directory and a browser will
+    /// not, so the theme a surface renders is the one the machine sent. Depth is
+    /// applied here, locally (`ThemeTokens::to_theme`), which is what makes one
+    /// document correct on a 16-colour terminal and a truecolor one.
+    ///
+    /// The local catalog is deliberately untouched: it stays what the picker
+    /// lists and what [`ThemeState::select`] resolves, so a theme that arrived
+    /// over the wire does not become a file this process claims to have.
+    pub fn apply_received(&mut self, tokens: &ThemeTokens) -> Result<(), TokenError> {
+        let theme = tokens.to_theme(self.depth)?;
         self.theme = theme;
         Ok(())
     }
@@ -241,6 +260,59 @@ mod tests {
             state.theme().name(),
             before,
             "a failed switch must not blank the UI"
+        );
+    }
+
+    /// **A received theme renders at this terminal's depth** (T-0116): the
+    /// document carries the authored colors, and the surface quantizes — so the
+    /// same reply is a 24-bit palette here and a 16-colour one on a legacy
+    /// terminal.
+    #[test]
+    fn a_received_theme_is_quantized_for_this_terminal() {
+        let received = ThemeTokens {
+            name: "pushed".to_string(),
+            variant: Variant::Dark,
+            tokens: std::collections::BTreeMap::from([
+                ("question".to_string(), "#00ff00".to_string()),
+                ("text".to_string(), "none".to_string()),
+            ]),
+        };
+
+        let mut truecolor = ThemeState::with_depth(Depth::Truecolor, Variant::Dark);
+        truecolor
+            .apply_received(&received)
+            .expect("a received theme applies");
+        assert_eq!(truecolor.theme().name(), "pushed");
+        assert_eq!(truecolor.color("question"), UiColor::Rgb(0x00, 0xff, 0x00));
+        assert_eq!(truecolor.color("text"), UiColor::Reset);
+
+        let mut sixteen = ThemeState::with_depth(Depth::Ansi16, Variant::Dark);
+        sixteen
+            .apply_received(&received)
+            .expect("a received theme applies");
+        match sixteen.color("question") {
+            UiColor::Indexed(index) => assert!(index < 16, "{index} is not a legacy color"),
+            other => panic!("a 16-colour surface got {other:?}"),
+        }
+
+        // A document that cannot be rendered leaves the current theme alone:
+        // the UI keeps a working look and the caller has the reason.
+        let broken = ThemeTokens {
+            name: "broken".to_string(),
+            variant: Variant::Dark,
+            tokens: std::collections::BTreeMap::from([(
+                "question".to_string(),
+                "darkQuestion".to_string(),
+            )]),
+        };
+        let err = sixteen
+            .apply_received(&broken)
+            .expect_err("a def name is not a color");
+        assert!(err.to_string().contains("darkQuestion"), "{err}");
+        assert_eq!(
+            sixteen.theme().name(),
+            "pushed",
+            "a refused document must not blank the UI"
         );
     }
 }

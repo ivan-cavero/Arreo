@@ -365,6 +365,11 @@ enum Poll {
     /// (T-0074's fingerprint confirmation). Boxed: a `GrantPreview` carries a
     /// device key and a rendered line, and the channel carries many polls.
     ConfirmGrant(Box<GrantPreview>),
+    /// The machine's theme, as the daemon answered it (T-0116), or `None` when
+    /// it did not answer — an older daemon refuses the unknown verb, the name is
+    /// not one it has, or the request never reached it. `None` is not an error:
+    /// the local catalog is what this process rendered before the verb existed.
+    Theme(Option<arreo_core::theme::ThemeTokens>),
 }
 
 /// A verb the UI wants run on the daemon connection the poller already holds
@@ -406,6 +411,17 @@ struct ThemeRequest {
     theme: Option<String>,
     variant: Option<Variant>,
     depth: Option<Depth>,
+}
+
+/// The theme this run asks its machine for (T-0116).
+///
+/// `name` empty is a question rather than a typo — "what is this machine's
+/// theme?" — which is what a surface with no theme of its own asks, and what an
+/// unconfigured machine answers with the built-in default.
+#[derive(Debug, Clone)]
+struct WantedTheme {
+    name: String,
+    variant: Variant,
 }
 
 /// The opt-in exit as this run resolved it (T-0073): the flag's answer over the
@@ -523,7 +539,8 @@ async fn run(
     app.role = identity.role;
     app.device = identity.device;
     let depth = request.depth.unwrap_or_else(Depth::detect);
-    app.theme = ThemeState::with_depth(depth, request.variant.unwrap_or_default());
+    let variant = request.variant.unwrap_or_default();
+    app.theme = ThemeState::with_depth(depth, variant);
     // `[tui]` settings (T-0076, T-0073): from the same config file the daemon
     // reads, plus what the terminal itself decides (NO_COLOR implies still).
     // Resolved by `main`, because the opt-in exit has to be known before the
@@ -538,6 +555,12 @@ async fn run(
     // only ever used when the opt-in was honored — which a remote target never
     // reaches.
     let local_socket = fleet.socket.clone();
+    // The local catalog is the *fallback* (T-0116): the machine's own theme
+    // arrives over the poller's connection a moment after this and replaces
+    // whatever was resolved here, because the machine's theme is what every
+    // surface is supposed to share. This runs first so a daemon that is not up
+    // yet — or one that has never heard of the verb — leaves exactly the look
+    // this process has always had.
     if let Some(name) = request.theme.as_deref() {
         if let Err(e) = app.theme.select(name) {
             // A bad --theme is worth saying out loud, not silently ignoring.
@@ -562,11 +585,21 @@ async fn run(
     // connection (T-0074): one connection, one audit attribution.
     let (commands, command_rx) = tokio::sync::mpsc::channel::<Command>(8);
     let subscription = Arc::new(Mutex::new(Subscription::default()));
+    // The theme to ask this machine for (T-0116): the name this run wants, or
+    // the empty string for "the machine's own theme". It rides the poller's
+    // connection rather than opening one of its own — one connection, one audit
+    // attribution (the same rule the T-0074 verbs follow), and on a remote
+    // machine no extra session appears in the far end's audit trail.
+    let wanted_theme = WantedTheme {
+        name: request.theme.clone().unwrap_or_default(),
+        variant,
+    };
     let poller = tokio::spawn(poll_daemon(
         target.clone(),
         tx.clone(),
         command_rx,
         Arc::clone(&subscription),
+        wanted_theme,
     ));
 
     let mut needs_draw = true;
@@ -652,6 +685,19 @@ async fn run(
                     app.status = format!("daemon unreachable: {e}");
                 }
                 Poll::Status(line) => app.status = line,
+                // The machine's theme (T-0116): the same document every other
+                // surface gets, quantized for *this* terminal by
+                // `apply_received`. `None` means the machine did not answer,
+                // and the local catalog resolved at startup stands — which is
+                // exactly how this process rendered before the verb existed.
+                Poll::Theme(Some(tokens)) => {
+                    if let Err(e) = app.theme.apply_received(&tokens) {
+                        // A document this surface cannot render is worth saying
+                        // out loud; the current theme is kept.
+                        app.status = format!("theme {}: {e}", tokens.name);
+                    }
+                }
+                Poll::Theme(None) => {}
                 Poll::Result(line) => {
                     // Held until the next keypress: a sentence the frame never
                     // painted was never a sentence at all.
@@ -1011,6 +1057,7 @@ async fn poll_daemon(
     tx: tokio::sync::mpsc::Sender<Poll>,
     mut commands: tokio::sync::mpsc::Receiver<Command>,
     subscription: Arc<Mutex<Subscription>>,
+    wanted_theme: WantedTheme,
 ) {
     let mut tick = tokio::time::interval(Duration::from_secs(1));
     let mut attempt: u32 = 0;
@@ -1025,6 +1072,28 @@ async fn poll_daemon(
                     let _ = tx
                         .send(Poll::Status(format!("connected to {}", target.describe())))
                         .await;
+                    // The machine's theme, asked on every fresh connection
+                    // (T-0116): the same connection the sidebar rides, so the
+                    // verb costs no second session and, on a remote machine, no
+                    // extra connect/disconnect pair in the far end's audit
+                    // trail. An answer that never comes — an older daemon
+                    // refusing the unknown verb, a name it does not have, a
+                    // carrier that dies first — is `None`, and the local
+                    // catalog this process already resolved stands.
+                    if let Some(active) = conn.as_mut() {
+                        let answer = active
+                            .call(&Message::Theme {
+                                v: VERSION,
+                                name: wanted_theme.name.clone(),
+                                variant: wanted_theme.variant,
+                            })
+                            .await;
+                        let received = match answer {
+                            Ok(Message::ThemeReply { theme, .. }) => Some(theme),
+                            _ => None,
+                        };
+                        let _ = tx.send(Poll::Theme(received)).await;
+                    }
                 }
                 Err(e) => {
                     let delay = report_disconnected(&tx, &target, attempt, &e).await;

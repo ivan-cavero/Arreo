@@ -65,6 +65,29 @@ const SHAPES: &[Shape] = &[
     },
 ];
 
+/// The theme **only the daemon can see** (T-0116), and the fixture that makes
+/// the push provable: the slice starts the server with `ARREO_THEME_DIR`
+/// pointing at a directory nothing else in this process reads, so a surface that
+/// renders this theme received it over the socket rather than finding it on
+/// disk.
+///
+/// The shape is deliberately the awkward one: `defs` (so the wire has to carry
+/// the *resolution*, not the document) and three tokens (so the base look's
+/// inheritance is the server's work too). The question hue is one no built-in
+/// carries, so the color a terminal shows is evidence of *this* document.
+const PUSHED_NAME: &str = "pushed";
+const PUSHED_DEF: &str = "pushedInk";
+const PUSHED_QUESTION: &str = "#00ff00";
+const PUSHED_THEME: &str = r##"{
+    "$schema": "https://opencode.ai/theme.json",
+    "defs": { "pushedInk": "#123456", "pushedPaper": "#f0f0f0" },
+    "theme": {
+        "primary": "pushedInk",
+        "question": "#00ff00",
+        "text": { "dark": "pushedPaper", "light": "#101010" }
+    }
+}"##;
+
 pub fn run(rest: &[String]) -> ExitCode {
     let evidence = rest.iter().any(|a| a == "--interactive-evidence");
     let evidence_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -178,7 +201,27 @@ pub fn run(rest: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     }
-    let server = match TestServer::spawn(&server_bin, &socket, "server start") {
+    // The daemon's own theme directory (T-0116), written before it starts.
+    let pushed_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("workspace root")
+        .join("target")
+        .join("test-scratch")
+        .join("T-0116")
+        .join("slice-themes");
+    let _ = std::fs::remove_dir_all(&pushed_dir);
+    std::fs::create_dir_all(&pushed_dir).expect("scratch theme dir");
+    std::fs::write(pushed_dir.join(format!("{PUSHED_NAME}.json")), PUSHED_THEME)
+        .expect("write the pushed theme");
+    let server = match TestServer::spawn_with_env(
+        &server_bin,
+        &socket,
+        "server start",
+        // T-0116: the pushed theme is the *daemon's*, and nothing else in this
+        // process reads this directory — which is what makes "the TUI rendered
+        // it" evidence of a received theme rather than a discovered one.
+        &[("ARREO_THEME_DIR", pushed_dir.to_str().expect("utf-8 path"))],
+    ) {
         Ok(server) => server,
         Err(code) => return code,
     };
@@ -508,6 +551,142 @@ pub fn run(rest: &[String]) -> ExitCode {
     );
 
     drop(session);
+
+    // ---- Layer 5: the machine pushes a theme (T-0116) ------------------------
+    //
+    // One theme, every surface: the daemon resolves a theme *it* has and sends
+    // the tokens, and a surface with no theme file of its own renders them.
+    // Both halves are judged here on the real binaries — the CLI prints exactly
+    // what the verb returns, and the TUI paints a theme it *received* — at both
+    // depths, which is T-0016's property carried across the wire.
+    //
+    // The fixture is the daemon's alone (`ARREO_THEME_DIR` was set for the
+    // server process and for nothing else), so a render here cannot be a file
+    // this process discovered. That guard is asserted first: if the theme ever
+    // became visible locally, every check below would pass for the wrong reason.
+    check(
+        "the pushed theme is not on this process's own hierarchy",
+        !Catalog::discover(&Catalog::default_dirs()).contains(PUSHED_NAME),
+        "the fixture is visible locally, so nothing here proves it came over the wire",
+    );
+
+    let pushed_question = Color::parse(PUSHED_QUESTION).expect("the fixture's question hue");
+
+    // (a) `arreo theme export pushed`: the CLI cannot resolve this name on its
+    //     own, so what it prints is the daemon's answer.
+    let (ok, out) = cli(&cli_bin, &socket, &["theme", "export", PUSHED_NAME]);
+    check(
+        "arreo theme export prints what the verb returns",
+        ok && out.contains(&format!("{PUSHED_NAME} (dark)")) && out.contains(PUSHED_QUESTION),
+        &out,
+    );
+    // …and every value it printed is a *literal* color. A `defs` name in the
+    // output would mean the raw document crossed the wire for the client to
+    // resolve — the shape this verb exists to avoid.
+    let mut literals = 0usize;
+    let mut unresolved = String::new();
+    for line in out.lines().skip(2) {
+        let mut parts = line.split_whitespace();
+        // A token line is exactly `<token> <color>`: a third field means the
+        // output is not the shape a client consumes, and it is ignored here rather
+        // than counted (the check below asserts on what was counted).
+        if let (Some(token), Some(color), None) = (parts.next(), parts.next(), parts.next()) {
+            literals += 1;
+            if Color::parse(color).is_err() {
+                unresolved = format!("{token}={color}");
+            }
+        }
+    }
+    check(
+        "every token on the wire is a literal color, not a def reference",
+        unresolved.is_empty() && literals > 10 && !out.contains(PUSHED_DEF),
+        &format!("{literals} token lines, unresolved: {unresolved:?}"),
+    );
+    // The round trip is inspectable in the shape a client consumes, too.
+    let (json_ok, json_out) = cli(
+        &cli_bin,
+        &socket,
+        &["theme", "export", PUSHED_NAME, "--json"],
+    );
+    check(
+        "--json prints the wire shape (name, variant, token → color)",
+        json_ok
+            && json_out.contains(&format!("\"name\":\"{PUSHED_NAME}\""))
+            && json_out.contains("\"variant\":\"dark\"")
+            && json_out.contains(&format!("\"question\":\"{PUSHED_QUESTION}\"")),
+        &json_out,
+    );
+    // A machine with no theme configured answers the built-in default, and an
+    // unknown name is refused naming the name — neither is an error page.
+    let (default_ok, default_out) = cli(&cli_bin, &socket, &["theme", "export"]);
+    check(
+        "an unconfigured machine answers with the built-in default",
+        default_ok && default_out.contains("theme: arreo (dark)"),
+        &default_out,
+    );
+    let (refused_ok, refused_out) = cli(&cli_bin, &socket, &["theme", "export", "solarized"]);
+    check(
+        "an unknown theme is refused, naming it",
+        !refused_ok && refused_out.contains("solarized"),
+        &refused_out,
+    );
+
+    // (b) The TUI renders the received theme at both depths: **one document,
+    //     two terminals** — the degradation happens at the receiving surface,
+    //     which is what makes a 16-colour phone and a truecolor one correct from
+    //     the same reply.
+    for shape in SHAPES
+        .iter()
+        .filter(|shape| shape.depth == Depth::Truecolor || shape.depth == Depth::Ansi16)
+    {
+        let Some(session) =
+            TuiSession::start_with(&tui_bin, &socket, &["--theme", PUSHED_NAME], shape.env)
+        else {
+            println!(
+                "[FAIL] theme: could not start the TUI for the pushed theme ({})",
+                shape.name
+            );
+            return ExitCode::FAILURE;
+        };
+        std::thread::sleep(Duration::from_secs(3));
+        let raw = session.transcript();
+        let screen = session.screen();
+        if evidence {
+            let _ = std::fs::write(
+                evidence_dir.join(format!("pushed-{}.txt", shape.name)),
+                &screen,
+            );
+            let _ = std::fs::write(
+                evidence_dir.join(format!("pushed-{}.raw", shape.name)),
+                &raw,
+            );
+        }
+        let expected = pushed_question.quantize(shape.depth);
+        check(
+            &format!(
+                "{} renders the theme it received (the daemon's question hue)",
+                shape.name
+            ),
+            carries_color(&raw, expected),
+            &format!("{expected:?} never reached the pty: the pushed theme was not applied"),
+        );
+        check(
+            &format!("{} degrades the received document locally", shape.name),
+            match shape.depth {
+                // The authored 24-bit color, because this terminal can show it.
+                Depth::Truecolor => contains_subslice(&raw, b"\x1b[38;2;"),
+                // The terminal's own palette only: never a 24-bit sequence, and
+                // every index inside the 16 the legacy shape has.
+                Depth::Ansi16 => {
+                    !contains_subslice(&raw, b"\x1b[38;2;")
+                        && palette_indices(&raw).all(|index| index < 16)
+                }
+                Depth::Ansi256 | Depth::NoColor => true,
+            },
+            "the received document was rendered at the wrong depth",
+        );
+    }
+
     drop(server);
     let _ = std::fs::remove_file(&socket);
     let mut db = socket.into_os_string();

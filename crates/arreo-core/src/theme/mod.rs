@@ -7,8 +7,9 @@
 //!
 //! Layout: [`color`] owns the color model and terminal capability detection,
 //! [`schema`] owns the file format and its validation, [`loader`] finds and
-//! merges theme files (built-in → user → project → cwd), and [`Theme`] is
-//! what the UI consumes.
+//! merges theme files (built-in → user → project → cwd), [`Theme`] is what the
+//! UI consumes, and [`ThemeTokens`] is the resolved table that crosses the wire
+//! so a surface with no theme directory renders the machine's theme (T-0116).
 
 pub mod brand;
 pub mod color;
@@ -152,6 +153,94 @@ impl Default for Theme {
     }
 }
 
+/// One theme's resolved token map: the shape that crosses the wire (T-0116).
+///
+/// **Resolved, not raw, and that is the whole point.** The theme engine has two
+/// JSON shapes and neither is what a client should receive. `schema::RawTheme`
+/// is the *on-disk* file: `defs` (named color references), per-token per-variant
+/// values, and no serializer at all. `brand` parses the brand document, which is
+/// a design artifact rather than a user theme. Sending either would push the
+/// `defs` resolution, the token-name validation and the variant unwrapping onto
+/// every surface — a phone and a browser would each carry the resolver, and each
+/// would be a place the resolution could diverge, which is the opposite of "one
+/// theme, every surface". `schema::resolve` already produces exactly the flat
+/// table `Theme::new` takes, so **that table is what travels**: a surface builds
+/// its theme from the reply with no resolver of its own.
+///
+/// **Depth is not on the wire.** The tokens are the theme file's own colors,
+/// unquantized; [`ThemeTokens::to_theme`] is where a surface applies *its*
+/// capability. That is what makes one document render correctly on a 16-colour
+/// terminal and a truecolor one (T-0016's property, asserted at both depths) —
+/// a document quantized at the sender would show the 16-colour approximation on
+/// the truecolor surface, one theme with two looks.
+///
+/// Each color travels as the spelling the theme files already use
+/// (`#rrggbb`, a palette index, or `none`), which `Color::parse` reads back
+/// exactly — so the wire is inspectable by a human and by `arreo theme export`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ThemeTokens {
+    pub name: String,
+    pub variant: Variant,
+    /// `token -> color`, every value a literal: `Catalog::tokens` resolves the
+    /// file before anything is sent.
+    pub tokens: BTreeMap<String, String>,
+}
+
+impl ThemeTokens {
+    /// An already-resolved theme's tokens, as the wire spells them.
+    #[must_use]
+    pub fn from_theme(theme: &Theme) -> Self {
+        Self {
+            name: theme.name.clone(),
+            variant: theme.variant,
+            tokens: theme
+                .colors
+                .iter()
+                .map(|(token, color)| (token.clone(), color.to_string()))
+                .collect(),
+        }
+    }
+
+    /// The theme these tokens describe, quantized for `depth` — the client half
+    /// of the verb.
+    ///
+    /// No token-name validation happens here, deliberately: the server resolved
+    /// and validated the file, and a client re-validating would be a second
+    /// place the rule could live. What *is* checked is the one thing a client
+    /// can check on its own: that each value is a color. A `defs` reference
+    /// arriving here (which is what a raw document would produce) is refused by
+    /// name rather than painted as a guess.
+    pub fn to_theme(&self, depth: Depth) -> Result<Theme, TokenError> {
+        let mut colors = BTreeMap::new();
+        for (token, value) in &self.tokens {
+            let color = Color::parse(value).map_err(|_| TokenError::BadColor {
+                theme: self.name.clone(),
+                token: token.clone(),
+                value: value.clone(),
+            })?;
+            colors.insert(token.clone(), color);
+        }
+        Ok(Theme::new(self.name.clone(), self.variant, depth, colors))
+    }
+
+    /// One token's color as the wire spells it.
+    #[must_use]
+    pub fn color(&self, token: &str) -> Option<&str> {
+        self.tokens.get(token).map(String::as_str)
+    }
+}
+
+/// A received token map that cannot become a theme.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum TokenError {
+    #[error("theme {theme:?} token {token:?} is not a color: {value:?}")]
+    BadColor {
+        theme: String,
+        token: String,
+        value: String,
+    },
+}
+
 /// Render the theme as a standalone HTML reference from the same token table
 /// the TUI reads. Used by `xtask e2e --slice theme` (shared-token check) and
 /// by the docs build.
@@ -263,6 +352,116 @@ mod tests {
         assert_eq!(truecolor.color("primary"), Color::Rgb(0x6f, 0xd3, 0xe8));
         let no_color = theme.with_depth(Depth::NoColor);
         assert_eq!(no_color.color("primary"), Color::None);
+    }
+
+    /// **The wire carries the resolution, not the document** (T-0116).
+    ///
+    /// `RawTheme` is the on-disk shape: `defs` plus per-token, per-variant
+    /// values that may be *references* into `defs`. A client handed that would
+    /// need the resolver, the token-name validation and the variant unwrapping
+    /// — three places per surface for the resolution to diverge, which is the
+    /// opposite of one theme on every surface. What [`Catalog::tokens`]
+    /// produces is the flat table `Theme::new` already takes, so a client
+    /// builds its theme from the reply with no resolver at all.
+    #[test]
+    fn the_wire_carries_resolved_tokens_not_the_document() {
+        let tokens = Catalog::builtin()
+            .tokens("arreo", Variant::Dark)
+            .expect("arreo resolves");
+        let raw: crate::theme::schema::RawTheme =
+            serde_json::from_str(include_str!("../../themes/arreo.json")).expect("built-in JSON");
+        assert!(
+            !raw.defs.is_empty(),
+            "the fixture proves nothing without defs"
+        );
+        // Every value is a literal color a client can parse — no references.
+        for (token, value) in &tokens.tokens {
+            Color::parse(value).unwrap_or_else(|e| panic!("{token}={value:?}: {e}"));
+        }
+        // No `defs` name crossed the wire: the resolution happened here.
+        for def in raw.defs.keys() {
+            assert!(
+                !tokens.tokens.values().any(|value| value == def),
+                "def {def:?} travelled unresolved"
+            );
+        }
+        // And it is the file's own resolution, not a re-derived approximation.
+        assert_eq!(tokens.color("question"), Some("#e8b45a"));
+    }
+
+    /// **One document, both depths** (T-0116: T-0016's property over the wire).
+    ///
+    /// The tokens are the theme file's own colors and the *receiving surface*
+    /// applies its depth, so the same received document is correct on a
+    /// 16-colour terminal and on a truecolor one. A server that quantized
+    /// before sending would make the truecolor surface show the 16-colour
+    /// approximation — one theme, two looks — and this test red.
+    #[test]
+    fn one_received_document_renders_at_both_depths() {
+        let tokens = Catalog::builtin()
+            .tokens("arreo", Variant::Dark)
+            .expect("arreo resolves");
+        let authored = Color::Rgb(0xe8, 0xb4, 0x5a);
+        assert_eq!(
+            tokens.color("question"),
+            Some("#e8b45a"),
+            "the wire carries the authored color, unquantized"
+        );
+
+        let truecolor = tokens.to_theme(Depth::Truecolor).expect("client builds");
+        assert_eq!(truecolor.color("question"), authored);
+
+        let sixteen = tokens.to_theme(Depth::Ansi16).expect("client builds");
+        let Color::Ansi(index) = sixteen.color("question") else {
+            panic!(
+                "a 16-colour client must get a palette index, got {:?}",
+                sixteen.color("question")
+            );
+        };
+        assert!(index < 16, "outside the terminal's own palette: {index}");
+        assert_eq!(sixteen.color("question"), authored.quantize(Depth::Ansi16));
+
+        // Depth is the surface's, never the document's: the same reply holds
+        // the same colors on both.
+        assert_eq!(
+            truecolor.colors(),
+            sixteen.colors(),
+            "depth must not change the received document"
+        );
+    }
+
+    /// A token value that is not a color is refused by the **client**, naming
+    /// the token — which is exactly what a raw document would produce: a `defs`
+    /// reference is a bare word, and a client with no resolver must say so
+    /// rather than paint a guess.
+    #[test]
+    fn a_received_token_that_is_not_a_color_is_refused() {
+        let tokens = ThemeTokens {
+            name: "half".to_string(),
+            variant: Variant::Dark,
+            tokens: BTreeMap::from([
+                ("question".to_string(), "darkQuestion".to_string()),
+                ("text".to_string(), "#ffffff".to_string()),
+            ]),
+        };
+        let error = tokens
+            .to_theme(Depth::Truecolor)
+            .expect_err("a def name is not a color");
+        assert!(error.to_string().contains("darkQuestion"), "{error}");
+        assert!(error.to_string().contains("question"), "{error}");
+    }
+
+    #[test]
+    fn a_theme_round_trips_through_the_wire_shape() {
+        let theme = Theme::arreo(Depth::Truecolor);
+        let tokens = ThemeTokens::from_theme(&theme);
+        assert_eq!(tokens.name, "arreo");
+        assert_eq!(tokens.variant, Variant::Dark);
+        assert_eq!(tokens.tokens.len(), theme.colors().len());
+        let rebuilt = tokens.to_theme(Depth::Truecolor).expect("rebuild");
+        assert_eq!(rebuilt.colors(), theme.colors());
+        assert_eq!(rebuilt.color("primary"), theme.color("primary"));
+        assert_eq!(rebuilt.name(), theme.name());
     }
 
     #[test]
