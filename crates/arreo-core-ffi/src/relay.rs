@@ -2,8 +2,9 @@
 //!
 //! One sentence: dial the relay as a paired device, then drain the durable
 //! inbox, acknowledge what has been read, read the account's machine directory,
-//! read a pane's metrics series from a machine's daemon over a peer stream, and
-//! carry bytes to and from a peer over the session's per-peer streams.
+//! read a pane's metrics series from a machine's daemon over a peer stream,
+//! answer a pane's notification on that same daemon conversation, and carry
+//! bytes to and from a peer over the session's per-peer streams.
 //!
 //! **What a client is, and is not.** `arreo_core::relay::session::RelaySession`
 //! has no `send` and no `recv`: sending to a peer goes through `RelayStream`
@@ -13,35 +14,37 @@
 //! exactly that shape, because a surface offering "receive a message" without a
 //! stream would be a different protocol from the one the daemon speaks.
 //!
-//! **The daemon read, and why it does not dial a second session.** Metrics are a
-//! *daemon* verb, not a relay one: the relay routes bytes and knows nothing about
-//! panes. So [`RelaySessionHandle::metrics_history`] opens a stream to the
-//! machine, runs the transport's Noise handshake over it with the key the caller
-//! pinned, and speaks the daemon protocol's own Hello/Welcome before asking —
-//! which is the path `arreo attach --machine` takes, because a machine's daemon
-//! refuses a stream it has not authenticated. What it deliberately does **not**
-//! do is dial a second relay session the way `mesh::session`'s remote client
-//! does: the relay allows one session per device, so a second one displaces the
-//! first (T-0060) and the phone would lose the session it was already using. One
-//! session, one stream, **one conversation per peer, reused by every verb** — the
-//! daemon keeps its own session open after a verb, so a client that handshakes
-//! per call hands its next handshake to the conversation the daemon is still
-//! holding, and the read never arrives (T-0114's p1). The conversation lives in
-//! [`RelaySessionHandle`] and is dropped when a verb fails.
+//! **The daemon verbs, and why they do not dial a second session.** Metrics and
+//! quick actions are *daemon* verbs, not relay ones: the relay routes bytes and
+//! knows nothing about panes. So [`RelaySessionHandle::metrics_history`] and
+//! [`RelaySessionHandle::notify_act`] open a stream to the machine, run the
+//! transport's Noise handshake over it with the key the caller pinned, and speak
+//! the daemon protocol's own Hello/Welcome before asking — which is the path
+//! `arreo attach --machine` takes, because a machine's daemon refuses a stream it
+//! has not authenticated. What they deliberately do **not** do is dial a second
+//! relay session the way `mesh::session`'s remote client does: the relay allows
+//! one session per device, so a second one displaces the first (T-0060) and the
+//! phone would lose the session it was already using. One session, one stream,
+//! **one conversation per peer, reused by every verb** — the daemon keeps its own
+//! session open after a verb, so a client that handshakes per call hands its next
+//! handshake to the conversation the daemon is still holding, and the verb never
+//! arrives (T-0114's p1). The conversation lives in [`RelaySessionHandle`] and is
+//! dropped when a verb fails.
 //!
 //! **Two locks, and what each one costs.** `next_peer` takes `&mut RelaySession`
 //! and a UniFFI object is shared by `Arc`, so the session lives behind a
 //! `tokio::sync::Mutex`. Everything that can avoid that lock does: the closure
 //! signal, the identity accessors and a `StreamFactory` are cached at dial time,
-//! `heartbeat` goes through an `OutboundHandle`, and the metrics read opens its
+//! `heartbeat` goes through an `OutboundHandle`, and the daemon verbs open their
 //! stream through that same cached factory — so `stream_to`, `closed`,
-//! `device_id`, `account`, `nonce`, `heartbeat` and `metrics_history` never queue
-//! behind a parked accept. What *does* queue is a directory read issued while a
-//! caller sits in `next_peer`; `docs/mobile.md` records that ordering rule for
-//! the UI. The daemon conversations are a **second** lock, for a different
-//! reason: one conversation per peer is the protocol, and the mutex is what stops
-//! two concurrent reads from opening two of them on one peer's channel — so two
-//! metrics polls are serialized against each other, and against nothing else.
+//! `device_id`, `account`, `nonce`, `heartbeat`, `metrics_history` and
+//! `notify_act` never queue behind a parked accept. What *does* queue is a
+//! directory read issued while a caller sits in `next_peer`; `docs/mobile.md`
+//! records that ordering rule for the UI. The daemon conversations are a
+//! **second** lock, for a different reason: one conversation per peer is the
+//! protocol, and the mutex is what stops two concurrent calls from opening two of
+//! them on one peer's channel — so two metrics polls, or a poll and an answer to a
+//! notification, are serialized against each other, and against nothing else.
 //!
 //! **Identity comes from this device's key, not from the relay.** The Noise hint
 //! that opens a peer stream is an assertion of who is dialing, and
@@ -64,6 +67,7 @@ use std::time::Duration;
 
 use arreo_core::identity::{verifying_key_from_hex, DeviceId, VerifyingKey};
 use arreo_core::mesh::MeshClientError;
+use arreo_core::notify::NotifyAction;
 use arreo_core::proto::{client_versions, codec, Message, VERSION};
 use arreo_core::relay::session::{
     Closed, OutboundHandle, RelaySession, RelayStream, StreamFactory,
@@ -72,7 +76,7 @@ use arreo_core::transport::SecureChannel;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Mutex;
 
-use crate::codec::WireMetricsPoint;
+use crate::codec::{WireMetricsPoint, WireNotifyAction};
 use crate::directory::MachineRowInfo;
 use crate::errors::{CertFfiError, SessionFfiError};
 use crate::identity::{DeviceCertHandle, DeviceKeyHandle};
@@ -342,8 +346,9 @@ impl RelaySessionHandle {
     /// the older one never sees its reply, while both write the same per-device
     /// wire channel. That is the right shape for a re-handshake after a
     /// reconnect, and it is why a caller must not hold two conversations with one
-    /// peer at once: the daemon conversation is serialized by the lock in
-    /// [`RelaySessionHandle::metrics_history`] for exactly this reason.
+    /// peer at once: the daemon conversations are serialized by the lock in
+    /// [`RelaySessionHandle::metrics_history`] and
+    /// [`RelaySessionHandle::notify_act`] for exactly this reason.
     ///
     /// Lock-free — the factory was taken from the session at dial time, and it is
     /// the same one implementation the session itself uses.
@@ -449,12 +454,13 @@ impl RelaySessionHandle {
     /// naming a *different* pinned key for the same peer is refused rather than
     /// served on it.
     ///
-    /// **It queues behind another read of the same session, deliberately.** The
-    /// conversation cache is one mutex: two meters polling at once are serialized
-    /// rather than interleaved, because `stream_to` replaces the live peer's
-    /// routing and two conversations on one peer would corrupt each other's
-    /// framing. It does *not* queue behind `next_peer`, which holds the session's
-    /// own lock — a poll and an accept loop are still independent.
+    /// **It queues behind another daemon verb on the same session,
+    /// deliberately.** The conversation cache is one mutex: two meters polling at
+    /// once — or a poll and an answer to a notification — are serialized rather
+    /// than interleaved, because `stream_to` replaces the live peer's routing and
+    /// two conversations on one peer would corrupt each other's framing. It does
+    /// *not* queue behind `next_peer`, which holds the session's own lock — a poll
+    /// and an accept loop are still independent.
     pub async fn metrics_history(
         &self,
         peer: Arc<RelayPeerHandle>,
@@ -494,6 +500,89 @@ impl RelaySessionHandle {
                 downshifted,
                 rows: rows.iter().map(WireMetricsPoint::from_point).collect(),
             }),
+            Message::Error { message, .. } => Err(SessionFfiError::Daemon(message)),
+            other => Err(SessionFfiError::Daemon(format!("unexpected {other:?}"))),
+        }
+    }
+
+    /// Answer a pane's notification in one verb — the act door T-0094 built and
+    /// the CLI's `arreo notify act` drives.
+    ///
+    /// `action` is the bounded three of `arreo_core::notify::NotifyAction`, and
+    /// all three cross because the daemon's gate treats them differently: `reply`
+    /// sends `text + "\n"` through the very same audited send path a direct
+    /// `Message::Send` takes (same per-verb trust gate, same redaction), `skip`
+    /// writes no pane bytes at all, and `kill` ends the pane through the pane-kill
+    /// path. `text` is the operator's reply for `Reply` and absent for the other
+    /// two — and the *daemon* is the fence on that shape: a reply without text or
+    /// text on a `skip` comes back as its refusal rather than being guessed at (or
+    /// quietly dropped) here.
+    ///
+    /// **Every refusal is the daemon's own sentence, carried byte for byte.** The
+    /// pane's state is the authority — "the pane has exited" (the pinned
+    /// `arreo_core::notify::PANE_EXITED` the CLI keys its exit code on), "cannot
+    /// reply: the pane is not asking (state=…)", "reply text is too long: N bytes,
+    /// the bound is 4096" — and so is the trust gate's, which answers a device
+    /// without the capability in `RoleError::Denied`'s own words. Both shapes cross
+    /// as [`SessionFfiError::Daemon`], the same typed refusal a metrics refusal
+    /// crosses as, so a phone shows what the daemon said rather than a paraphrase of
+    /// it.
+    ///
+    /// **The 4096-byte bound is the daemon's to enforce, and this does not
+    /// pre-check it.** The daemon refuses an over-long reply with its own sentence
+    /// *and records the refusal as an audit row* (T-0094: every outcome, sent or
+    /// refused, is on the record). A courtesy check here would need a second copy of
+    /// that sentence — the drift this crate's error rule exists to prevent — and
+    /// would hide the refusal from the log. The bound has one definition
+    /// (`arreo_core::notify::MAX_REPLY_BYTES`, which the daemon's refusal names and
+    /// the contract test drives the over-bound case through); the CLI's own
+    /// pre-check is a *usage* error at a command-line door, which this door does not
+    /// have.
+    ///
+    /// **What a phone must be admitted as to act.** `reply` and `skip` are
+    /// `Verb::Send` and `kill` is `Verb::Kill` at the daemon's gate, and both verbs
+    /// need `Capability::Control`, which only the owner role holds — so a viewer's
+    /// act is refused with the gate's sentence. A phone that answers notifications
+    /// is an owner; `docs/mobile.md` records the consequence.
+    ///
+    /// The peer, the pinned `server_key` and the conversation are
+    /// [`RelaySessionHandle::metrics_history`]'s, field for field: the same daemon,
+    /// the same one-conversation-per-peer cache, the same serialization behind its
+    /// lock. A phone that polls a meter and then answers a question does both on one
+    /// handshake.
+    pub async fn notify_act(
+        &self,
+        peer: Arc<RelayPeerHandle>,
+        server_key: String,
+        pane: String,
+        action: WireNotifyAction,
+        text: Option<String>,
+    ) -> Result<(), SessionFfiError> {
+        let server = verifying_key_from_hex(&server_key)
+            .map_err(|e| SessionFfiError::BadPeerKey(e.to_string()))?;
+        let answer = self
+            .daemon_call(
+                &peer,
+                &server,
+                &Message::NotifyAct {
+                    v: VERSION,
+                    pane,
+                    action: NotifyAction::from(action),
+                    text,
+                },
+            )
+            .await?;
+        match answer {
+            // The action was taken. `ok` is the whole of the success answer: the
+            // daemon's `detail` is empty on that path, and the CLI reads it the
+            // same way.
+            Message::NotifyActReply { ok: true, .. } => Ok(()),
+            Message::NotifyActReply {
+                ok: false, detail, ..
+            } => Err(SessionFfiError::Daemon(detail)),
+            // The gate's answer for a device the daemon will not let act, and an
+            // old daemon's typed refusal of a verb it never heard of — both
+            // `Message::Error`, both the daemon's own sentence.
             Message::Error { message, .. } => Err(SessionFfiError::Daemon(message)),
             other => Err(SessionFfiError::Daemon(format!("unexpected {other:?}"))),
         }

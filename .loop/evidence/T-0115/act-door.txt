@@ -1,0 +1,103 @@
+T-0115 — FFI: the act door for quick answers
+============================================
+
+A phone answers a blocked agent from its notification. The whole path is T-0094's
+(`Message::NotifyAct`, the daemon's single act path, the pane's state as the authority on
+refusals, an audit row for every outcome); this is its third caller, over the boundary.
+
+WHAT SHIPPED
+------------
+crates/arreo-core-ffi/src/relay.rs
+  RelaySessionHandle::notify_act(peer, server_key, pane, action, text) -> Result<(), _>
+    over arreo_core::proto::Message::NotifyAct (T-0094's — no new wire message)
+crates/arreo-core-ffi/src/errors.rs
+  SessionFfiError::Daemon's doc extended: both refusal shapes cross here
+  (an answered Message::Error — the trust gate's sentence, or a verb an old daemon
+  does not know — and NotifyActReply { ok: false } — the pane's state, the state gate,
+  the reply bound)
+crates/arreo-core-ffi/tests/contract.rs   16 tests (14 -> 16)
+xtask/src/ffi.rs                          GOLDEN_SYMBOLS += …relaysessionhandle_notify_act (86 -> 87)
+docs/mobile.md                            the surface row, and "Quick answers: the act door"
+
+**The worker crashed mid-flight and the integrator finished the unit.** It landed the code,
+the two tests and the golden symbol, then died (exit 1) before running the tests, before the
+mutations and before the docs. The tree it left compiled and its suite was 16/16 green, so
+the unit was taken over rather than re-dispatched: the remaining work was the verification
+(the four mutations below), the docs, and the battery.
+
+THE DESIGN, AND THE TWO THINGS IT DELIBERATELY DOES NOT DO
+----------------------------------------------------------
+All three actions cross, because the machine's gate treats them differently: `reply` sends
+`text + "\n"` through the *same audited send path* a direct send takes (same trust gate,
+same secret scan, same redaction), `skip` writes no pane bytes at all, `kill` ends the pane
+through the pane-kill path. The gate: `reply`/`skip` are `Verb::Send`, `kill` is `Verb::Kill`.
+
+**Every refusal is the machine's own sentence, carried byte for byte** into
+`SessionFfiError::Daemon`, exactly as a metrics refusal crosses — "the pane has exited" (the
+pinned sentence the CLI keys its exit code on), "cannot reply: the pane is not asking
+(state=…)", "reply text is too long: N bytes, the bound is 4096".
+
+Two things the boundary does **not** do, both for the same reason:
+
+- **No client-side reply-bound check.** The daemon refuses an over-long reply with its own
+  sentence *and records the refusal as an audit row*. A courtesy check here would need a
+  second copy of that sentence — the drift the typed-error rule exists to prevent — and
+  would hide the refusal from the log. One definition (`arreo_core::notify::MAX_REPLY_BYTES`,
+  which the daemon's refusal names and which the test drives the over-bound case through).
+- **No client-side capability check.** A viewer's act is *sent*, and the daemon refuses it, so
+  the sentence the phone shows is one the machine actually said. A boundary that decided
+  locally would show the operator a rule the machine never applied — which is exactly what
+  the viewer test's last assertion pins ("the verb reached the machine").
+
+**A phone that answers notifications is an owner.** `reply`/`skip` gate as `Verb::Send` and
+`kill` as `Verb::Kill`, and both need `Capability::Control`, which only the owner role holds.
+A viewer can read panes, metrics and the directory, and cannot answer. That is T-0046's
+intended split, and `docs/mobile.md` states it where a pairing screen would need it.
+
+T-0114's LESSON, APPLIED
+------------------------
+T-0114 shipped green-and-wrong because its fixture closed its session after each answer,
+hiding the behaviour a real daemon has. This verb rides the **same** cached conversation, so
+the test was written against the rewritten fixture (one conversation, N verbs) and asserts
+**seven verbs on one handshake**: a metrics read first, then `reply` (taken), `skip` (taken),
+the pane-exited refusal, the not-asking refusal, the over-bound refusal, and a `kill`. A read
+and five acts on one conversation — the cache is per peer, not per verb.
+
+The refusal sentences in the fixture are **built by the daemon's own rules**
+(`notify::state_word`, `notify::MAX_REPLY_BYTES`, the pinned `notify::PANE_EXITED`) rather
+than typed as literals, so the test asserts the crossing rather than a second spelling of it.
+The viewer test asks the core's own policy for the denial sentence
+(`SessionAuth::authorize`'s `denial.to_string()`) for the same reason.
+
+MUTATIONS — four, all RED
+-------------------------
+A  the boundary paraphrases the refusal (`Daemon("the act was refused")`)
+     → RED: the sentence assertion fails; the machine's words are load-bearing
+B  the act handshakes per call instead of using the cached conversation
+     → RED, and in **10.32 s** — the same handshake-timeout signature as T-0114's p1. The
+       conversation reuse is load-bearing for this verb too, not just for the read
+C  a taken action reports failure (`NotifyActReply { ok: true }` → Err)
+     → RED: the success path is checked, not assumed
+D  the daemon's refusal is swallowed (`Message::Error` → `Ok(())`)
+     → RED: `a_viewer_cannot_answer_a_notification` fails, so the viewer refusal is really
+       crossing rather than being reported as success
+
+VERIFIED
+--------
+cargo test -p arreo-core-ffi            → 16 passed, 0 failed
+cargo xtask ffi --check                 → build PASS, generate swift/kotlin PASS,
+                                          surface swift/kotlin PASS (87 golden symbols),
+                                          kotlin compile SKIP, swift compile SKIP,
+                                          5 pass / 2 skip
+New tests: `the_session_acts_on_a_notification_over_one_conversation`,
+           `a_viewer_cannot_answer_a_notification`
+
+Note on the batch: T-0116 (`ThemePush`) ran concurrently on genuinely disjoint paths
+(`arreo-core/src/theme`, proto, daemon, CLI, TUI, `docs/themes.md`), so the workspace was
+transiently unbuildable from its in-flight edits while this unit was being verified. That is
+the accepted turbulence of a parallel batch, not a defect in either unit; the battery below
+is run on the integrated tree once both land.
+
+BATTERY (integrated tree, after both units landed)
+--------------------------------------------------
+See the ledger's snapshot line for this integration point.

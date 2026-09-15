@@ -265,7 +265,11 @@ pub enum SessionFfiError {
     Peer(String),
     /// The machine's daemon answered a request with a refusal, in its own
     /// sentence — which is what the CLI prints for the same answer
-    /// (`metrics history: {message}`).
+    /// (`metrics history: {message}`, `notify act: {detail}`). Both shapes a
+    /// refusal arrives in cross here: an answered `Message::Error` (the trust
+    /// gate's sentence, or a verb the daemon does not know) and a
+    /// `NotifyActReply { ok: false }` (the pane's state, the state gate, the reply
+    /// bound).
     #[error("{0}")]
     Daemon(String),
 }

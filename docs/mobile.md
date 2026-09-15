@@ -56,6 +56,7 @@ Swift and Kotlin alike).
 | `RelaySessionHandle::drain(from_seq)` / `::ack(seq)` / `::heartbeat()` | `drain` / `ack` / `heartbeat` | **Async.** The durable inbox cursor, and the presence beat. |
 | `RelaySessionHandle::machines(all)` | `machines` | **Async.** The account's machine directory. `refused` is an *answer*, not an error. |
 | `RelaySessionHandle::metrics_history(peer, server_key, pane, since_ms, until_ms, step_ms)` | `metricsHistory` | **Async.** One pane's durable series (T-0040), from the machine's **daemon** over a peer stream, on a conversation reused per peer. `server_key` is the machine's pinned key, hex. `until_ms = u64::MAX` means "to now". See "A RAM meter" below. |
+| `RelaySessionHandle::notify_act(peer, server_key, pane, action, text)` | `notifyAct` | **Async.** Answer a pane's notification (T-0094's act door, the same one `arreo notify act` drives): `reply` (text), `skip`, `kill`. Same peer, same `server_key`, same per-peer conversation as the metrics read. Every refusal is the machine's own sentence. A viewer is refused here — see "Quick answers" below. |
 | `RelaySessionHandle::next_peer()` | `nextPeer` | **Async.** The accept door: who has written to you and has no stream yet. |
 | `RelaySessionHandle::stream_to(peer)` | `streamTo` | Opens (or reuses) the byte stream to a peer. Lock-free. |
 | `RelaySessionHandle::closed()` | `closed` | **Async.** Wait until the session ends. Lock-free, so a UI can always notice. |
@@ -161,6 +162,43 @@ cursor becomes the `WireCursor` record, and a `usize` field becomes `u64`
 a token table the UI passes in — the UI has the platform's file APIs, this crate
 deliberately does not. `depth` is a **parameter**, not a detection: `TERM` and
 `COLORTERM` are terminal questions and a phone has no terminal.
+
+### Quick answers: the act door
+
+A blocked agent is a question, and the phone answers it from the notification. The
+whole path is T-0094's — `Message::NotifyAct`, the daemon's single act path, the pane's
+state as the authority on refusals, an audit row for every outcome, sent or refused — and
+the CLI and the TUI are its two callers. `RelaySessionHandle::notify_act` is the third,
+riding the **same per-peer conversation** as the metrics read: a phone that polls a meter
+and then answers a question does both on one handshake.
+
+All three actions cross, because the machine's gate treats them differently:
+
+| Action | What it does | Gate |
+|---|---|---|
+| `reply` | Sends `text` + `"\n"` through the **same audited send path** a direct send takes — same trust gate, same secret scan, same redaction | `Verb::Send` |
+| `skip` | Writes no pane bytes at all; the audit row is the whole trace | `Verb::Send` |
+| `kill` | Ends the pane through the pane-kill path | `Verb::Kill` |
+
+**Every refusal is the machine's own sentence, carried byte for byte** into
+`SessionFfiError::Daemon`, exactly as a metrics refusal crosses: "the pane has exited"
+(the pinned sentence the CLI keys its exit code on), "cannot reply: the pane is not asking
+(state=…)", "reply text is too long: N bytes, the bound is 4096". A phone shows what the
+machine said rather than a paraphrase of it.
+
+**The reply bound is the machine's to enforce, and the boundary does not pre-check it.**
+The daemon refuses an over-long reply with its own sentence *and records the refusal as an
+audit row*; a courtesy check at the boundary would need a second copy of that sentence —
+the drift the typed-error rule exists to prevent — and would hide the refusal from the log.
+For the same reason there is **no client-side capability check**: a viewer's act is sent and
+the daemon refuses it, so the sentence a phone shows is one the machine actually said. A
+client that decided locally would be showing the operator a rule the machine never applied.
+
+**A phone that answers notifications is an owner.** `reply` and `skip` gate as
+`Verb::Send` and `kill` as `Verb::Kill`, and both need `Capability::Control`, which only the
+owner role holds. A phone admitted as a viewer can read panes, panes' metrics and the
+directory — and cannot answer. That is the intended split (T-0046's roles), and it is worth
+stating in a pairing screen: "answer from your phone" is an owner's feature.
 
 ## Errors: typed, and carrying the CLI's sentences
 

@@ -43,8 +43,9 @@ use std::time::Duration;
 
 use arreo_core::identity::{DeviceCert, DeviceId, DeviceKey, VerifyingKey};
 use arreo_core::mesh::{MachineId, MachineRow, Name, Presence};
+use arreo_core::notify::{NotifyAction, MAX_REPLY_BYTES, PANE_EXITED};
 use arreo_core::pairing::{MailboxRequest, MailboxResponse, Slot};
-use arreo_core::proto::{codec, Message, MetricsPoint, VERSION};
+use arreo_core::proto::{codec, AgentState, Message, MetricsPoint, VERSION};
 use arreo_core::relay::session::RelaySession;
 use arreo_core::relay::{
     decode_message, encode_message, encode_payload, read_envelope, read_frame, verify_auth,
@@ -56,7 +57,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use arreo_core_ffi::codec::{
     codec_decode, codec_encode, codec_encode_frame, codec_max_frame_bytes, codec_protocol_version,
-    WireAgentState, WireCursor, WireMessage, WireMetricsPoint,
+    WireAgentState, WireCursor, WireMessage, WireMetricsPoint, WireNotifyAction, WireThemeTokens,
 };
 use arreo_core_ffi::directory::{directory_cache_new, FfiPresence, MachineRowInfo};
 use arreo_core_ffi::errors::{CodecFfiError, PairingFfiError, SessionFfiError};
@@ -69,7 +70,7 @@ use arreo_core_ffi::pairing::{
     pairing_phone_join, pairing_server_begin,
 };
 use arreo_core_ffi::relay::{relay_peer_parse, relay_session_dial};
-use arreo_core_ffi::theme::{theme_builtin, FfiColor, FfiDepth, FfiVariant};
+use arreo_core_ffi::theme::{theme_builtin, FfiColor, FfiDepth, FfiVariant, ThemeToken};
 
 // ---------------------------------------------------------------------------
 // A mailbox that speaks the shipped pairing protocol.
@@ -504,10 +505,12 @@ async fn serve_relay_connection(
 // A machine's daemon, behind the relay
 // ---------------------------------------------------------------------------
 
-/// The machine's half of a metrics read: the same two steps the daemon's relay
-/// peer path runs — accept the Noise channel over the relay stream, answer the
-/// daemon handshake, then answer the verbs — with the daemon's own session loop
-/// replaced by the answers this test needs.
+/// The machine's half of a daemon conversation: the same two steps the daemon's
+/// relay peer path runs — accept the Noise channel over the relay stream, answer
+/// the daemon handshake, then answer the verbs — with the daemon's own session
+/// loop replaced by the answers this test needs. One answer per verb asked, in
+/// order, whatever the verb is: a metrics read (T-0114) and a quick action
+/// (T-0115) are both daemon verbs and both ride this one conversation.
 ///
 /// **One conversation, N verbs, which is what a real daemon does.** The daemon's
 /// relay peer runs `serve_session` behind `serve_peer`, and that loop *stays
@@ -529,7 +532,7 @@ async fn serve_relay_connection(
 /// last frame, close the write half, and give the pump [`FINAL_FRAME_GRACE`] to
 /// put it on the wire — so the client reads its answer rather than a bare close.
 /// Once a conversation, at the end, instead of once per verb.
-async fn serve_metrics_daemon(
+async fn serve_daemon(
     mut session: RelaySession,
     key: DeviceKey,
     phone: VerifyingKey,
@@ -681,6 +684,14 @@ const DAEMON_SEED: [u8; 32] = [0x44; 32];
 /// sees a bare close instead of its answer. `arreo-server` is AGPL and this test
 /// may not link it, so the number is repeated here rather than imported.
 const FINAL_FRAME_GRACE: Duration = Duration::from_millis(300);
+
+/// The operator's reply text in the act test, verbatim across the boundary.
+///
+/// Not a bare `"y"`: the daemon sends `text + "\n"` to the pane through the
+/// audited send path, so the bytes a phone sends *are* what the agent reads, and a
+/// boundary that trimmed, re-encoded or newline-fixed the text would change the
+/// agent's input. Spaces and punctuation are where such a mangle shows.
+const REPLY_TEXT: &str = "yes, go ahead: run the migration first";
 
 fn row_for(seed: &[u8; 32], name: &str, presence: Presence) -> MachineRow {
     let key = device_key_from_seed(seed.to_vec()).expect("a key from a 32-byte seed");
@@ -1207,7 +1218,7 @@ fn the_session_reads_a_panes_metrics_series() {
         let daemon_key_hex = daemon_key.public_hex();
         let phone_key =
             arreo_core::identity::verifying_key_from_hex(&phone.public_hex()).expect("hex");
-        let machine = tokio::spawn(serve_metrics_daemon(daemon, daemon_key, phone_key, answers));
+        let machine = tokio::spawn(serve_daemon(daemon, daemon_key, phone_key, answers));
 
         // The peer, named the way a phone names it: the device id of the key the
         // machine publishes as its dial key (`daemon_key`), which is the id it
@@ -1424,6 +1435,494 @@ fn the_session_reads_a_panes_metrics_series() {
             arreo_core::identity::verifying_key_from_hex("not a key")
                 .expect_err("the core refuses it")
                 .to_string()
+        );
+    });
+}
+
+/// The act door: a phone answers a blocked agent from its notification, and
+/// every refusal is the machine's own sentence.
+///
+/// T-0094 built the whole path — `Message::NotifyAct` with the bounded three
+/// actions, the daemon's single act path, the pane's state as the authority on
+/// refusals, the audit row — and the CLI and the TUI are its two callers. This is
+/// the third, over the same boundary the metrics read crosses and the same
+/// one-conversation-per-peer cache: a phone that polls a meter and then answers a
+/// question does both on one handshake.
+///
+/// All three actions cross, because the daemon's gate treats them differently
+/// (`serve_notify_act`'s caller: `reply`/`skip` are `Verb::Send`, `kill` is
+/// `Verb::Kill`), and so does every refusal — the pane's state, the state gate and
+/// the reply bound are the daemon's sentences, carried byte for byte into
+/// [`SessionFfiError::Daemon`]. The sentences the fixture returns are built the
+/// way the daemon builds them (`notify::state_word`, `notify::MAX_REPLY_BYTES`,
+/// the pinned `notify::PANE_EXITED`), so this asserts the crossing rather than a
+/// second spelling of it.
+///
+/// The phone is an **owner** because that is what acting needs:
+/// `Capability::Control` (`identity::role::required`), which only the owner role
+/// holds. `a_viewer_cannot_answer_a_notification` is the other half of that.
+#[test]
+fn the_session_acts_on_a_notification_over_one_conversation() {
+    let runtime = tokio::runtime::Runtime::new().expect("a runtime");
+    runtime.block_on(async {
+        let root = Arc::new(arreo_core::identity::RootKey::from_seed(SERVER_SEED));
+        let relay = TestRelay::start(ACCOUNT.to_string(), Arc::clone(&root), Vec::new()).await;
+        let root_handle = root_key_from_seed(SERVER_SEED.to_vec()).expect("a root");
+
+        let phone = device_key_from_seed(PHONE_SEED.to_vec()).expect("a key");
+        let phone_cert = device_cert_issue(
+            Arc::clone(&root_handle),
+            phone.public_hex(),
+            "pixel-7".to_string(),
+            FfiRole::Owner,
+            1_760_000_000_000,
+            1,
+        )
+        .expect("a certificate");
+        let session = relay_session_dial(
+            relay.address(),
+            ACCOUNT.to_string(),
+            Arc::clone(&phone),
+            phone_cert,
+        )
+        .await
+        .expect("the relay accepts the phone");
+        relay.await_route(&phone.fingerprint()).await;
+
+        let daemon_key = DeviceKey::from_seed(DAEMON_SEED);
+        let daemon_id = DeviceId::from_key(&daemon_key.public());
+        let daemon_cert = device_cert_issue(
+            Arc::clone(&root_handle),
+            daemon_key.public_hex(),
+            "server-box".to_string(),
+            FfiRole::Owner,
+            1_760_000_000_000,
+            2,
+        )
+        .expect("a certificate");
+        let daemon_cert =
+            DeviceCert::decode(&daemon_cert.encode().expect("the certificate encodes"))
+                .expect("the core reads its own certificate");
+        let daemon = RelaySession::dial(relay.addr, ACCOUNT, &daemon_key, &daemon_cert)
+            .await
+            .expect("the relay accepts the daemon");
+        relay.await_route(daemon_id.as_str()).await;
+
+        // The daemon's own sentences, built by the daemon's own rules rather than
+        // typed here: the state word is `notify::state_word`'s, the bound is
+        // `notify::MAX_REPLY_BYTES`, and the exited sentence is the pinned
+        // `notify::PANE_EXITED` the CLI keys its exit code on. A refusal that this
+        // boundary invented could not equal these.
+        let not_asking = format!(
+            "cannot reply: the pane is not asking (state={})",
+            arreo_core::notify::state_word(AgentState::Working)
+        );
+        let too_long_text = "x".repeat(MAX_REPLY_BYTES + 1);
+        let too_long = format!(
+            "reply text is too long: {} bytes, the bound is {}",
+            too_long_text.len(),
+            MAX_REPLY_BYTES
+        );
+
+        let answers = vec![
+            // A read first, so the conversation is shared across *both* kinds of
+            // daemon verb: the cache is per peer, not per verb.
+            Message::MetricsSeries {
+                v: VERSION,
+                id: "pane-1".to_string(),
+                step_ms: 10_000,
+                downshifted: false,
+                rows: vec![MetricsPoint {
+                    ts_ms: 1_760_000_000_000,
+                    rss_avg: 4 * 1024 * 1024,
+                    rss_peak: 9 * 1024 * 1024,
+                    cpu_avg: 1.5,
+                    cpu_peak: 7.25,
+                    pids: 12,
+                }],
+            },
+            // The reply the operator sent: taken.
+            Message::NotifyActReply {
+                v: VERSION,
+                ok: true,
+                detail: String::new(),
+            },
+            // A dismissal: taken, and it writes no pane bytes.
+            Message::NotifyActReply {
+                v: VERSION,
+                ok: true,
+                detail: String::new(),
+            },
+            // The pane has since exited — the pane's own word, pinned.
+            Message::NotifyActReply {
+                v: VERSION,
+                ok: false,
+                detail: PANE_EXITED.to_string(),
+            },
+            // The state gate: a reply needs a pane the engine sees asking.
+            Message::NotifyActReply {
+                v: VERSION,
+                ok: false,
+                detail: not_asking.clone(),
+            },
+            // The bound: a refusal, never a truncation.
+            Message::NotifyActReply {
+                v: VERSION,
+                ok: false,
+                detail: too_long.clone(),
+            },
+            // Text on a non-reply: the daemon refuses it rather than guessing.
+            Message::NotifyActReply {
+                v: VERSION,
+                ok: false,
+                detail: "--text applies only to reply".to_string(),
+            },
+            // The kill, taken — after five verbs and three refusals, on the
+            // conversation the read opened: a refusal is an *answer*, so it costs
+            // the conversation nothing.
+            Message::NotifyActReply {
+                v: VERSION,
+                ok: true,
+                detail: String::new(),
+            },
+        ];
+
+        let daemon_key_hex = daemon_key.public_hex();
+        let phone_key =
+            arreo_core::identity::verifying_key_from_hex(&phone.public_hex()).expect("hex");
+        let machine = tokio::spawn(serve_daemon(daemon, daemon_key, phone_key, answers));
+        let peer = relay_peer_parse(daemon_id.display_id()).expect("a device id");
+
+        let series = session
+            .metrics_history(
+                Arc::clone(&peer),
+                daemon_key_hex.clone(),
+                "pane-1".to_string(),
+                1_759_999_784_000,
+                u64::MAX,
+                10_000,
+            )
+            .await
+            .expect("the machine answers the read");
+        assert_eq!(series.rows.len(), 1);
+
+        // `reply`, with the operator's text. The boundary does not append the
+        // newline and does not redact: the daemon sends `text + "\n"` through the
+        // audited send path (T-0094), and a client that mangled the bytes would
+        // change what the agent reads.
+        session
+            .notify_act(
+                Arc::clone(&peer),
+                daemon_key_hex.clone(),
+                "pane-1".to_string(),
+                WireNotifyAction::Reply,
+                Some(REPLY_TEXT.to_string()),
+            )
+            .await
+            .expect("the machine takes the reply");
+
+        // `skip`: a dismissal, no pane bytes.
+        session
+            .notify_act(
+                Arc::clone(&peer),
+                daemon_key_hex.clone(),
+                "pane-1".to_string(),
+                WireNotifyAction::Skip,
+                None,
+            )
+            .await
+            .expect("the machine takes the skip");
+
+        // `kill` on a pane that has exited: the pinned sentence, as the typed
+        // refusal. The CLI keys its exit code on exactly these bytes, so a phone
+        // and a terminal cannot disagree about why the kill did not happen.
+        let refusal = session
+            .notify_act(
+                Arc::clone(&peer),
+                daemon_key_hex.clone(),
+                "pane-1".to_string(),
+                WireNotifyAction::Kill,
+                None,
+            )
+            .await
+            .expect_err("a pane that has exited cannot be killed");
+        assert_eq!(
+            refusal,
+            SessionFfiError::Daemon(PANE_EXITED.to_string()),
+            "the pane's own word, byte for byte, typed as the machine's refusal"
+        );
+
+        // `reply` on a pane that is not asking: the state gate's sentence, which
+        // names the state the engine saw.
+        let refusal = session
+            .notify_act(
+                Arc::clone(&peer),
+                daemon_key_hex.clone(),
+                "pane-1".to_string(),
+                WireNotifyAction::Reply,
+                Some("y".to_string()),
+            )
+            .await
+            .expect_err("a pane that is not asking cannot be answered");
+        assert_eq!(
+            refusal,
+            SessionFfiError::Daemon(not_asking.clone()),
+            "the gate's sentence, naming the state it saw"
+        );
+
+        // `reply` past the bound: refused, and the sentence names the core's
+        // constant — the one definition the CLI checks and the daemon enforces.
+        let refusal = session
+            .notify_act(
+                Arc::clone(&peer),
+                daemon_key_hex.clone(),
+                "pane-1".to_string(),
+                WireNotifyAction::Reply,
+                Some(too_long_text.clone()),
+            )
+            .await
+            .expect_err("text past the bound is refused, never truncated");
+        assert_eq!(
+            refusal,
+            SessionFfiError::Daemon(too_long.clone()),
+            "the bound's refusal is the daemon's, and it names {MAX_REPLY_BYTES} bytes"
+        );
+
+        // Text on a `skip`: the boundary passes the caller's arguments through and
+        // lets the daemon refuse — it does not silently drop the text, which would
+        // hide a caller's bug behind a successful dismissal.
+        let refusal = session
+            .notify_act(
+                Arc::clone(&peer),
+                daemon_key_hex.clone(),
+                "pane-1".to_string(),
+                WireNotifyAction::Skip,
+                Some("y".to_string()),
+            )
+            .await
+            .expect_err("text on a skip is refused");
+        assert_eq!(
+            refusal,
+            SessionFfiError::Daemon("--text applies only to reply".to_string())
+        );
+
+        session
+            .notify_act(
+                Arc::clone(&peer),
+                daemon_key_hex.clone(),
+                "pane-1".to_string(),
+                WireNotifyAction::Kill,
+                None,
+            )
+            .await
+            .expect("the machine takes the kill");
+
+        // What the machine saw, read once it has finished: eight verbs on the one
+        // conversation the read opened — a second handshake would have reached no
+        // accept door (the fixture accepts exactly one), which is the property
+        // T-0114's p1 turned on.
+        let seen = machine.await.expect("the machine task finishes");
+        assert_eq!(
+            seen.len(),
+            8,
+            "one verb per call, all on one conversation: {seen:?}"
+        );
+        assert_eq!(
+            seen[0],
+            Message::MetricsHistory {
+                v: VERSION,
+                id: "pane-1".to_string(),
+                since_ms: 1_759_999_784_000,
+                until_ms: u64::MAX,
+                step_ms: 10_000,
+            }
+        );
+        assert_eq!(
+            seen[1],
+            Message::NotifyAct {
+                v: VERSION,
+                pane: "pane-1".to_string(),
+                action: NotifyAction::Reply,
+                text: Some(REPLY_TEXT.to_string()),
+            },
+            "the action and the operator's text cross field for field"
+        );
+        assert_eq!(
+            seen[2],
+            Message::NotifyAct {
+                v: VERSION,
+                pane: "pane-1".to_string(),
+                action: NotifyAction::Skip,
+                text: None,
+            },
+            "a skip must not arrive as a reply: the gate treats them differently"
+        );
+        assert_eq!(
+            seen[3],
+            Message::NotifyAct {
+                v: VERSION,
+                pane: "pane-1".to_string(),
+                action: NotifyAction::Kill,
+                text: None,
+            },
+            "kill is its own action, and it is the one that ends the pane"
+        );
+        assert_eq!(
+            seen[4],
+            Message::NotifyAct {
+                v: VERSION,
+                pane: "pane-1".to_string(),
+                action: NotifyAction::Reply,
+                text: Some("y".to_string()),
+            }
+        );
+        assert_eq!(
+            seen[5],
+            Message::NotifyAct {
+                v: VERSION,
+                pane: "pane-1".to_string(),
+                action: NotifyAction::Reply,
+                text: Some(too_long_text.clone()),
+            },
+            "the over-bound text went to the machine, which refused it — the \
+             boundary does not pre-check the bound and invent its own sentence"
+        );
+        assert_eq!(
+            seen[6],
+            Message::NotifyAct {
+                v: VERSION,
+                pane: "pane-1".to_string(),
+                action: NotifyAction::Skip,
+                text: Some("y".to_string()),
+            },
+            "the text is passed through, not dropped, so the daemon can refuse it"
+        );
+        assert_eq!(
+            seen[7],
+            Message::NotifyAct {
+                v: VERSION,
+                pane: "pane-1".to_string(),
+                action: NotifyAction::Kill,
+                text: None,
+            }
+        );
+    });
+}
+
+/// A phone admitted as a **viewer** cannot answer, and the refusal is the gate's
+/// sentence rather than this boundary's.
+///
+/// `reply` and `skip` are `Verb::Send` and `kill` is `Verb::Kill` (the daemon's
+/// `verb_of`), and both verbs need `Capability::Control`, which only the owner
+/// role holds (`identity::role::required`). So the act a viewer attempts is the
+/// one refusal a phone actually meets on this path, and it arrives as
+/// `Message::Error` carrying `RoleError::Denied`'s sentence — the same bytes the
+/// CLI prints for `arreo notify act` against a machine that admitted it as a
+/// viewer.
+///
+/// The assertion that carries the weight is the last one: **the verb reached the
+/// machine.** A boundary that refused the act itself (a client-side role check)
+/// would never send it, and the phone would be showing a sentence the daemon never
+/// said.
+#[test]
+fn a_viewer_cannot_answer_a_notification() {
+    let runtime = tokio::runtime::Runtime::new().expect("a runtime");
+    runtime.block_on(async {
+        let root = Arc::new(arreo_core::identity::RootKey::from_seed(SERVER_SEED));
+        let relay = TestRelay::start(ACCOUNT.to_string(), Arc::clone(&root), Vec::new()).await;
+        let root_handle = root_key_from_seed(SERVER_SEED.to_vec()).expect("a root");
+
+        let phone = device_key_from_seed(PHONE_SEED.to_vec()).expect("a key");
+        let phone_cert = device_cert_issue(
+            Arc::clone(&root_handle),
+            phone.public_hex(),
+            "pixel-7".to_string(),
+            FfiRole::Viewer,
+            1_760_000_000_000,
+            1,
+        )
+        .expect("a certificate");
+        let session = relay_session_dial(
+            relay.address(),
+            ACCOUNT.to_string(),
+            Arc::clone(&phone),
+            phone_cert,
+        )
+        .await
+        .expect("the relay accepts the phone");
+        relay.await_route(&phone.fingerprint()).await;
+
+        let daemon_key = DeviceKey::from_seed(DAEMON_SEED);
+        let daemon_id = DeviceId::from_key(&daemon_key.public());
+        let daemon_cert = device_cert_issue(
+            Arc::clone(&root_handle),
+            daemon_key.public_hex(),
+            "server-box".to_string(),
+            FfiRole::Owner,
+            1_760_000_000_000,
+            2,
+        )
+        .expect("a certificate");
+        let daemon_cert =
+            DeviceCert::decode(&daemon_cert.encode().expect("the certificate encodes"))
+                .expect("the core reads its own certificate");
+        let daemon = RelaySession::dial(relay.addr, ACCOUNT, &daemon_key, &daemon_cert)
+            .await
+            .expect("the relay accepts the daemon");
+        relay.await_route(daemon_id.as_str()).await;
+
+        // The gate's sentence, asked of the core's own policy rather than spelled
+        // here: the daemon answers a refusal with `denial.to_string()`
+        // (`SessionAuth::authorize`), so this is the byte-for-byte answer a real
+        // machine sends a viewer.
+        let denial = arreo_core::identity::role::check(
+            arreo_core::identity::Role::Viewer,
+            arreo_core::identity::role::Verb::Send,
+        )
+        .expect_err("a viewer may not send")
+        .to_string();
+        assert!(
+            denial.contains("viewer"),
+            "the refusal names the role: {denial}"
+        );
+
+        let answers = vec![Message::Error {
+            v: VERSION,
+            message: denial.clone(),
+        }];
+        let daemon_key_hex = daemon_key.public_hex();
+        let phone_key =
+            arreo_core::identity::verifying_key_from_hex(&phone.public_hex()).expect("hex");
+        let machine = tokio::spawn(serve_daemon(daemon, daemon_key, phone_key, answers));
+        let peer = relay_peer_parse(daemon_id.display_id()).expect("a device id");
+
+        let refusal = session
+            .notify_act(
+                Arc::clone(&peer),
+                daemon_key_hex,
+                "pane-1".to_string(),
+                WireNotifyAction::Reply,
+                Some("y".to_string()),
+            )
+            .await
+            .expect_err("a viewer's act is refused by the machine");
+        assert_eq!(
+            refusal,
+            SessionFfiError::Daemon(denial.clone()),
+            "the gate's own sentence, carried rather than restated"
+        );
+
+        let seen = machine.await.expect("the machine task finishes");
+        assert_eq!(
+            seen.len(),
+            1,
+            "the refused act is a verb the machine saw: {seen:?}"
+        );
+        assert!(
+            matches!(&seen[0], Message::NotifyAct { .. }),
+            "the boundary sent the act and let the machine refuse it, rather than \
+             refusing it itself: {:?}",
+            seen[0]
         );
     });
 }
