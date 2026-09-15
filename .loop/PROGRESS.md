@@ -1,50 +1,61 @@
 ## State snapshot          ← REWRITTEN (not appended) at every checkpoint
 
-Task: **T-0115 + T-0116 done** — the FFI act door, and the server-pushed theme.
-Where you are: committing. Two parallel workers on disjoint scopes; one crashed mid-flight
-(`FfiActDoor`, exit 1, after landing code + tests but before verifying) and the planner finished
-that unit (four mutations, the docs, the battery). The other (`ThemePush`) delivered complete.
-Battery on the integrated tree: **954 tests, 0 failed; 14/14 slices (theme 43, up from 33);
-sync 14/14; vet 375; deny 4/4; audit 0; check-targets PASS/SKIP; bench 6/6; clippy 0 on both
-toolchains; fmt clean.**
-**T-0115** — `RelaySessionHandle::notify_act` over T-0094's existing `NotifyAct`, riding
-T-0114's cached per-peer conversation. All three actions cross; every refusal is the machine's
-own sentence byte for byte; no client-side bound check and no client-side capability check, both
-so a rule has one definition (the daemon refuses *and* audits, and the viewer refusal the phone
-shows is one the machine actually applied). A phone that answers is an owner (`Capability::Control`).
-The test asserts **seven verbs on one handshake**, with the refusal sentences built by the
-daemon's own rules rather than typed as literals.
-**T-0116** — the wire carries the **resolved token map** (`ThemeTokens`), the shape pinned before
-dispatch; the third mutation is the proof it matters (shipping the document reddens the TUI
-checks because the client has no resolver). Depth fallback stays a client-side property.
-**Integration the planner did**: the FFI's `WireMessage` mirrors `Message` variant for variant
-with an exhaustive match, so T-0116's new variants were a compile error — honoured as the tripwire
-it is (`WireThemeTokens`, both arms, the core's own `Color`/`Display`) plus `tests/theme_mirror.rs`,
-because the match catches a *missing* variant but not a *wrong* mapping. Three clippy findings
-fixed.
-Next step: integrate `FfiSlice` (T-0125, the durable real-daemon slice) and `PushPayload` (T-0117,
-the push payload + offline delivery) — dispatched in parallel on a stated ownership split (the
-slice owns `xtask/**` + `crates/arreo-core-ffi/tests/**`; the push owns
-`crates/arreo-core-ffi/src/codec.rs` only, because the FFI's `WireMessage` mirrors `Message`
-variant-for-variant with an exhaustive match and whoever adds a variant adds its arm).
-**T-0117 was re-scoped before dispatch, with the reason written into the task file**: its fence
-originally stopped at `arreo-relay`, but the audience rule is the *daemon's* (the T-0093 policy
-and the paired-device list both live there), and the queueing needs no new code — the relay's
-`Inbox::enqueue` is what its router already calls for an offline device. The real work is wiring
-a relay-session handle the notify tick does not have today, which is `arreo-server` work.
-Then T-0118 (the pairing payload a camera can scan). T-0095 (approval gates, p3) and T-0111 (p3)
-remain.
-Open workers: FfiSlice (T-0125), PushPayload (T-0117) — both running, disjoint scopes.
-Known broken: T-0063 (CI never-green — the user's, untouched) · Parked: T-0048 needs-human
-**Phase 3's queue** (T-0113..T-0125): done — T-0104, T-0114, T-0115, T-0116. Provable here —
-T-0117, T-0118, T-0125. `needs-human` for a different machine or a purchase — T-0119/T-0121 (iOS),
-T-0120/T-0122 (Android), T-0123 (store beta tracks), T-0124 (the phase-exit demo). T-0113 (make
-the core separable so the phone artifact drops SQLite).
+Task: **T-0117 + T-0125 done** — push payload + offline-queued delivery, and the durable
+real-daemon FFI slice. **The user directed this turn: collect the in-flight workers, dispatch no
+more tasks, leave the tree clean, the battery green, and pushed.** Honoured: both workers are
+collected, the planner did the integration and the verification a reviewer agent would have done,
+and both are committed and pushed.
+Where you are: committing and pushing. Nothing left uncommitted but the user's own untracked
+`site/` and `.loop/evidence/landing/`.
+Battery on the integrated tree: **969 tests, 0 failed; 15/15 slices (the new `ffi` slice is one of
+them); sync 14/14; vet 375; deny 4/4; audit 0; check-targets PASS/SKIP; workspace_deps 8/8;
+bench 6/6; clippy 0 on both toolchains; fmt clean.**
+**T-0125** — `cargo xtask e2e --slice ffi`: real `arreo-relay` + `arreo-server` processes, a viewer
+and an owner pinned through the real CLI, panes spawned, and the exported FFI surface driven —
+three metrics reads on one session, the viewer's act refused by the machine's own gate, a
+wrong-but-valid key refused, an empty window answered as a state, then an owner acting and killing
+over the same conversation. It **re-checks the driver's numbers before calling a run a PASS**
+(proven by faking `rows_min=0` and watching it refuse). The pre-fix red was reproduced by the
+planner: disabling the conversation cache gives the criterion's own text, `read #2 FAIL — the
+SECOND read failed: handshake took longer than 10s`, read #1 green first.
+**T-0117** — a delivered notification is pushed to the paired devices that should receive it,
+sealed per device with one-way Noise (so an *absent* device can be pushed to), queued by the relay's
+existing `Inbox`, drained in order on reconnect. **The suppression guarantee is a type**: the
+`Suppressed` arm of `push_payload` cannot produce a payload, so the failure mode that would have
+made the rules engine decorative cannot be expressed.
+**The worker flagged one of its own tests as passing vacuously pre-fix** (no push leg existed, so
+"suppressed is not pushed" passed for the wrong reason). Honest and correct; the mutation that
+pushes a withheld decision now fails it. **A real T-0030 defect was found and fixed in scope**:
+enqueue and drain each added the sweep's total to the caller's device on top of the per-device
+attribution, so a device was told it lost messages it never had (`dropped 4` for 2).
+**The planner's own verification, and two bad mutations it had to correct**: M1 (a suppressed
+notification IS pushed) reddens both the unit and the e2e test; M2' (an empty audience) reddens the
+offline test `left: 0, right: 3`; M3' (the drain-side double-count) reddens the attribution test
+`left: 4, right: 1`. Two earlier attempts at M2 and M3 came back GREEN and were **bad mutations,
+not weak tests** (one filtered on a certificate timestamp rather than presence; one patched the
+`enqueue` path while the test exercises `drain`) — recorded either way, since a green mutation is a
+finding.
+**One integration failure this batch caused, and the fix**: `check-targets` went RED
+(`x86_64-pc-windows-msvc FAIL: no method named noise_static`). Cause was T-0117's `notify/push.rs`
+— its `#[cfg(test)]` module called transport-gated functions, so the pure-Rust
+`--no-default-features` check could not compile them. Fixed by gating the four sealing tests
+individually rather than the module, so the pure build still exercises the framing and the bound.
+Back to PASS/SKIP.
+Next step: **the user's directive is honoured — no new work dispatched this turn.** The next
+iteration picks up the queue: T-0118 (the pairing payload a camera can scan, p3, the last provable
+Phase-3 task), then Phase 4's unblocked items — T-0095 (approval gates), T-0111 (the notify tick's
+cost), T-0113 (make the core separable), and the seven `needs-human` Phase-3 tasks that need a
+different machine or a purchase. **T-0127** is filed: a handed-over daemon has no relay session, so
+it cannot push (T-0117 made it log rather than be silent; the fix is `arreo-server` work).
+Open workers: none.
+Known broken: T-0063 (CI never-green — the user's, untouched) · T-0127 (a handed-over daemon cannot
+push; logged, filed) · Parked: T-0048 needs-human
 **This session's units.** T-0093, T-0112, T-0110, T-0094, T-0105, T-0104, T-0114, T-0115, T-0116,
-plus RUSTSEC-2026-0285 (rustls 0.23.45). Filed: T-0113, T-0125.
-**Slice failures during verification, all attributed.** `handoff-abort` 2/41 in the run right after
-a 13-slice batch and 41/41 alone (load-sensitive). Earlier: the persistence recall check (the
-harness's own model answering empty — a skip that says so) and batch contention on tui/mesh.
+T-0117, T-0125, plus RUSTSEC-2026-0285 (rustls 0.23.45). Filed: T-0113, T-0125, T-0127.
+**Slice failures during verification, all attributed.** `handoff-abort` 2/41 in a run right after a
+13-slice batch and 41/41 alone (load-sensitive — it SIGKILLs daemons at sub-second deadlines).
+Earlier: the persistence recall check (the harness's own model answering empty — a skip that says
+so) and batch contention on tui/mesh.
 ## Event log               ← append-only; newest last; never rewrite
 - 2026-09-10 [turn 1] ledger created; repo at e489fac (docs only); T-0001 + T-0022 (AGENTS.md gardened) done
 - 2026-09-10 [turn 2] T-0002 PTY manager done+pushed (342606c; 9 tests); PROMPT.md v2 synced + ADR 0001 (ef6c595)
@@ -281,3 +292,8 @@ harness's own model answering empty — a skip that says so) and batch contentio
 - 2026-09-15 [turn 32] **T-0116 done** — the server can push a theme. `Message::Theme`/`ThemeReply` carrying `ThemeTokens` (the **resolved** token map, the shape pinned before dispatch). An unknown name is a typed refusal naming it and listing the built-ins; an unconfigured machine answers with the built-in default; `Verb::Read`, no audit row (reads are unaudited); `size_of::<Message>() == 112` still holds. The TUI renders a received theme, `arreo theme export` prints what the verb returns, the slice grew 33 → 43 checks at both depths. Three mutations all RED — and the third is the design's proof: shipping the document's own values reddens three server tests **and both TUI checks, because the client has no resolver**.
 - 2026-09-15 [turn 32] **Integration the planner did, and why it is the interesting part of this batch.** T-0116 added two `Message` variants, and the FFI's `WireMessage` mirrors `Message` variant for variant with an **exhaustive** match — so the workspace did not compile. That tripwire is a feature (it forces a decision rather than letting the mirror fall behind), so it was honoured rather than worked around: `WireThemeTokens`, both variants, both match arms, the theme spelled through the core's own `Color`/`Display` rather than a format string written in the FFI. The match catches a *missing* variant but not a *wrong* mapping, so the round trip is asserted in its own `tests/theme_mirror.rs` (kept separate so the two units could be two commits) — a mutation that drops the variant reddens it. Also three clippy findings the workers were correctly told not to chase.
 - 2026-09-15 [turn 33] **T-0125 + T-0117 dispatched in parallel** on a stated ownership split (the slice owns `xtask/**` + `crates/arreo-core-ffi/tests/**`; the push owns `crates/arreo-core-ffi/src/codec.rs` only). T-0125 turns the scratch probe that caught T-0114's p1 — which lived under gitignored `target/` and would have evaporated — into a real gate (`xtask e2e --slice ffi`), and can now cover the act door on the same conversation. **T-0117 was re-scoped before dispatch with the reason in the task file**: its fence stopped at `arreo-relay`, but the audience rule is the daemon's (the T-0093 policy and the paired-device list both live there) and the queueing needs no new code — the relay's `Inbox::enqueue` is what its router already calls for an offline device — so the real work is wiring a relay-session handle the notify tick does not have, which is `arreo-server` work. Both briefs carry the batch contract: the FFI mirror is exhaustive and whoever adds a `Message` variant adds its arm, plus the environment facts that cost the last worker time (`--root-key` wants the public hex; the cert file is MessagePack bytes).
+- 2026-09-15 [turn 33] **USER DIRECTIVE**: "tras colectar a los workers en vuelo, no despaches más tasks; deja árbol limpio, batería verde y pusheado." Honoured: FfiSlice (T-0125) is collected and verified; PushPayload (T-0117) is being collected; both are integrated by the planner (including the verification a reviewer agent would otherwise have done — no new workers), then the full battery, commit and push.
+- 2026-09-15 [turn 33] **T-0117 + T-0125 done, pushed. The user's directive honoured**: after collecting the in-flight workers, no new tasks were dispatched; the planner did the integration and the verification a reviewer would have done. **T-0125** — `cargo xtask e2e --slice ffi`, real relay + real daemon, a viewer and an owner pinned through the real CLI, three metrics reads on one session, the viewer's act refused by the machine's own gate, a wrong-but-valid key refused, an empty window as a state, an owner acting and killing on the same conversation; the runner re-checks the driver's numbers before calling a PASS (proven by faking `rows_min=0`). Pre-fix red reproduced by the planner: `read #2 FAIL — the SECOND read failed: handshake took longer than 10s`. **T-0117** — a delivered notification is pushed, sealed per device with one-way Noise so an absent device can be pushed to, queued by the relay's existing `Inbox`, drained in order; suppression is a **type** (the `Suppressed` arm cannot produce a payload), so the failure mode that would make the rules engine decorative cannot be expressed. A real T-0030 defect found and fixed in scope (the sweep total double-counted onto the caller's device: `dropped 4` for 2).
+- 2026-09-15 [turn 33] Verification detail worth keeping: M1 (a suppressed notification is pushed) reddens both the unit test and the e2e one; M2' (empty audience) reddens `an_absent_device_drains_what_it_missed_in_order` with `left: 0, right: 3`; M3' (the drain-side double-count) reddens `an_expiry_is_counted_for_the_device_that_lost_the_message` with `left: 4, right: 1`. **Two of the planner's own first attempts came back GREEN and were bad mutations rather than weak tests** — one filtered the audience on a certificate timestamp instead of presence, the other patched `enqueue` while the test exercises `drain`; both were corrected and re-run to a real red, and both are recorded because a green mutation is a finding either way. The T-0117 worker also flagged one of its own tests as passing vacuously pre-fix (no push leg existed); that was honest and the test is live now, proven by M1.
+- 2026-09-15 [turn 33] **An integration failure this batch caused, caught by the gate and fixed**: `check-targets` went RED for `x86_64-pc-windows-msvc` (`no method named noise_static`). T-0117's new `notify/push.rs` had a `#[cfg(test)]` module calling transport-gated functions, so the pure-Rust `--no-default-features` check could not compile them. Fixed by gating the four sealing tests individually rather than the module, so the pure build still exercises the framing and the bound — the half a no-transport check can actually prove. Also fixed two clippy findings that were leftovers from moving the mirror test out of `contract.rs`. Back to PASS/SKIP, clippy 0.
+- 2026-09-15 [turn 33] **T-0127 filed** (a handed-over daemon has no relay session, so it cannot push — T-0117 made it log that instead of being silently row-only; the fix is `arreo-server` work across the handoff path). Filed rather than fixed because it is outside T-0117's fence, and it is the kind of gap that is invisible from the daemon's own state: the row is written and `arreo notify --why` answers, so only the phone is silent.
