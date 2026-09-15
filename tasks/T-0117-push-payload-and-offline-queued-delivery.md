@@ -8,7 +8,11 @@ depends_on: [T-0030, T-0093, T-0104]
 scope:
   - crates/arreo-core/src/notify/**
   - crates/arreo-core/src/proto/message.rs
+  - crates/arreo-core-ffi/src/codec.rs
   - crates/arreo-relay/src/**
+  - crates/arreo-server/src/daemon.rs
+  - crates/arreo-server/src/relay_client.rs
+  - crates/arreo-server/src/main.rs
   - docs/notifications.md
   - .loop/evidence/T-0117/**
 verify:
@@ -48,3 +52,27 @@ carries and the rule that makes it survive a phone being offline.
 - APNs/FCM are the *transport*, and they are a different machine's problem (a store account, a
   key). This task is the payload and the queue semantics, which are provable here against the
   real relay.
+
+## Scope note (re-scoped by the planner before dispatch, with the reason)
+
+The fence above originally stopped at `arreo-relay`. Probing the code showed that cannot work,
+so the fence was widened **before** any code was written rather than discovered mid-task:
+
+- The audience rule is the daemon's: "every paired device that should receive it" is decided by
+  the T-0093 policy, which lives in the daemon's notify tick (`daemon.rs`), and the paired-device
+  list is the daemon's device authority. The relay has neither.
+- The *queueing* is already the relay's and needs no new rule: `Inbox::enqueue` (T-0030) is what
+  the relay's router calls when a device is offline, so a push that is **sent** to an absent
+  device is queued by the code that already exists. The task is therefore "send the payload to
+  the right devices", not "add a queue".
+- The send needs a relay-session handle the notify tick does not have today: the tick holds
+  `registry`, `db` and the policy; the session lives in `relay_client.rs`'s task, reached from
+  `main.rs`'s composition root. Wiring that (a sender the tick can publish to) is the bulk of the
+  real work, and it is `arreo-server` work.
+- `crates/arreo-core-ffi/src/codec.rs` is in the fence because the FFI's `WireMessage` mirrors
+  `Message` **variant for variant with an exhaustive match** (T-0116's lesson: adding a core
+  variant is a compile error there, deliberately). If this task adds a message, it adds the mirror
+  arm in the same commit — but it must **not** touch `crates/arreo-core-ffi/tests/**`, which
+  T-0125 owns concurrently.
+
+Nothing else changed: the goal, the criteria and the notes stand as written.
