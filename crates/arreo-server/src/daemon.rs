@@ -659,6 +659,319 @@ impl Drop for SessionGuard {
     }
 }
 
+/// What a cold start decided about a staged update (T-0105).
+///
+/// Four answers rather than a `bool`, because each one is a different thing to
+/// *do*: one replaces this process's image, one releases the rollback binary, and
+/// two serve — and a flag would leave the re-exec for the caller to invent, which
+/// is where a start path could re-exec without having promoted anything.
+///
+/// Split out from [`Daemon::prepare_start_update`] so the decision is testable
+/// against a **scratch** state directory: a test that writes the real one corrupts
+/// the machine it runs on (the reason `deferred::*_in` exists at all), and the
+/// decision is the whole policy, so it is the part worth testing directly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum StartDecision {
+    /// Serve this process as it is. Nothing was staged, or the stage was already
+    /// consumed, and there is nothing to say about it.
+    Serve,
+    /// A promotion happened and this process still runs the old image: replace the
+    /// image with `binary` (the installed one) before serving.
+    Reexec {
+        /// The installed path, which now holds the promoted bytes.
+        binary: PathBuf,
+        /// The version that was promoted — what the operator's line names.
+        version: String,
+    },
+    /// The pending version is the installed one: the update has taken over, so the
+    /// marker is cleared (T-0039's rule) and the rollback binary `previous` is
+    /// released. **Never re-execs** — this is the loop guard.
+    TakenOver {
+        /// `<installed>.prev`, the rollback slot, now no longer needed.
+        previous: PathBuf,
+        /// The version that took over.
+        version: String,
+    },
+    /// Serve as-is and say `why` **once** on stderr. Nothing was promoted: the
+    /// window was shut (the stage is kept) or the stage was refused and discarded
+    /// (T-0039: a refusal never retries). This process does not try again.
+    NotPromoted {
+        /// The refusal, in the sentence the CLI uses for the same state.
+        why: String,
+    },
+}
+
+impl StartDecision {
+    /// The one line this decision owes the operator, if any.
+    ///
+    /// One line, and the caller prints it exactly once: a start that reports the
+    /// same refusal on every retry, or twice in one start, is the loop this task
+    /// exists to make unreachable.
+    fn report(&self) -> Option<String> {
+        match self {
+            Self::Serve => None,
+            Self::Reexec { binary, version } => Some(format!(
+                "daemon: promoting the pending update to {version} — re-exec into {}",
+                binary.display()
+            )),
+            Self::TakenOver { previous, version } => Some(format!(
+                "daemon: {version} has taken over; the rollback binary {} is no longer needed",
+                previous.display()
+            )),
+            Self::NotPromoted { why } => Some(format!("daemon: {why}")),
+        }
+    }
+}
+
+impl Daemon {
+    /// Handle a pending staged update on the **cold start** path (T-0105), under
+    /// the socket lock and before the socket is bound.
+    ///
+    /// ## Where this runs, and why there
+    ///
+    /// `serve` holds the socket's exclusive lock by the time it calls this, so two
+    /// daemons starting together cannot both promote, and a promotion cannot race a
+    /// live daemon's pane list. The pane list is read from the registry **here**,
+    /// at the moment of the swap, and handed to
+    /// [`arreo_core::update::deferred::promote_in`] — the only place the window
+    /// rule lives ([`arreo_core::update::deferred::window_is_open`], one function,
+    /// never re-implemented). On a cold start the registry is empty by
+    /// construction, but it is *read* rather than assumed: the rule stays the
+    /// function, and the reading stays honest if this ever runs later in the start
+    /// path.
+    ///
+    /// ## The handoff path does not come through here
+    ///
+    /// [`Daemon::serve_inherited`] is the incoming side of a live cut: it has just
+    /// adopted the listener, the lock and live panes, and promoting there would
+    /// swap the binary under a live cut and re-exec a process holding adopted
+    /// panes. The guard is structural — `serve_inherited` never calls this, and
+    /// `tests/deferred_start.rs` asserts it (behaviorally, by staging a promotable
+    /// update and showing the handoff path leaves it alone).
+    ///
+    /// ## The state directory is the machine's
+    ///
+    /// This reads [`arreo_core::update::resume::dir`] — `$ARREO_STATE_DIR`, else
+    /// `$XDG_STATE_HOME/arreo`, else `~/.local/state/arreo` — because that is where
+    /// the machine's pending update actually is; the daemon is the thing that has
+    /// to act on it. A caller that starts a daemon **under test** must therefore
+    /// point `ARREO_STATE_DIR` at a scratch directory, or it will act on the
+    /// developer's real pending update (and, if one is waiting, re-exec into it).
+    async fn prepare_start_update(&self) -> StartDecision {
+        // The pane list at this instant, from the registry — see the docs above.
+        // Read under the async read lock, then handed to a decision that takes no
+        // lock of its own, so nothing sits between the reading and the promoting.
+        let live_panes: Vec<String> = {
+            let registry = self.registry.read().await;
+            registry.keys().cloned().collect()
+        };
+        // **This process's own image**, because a pending update is only *this*
+        // machine's business if the marker names the binary that is running
+        // (review finding, T-0105). `arreo_core::update::current_binary` is the
+        // canonicalized `current_exe()` — the same resolution `arreo update
+        // --status` uses to decide whether the update has taken over — so the
+        // daemon and the CLI answer "which binary am I?" the same way.
+        //
+        // A process that cannot identify itself cannot tell whether the update is
+        // for it, and must not promote, confirm or release anything on a guess;
+        // `start_decision` says so in one line, and only when something is
+        // actually pending.
+        let running = arreo_core::update::current_binary().ok();
+        Self::start_decision(
+            &arreo_core::update::resume::dir(),
+            &live_panes,
+            running.as_deref(),
+        )
+    }
+
+    /// The decision itself, against a state directory the caller names.
+    ///
+    /// ## The order is the policy
+    ///
+    /// 1. **Confirm before promoting — this is the loop guard.** A marker naming
+    ///    the version the *installed* binary reports means the update has already
+    ///    landed (a previous start promoted it; this is the post-exec image, or a
+    ///    restart after one). The marker is cleared with
+    ///    [`arreo_core::update::deferred::clear_after_confirm_in`] — T-0039's rule,
+    ///    unchanged: the swap moves a file, the version is what a binary reports —
+    ///    and `.prev` is released. **No re-exec**: the image that asks this
+    ///    question is already the answer, which is what makes the loop impossible
+    ///    by construction rather than by counting attempts.
+    /// 2. **Promote.** [`arreo_core::update::deferred::promote_in`] swaps the
+    ///    staged artifact into place under the window rule, and does **not** clear
+    ///    the marker: the swap is a file operation, and the version is a fact about
+    ///    a running process. The promotion is what makes `.prev` exist, and it
+    ///    stays for `--rollback` until a start confirms the new version (step 1).
+    /// 3. **Re-exec** into the installed binary — the promotion installed it, but
+    ///    this process is still the old image.
+    /// 4. **Or serve and say why.** A refusal (the window is shut; the stage is no
+    ///    longer promotable) or a stale marker leaves this process serving what it
+    ///    started with, after one line. There is no retry inside a start: a start
+    ///    that looped would be a boot loop, which is the failure mode the whole
+    ///    design is arranged against.
+    ///
+    /// A start that promoted nothing deletes nothing: `.prev` is the previous
+    /// binary, and it must survive every start that did not land an update.
+    fn start_decision(
+        state_dir: &Path,
+        live_panes: &[String],
+        running: Option<&Path>,
+    ) -> StartDecision {
+        use arreo_core::update::deferred::{self, NotNow, Outcome};
+
+        let pending = match deferred::read_marker_in(state_dir) {
+            Ok(Some(pending)) => pending,
+            // Nothing is waiting: the ordinary start.
+            Ok(None) => return StartDecision::Serve,
+            // A marker nobody can read is reported, not silently treated as
+            // "nothing pending" — the silent deferral T-0039 refuses.
+            Err(e) => return StartDecision::NotPromoted { why: e.to_string() },
+        };
+
+        // Step 1: has the pending version taken over **this process's own
+        // image**? The oracle is the binary that is running — the same question
+        // `arreo update --status` asks of itself (T-0039) — and it is asked in two
+        // parts, both required.
+        //
+        // The marker must name the file this process is running. Checking only
+        // the *file* the marker names was a real defect (found by review, T-0105):
+        // a daemon started from a different path than the marker records — a dev
+        // build against a service-managed install, a second copy, any spelling
+        // `current_exe` canonicalizes differently — would see the marker's target
+        // already reporting the new version, print "<new version> has taken over",
+        // clear the marker and delete `.prev`, while itself still serving the old
+        // bytes. The update was then silently lost on every later start and the
+        // rollback slot was gone with it. Reproduced against the real daemon: a
+        // marker naming a stand-in reporting `arreo-server 9.9.9` made
+        // `target/debug/arreo-server` (0.1.0) announce 9.9.9 and destroy the
+        // rollback slot.
+        //
+        // The version must then match. Both halves are the confirmation; neither
+        // alone is.
+        let Some(running) = running else {
+            return StartDecision::NotPromoted {
+                why: "cannot tell whether the pending update is for this process: its own image                       could not be identified — nothing was promoted"
+                    .to_string(),
+            };
+        };
+        let target = pending.current_path();
+        if !same_file(&target, running) {
+            // The update is for another installation. This start leaves it exactly
+            // as it found it: no promotion (the target is not ours to swap), no
+            // confirmation (only the binary the update installed may confirm it),
+            // no `.prev` release, and the marker stays for the start that *is* that
+            // binary.
+            return StartDecision::NotPromoted {
+                why: format!(
+                    "the pending update targets {}, and this process is running {} — nothing \
+                     was done here; the update waits for a start of {}",
+                    target.display(),
+                    running.display(),
+                    target.display()
+                ),
+            };
+        }
+        let installed = arreo_core::update::verify_runs(running)
+            .unwrap_or_else(|e| format!("(will not run: {e})"));
+        if installed.trim() == pending.version.trim() {
+            let previous = arreo_core::update::prev_path(&target);
+            // **The report follows the fact, not the intent.** `.prev` is released
+            // only once the marker is actually gone: a marker that could not be
+            // cleared (a read-only or permission-denied state directory) leaves the
+            // update pending, so the rollback slot is still the operator's way back
+            // and the line says what happened instead of claiming a takeover that
+            // did not happen.
+            return match deferred::clear_after_confirm_in(state_dir, &pending.version) {
+                Ok(true) => {
+                    let _ = std::fs::remove_file(&previous);
+                    StartDecision::TakenOver {
+                        previous,
+                        version: pending.version,
+                    }
+                }
+                Ok(false) => StartDecision::NotPromoted {
+                    why: format!(
+                        "{} reports the pending version but the marker still names a different \
+                         version — leaving it pending",
+                        running.display()
+                    ),
+                },
+                Err(e) => StartDecision::NotPromoted {
+                    why: format!(
+                        "{} reports the pending version, but the pending marker could not be \
+                         cleared: {e} — leaving it pending, and the rollback binary in place",
+                        running.display()
+                    ),
+                },
+            };
+        }
+
+        // Step 2: promote, under the window rule — which is `promote_in`'s to
+        // apply, from the pane list read a moment ago.
+        match deferred::promote_in(state_dir, live_panes) {
+            Ok(Outcome::Promoted { version, .. }) => StartDecision::Reexec {
+                binary: pending.current_path(),
+                version,
+            },
+            // The staged bytes are already the installed bytes, so there was
+            // nothing to swap and `promote_in` cleared the stale marker. Nothing
+            // was promoted *here*, so `.prev` is left exactly as it was.
+            Ok(Outcome::AlreadyInstalled { version }) => StartDecision::NotPromoted {
+                why: format!(
+                    "already installed: {} reports {version}; the pending marker was stale and \
+                     is cleared — the rollback binary is untouched",
+                    pending.current
+                ),
+            },
+            Ok(Outcome::NothingPending) => StartDecision::Serve,
+            // The window is shut. The stage is **kept**, so this is a state the
+            // operator can still act on: the sentence names the panes, and
+            // `arreo update --apply-now` (or the next start) is the remedy. The
+            // wording is the CLI's, so the same state reads the same way wherever
+            // it is reported.
+            Err(NotNow::PanesLive { panes }) => StartDecision::NotPromoted {
+                why: format!(
+                    "{} — the update is staged and waiting",
+                    deferred::panes_block(&panes)
+                ),
+            },
+            // The stage was refused and discarded, so nothing is pending any more
+            // and nothing will be retried: the sentence says both.
+            Err(NotNow::NotPromotable { reason }) => StartDecision::NotPromoted { why: reason },
+        }
+    }
+
+    /// Replace this process's image with the installed binary (T-0105), keeping
+    /// the pid and the arguments.
+    ///
+    /// **Returns only on failure** — `exec` does not come back. The caller reports
+    /// that failure and serves the image it started with, once; the update stays
+    /// pending, and the next start finds the new bytes installed and confirms them
+    /// (step 1), so a failed re-exec costs one restart rather than a boot loop.
+    ///
+    /// The arguments are this process's own (`argv[0]` is set by `exec`), so the
+    /// new image serves the same socket with the same configuration, and the
+    /// environment is inherited — including `ARREO_STATE_DIR`, which is how the
+    /// new image finds the marker it is about to confirm.
+    #[cfg(unix)]
+    fn reexec_into(binary: &Path) -> Result<(), DaemonError> {
+        use std::os::unix::process::CommandExt;
+        let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+        let error = std::process::Command::new(binary).args(&args).exec();
+        Err(DaemonError::Io(error))
+    }
+
+    // ## There is no Windows arm, and this is not an omission
+    //
+    // Windows has no `execv`: the application point there is a spawn-and-exit, so
+    // the pid changes and the socket changes hands. That is **T-0090's**, on the
+    // Windows runner, and writing it here would be dead code — this module is
+    // Unix-only today (`tokio::net::UnixListener`, `std::os::unix::fs`), so a
+    // `#[cfg(not(unix))]` arm could never be compiled, let alone tested, and a
+    // comment claiming it was type-checked would be false. The honest state is
+    // that the deferred start path is proven on Unix and planned for Windows.
+}
+
 pub struct Daemon {
     registry: Registry,
     socket: PathBuf,
@@ -934,6 +1247,42 @@ impl Daemon {
                 format!("socket {} already served", self.socket.display()),
             )));
         }
+
+        // The deferred update lands here (T-0105), and the placement is the
+        // design: under the lock (so two daemons starting together cannot both
+        // promote, and a promotion cannot race a live daemon's pane list) and
+        // before the bind. See `prepare_start_update` for the decisions and why
+        // they are in that order.
+        let update = self.prepare_start_update().await;
+        if let Some(line) = update.report() {
+            eprintln!("{line}");
+        }
+        if let StartDecision::Reexec { binary, .. } = &update {
+            // `execv`, still before the bind: the new image owns the socket, the
+            // boot restore and the pane list, so a process that bound first and
+            // re-exec'd after would restore the panes twice.
+            //
+            // The lock is not held across the exec: the lock file is opened
+            // `O_CLOEXEC` (every descriptor Rust opens is), so the flock is
+            // released the instant the image is replaced and re-taken by the new
+            // image's own `serve`. The window is not a hole: the lock still makes
+            // probe→remove→bind a critical section in whichever process ends up
+            // holding it, so a daemon that slips into the gap either wins (and
+            // this one refuses with "already served") or is refused by the new
+            // image. Either way exactly one daemon serves the socket, and the
+            // loser says so rather than serving beside it.
+            if let Err(e) = Self::reexec_into(binary) {
+                // One attempt, no loop. The image this process started with
+                // serves; the update stays pending, and the next start finds the
+                // promoted bytes installed and confirms them.
+                eprintln!(
+                    "daemon: cannot re-exec into {}: {e} — serving the binary this process \
+                     started with; the update is still pending",
+                    binary.display()
+                );
+            }
+        }
+
         let _ = std::fs::remove_file(&self.socket);
         let listener = UnixListener::bind(&self.socket)?;
         self.serve_on(listener, None, None).await
@@ -1451,6 +1800,22 @@ fn now_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+/// Whether two paths name the same file, **canonicalized on both sides** (T-0105).
+///
+/// The marker records the path the client resolved and this process knows its own
+/// path from `current_exe`; the two are the same file in the ordinary case and can
+/// be spelled differently (a symlinked install directory, a relative path, a
+/// `/proc/self/exe` target), so the comparison is on the resolved paths. A path
+/// that does not resolve — a marker naming something that has since been removed —
+/// is not this process's image, which is the safe answer: the update stays pending
+/// for the start that *is* that binary.
+fn same_file(a: &Path, b: &Path) -> bool {
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
 }
 
 /// The graded-alert level a wire string names, if any.
@@ -5163,5 +5528,422 @@ mod notify_act_tests {
                 "{action:?} writes its own outcome row"
             );
         }
+    }
+}
+
+/// The cold-start update path (T-0105), against scratch state directories.
+///
+/// Unix-only, and honestly so: the fixture is a stand-in server — a shell script
+/// that answers `--version` — which is what makes an "installed version" and a
+/// "staged version" two different facts without building two daemons. The Windows
+/// proof of the same behavior is T-0090's.
+#[cfg(all(test, unix))]
+mod start_update_tests {
+    use super::*;
+    use arreo_core::update::deferred;
+
+    /// A scratch directory under the workspace's `target/test-scratch`, named per
+    /// test and per process: two tests never share a state directory, and nothing
+    /// is written outside the build tree — `/tmp` is the machine's, and a test
+    /// that wrote the real state directory would corrupt the machine it runs on.
+    fn scratch(name: &str) -> PathBuf {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .expect("the workspace root is two levels above this crate")
+            .join("target")
+            .join("test-scratch")
+            .join("daemon-start")
+            .join(format!("{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("the scratch directory");
+        dir
+    }
+
+    /// A stand-in server: answers `--version` with `version` and exits. Enough for
+    /// every fact this path is about (which version is installed, which is staged)
+    /// and deliberately not more — the same fixture the update slice uses.
+    fn server(path: &Path, version: &str) {
+        let body = format!(
+            "#!/bin/sh\ncase \"$1\" in\n  --version) echo \"arreo-server {version}\" ;;\nesac\nexit 0\n"
+        );
+        std::fs::write(path, body).expect("write the stand-in");
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
+            .expect("make the stand-in executable");
+    }
+
+    /// What a binary reports, the way `verify_runs` reads it.
+    fn reported(path: &Path) -> String {
+        arreo_core::update::verify_runs(path)
+            .expect("the stand-in answers --version")
+            .trim()
+            .to_string()
+    }
+
+    /// Stage a promotable update: the install path reports 0.1.0, the artifact
+    /// reports 0.3.0, and the marker records both. Returns (state dir, install
+    /// path, artifact).
+    fn staged(dir: &Path) -> (PathBuf, PathBuf, PathBuf) {
+        let state = dir.join("state");
+        let current = dir.join("arreo-server");
+        server(&current, "0.1.0");
+        let artifact = dir.join("server-new");
+        server(&artifact, "0.3.0");
+        deferred::stage_next_in(
+            &state,
+            &artifact,
+            &current,
+            "arreo-server 0.1.0",
+            "arreo-server 0.3.0",
+        )
+        .expect("stage the artifact");
+        (state, current, artifact)
+    }
+
+    /// **The load-bearing check.** A cold start with a promotable stage promotes it
+    /// by itself and re-execs into what it installed — which is the whole point of
+    /// the task: nobody types `--apply-now`.
+    #[test]
+    fn a_start_promotes_a_pending_update_and_re_execs_into_it() {
+        let dir = scratch("promote");
+        let (state, current, _artifact) = staged(&dir);
+
+        let decision = Daemon::start_decision(&state, &[], Some(&current));
+
+        assert_eq!(
+            decision,
+            StartDecision::Reexec {
+                binary: current.clone(),
+                version: "arreo-server 0.3.0".to_string(),
+            },
+            "a cold start with a promotable stage must promote and re-exec into the install path"
+        );
+        assert_eq!(
+            reported(&current),
+            "arreo-server 0.3.0",
+            "the install path holds the promoted bytes"
+        );
+        assert!(
+            deferred::read_marker_in(&state).expect("read").is_some(),
+            "T-0039's rule, unchanged: the swap does not clear the marker — only a binary \
+             reporting the new version does"
+        );
+        assert_eq!(
+            reported(&arreo_core::update::prev_path(&current)),
+            "arreo-server 0.1.0",
+            "the rollback slot holds what the promotion replaced"
+        );
+        let line = decision.report().expect("the promotion is reported");
+        assert!(
+            line.contains("arreo-server 0.3.0") && line.contains("re-exec"),
+            "the one line names the version being re-execed into: {line}"
+        );
+    }
+
+    /// The state a start finds **after** a promotion: the installed binary already
+    /// reports the version the marker is waiting for, and the promotion left a
+    /// rollback slot behind. Returns (state dir, install path, rollback path).
+    fn confirmed(dir: &Path) -> (PathBuf, PathBuf, PathBuf) {
+        let state = dir.join("state");
+        let current = dir.join("arreo-server");
+        server(&current, "0.3.0");
+        let artifact = dir.join("server-new");
+        server(&artifact, "0.3.0");
+        let previous = arreo_core::update::prev_path(&current);
+        server(&previous, "0.1.0");
+        deferred::stage_next_in(
+            &state,
+            &artifact,
+            &current,
+            "arreo-server 0.1.0",
+            "arreo-server 0.3.0",
+        )
+        .expect("stage the artifact");
+        (state, current, previous)
+    }
+
+    /// **The loop guard.** The image that already reports the pending version
+    /// clears the marker and serves — it never re-execs again, which is what makes
+    /// the loop impossible by construction rather than by counting attempts.
+    #[test]
+    fn a_start_already_running_the_pending_version_never_re_execs() {
+        let dir = scratch("loop-guard");
+        let (state, current, _previous) = confirmed(&dir);
+
+        let decision = Daemon::start_decision(&state, &[], Some(&current));
+
+        assert!(
+            matches!(decision, StartDecision::TakenOver { .. }),
+            "the image that already reports the pending version must serve, not re-exec again: \
+             {decision:?}"
+        );
+        assert!(
+            deferred::read_marker_in(&state).expect("read").is_none(),
+            "the marker clears on the version confirmation (T-0039), which is what happened"
+        );
+        assert!(
+            deferred::next_path(&current).exists(),
+            "and nothing was promoted: the stage was never consumed"
+        );
+    }
+
+    /// **A start confirms only its own image.** The marker naming a binary that
+    /// reports the pending version is not enough: this process must *be* that
+    /// binary (review finding, T-0105).
+    ///
+    /// The defect this pins was reproduced against the real daemon. A daemon
+    /// started from a path the marker does not name — a dev build beside a
+    /// service-managed install, a second copy, any spelling `current_exe`
+    /// canonicalizes differently — saw the marker's target already reporting the new
+    /// version, printed "<new version> has taken over", cleared the marker and
+    /// deleted `.prev`, while itself serving the old bytes: the update was silently
+    /// lost on every later start and the rollback slot was gone with it. The
+    /// `arreo-server` under `target/debug` announced `arreo-server 9.9.9` and
+    /// destroyed a rollback slot while reporting `0.1.0` itself.
+    #[test]
+    fn a_start_does_not_confirm_an_update_that_targets_another_binary() {
+        let dir = scratch("not-mine");
+        let (state, current, previous) = confirmed(&dir);
+        // The binary this process is running: a *different* file from the one the
+        // marker names, and still on the old version.
+        let mine = dir.join("elsewhere").join("arreo-server");
+        std::fs::create_dir_all(mine.parent().expect("parent")).expect("scratch");
+        server(&mine, "0.1.0");
+
+        let decision = Daemon::start_decision(&state, &[], Some(&mine));
+
+        let StartDecision::NotPromoted { why } = &decision else {
+            panic!("an update for another binary must not be acted on: {decision:?}")
+        };
+        assert!(
+            why.contains("targets") && why.contains("nothing"),
+            "the line says what was and was not done: {why}"
+        );
+        assert!(
+            deferred::read_marker_in(&state).expect("read").is_some(),
+            "the marker stays: only the binary the update installed may confirm it"
+        );
+        assert!(
+            previous.exists(),
+            "and the rollback slot is untouched — this process has no takeover to release"
+        );
+        assert_eq!(
+            reported(&current),
+            "arreo-server 0.3.0",
+            "the other installation is left exactly as it was"
+        );
+        assert_eq!(reported(&mine), "arreo-server 0.1.0", "and so is this one");
+    }
+
+    /// A process that cannot identify its own image promotes nothing, confirms
+    /// nothing and releases nothing — the conservative answer, in one line.
+    #[test]
+    fn a_start_that_cannot_identify_itself_touches_nothing() {
+        let dir = scratch("no-self");
+        let (state, current, previous) = confirmed(&dir);
+
+        let decision = Daemon::start_decision(&state, &[], None);
+
+        let StartDecision::NotPromoted { why } = &decision else {
+            panic!("an unidentifiable image must not act: {decision:?}")
+        };
+        assert!(why.contains("could not be identified"), "{why}");
+        assert!(deferred::read_marker_in(&state).expect("read").is_some());
+        assert!(previous.exists());
+        assert_eq!(reported(&current), "arreo-server 0.3.0");
+    }
+
+    /// The rollback slot is released by the start that **confirms** the new
+    /// version — not by the swap, and not by a start that promoted nothing. Until
+    /// then `--rollback` has something to roll back to.
+    #[test]
+    fn a_start_that_confirms_the_new_version_releases_the_rollback_slot() {
+        let dir = scratch("release-prev");
+        let (state, current, previous) = confirmed(&dir);
+        assert!(previous.exists(), "the fixture's rollback slot is there");
+
+        let decision = Daemon::start_decision(&state, &[], Some(&current));
+
+        assert!(
+            !previous.exists(),
+            "`.prev` is released once a start has succeeded with the new binary \
+             (decision: {decision:?})"
+        );
+        assert_eq!(
+            reported(&current),
+            "arreo-server 0.3.0",
+            "and the installed binary is the one that took over"
+        );
+    }
+
+    /// The pane list is **read from the registry**, not assumed empty.
+    ///
+    /// On a cold start the registry is empty by construction, so this cannot be
+    /// observed through a real daemon — which is exactly why the property is worth
+    /// a test: the rule that decides the window is
+    /// `deferred::window_is_open(pane_count)`, and a start path that skipped the
+    /// reading and passed an empty list would still pass every other check in this
+    /// module. Here the registry has a pane in it, so a start that read it refuses.
+    ///
+    /// `ARREO_STATE_DIR` is how `prepare_start_update` finds the machine's pending
+    /// update, so this test points it at its own scratch state directory. Nothing
+    /// else in this test binary reads that variable (the `deferred` unit tests were
+    /// split into `_in` forms for exactly this reason), so the process-wide set is
+    /// safe here.
+    #[test]
+    fn a_start_reads_the_pane_list_from_the_registry() {
+        let dir = scratch("registry-panes");
+        let (state, _current, _artifact) = staged(&dir);
+        std::env::set_var("ARREO_STATE_DIR", &state);
+
+        // **The marker must name this process's own image**, or `prepare_start_update`
+        // refuses on identity before it ever looks at the panes (T-0105's review
+        // finding) — and this test is about the pane list, not about identity. The
+        // test binary is what `current_binary()` resolves here, and it is a safe
+        // stand-in for "the installed binary" *only because the window stays shut*:
+        // `promote_in` refuses on the live pane below before it touches the install
+        // path. Do not add a case to this test that empties the registry — that
+        // would swap the test binary for the stage.
+        let mine = std::env::current_exe().expect("this process's own path");
+        let mut pending = deferred::read_marker_in(&state)
+            .expect("read the marker")
+            .expect("the fixture staged one");
+        pending.current = mine.display().to_string();
+        deferred::write_marker_in(&state, &pending).expect("point the marker at this process");
+
+        let socket = dir.join("arreo.sock");
+        let daemon = Daemon::new(&socket);
+        let registry = daemon.registry();
+        let pane = Arc::new(Pane::spawn("/bin/sh", &["-c", "sleep 30"], 80, 24).expect("spawn"));
+        let adapter = PaneEntry::adapter_for(&pane.spawn_spec().program);
+        let entry = Arc::new(PaneEntry::with_adapter(pane, None, false, adapter, None));
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a runtime")
+            .block_on(async {
+                registry.write().await.insert("pane-1".to_string(), entry);
+            });
+
+        let decision = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a runtime")
+            .block_on(daemon.prepare_start_update());
+        std::env::remove_var("ARREO_STATE_DIR");
+
+        let StartDecision::NotPromoted { why } = &decision else {
+            panic!("a live pane in the registry must shut the window: {decision:?}")
+        };
+        assert!(why.contains("pane-1"), "the refusal names the pane: {why}");
+        assert!(
+            deferred::read_marker_in(&state).expect("read").is_some(),
+            "and nothing was promoted: the stage and its marker are still there"
+        );
+        assert!(
+            pending.staged_path().exists(),
+            "and the stage is untouched: the refusal happened before anything was swapped"
+        );
+    }
+
+    /// The re-exec is the one step that can fail *after* the promotion, and the
+    /// contract `serve` depends on is that it **returns** the failure: the caller
+    /// reports it once and serves the image it started with. A `reexec_into` that
+    /// panicked (or was `-> !`) would take the whole start down and leave the socket
+    /// unserved, which is the failure this test exists to catch.
+    ///
+    /// The error's *kind* is not pinned: `serve` prints it and branches on nothing,
+    /// so the kind is not part of anything a caller observes — the path in the
+    /// operator's line comes from the caller, which knows it.
+    #[test]
+    fn a_re_exec_that_cannot_run_returns_the_failure() {
+        let dir = scratch("reexec-failure");
+        let missing = dir.join("no-such-binary");
+
+        let error = Daemon::reexec_into(&missing)
+            .expect_err("a binary that is not there cannot be re-execed into");
+
+        assert!(
+            matches!(error, DaemonError::Io(_)),
+            "a failed re-exec is the caller's to report, and it is an io failure: {error}"
+        );
+        // Reaching this line at all is the assertion that matters: `exec` did not
+        // replace this process, so the caller still gets to serve.
+    }
+
+    /// The window rule is `promote_in`'s, read from the pane list this start
+    /// observed: a live pane refuses the promotion, the stage is **kept**, and the
+    /// machine serves what it started with.
+    #[test]
+    fn a_shut_window_keeps_the_stage_and_serves_as_it_is() {
+        let dir = scratch("panes");
+        let (state, current, _artifact) = staged(&dir);
+        let previous = arreo_core::update::prev_path(&current);
+        server(&previous, "0.0.9");
+
+        let decision = Daemon::start_decision(&state, &["pane-1".to_string()], Some(&current));
+
+        let StartDecision::NotPromoted { why } = &decision else {
+            panic!("a live pane must refuse the promotion: {decision:?}")
+        };
+        assert!(why.contains("pane-1"), "the refusal names the pane: {why}");
+        assert_eq!(
+            reported(&current),
+            "arreo-server 0.1.0",
+            "nothing was installed"
+        );
+        assert!(
+            deferred::next_path(&current).exists(),
+            "the stage is kept: the window opens later, and `--apply-now` can use it"
+        );
+        assert!(
+            deferred::read_marker_in(&state).expect("read").is_some(),
+            "and the marker still reports it"
+        );
+        assert!(previous.exists(), "a refused promotion deletes nothing");
+        assert!(decision.report().is_some(), "and it is reported once");
+    }
+
+    /// A stage that is no longer runnable is refused **and discarded**, reported
+    /// once — and a second start has nothing left to try, which is what "never
+    /// retried" means in code rather than in a comment.
+    #[test]
+    fn a_stage_that_will_not_run_is_discarded_and_not_retried() {
+        let dir = scratch("refused");
+        let (state, current, _artifact) = staged(&dir);
+        let previous = arreo_core::update::prev_path(&current);
+        server(&previous, "0.0.9");
+        // The stage loses its executable bit between the verification that staged
+        // it and the start that would promote it.
+        std::fs::set_permissions(
+            deferred::next_path(&current),
+            std::fs::Permissions::from_mode(0o644),
+        )
+        .expect("unset the stage's executable bit");
+
+        let decision = Daemon::start_decision(&state, &[], Some(&current));
+
+        let StartDecision::NotPromoted { why } = &decision else {
+            panic!("a stage that will not run must be refused: {decision:?}")
+        };
+        assert!(why.contains("no longer a runnable binary"), "{why}");
+        assert!(
+            deferred::read_marker_in(&state).expect("read").is_none(),
+            "T-0039: the refusal discards the marker, which is what makes it non-retrying"
+        );
+        assert!(
+            !deferred::next_path(&current).exists(),
+            "and the stage with it"
+        );
+        assert_eq!(reported(&current), "arreo-server 0.1.0");
+        assert!(
+            previous.exists(),
+            "a start that promoted nothing deletes nothing"
+        );
+        assert_eq!(
+            Daemon::start_decision(&state, &[], Some(&current)),
+            StartDecision::Serve,
+            "the next start has nothing pending at all: one attempt, no retry"
+        );
     }
 }

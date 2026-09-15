@@ -151,7 +151,10 @@ pub fn run(rest: &[String]) -> ExitCode {
 /// artifact instead of discarding it; the pending state is reported and does not
 /// claim to be applied; `--apply-now` refuses while a pane is live and *names*
 /// it; at zero panes the promotion happens and `.prev` holds what it replaced;
-/// and the marker clears only once the installed binary reports the new version.
+/// the marker clears only once the installed binary reports the new version; and
+/// — T-0105 — a daemon **restart** promotes a pending update by itself, re-execs
+/// into what it installed, and releases the rollback slot (checks 8-13, on a real
+/// daemon running a real release).
 ///
 /// Unix-only, and honestly so: the proof needs a **stand-in** server that answers
 /// `--version` and nothing else, which is a shell script — a real `arreo-server`
@@ -226,12 +229,11 @@ fn deferred_case_unix(report: &mut Report) {
             return;
         }
     }
-    let installed_path = installed.display().to_string();
     let candidate_path = candidate.display().to_string();
     let staged = root.join("arreo-server.next");
     let marker = root.join("arreo-state").join("update-pending.json");
 
-    let daemon = match Daemon::spawn(&sandbox, &server_bin, &cli_bin, &socket) {
+    let mut daemon = match Daemon::spawn(&sandbox, &server_bin, &cli_bin, &socket) {
         Ok(daemon) => daemon,
         Err(e) => {
             report.check("the daemon starts and binds its socket", false, &e);
@@ -393,7 +395,332 @@ fn deferred_case_unix(report: &mut Report) {
         &first_line(&r.output),
     );
 
-    let _ = installed_path;
+    // ---- 7. the restart story (T-0105): a start promotes it by itself --------
+    //
+    // The checks above prove the deferred *state* with stand-in servers. This is
+    // the other half: a real daemon restart, a real release on disk, and the
+    // promotion happening because the daemon started.
+    //
+    // The client is the **copy** in the scratch directory, never the build tree's
+    // own artefact (the trap the main slice documents).
+    restart_story(
+        report,
+        &sandbox,
+        &root,
+        &socket,
+        &server_bin,
+        &installed,
+        &mut daemon,
+    );
+}
+
+/// The restart story (T-0105): **a start promotes the pending update by itself**.
+///
+/// Checks 1-6 prove the deferred state — an artifact is kept, reported, promoted in
+/// the window, and the marker clears only on the version confirmation. This story
+/// proves what T-0105 adds: a daemon **restart** with a promotable stage waiting
+/// promotes it, re-execs into what it installed, and cleans up, with nobody typing
+/// `--apply-now`.
+///
+/// ## Why the "new release" is the real server with its version replaced
+///
+/// The re-exec is only observable if the binary it re-execs *into* can serve, and
+/// the staged artifact must report the version the marker records — a stand-in shell
+/// script satisfies neither (checks 1-6 use one precisely because they are about the
+/// state machine, not about serving a socket). So the release here is a copy of the
+/// real server with its version string rewritten in place: same length, so nothing
+/// moves in the file and the copy is a working daemon that reports a different
+/// version. That difference is the whole point of an update.
+///
+/// ## Why the state is staged with the library call the CLI makes
+///
+/// `arreo update --server` defers only when the live cut *fails*, and a candidate
+/// that fails a cut is a candidate that cannot serve — so on Unix a real serving
+/// artifact never reaches the deferred state through the CLI, and a fixture that
+/// got there through the CLI would be one this story could not restart into. The
+/// pending state is therefore written with `deferred::stage_next_in`, the same call
+/// `defer_install` reaches through `deferred::stage_next`, and the story spends its
+/// checks on the start path — which is what T-0105 changed.
+///
+/// `client` is the **copy** of the `arreo` binary in the scratch directory: every
+/// verb in this story goes through it, and `target/debug/arreo` is only ever read
+/// (the trap the main slice documents).
+#[cfg(unix)]
+fn restart_story(
+    report: &mut Report,
+    sandbox: &Sandbox,
+    root: &Path,
+    socket: &Path,
+    real_server: &Path,
+    client: &Path,
+    daemon: &mut Daemon,
+) {
+    use arreo_core::update::deferred;
+
+    let sock = socket.display().to_string();
+    let state_dir = root.join("arreo-state");
+    let server_dir = root.join("server");
+    let install = server_dir.join("arreo-server");
+    let candidate = root.join("server-new");
+    if let Err(e) = fs::create_dir_all(&server_dir) {
+        report.check(
+            "the restart fixture has a directory for the daemon it runs",
+            false,
+            &format!("{}: {e}", server_dir.display()),
+        );
+        return;
+    }
+
+    // The daemon the operator runs, and the release that replaces it.
+    if let Err(e) = copy_with_tail(real_server, &install, b"") {
+        report.check(
+            "the restart fixture copies the real server",
+            false,
+            &format!("{}: {e}", install.display()),
+        );
+        return;
+    }
+    let old_line = run_cli(sandbox, &install, &["--version"], CLI_DEADLINE)
+        .output
+        .trim()
+        .to_string();
+    let Some((old_token, new_line)) = retagged(&old_line) else {
+        report.check(
+            "the server's version can be replaced in place",
+            false,
+            &format!("{old_line:?} does not end in a digit to bump"),
+        );
+        return;
+    };
+    let new_token = new_line.rsplit(' ').next().unwrap_or_default().to_string();
+    if let Err(e) = copy_with_tail(real_server, &candidate, b"")
+        .and_then(|()| retag_version(&candidate, &old_token, &new_token))
+    {
+        report.check(
+            "the new release is the real server reporting a different version",
+            false,
+            &e,
+        );
+        return;
+    }
+    let candidate_line = run_cli(sandbox, &candidate, &["--version"], CLI_DEADLINE)
+        .output
+        .trim()
+        .to_string();
+    report.check(
+        "the new release runs and reports a version the installed one does not",
+        candidate_line == new_line && new_line != old_line,
+        &format!("installed={old_line:?} candidate={candidate_line:?}"),
+    );
+    if candidate_line != new_line || new_line == old_line {
+        return;
+    }
+
+    // The machine serves the old version, from a path this slice owns.
+    daemon.stop();
+    let mut serving = match Daemon::spawn(sandbox, &install, client, socket) {
+        Ok(daemon) => daemon,
+        Err(e) => {
+            report.check("the daemon starts from the install path", false, &e);
+            return;
+        }
+    };
+    report.say(format!(
+        "restart: the daemon (pid {}) serves {sock} from {}",
+        serving.id,
+        install.display()
+    ));
+
+    // A verified artifact kept for the next start — the deferred state.
+    let pending =
+        match deferred::stage_next_in(&state_dir, &candidate, &install, &old_line, &new_line) {
+            Ok(pending) => pending,
+            Err(e) => {
+                report.check(
+                    "the update is staged for the next start",
+                    false,
+                    &format!("{e}"),
+                );
+                return;
+            }
+        };
+    let marker = deferred::marker_in(&state_dir);
+    let installed_before = run_cli(sandbox, &install, &["--version"], CLI_DEADLINE)
+        .output
+        .trim()
+        .to_string();
+    // T-0039's rule, on this fixture: the update is pending and the surface says
+    // so, because the installed binary does not report the new version yet. That
+    // is the state a restart is about to change, and the state a start must not
+    // claim to have changed until the version confirms.
+    let status = run_cli(sandbox, client, &["update", "--status"], CLI_DEADLINE);
+    report.check(
+        "the update is staged for the next start: the marker is there, nothing is installed, and --status says so",
+        marker.exists()
+            && pending.staged_path().exists()
+            && installed_before == old_line
+            && status.output.contains(&format!("{old_line} → {new_line}"))
+            && status.output.contains("not applied yet"),
+        &format!(
+            "marker={} staged={} installed={installed_before:?} status={:?}",
+            marker.exists(),
+            pending.staged_path().exists(),
+            first_line(&status.output),
+        ),
+    );
+
+    // The operator restarts the daemon the way a service does: stop, start.
+    serving.stop();
+    let mut restarted = match Daemon::spawn(sandbox, &install, client, socket) {
+        Ok(daemon) => daemon,
+        Err(e) => {
+            report.check(
+                "the restarted daemon serves the socket",
+                false,
+                &e.to_string(),
+            );
+            return;
+        }
+    };
+
+    // ---- the property an operator cares about ------------------------------
+    let installed_now = run_cli(sandbox, &install, &["--version"], CLI_DEADLINE)
+        .output
+        .trim()
+        .to_string();
+    let panes = run_cli(sandbox, client, &["panes", "--socket", &sock], CLI_DEADLINE);
+    report.check(
+        "a restart promotes the pending update by itself: the new version is installed and the daemon serves",
+        installed_now == new_line && panes.ok(),
+        &format!(
+            "installed={installed_now:?} panes_exit={:?} said={:?}",
+            panes.code,
+            first_line(&panes.output)
+        ),
+    );
+
+    // The process that was started is still the process serving, and it is
+    // **running the installed binary**: `/proc/<pid>/exe` names the image the
+    // kernel has for it. That is `execv` and not spawn-and-exit — a spawned
+    // replacement would leave this pid exited and its own pid serving.
+    let exe = fs::read_link(format!("/proc/{}/exe", restarted.id))
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|e| format!("(cannot read /proc/{}/exe: {e})", restarted.id));
+    let log = restarted.log_tail();
+    report.check(
+        "the re-exec happened in the process this slice started, and it is running the installed binary",
+        exe == install.display().to_string()
+            && log.contains("re-exec into")
+            && log.contains(&new_line)
+            // Only the post-exec image can print this one: it is what the start
+            // says when it finds the installed binary already reporting the
+            // pending version (T-0039's confirmation). A start that promoted and
+            // kept serving the old image cannot produce it.
+            && log.contains("has taken over")
+            && restarted.still_running().is_ok(),
+        &format!(
+            "exe={exe:?} promotion_line={} takeover_line={} running={:?}",
+            log.contains("re-exec into"),
+            log.contains("has taken over"),
+            restarted.still_running()
+        ),
+    );
+
+    let previous = arreo_core::update::prev_path(&install);
+    report.check(
+        "the marker is gone and the rollback slot is released once the start has the new binary",
+        !marker.exists() && !previous.exists(),
+        &format!("marker={} prev={}", marker.exists(), previous.exists()),
+    );
+
+    // ---- and the other half of the `.prev` rule ----------------------------
+    //
+    // A rollback slot beside the install path (what `--apply-now` leaves) must
+    // survive a start that promoted nothing: the slot is for the next update, and
+    // deleting it on every start would take `--rollback` away from the operator.
+    //
+    // The marker is cleared first so this check stands on its own fixture — the
+    // state is "the update is done, the rollback slot is still there" — and a
+    // failure here can only be *this* start deleting the slot.
+    restarted.stop();
+    let _ = deferred::clear_marker_in(&state_dir);
+    if let Err(e) = fs::copy(&install, &previous) {
+        report.check(
+            "the rollback slot can be put back for the negative check",
+            false,
+            &format!("{}: {e}", previous.display()),
+        );
+        return;
+    }
+    let mut quiet = match Daemon::spawn(sandbox, &install, client, socket) {
+        Ok(daemon) => daemon,
+        Err(e) => {
+            report.check("the daemon starts with nothing pending", false, &e);
+            return;
+        }
+    };
+    report.check(
+        "a start that promotes nothing deletes nothing: the rollback slot survives it",
+        previous.exists() && quiet.still_running().is_ok(),
+        &format!(
+            "prev={} running={:?}",
+            previous.exists(),
+            quiet.still_running()
+        ),
+    );
+}
+
+/// A `--version` line and the same line with its version's final digit bumped.
+///
+/// Same length by construction, which is what lets [`retag_version`] rewrite a real
+/// binary in place. `None` when the line does not end in a digit, which is a fact
+/// about this build rather than something to guess at.
+#[cfg(unix)]
+fn retagged(line: &str) -> Option<(String, String)> {
+    let token = line.rsplit(' ').next()?.to_string();
+    let last = token.chars().last()?;
+    if !last.is_ascii_digit() {
+        return None;
+    }
+    let mut bumped = token.clone();
+    bumped.pop();
+    bumped.push(if last == '9' { '8' } else { '9' });
+    let prefix = line[..line.len() - token.len()].trim_end();
+    let new_line = if prefix.is_empty() {
+        bumped.clone()
+    } else {
+        format!("{prefix} {bumped}")
+    };
+    Some((token, new_line))
+}
+
+/// Replace every occurrence of `from` with `to` in `path`, in place.
+///
+/// An `arreo-server` build carries the version string twice — the
+/// `env!("CARGO_PKG_VERSION")` literal and the copy of it in the binary's own help
+/// text — and the protocol version is a `u32`, so it is not touched. `from` and `to`
+/// must be the same length: nothing in the file moves, and the copy still runs.
+#[cfg(unix)]
+fn retag_version(path: &Path, from: &str, to: &str) -> Result<(), String> {
+    if from.len() != to.len() {
+        return Err(format!(
+            "{from:?} and {to:?} differ in length, so the binary cannot be retagged in place"
+        ));
+    }
+    let mut bytes = fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let needle = from.as_bytes();
+    let mut hits = 0usize;
+    let mut at = 0usize;
+    while let Some(found) = bytes[at..].windows(needle.len()).position(|w| w == needle) {
+        let start = at + found;
+        bytes[start..start + needle.len()].copy_from_slice(to.as_bytes());
+        hits += 1;
+        at = start + needle.len();
+    }
+    if hits == 0 {
+        return Err(format!("{} does not contain {from:?}", path.display()));
+    }
+    fs::write(path, bytes).map_err(|e| format!("{}: {e}", path.display()))
 }
 
 /// A stand-in `arreo-server` that answers `--version` with `version` and exits.

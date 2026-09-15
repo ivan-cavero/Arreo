@@ -1,0 +1,138 @@
+T-0105 — The start path: promote a pending update, re-exec into it, release `.prev`
+==================================================================================
+
+A daemon cold start promotes a staged update by itself, re-execs into the installed
+binary, and releases the rollback slot once the new version confirms — so a deferred
+update lands on the next restart with nobody typing `--apply-now`.
+
+WHAT SHIPPED
+------------
+crates/arreo-server/src/daemon.rs
+  StartDecision { Serve | Reexec | TakenOver | NotPromoted } + report()
+  Daemon::prepare_start_update()   — the cold-start door, called from serve()
+  Daemon::start_decision(state_dir, live_panes, running)  — the whole policy
+  Daemon::reexec_into()            — execv (cfg(unix)); no Windows arm (see below)
+  #[cfg(all(test, unix))] mod start_update_tests — 9 tests
+  fn same_file(a, b)               — canonicalized identity, both sides
+crates/arreo-server/tests/deferred_start.rs — the handoff exclusion (1 test)
+xtask/src/update_slice.rs — restart_story(): 7 checks appended to `--case deferred` (13 total)
+docs/release.md — the operator story leads with a restart; a new section on why it cannot loop
+crates/arreo-server/tests/{api,compat,notify}.rs — update-state isolation in the helpers
+
+THE DESIGN, AND WHY THE PLACEMENT IS THE DESIGN
+------------------------------------------------
+Promotion lives inside `Daemon::serve()`: after the socket lock is taken and the second
+`is_live` probe has refused, before `remove_file`+bind. Under the lock, so two daemons
+starting together cannot both promote and a promotion cannot race a live daemon's pane
+list; before the bind, so the re-exec'd image owns the socket, the boot restore and the
+pane list (binding first would restore the panes twice). The pane list is read from the
+registry at that instant — empty on a cold start by construction, but *read*, so the
+window rule stays the one function `deferred::window_is_open`.
+
+`serve_inherited` (the incoming side of a live cut) never promotes: it has just adopted
+the listener, the lock and the panes, and re-execing there would drop all three. The
+guard is structural, and `tests/deferred_start.rs` proves it behaviorally — it stages a
+genuinely promotable artifact (verified by `verify_runs`, the same predicate
+`promote_in` re-proves), drives the inherited path with an *empty* adopted list (so the
+window would be open), and asserts the marker, the stage, the install and `.prev` are all
+untouched. The fixture's stand-in exits 1 on anything but `--version`, so a wrong exec
+kills the test binary as well.
+
+THE LOOP GUARD
+--------------
+Step 1 of `start_decision`: if the marker names this process's own image and that image
+reports the pending version, the update has taken over — clear the marker, release
+`.prev`, serve, and **never re-exec**. That is the loop guard by construction rather than
+by counting attempts. Every other arm was traced: an unreadable marker reports once;
+`NothingPending` serves; `PanesLive` keeps the stage and names the panes; `NotPromotable`
+discards the stage and never retries (T-0039's rule); `AlreadyInstalled` clears the stale
+marker and touches nothing else; a failed `execv` reports once and serves the image it
+started with, costing one restart.
+
+THE REVIEW'S p1, AND THE FIX
+----------------------------
+Step 1 originally decided "taken over" from the **file the marker names** — a fact about a
+path, not about the process. Reproduced against the real binary:
+
+  $ python3 -c 'json.dump({"staged": R+"/other-server.next", "current": R+"/other-server",
+                           "from_version": "arreo-server 0.1.0",
+                           "version": "arreo-server 9.9.9"}, ...)'
+  $ ARREO_STATE_DIR=$R/state ./target/debug/arreo-server --socket $R/s.sock
+  daemon: arreo-server 9.9.9 has taken over; the rollback binary …/other-server.prev is
+          no longer needed
+  $ ./target/debug/arreo-server --version
+  arreo-server 0.1.0
+  marker exists: NO   .prev exists: NO
+
+A daemon reporting 0.1.0 announced 9.9.9, cleared the pending marker and destroyed the
+rollback slot — the update silently lost on every later start, `--rollback` with nothing
+to roll back to. Reachable whenever the restarting daemon is not the file the client
+resolved as "arreo-server beside me": a dev build against a service-managed install, a
+second copy, any spelling `current_exe` canonicalizes differently.
+
+Fixed: the confirmation is now **two facts, both required** — the marker must name this
+process's own image (`same_file`, canonicalized on both sides, the same resolution
+`arreo update --status` uses for itself) and that image must report the pending version.
+A marker for another binary is left exactly as found, with one line saying so and where
+the update waits. The same repro against the fixed binary:
+
+  daemon: the pending update targets …/other-server, and this process is running
+          …/target/debug/arreo-server — nothing was done here; the update waits for a
+          start of …/other-server
+  marker exists: YES   .prev exists: YES
+
+MUTATIONS — each reddens exactly its test
+-----------------------------------------
+A  confirmed image re-execs anyway (the boot loop)
+     → a_start_already_running_the_pending_version_never_re_execs FAILED
+B  `.prev` never released → a_start_that_confirms_the_new_version_releases_the_rollback_slot
+     FAILED
+C  the pane list hardcoded empty → a_start_reads_the_pane_list_from_the_registry FAILED
+D  the identity half of the confirmation dropped (the pre-fix behaviour)
+     → a_start_does_not_confirm_an_update_that_targets_another_binary FAILED
+E  the promotion moved onto `serve_inherited`
+     → the_handoff_path_never_promotes_a_pending_update FAILED (the wrongly-exec'd test
+       process dies on the fixture, exit status 1 — the worker's documented mechanism)
+F  the promotion disabled at start (env-gated, passed through to the slice's daemons)
+     → 3 slice checks red: "a restart promotes the pending update by itself" with
+       installed="arreo-server 0.1.0", "the re-exec happened in the process this slice
+       started", "the marker is gone and the rollback slot is released"
+
+HONEST NOTE ON ONE OF THEM: the isolation helper added to api/compat/notify (review
+finding 2) does **not** redden when removed — the identity fix above already refuses a
+marker that names another binary, so the live hazard was subsumed. It is kept as
+hermeticity (the suite no longer depends on what the machine's real state directory
+holds), not as the guard. Verified both ways: with a pending marker exported as
+ARREO_STATE_DIR, `cargo test -p arreo-server --test api` passes and the marker and `.prev`
+survive.
+
+THE OTHER REVIEW FINDINGS
+-------------------------
+p3 `.prev` is released only when the marker was *actually* cleared — a marker that cannot
+   be removed (read-only state dir) leaves the update pending, so the rollback slot is
+   still the operator's way back and the line says what happened instead of claiming a
+   takeover that did not happen.
+p2 the older in-process helpers (`api`, `compat`, `notify`) now point `ARREO_STATE_DIR` at
+   a per-pid scratch directory. See the honest note above.
+p3 the `#[cfg(not(unix))]` re-exec arm was **deleted**, not kept: `daemon.rs` cannot
+   compile on a non-unix target today (`tokio::net::UnixListener`, `std::os::unix::fs`), so
+   the arm was dead code whose comment claimed a type-check that never happened. The
+   Windows application point is T-0090's, on the Windows runner, and the comment now says
+   exactly that.
+Verified sound by the reviewer: the lock-across-`exec` argument (`ExclusiveLock::acquire`
+opens O_CLOEXEC, so the flock releases at exec and the new image re-acquires; on exec
+*failure* the fd stays open, so the fall-through unlink+bind is still done by the lock
+holder) and the handoff exclusion.
+
+BATTERY (integrated tree)
+-------------------------
+cargo test --workspace: 925 passed / 0 failed.
+clippy --workspace --all-targets: 0 findings (pinned + stable). fmt clean.
+14/14 slices (api = 2 suites; update 27 incl. the 13-check deferred case; tui 103;
+persistence 16; mesh 36+1; handoff-abort 41; worktree 9; compat both directions;
+lifecycle 2; reattach 11; enforcement; relay 20; chaos 8; theme 33).
+sync 14/14. vet 337. deny 4/4. audit 0. check-targets PASS/SKIP.
+bench 6/6 (19 MB RSS, 211 KB/pane, 0 ms detect, 64 ms sweep).
+One attribution: `handoff-abort` came back 2/41 in the run immediately after the 13-slice
+batch and is 41/41 in three consecutive runs alone (it SIGKILLs daemons at sub-second
+deadlines and is load-sensitive) — contention, not the change.

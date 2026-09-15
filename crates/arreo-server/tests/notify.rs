@@ -50,6 +50,22 @@ use arreo_core::notify::PANE_EXITED;
 /// slow. A failure prints what the log did hold.
 const WAIT: Duration = Duration::from_secs(20);
 
+/// Point the daemon's update state at a scratch directory (T-0105).
+///
+/// `Daemon::serve` now acts on the machine's pending update at start: with the
+/// real state directory, a machine that has a deferred update staged would make
+/// **this test binary** promote the artifact and re-exec into the installed
+/// server — a test run that installs software and dies. The value is derived from
+/// the pid, so every test in this process sets the *same* one: the process-wide
+/// `set_var` is idempotent and cannot race between the test threads.
+fn isolate_update_state() {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../target/test-scratch/daemon-start")
+        .join(format!("state-for-tests-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    std::env::set_var("ARREO_STATE_DIR", dir);
+}
+
 fn scratch(name: &str) -> PathBuf {
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../target/test-scratch/T-0093/integration")
@@ -197,6 +213,7 @@ async fn spawn_asking_pane(client: &mut Client, id: &str) {
 /// store path to read the outcome from.
 async fn daemon_with_asking_pane(dir: &Path, policy: Option<Policy>, id: &str) -> PathBuf {
     let socket = dir.join("arreo.sock");
+    isolate_update_state();
     let daemon = Daemon::new(&socket).with_notify_policy(policy);
     tokio::spawn(async move {
         let _ = daemon.serve().await;
@@ -481,6 +498,7 @@ const ASKS_TWICE: &str =
 /// the background tick can classify the pane.
 async fn daemon_with_script(dir: &Path, policy: Option<Policy>, id: &str, script: &str) -> PathBuf {
     let socket = dir.join("arreo.sock");
+    isolate_update_state();
     let daemon = Daemon::new(&socket).with_notify_policy(policy);
     tokio::spawn(async move {
         let _ = daemon.serve().await;
@@ -622,6 +640,7 @@ async fn a_transition_a_poll_consumed_is_still_decided() {
     let pane = "notify-polled";
 
     let socket = dir.join("arreo.sock");
+    isolate_update_state();
     let daemon = Daemon::new(&socket).with_notify_policy(Some(policy));
     tokio::spawn(async move {
         let _ = daemon.serve().await;

@@ -15,6 +15,22 @@ fn temp_socket(name: &str) -> PathBuf {
 }
 
 async fn spawn_daemon(socket: PathBuf) -> tokio::task::JoinHandle<()> {
+    /// Point the daemon's update state at a scratch directory (T-0105).
+    ///
+    /// `Daemon::serve` now acts on the machine's pending update at start: with the
+    /// real state directory, a machine that has a deferred update staged would make
+    /// **this test binary** promote the artifact and re-exec into the installed
+    /// server — a test run that installs software and dies. The value is derived from
+    /// the pid, so every test in this process sets the *same* one: the process-wide
+    /// `set_var` is idempotent and cannot race between the test threads.
+    fn isolate_update_state() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/test-scratch/daemon-start")
+            .join(format!("state-for-tests-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        std::env::set_var("ARREO_STATE_DIR", dir);
+    }
+    isolate_update_state();
     let _ = std::fs::remove_file(&socket);
     let daemon = Daemon::new(&socket);
     tokio::spawn(async move {

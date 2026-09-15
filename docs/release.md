@@ -484,6 +484,20 @@ $ arreo update --status
 update pending arreo-server 0.2.0 → arreo-server 0.3.0 (applies at next restart)
 /usr/local/bin/arreo-server reports: arreo-server 0.2.0
 not applied yet: the running binary does not report the new version
+$ systemctl restart arreo            # the ordinary way an operator gets the update
+$ arreo update --status
+no update pending
+running: arreo-server 0.3.0
+```
+
+**`--apply-now` is optional, and a restart is enough.** A daemon **start**
+promotes the pending update by itself: it swaps the staged artifact in, re-execs
+into the installed binary, and serves that. Nothing has to be typed for a
+deferred update to land — which is the whole point of deferring rather than
+failing. `--apply-now` remains for the operator who wants the window *now*, and it
+still refuses while an agent is running:
+
+```console
 $ arreo update --apply-now          # while an agent is running
 update: 1 live pane (build) — a pane is a running agent, so the update waits for
 the window where none is running
@@ -500,7 +514,9 @@ The state is three facts, and each is written down rather than implied:
   *running* process reports. `arreo update --status` clears the marker only once
   the installed binary reports the new version — a marker cleared by the rename
   would report success for a machine still serving the old code.
-- **`.prev`** holds what was replaced, for `--rollback`, until a start succeeds.
+- **`.prev`** holds what was replaced, for `--rollback`, until a start succeeds
+  with the new binary — the start that confirms the version releases it, and a
+  start that promoted nothing leaves it alone.
 
 **A stage that cannot be promoted is discarded, with its marker.** A truncated
 artifact, or one that no longer reports the version it was recorded with, is
@@ -508,12 +524,43 @@ refused *and removed* — keeping it would mean the same failure on every boot,
 which is a loop dressed as persistence. The refusal says so and asks for
 `arreo update` again.
 
+#### The start path, and why it cannot loop
+
+The promotion runs inside the daemon's cold start, under the socket lock and
+before the socket is bound, with the pane list read from the registry at that
+instant. Three properties make it safe, and each is a property of the *order* of
+the code rather than of a counter or a flag:
+
+- **The handoff path never promotes.** An incoming daemon (`--handoff-from`)
+  inherits the listener, the lock and the live panes; promoting there would swap
+  the binary under a live cut and re-exec a process holding adopted panes. Only
+  the cold-start path promotes, and that is asserted by a test rather than
+  promised by a comment.
+- **The start confirms before it promotes.** A marker naming the version the
+  installed binary already reports means the update has taken over: the marker is
+  cleared (the same confirmation `--status` performs), the rollback slot is
+  released, and the daemon serves — it never re-execs again. That is the loop
+  guard, and it is why one restart is one update.
+- **The re-exec is `execv`, not spawn** (`std::os::unix::process::CommandExt`):
+  the pid is unchanged, there is one process to supervise, and the daemon that
+  serves is the binary on disk. On Windows there is no `execv`, so the installed
+  binary is spawned with the same arguments and the starting process exits — the
+  pid changes, and that is T-0090's to prove on the Windows runner.
+
+A start that promotes and then cannot re-exec serves the image it started with,
+says so once on stderr, and does not retry: the update stays pending, and the next
+start finds the new bytes installed and confirms them. One attempt, no boot loop.
+The re-exec is visible in the daemon's log (`daemon: promoting the pending update
+to … — re-exec into …`), which is what the release slice greps for.
+
 #### What is proven where
 
 | Part | Proven by |
 | --- | --- |
 | The window rule, the marker, the refusals, `.prev` | `cargo test -p arreo-core update` (unit, all platforms) |
-| The whole path end to end on the real binaries | `cargo xtask e2e --slice update --case deferred` (Unix; the Windows runner reports the skip) |
+| The start path's decisions: promotion, the loop guard, the refusals, the rollback slot | `cargo test -p arreo-server` — the start-path unit tests in `daemon.rs`, against scratch state directories |
+| The handoff path never promotes | `cargo test -p arreo-server --test deferred_start` |
+| The whole path end to end on the real binaries, **including a daemon restart that promotes, re-execs and releases `.prev`** | `cargo xtask e2e --slice update --case deferred` (Unix; the Windows runner reports the skip) |
 | Windows service stop/start through control codes, promotion before the socket is bound, the `windows-deferred` case | **not yet** — T-0090, and it can only be proven on the Windows runner |
 
 The last row is the honest gap, and it is a gap in *this* document's story rather
