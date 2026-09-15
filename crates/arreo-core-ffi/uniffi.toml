@@ -1,0 +1,14 @@
+# UniFFI binding configuration for `arreo-core-ffi` (T-0104).
+#
+# Read by `uniffi-bindgen` from the crate root (library mode resolves it through
+# `cargo metadata`), so the generated API's names are the product's rather than
+# the crate's: an app writes `import dev.arreo.core` / `import ArreoCore`, not
+# `uniffi.arreo_core_ffi`.
+
+[bindings.kotlin]
+# The default would be `uniffi.<namespace>` = `uniffi.arreo_core_ffi`.
+package_name = "dev.arreo.core"
+
+[bindings.swift]
+# The default would be the namespace (`arreo_core_ffi`).
+module_name = "ArreoCore"

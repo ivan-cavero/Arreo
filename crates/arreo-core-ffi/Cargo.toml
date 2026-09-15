@@ -1,0 +1,87 @@
+[package]
+name = "arreo-core-ffi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+# The three crate types are three different consumers of one surface (T-0104):
+# - `cdylib` is what `uniffi-bindgen --library` reads the interface metadata out
+#   of, and what an Android app loads through JNA;
+# - `staticlib` is what an iOS app links into its Xcode target (there is no
+#   dynamic loading on iOS);
+# - `lib` is what the Rust-side contract test drives, so the boundary is
+#   exercised by `cargo test` on this box rather than only by an Xcode build.
+[lib]
+crate-type = ["cdylib", "staticlib", "lib"]
+
+[dependencies]
+# The bindings generator (T-0104). It is confined to this crate: nothing that
+# ships today links it, so the daemon/CLI/TUI binaries are unchanged.
+#
+# **`default-features = false`, and the two features this crate actually wants.**
+# The Design asked for `build` (the UDL-mode build-script helpers) and a
+# `build.rs`; neither applies here, and taking them would have been the expensive
+# kind of wrong. This crate is **proc-macro mode** — `#[uniffi::export]` plus
+# `uniffi::setup_scaffolding!()` in `lib.rs` — which emits the interface metadata
+# into the cdylib itself and needs no build script at all. `uniffi/build` is what
+# a `.udl` file's `build.rs` calls, and pulling it in drags `uniffi_build` →
+# `uniffi_bindgen` → askama, goblin and toml 1.x into the **shipped** graph
+# (`cargo tree -p arreo-core-ffi -e normal` shows it), i.e. a template engine
+# linked into a phone's library for no reason. Measured, not assumed: the
+# generated Swift and Kotlin are identical either way.
+#
+# `uniffi`'s own default is `cargo-metadata`, which exists for the bindgen's
+# config lookup. It is off here and enabled by the `cli` feature instead, which
+# is the only thing that needs it — so the shipped graph drops `cargo_metadata`
+# and `cargo-platform` too.
+#
+# `tokio` is what makes `async_runtime = "tokio"` available, which the relay
+# session needs: a foreign runtime cannot drive a quinn connection.
+uniffi = { version = "0.32", default-features = false, features = ["tokio"] }
+# The one first-party edge, and the reason this crate is a leaf: it wraps the
+# client-relevant core and adds nothing else.
+# **The store is still linked, and this is a known, filed weight problem (T-0113).**
+# `arreo-core`'s defaults are `sqlite` + `transport`; a phone needs the transport and
+# has no use for the store, so `default-features = false, features = ["transport"]`
+# is the right *intent* — and it does not compile today, because `arreo-core`'s
+# `mesh::resolve` calls `crate::store::rfc3339_ms` unconditionally while `store` is
+# gated behind `sqlite`. Making the core separable is a change outside this task's
+# fence, so it is filed rather than smuggled in: until then the shipped cdylib
+# carries SQLite (measured: 15 sqlite symbols) with no export able to reach it.
+arreo-core = { version = "0.1.0", path = "../arreo-core" }
+# The typed errors' `Display` (the sentences that cross the boundary). Already in
+# the graph via `arreo-core`, at the same major, so this adds no supply-chain
+# entry — the standard the `rustix` and `rustls-native-certs` notes set.
+thiserror = "2"
+# The FFI surface owns the runtime the async exports run on. Without this a
+# Swift/Kotlin caller would have to provide one, which is exactly the kind of
+# "the binding leaks its implementation" that UniFFI's `async_runtime` exists to
+# avoid.
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time"] }
+
+[features]
+# The `uniffi-bindgen` binary. Off by default so the shipped cdylib/staticlib
+# never carry the generator: clap, askama, goblin, `cargo_metadata` and a TOML
+# parser are a developer's tools, not a phone's dependencies. `cargo-metadata`
+# rides here rather than in `[dependencies]` because the bindgen's config lookup
+# is the only thing that reads it.
+cli = ["uniffi/cli", "uniffi/cargo-metadata"]
+
+[[bin]]
+name = "uniffi-bindgen"
+path = "src/bin/uniffi-bindgen.rs"
+required-features = ["cli"]
+
+[dev-dependencies]
+# The contract test drives a session, which means standing up a relay that
+# speaks the protocol in `arreo-core::relay` — the QUIC endpoint comes from the
+# transport module the product already ships, and `quinn` is re-exported there
+# (`arreo_core::transport::{Endpoint, Connection}`), so no new crate enters the
+# graph for it.
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", "net"] }
+# The mailbox the test stands up speaks the shipped `MailboxRequest` /
+# `MailboxResponse` JSON — the same encoding the real mailbox uses — so the test
+# needs a JSON codec. Already in the graph via `arreo-core`, at the same major.
+serde_json = "1"

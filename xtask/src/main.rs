@@ -17,6 +17,7 @@ mod check_targets;
 mod compat_slice;
 mod demo;
 mod enforcement_slice;
+mod ffi;
 mod handoff_abort_slice;
 mod harness;
 mod lifecycle_slice;
@@ -38,7 +39,7 @@ fn main() -> ExitCode {
     let (cmd, rest) = match args.split_first() {
         Some((first, rest)) => (first.as_str(), rest),
         None => {
-            eprintln!("usage: xtask <e2e|bench|conpty-smoke|check-targets|sync --check> [options]");
+            eprintln!("usage: xtask <e2e|bench|conpty-smoke|check-targets|ffi --check|sync --check> [options]");
             return ExitCode::from(2);
         }
     };
@@ -49,12 +50,13 @@ fn main() -> ExitCode {
         "conpty-smoke" => conpty_smoke(rest),
         "check-targets" => check_targets::check_targets(rest),
         "adapters" => adapters_check::run(rest),
+        "ffi" => ffi::ffi(rest),
         "package" => package::package(rest),
         "release-check" => release_check::release_check(rest),
         "sync" => sync_check::run(rest),
         other => {
             eprintln!("unknown xtask command: {other}");
-            eprintln!("usage: xtask <e2e|bench|conpty-smoke|check-targets|sync --check> [options]");
+            eprintln!("usage: xtask <e2e|bench|conpty-smoke|check-targets|ffi --check|sync --check> [options]");
             ExitCode::from(2)
         }
     }

@@ -1,0 +1,154 @@
+T-0104 — UniFFI core bindings: one core, three UIs
+==================================================
+
+The client-relevant core gets a typed UniFFI surface so the Phase-3 mobile UIs are
+written against a generated API rather than a Rust ABI. This is the one Phase-3 task
+provable on this box, and the one the rest of Phase 3 depends on.
+
+WHAT SHIPPED
+------------
+crates/arreo-core-ffi/            a leaf crate: cdylib + staticlib + lib
+  src/{lib,errors,identity,pairing,relay,directory,codec,theme}.rs
+  src/bin/uniffi-bindgen.rs       the generator, behind a `cli` feature
+  uniffi.toml                     kotlin package dev.arreo.core, swift module ArreoCore
+  tests/contract.rs               10 tests
+xtask/src/ffi.rs                  the `ffi --check` gate (588 lines)
+docs/mobile.md                    the surface, the SKIPs, what a UI still brings, the weight
+Cargo.toml                        workspace members += the crate
+supply-chain/config.toml          337 -> 375 exemptions (the uniffi tree)
+
+THE DEPENDENCY DECISION (recorded before a line was written)
+-----------------------------------------------------------
+`uniffi` 0.32, chosen over: a hand-written C ABI (no type/error mapping — every function
+is a manual edit in four places, and a struct change silently desynchronises them);
+`cbindgen` (C headers only, no async, so Swift and Kotlin stay hand-written);
+`flutter_rust_bridge` (targets a runtime ROADMAP §3.5 explicitly rejects: "no Flutter
+runtime"). UniFFI generates Swift *and* Kotlin from one definition with typed errors,
+records, enums and async — and it is what §3.5 already decided.
+
+EXPORTED SURFACE: 85 symbols, all client-shaped
+-----------------------------------------------
+free fns  pairing_server_begin, pairing_invite_parse, pairing_invite_uri,
+          pairing_code_random, pairing_code_phrase, pairing_phone_join,
+          device_key_from_seed, root_key_from_seed, device_cert_issue,
+          device_cert_decode, fingerprint_of_public_key, identity_verify,
+          role_word, role_parse, relay_session_dial, relay_peer_parse,
+          directory_cache_new, presence_word, codec_* (12), theme_* (6)
+objects   PairingServerHandle, PairingPhoneHandle, DeviceKeyHandle, RootKeyHandle,
+          DeviceCertHandle, RelaySessionHandle, RelayPeerHandle, RelayStreamHandle,
+          DirectoryCacheHandle, ThemeHandle
+errors    8 flat #[derive(uniffi::Error)] enums; NO Result<_, String> anywhere
+
+No function takes a path, spawns a child, or exposes PTY/daemon/store: a phone is a
+client, and the crate is a leaf nothing may depend on.
+
+WHAT THE GATE PROVES
+--------------------
+$ cargo xtask ffi --check
+ffi --check: build PASS (/home/dev/dev/Arreo/target/debug/libarreo_core_ffi.so)
+ffi --check: generate swift PASS
+ffi --check: surface swift PASS (85 golden symbols present)
+ffi --check: generate kotlin PASS
+ffi --check: surface kotlin PASS (85 golden symbols present)
+ffi --check: kotlin compile SKIP (no `kotlinc` on PATH — a JDK alone cannot compile
+            Kotlin; install the Kotlin compiler, e.g. `sdk install kotlin`, to lift this)
+ffi --check: swift compile SKIP (needs macOS + Xcode — `swiftc` is Apple-only; the
+            GitHub macOS runner is where this is executed, the same class of gate as T-0090)
+ffi --check: 5 pass, 2 skip (a machine with the toolchain is authority for skipped)
+
+**The task's own premise was corrected before delegating.** It said "Kotlin bindings can
+be compiled with a JDK if one is installed"; a JDK cannot compile Kotlin — `kotlinc` is a
+separate compiler and this box has none (JDK 25 is present). The criterion was rewritten
+rather than left as a claim that would have failed.
+
+MUTATIONS
+---------
+1. An export removed from the FFI source (dropped `#[uniffi::export]` on `color_parse`):
+   surface swift/kotlin FAIL with the exact symbol named
+   (`uniffi_arreo_core_ffi_fn_func_color_parse`) — the check reads generated *output*,
+   not the Rust source.
+2. The same check fired **unprompted during integration**: dropping the unused
+   `RootKeyHandle::sign` export made the gate report
+   `1 golden symbol(s) absent … first: uniffi_arreo_core_ffi_fn_method_rootkeyhandle_sign`
+   before I had touched the list. That is the gate doing its job in the real direction.
+3. The weak-key refusal removed → `a_weak_public_key_cannot_be_pinned_through_the_boundary`
+   FAILED with `a small-order point must not be pinnable`.
+
+THE REVIEW, AND WHAT CHANGED
+----------------------------
+An independent reviewer returned **ship-with-follow-ups**: no p1, no data-loss or
+auth-bypass defect, and it verified sound the three things I most wanted a second pair of
+eyes on — the surface is client-shaped and leaks no server capability; the golden-symbol
+assertion reads generated output and cannot pass vacuously (it checks both directions, and
+the golden strings appear nowhere in the Rust source); the Kotlin "compile" branch is a real
+`kotlinc` invocation, not a stub that reports PASS without compiling.
+
+Nine of its ten findings are fixed here:
+
+p2 the gate could not run off Linux — `CDYLIB` was the literal `libarreo_core_ffi.so`, so
+   on the macOS runner (the platform that lifts the Swift SKIP) step 1 would fail after a
+   successful build. Now `DLL_PREFIX`/`DLL_SUFFIX`.
+p2 the Kotlin classpath was missing `kotlinx-coroutines-core` — uniffi emits
+   `kotlinx.coroutines.*` imports whenever the interface has async functions (this surface's
+   relay exports), and it is a separate Maven artifact, so the one non-SKIP compile path
+   could not PASS even on a machine with everything the SKIP named. Now probed, added to the
+   classpath, and named in the SKIP.
+p2 **`device_cert_issue` bypassed the core's weak-key refusal.** This is the security half
+   of the review. A small-order ed25519 point is not a key anybody can prove possession of —
+   ed25519-dalek's own docs say a signature can be forged for almost any message under one —
+   and `DeviceAuthority::issue` refuses it as `WeakKey`. This surface is the *only* issuing
+   door a mobile UI has, and the key arrives from the peer
+   (`PairingRequest.public_key`), so a malicious phone pushed a weak key through the one
+   path that had no check: the FFI pinned an identity the CLI refuses. Fixed with the core's
+   own predicate (`is_weak`) and the core's own sentence (carried from
+   `AuthorityError::WeakKey`, never restated), plus a regression test and its control (a
+   real key still issues, so the check refuses the *key*, not the call).
+p3 a failed scratch-dir removal was swallowed, which could let a stale file satisfy the
+   golden check — now a FAIL unless the error is `NotFound`.
+p3 the summary printed `5 - skipped.len()` and so reported "3 pass, 2 skip" after five
+   steps passed; now counted as they happen (the run above prints 5).
+p3 `RootKeyHandle::sign` was an arbitrary-bytes signing oracle for the account's trust
+   anchor, exported and called by nothing, and `docs/mobile.md` claimed the key "signs
+   certificates and nothing else". Deleted, per the rule that everything in the tree exists
+   because it is used — and the gate immediately caught the stale golden entry (mutation 2
+   above).
+p3 three doc corrections: the error-enum count (said ten, there are eight); the claim that
+   CI runs this gate (`.github/workflows/ci.yml` has no `xtask ffi` step and is the user's
+   file during T-0063 — the doc now says so plainly rather than implying a pre-merge job
+   already tolerates the SKIPs); and the `cargo tree` evidence backing the proc-macro
+   decision (askama/goblin/clap are *absent* from the normal tree; the one edge that is
+   there, toml/fs-err/camino, arrives through the host-side `uniffi_macros` proc-macro).
+
+**One finding is filed, not fixed — T-0113.** The reviewer is right that the shipped cdylib
+carries SQLite (53 defined symbols matching `sqlite`; `rusqlite → libsqlite3-sys` in the
+normal tree) and ~197 PTY symbols, none reachable from any export, in a product whose
+ROADMAP §3.5 sets an explicit size discipline. I attempted the obvious fix —
+`arreo-core = { default-features = false, features = ["transport"] }` — and **it does not
+compile**: `arreo-core::mesh::resolve` calls `crate::store::rfc3339_ms` unconditionally
+while `store` is gated behind `sqlite`. Making the core separable is a change to
+`crates/arreo-core/src/**`, which is **outside this task's fence**, so the attempt was
+reverted with the reason recorded in the manifest and the work filed as T-0113 (with the
+rule that its fix is measured by symbol count, not asserted). The numbers in
+`docs/mobile.md` are my own measurements, and they disagree with the reviewer's (53 vs its
+15) — the doc states the exact command so the figure is reproducible rather than borrowed.
+
+VERIFIED SOUND BY THE REVIEWER (no change needed)
+-------------------------------------------------
+- The exported surface is client-shaped; no path, no child process, no PTY/daemon/store
+  capability; the codec is a pure transform so the daemon's role gate still decides every verb.
+- No `Result<_, String>` in the surface; the sentences are the core's own `Display`, so they
+  are the CLI's by construction.
+- The contract test drives the exported items; its only `arreo_core` references are
+  server-side vocabulary the test-local mailbox/relay need, never a client API underneath.
+- All 38 new vet exemptions exist in `Cargo.lock` and none is unused.
+
+BATTERY (integrated tree)
+-------------------------
+cargo test --workspace: 935 passed / 0 failed (was 925; +10 contract tests).
+clippy --workspace --all-targets: 0 findings (pinned + stable). fmt clean.
+14/14 slices (api = 2 suites; tui 103; update 27; persistence 16; mesh 36+1;
+handoff-abort 41; worktree 9; compat both directions; lifecycle 2; reattach 11;
+enforcement; relay 20; chaos 8; theme 33).
+sync 14/14. vet 375. deny 4/4. audit 0. check-targets PASS/SKIP.
+workspace_deps 8/8 (the license/dependency-direction gate the new crate had to satisfy).
+bench 6/6 (18 MB RSS, 211 KB/pane, 0 ms detect, 76 ms sweep).
