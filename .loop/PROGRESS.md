@@ -1,7 +1,12 @@
 ## State snapshot          ← REWRITTEN (not appended) at every checkpoint
 
-Task: **T-0104 done** — UniFFI core bindings. Phase 3 is open (it had 0 of 60 tasks).
-Where you are: committing. `crates/arreo-core-ffi` (leaf, cdylib+staticlib+lib) exports the
+Task: **T-0114 in progress** — the FFI metrics reads (worker `FfiMetricsFix` fixing the review's
+p1). T-0104 done and pushed (86be4a9); Phase 3's queue drafted (37e608e).
+Where you are: the first T-0114 implementation is in the working tree, **uncommitted**, with a
+security review's findings pinned into the task file and a fix worker on them. The full battery
+was green on that tree (936 tests, 14/14 slices, bench 6/6, all gates) — but the battery is
+exactly what could not see the p1, which is why the fix is gated on a real-daemon retest.
+Where you were: `crates/arreo-core-ffi` (leaf, cdylib+staticlib+lib) exports the
 client surface — 85 symbols: pairing both sides, identity + fingerprint, the relay session,
 the machine directory, the codec, the theme tokens — with 8 flat typed error enums and no
 `Result<_, String>`. `cargo xtask ffi --check` builds, generates Swift+Kotlin, asserts the
@@ -20,8 +25,21 @@ reach — the obvious fix does not compile (`mesh::resolve` calls `store::rfc333
 `store` is gated), and that is a core change outside the fence, so it is **T-0113**.
 Battery: **935 tests, 0 failed; 14/14 slices; sync 14/14; vet 375; deny 4/4; audit 0;
 check-targets PASS/SKIP; workspace_deps 8/8; bench 6/6; clippy 0 on both toolchains; fmt clean.**
-Next step: integrate the T-0114 worker (the FFI metrics reads), then T-0115 (the act door).
-Then T-0095 (approval gates, p3) or T-0111 (the notify tick's cost, p3).
+Next step: integrate FfiMetricsFix (the p1 fix + the bounds/identity/test findings), then
+T-0115 (the act door for quick answers). Then T-0095 (approval gates, p3) or T-0111 (p3).
+**T-0114's p1, and why the battery did not catch it.** The read opened a fresh Noise handshake
+per call and "closed" by dropping the session — nothing goes on the wire when it drops, and the
+daemon keeps its session open after a verb, so the *second* call's bytes land in the stale
+session and its pump reads the 32-byte hint as a ~25 KB frame length and waits. The phone's
+single unretried 10 s attempt fails, and keeps failing. The contract test could not see it
+because its fixture closes after each answer (the client's expectation, not a real daemon's
+behaviour). Verified independently: the fixture's shutdown is real, and the core's own client
+retries on fresh streams with the comment "the peer may still be holding an earlier stream" —
+the same failure mode, worked around in the core and absent here. The review also established
+what the design rests on: **the peer key is genuinely pinned** (it becomes Noise-KK's remote
+static, so a substituted key cannot complete the handshake) and **the per-verb gate applies**
+(same `serve_session`, same `check_verb` + trust ledger; `MetricsHistory` needs
+`Capability::Observe`, which a Viewer holds — the intended rule).
 **Phase 3's queue is drafted** (T-0104's notes owed it): five tasks provable on this box —
 T-0114 FFI metrics reads, T-0115 the act door, T-0116 the server pushes a theme, T-0117 the push
 payload + offline-queued delivery, T-0118 the pairing payload a camera can scan — and seven
@@ -29,7 +47,7 @@ payload + offline-queued delivery, T-0118 the pairing payload a camera can scan 
 screens, Xcode/macOS), T-0120/T-0122 (Android shell + screens, SDK/NDK), T-0123 (both store beta
 tracks, accounts + signing), T-0124 (the phase-exit demo, real devices). Plus T-0113 (make the
 core separable, so the phone artifact drops SQLite).
-Open workers: T-0114 (FfiMetrics) — dispatched.
+Open workers: FfiMetricsFix (T-0114's p1 + findings B–F).
 Known broken: T-0063 (CI never-green — the user's, untouched) · Parked: T-0048 needs-human
 **T-0105 (done) — the review's p1 was real.** The deferred start path keyed "has the update
 taken over?" off the *file the marker names* rather than this process's own image, so a daemon
@@ -274,3 +292,4 @@ after a 13-slice batch and 41/41 alone (load-sensitive). Earlier: the persistenc
 - 2026-09-15 [turn 29] T-0104: **the task's own premise was wrong and was corrected before delegating** — a JDK cannot compile Kotlin (`kotlinc` is separate; none on this box), so that criterion became a probe-and-report instead of a claim that would have failed. An independent review returned ship-with-follow-ups: nine of ten findings fixed, including a **security** one — `device_cert_issue` bypassed the core's weak-key refusal, so a malicious phone could push a small-order ed25519 point (a key whose signatures are forgeable for almost any message) through the only issuing door a mobile UI has, pinning an identity the CLI refuses. Fixed with the core's own predicate and its own sentence (carried, not restated) + a regression test with a control. Also: the gate's cdylib name was Linux-literal (so it could not run on the macOS runner that lifts the Swift SKIP); the Kotlin classpath lacked `kotlinx-coroutines-core` (so the one non-SKIP compile path could not PASS even with everything the SKIP named); a swallowed scratch-removal could let a stale file satisfy the golden check; the summary's pass count was derived rather than counted; the unused `RootKeyHandle::sign` (an arbitrary-signing oracle for the trust anchor) deleted — and the gate caught its stale golden entry unprompted, which is the check working in the real direction. Three doc corrections.
 - 2026-09-15 [turn 29] T-0104's tenth finding **filed, not fixed**: the shipped library carries SQLite (53 defined symbols) and PTY (197) that no export can reach. The obvious fix (`arreo-core = { default-features = false, features = ["transport"] }`) **does not compile** — `arreo-core::mesh::resolve` calls `crate::store::rfc3339_ms` while `store` is gated behind `sqlite`. A core change outside T-0104's fence, so it was reverted with the reason in the manifest and filed as **T-0113** (whose fix is measured by symbol count, not asserted). `docs/mobile.md` carries my own measurements with the exact command (they differ from the reviewer's 15; 53 is what `nm … | grep -ci sqlite` prints).
 - 2026-09-15 [turn 29] **Phase 3's queue drafted** (owed by T-0104's notes: the phase had 0 of 60 tasks). Twelve tasks, split by what is actually provable on this box. Provable here: **T-0114** (the FFI metrics reads a RAM meter needs — `MetricsHistory`/`MetricsSeries` already exist on the wire, the boundary cannot reach them), **T-0115** (the act door for quick answers — T-0094's `NotifyAct` exists, the boundary cannot reach it), **T-0116** (the server pushes a theme, so one theme reaches every surface — today a theme reaches a client only by discovering files in a directory, which a phone does not have), **T-0117** (the push payload and offline-queued delivery over T-0030's durable inbox, with T-0093's decision as the audience gate), **T-0118** (the pairing payload a camera can scan — the URI exists; its *fitness for a QR* is unmeasured). `needs-human` because they need a different machine or a purchase: T-0119/T-0121 (iOS shell + the five screens: Xcode, macOS), T-0120/T-0122 (Android shell + screens: SDK/NDK), T-0123 (both stores' beta tracks: accounts, signing identities), T-0124 (the Phase-3 exit demo: 30 agents from a phone on real devices). T-0122's criteria include the phase's real integration test: the two UIs side by side showing the same state word, refusal sentence and colours — duplicated UI is the accepted cost, identical behaviour is what the shared core buys.
+- 2026-09-15 [turn 30] T-0114's first implementation passed the whole battery (936 tests, 14/14 slices, bench 6/6, vet 375, deny 4/4, check-targets PASS/SKIP) and was still **wrong in a way the battery cannot see**: a security review found the read works once and fails from then on against a real daemon. Root cause: a fresh Noise handshake per call, closed by dropping the session — but nothing goes on the wire when it drops (the relay has no per-stream close; `PeerGone` is only for a device's relay session ending) and the daemon keeps its session open after a verb, so the second call's bytes land in the stale session, whose pump reads the 32-byte hint as a ~25 KB frame length and waits for bytes that never come. The contract test passed because its fixture `shutdown()`s after each answer, forcing the reconnect path — the client's expectation, not a real daemon's behaviour. **Attribution: this is a fixture-fidelity defect, not a flaky test**, and it is the exact class of thing "verified against a real daemon, not only the fixture" exists for. The review's two load-bearing verdicts are TRUE: the peer key is genuinely pinned (it becomes Noise-KK's remote static) and the per-verb gate + role semantics apply on this path (a Viewer may read metrics — the intended `Capability::Observe`). The fix is pinned in the task file as a decided shape and delegated to `FfiMetricsFix` (one cached conversation per peer under one mutex, lazy invalidation, bounded send, fail-fast on a non-truncated frame error, the Noise hint derived locally, the fixture rewritten to keep its session open, a wrong-but-valid key as the pinning falsification, and a real-daemon retest).
