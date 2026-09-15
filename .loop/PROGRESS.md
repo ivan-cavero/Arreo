@@ -1,43 +1,41 @@
 ## State snapshot          ← REWRITTEN (not appended) at every checkpoint
 
-Task: **T-0094 done** — quick actions: a notification you can answer where you read it.
-Where you are: committed and pushed. A Question notification carries a bounded action list
-(reply ≤ 4096 bytes through the existing send path, skip, kill); `arreo notify act
-<pane> <action> [--text ...]` is the single CLI door and the TUI answers in place (r / space / K).
-Refusals are the pane's or the role's, never the notifier's; every outcome a notify.act row;
-N−1 holds. Two workers on disjoint crates against a frozen contract; an independent review
-found no P1/P2 and four P3 (two fixed, two accepted with reasons). Three load-bearing
-mutations, each reddening exactly its test. Battery on the integrated tree: **915 tests, 0
-failed; 14/14 slices; sync 14/14; vet 337; deny 4/4; audit 0; check-targets PASS/SKIP; bench 6/6;
-clippy 0 findings on both toolchains; fmt clean.**
-Next step: the next unblocked unit — **T-0105** (the deferred update's start path, p2) or
-**T-0104** (uniffi bindings, p2, larger). **T-0111** (p3) is the remaining follow-up T-0093 filed.
+Task: **T-0105 done** — the deferred update's start path: a daemon cold start promotes a
+pending update by itself, re-execs into it, and releases `.prev` once the new version confirms.
+Where you are: committed and pushed. Promotion runs inside `Daemon::serve()` under the socket
+lock and before the bind (pane list read from the registry; `window_is_open` is the only rule);
+`serve_inherited` never promotes; the re-exec is `execv`; the loop guard is the version
+confirmation; `.prev` is released only by the confirming start. 9 unit tests + 1 integration
+test + a 7-check restart story in the update slice + docs/release.md.
+**An independent review found one p1, and it was real**: step 1 keyed off the *file the marker
+names*, so a daemon running from a different path than the marker records announced the new
+version, cleared the marker and deleted `.prev` while itself serving the old bytes (reproduced
+against the real binary: a 0.1.0 daemon announced 9.9.9 and destroyed the rollback slot). Fixed
+— the confirmation now requires the marker to name *this* process's own image (canonicalized)
+and that image to report the pending version. Two regression tests; 6 mutations each redden
+exactly their test. Battery: **925 tests, 0 failed; 14/14 slices; sync 14/14; vet 337; deny
+4/4; audit 0; check-targets PASS/SKIP; bench 6/6; clippy 0 on both toolchains; fmt clean.**
+Next step: **T-0104** (uniffi core bindings, p2, larger) or **T-0111** (p3, the notify tick's
+cost — the last T-0093 follow-up). T-0095 (approval gates, p3) is also unblocked.
 Open workers: none.
 Known broken: T-0063 (CI never-green — the user's, untouched) · Parked: T-0048 needs-human
-**T-0094 — how it was built.** Worker A did the vocabulary, the wire (`Message::NotifyAct` +
-`NotifyActReply`, serde defaults, old daemons refuse the variant loudly), the daemon's single
-act path (shape validation, the pane's live state as the authority on refusals, reply via the
-existing send + pump, skip writing nothing, kill through the shared pane-kill path, every
-outcome a notify.act row with the reply text redacted by the send-path scan), the CLI verb and
-the api-slice scenario. Worker B did the TUI panel (reply prompt, optimistic skip dismiss +
-audited act, kill behind the panel's confirm) and the tui-slice scenario (103 checks, the reply
-marker exactly once in the journal, the daemon's own PanesDetail leaving Question). The review
-changed two things: skip is Verb::Send on both sides (a byte-free dismissal's honest capability),
-and a wire-shape test that pinned a frame the encoder never emits was deleted. The trim
-convention and the lagging-state panel were accepted as design, with reasons in the evidence.
-**A slice check softened, with its reason.** The persistence slice's pi-recall check asked the
-harness's own model for the codeword and failed twice on an empty answer — the model's behaviour,
-not the restore (the transcript and session-file checks prove the restore). It is now a skip that
-says so. The T-0112 marker fix holds (12 passed + the skip, 0 failed).
-**This session's units, so far.** (1) T-0093, the notification rules engine, integrated and then
-corrected by an independent review (four findings fixed, two filed as T-0110/T-0111). (2) T-0112,
-the persistence slice's 60 s marker outlived by its own 300 s waits (one token, green). (3)
-T-0110, the wait-provenance regression (the engine keeps how it derived its state). (4) T-0094,
-this task. Plus **RUSTSEC-2026-0285** (rustls 0.23.44 → 0.23.45, exemption moved).
-**Slice failures during verification, all attributed.** `persistence` recall (above — the model's
-empty answer, now a skip); a batch tui 96/7 and a mesh backtrace line (both contention — 103/0
-and 36+1 alone); `handoff-abort` 2/41 in a batch (41/41 alone — SIGKILLs at sub-second deadlines,
-run it alone).
+**T-0105 — what the review changed, and the three dispositions.** (1) The p1 above. (2) `.prev`
+is now released only when the marker was *actually* cleared — a read-only state dir leaves the
+update pending and the rollback slot intact, and the line says so. (3) The unreachable
+`#[cfg(not(unix))]` re-exec arm was deleted rather than kept claiming a type-check it never got
+(`daemon.rs` cannot compile off Unix today; the Windows application point is T-0090's).
+(4) The older in-process test helpers now isolate `ARREO_STATE_DIR` — and the evidence records
+honestly that its removal does *not* redden anything, because the identity fix already subsumes
+the live hazard: it is hermeticity, not the guard. Verified sound by the reviewer: the
+lock-across-`exec` argument (O_CLOEXEC releases the flock at exec; on exec failure the fd stays
+open so the fall-through unlink+bind is still the lock holder's) and the handoff exclusion.
+**This session's units.** T-0093 (notification rules engine, then corrected by review), T-0112
+(a persistence-slice marker outlived by its own waits), T-0110 (the wait-provenance regression),
+T-0094 (quick actions), T-0105 (this one), plus RUSTSEC-2026-0285 (rustls 0.23.45).
+**Slice failures during verification, all attributed.** `handoff-abort` 2/41 in the run right
+after the 13-slice batch, 41/41 in three consecutive runs alone — load-sensitive, not the
+change. Earlier in the session: the persistence recall check (the harness's own model answering
+empty, now a skip) and batch contention on tui/mesh (green alone).
 ## Event log               ← append-only; newest last; never rewrite
 - 2026-09-10 [turn 1] ledger created; repo at e489fac (docs only); T-0001 + T-0022 (AGENTS.md gardened) done
 - 2026-09-10 [turn 2] T-0002 PTY manager done+pushed (342606c; 9 tests); PROMPT.md v2 synced + ADR 0001 (ef6c595)
@@ -259,3 +257,5 @@ run it alone).
 - 2026-09-14 [turn 26] **T-0110 done** — `wait` answers with how the state was derived, whoever observed it. T-0093's tick pumps every pane once a second (deliberately not gated on a `[notify]` section), so the transition a client's own pump used to produce is normally already consumed by the time the client asks — and `Wait`'s "already" branch synthesised `direct:already` and dropped the matched pattern, with notifications *off* (every user). `Engine` now keeps the last transition's `Provenance { confidence, matched_pattern }` beside its state, set at every state assignment through one private `record` so the two cannot drift; the constructor's initial `Unknown` is the only state with no derivation. `Wait`'s branch fills the same two fields the event path fills; `direct:already` survives only where it is true. No wire change. Three tests (the regression through a real daemon+socket+config with no `[notify]`; the `direct:already`-still-true half; the accessor boundary in core), each mutation-proven: removing the fix reddens the first with `left: "direct:already", right: "inferred:silence+prompt-shape"`, a lying `None` branch reddens the second. Engine is a hot path, so the bench is verification: 6/6, no regression. Battery: 902 tests / 0 failed, 14/14 slices, sync 14/14, vet 337, deny 4/4, audit 0, check-targets PASS/SKIP, clippy 0/0, fmt clean. Commits: 436c000 + this ledger.
 - 2026-09-15 [turn 27] **T-0094 done** — quick actions on a Question notification (reply/skip/kill). Two workers on disjoint crates against a frozen contract: A did the vocabulary (`NotifyAction`, `actions_for`, 4096-byte bound, `PANE_EXITED`), the wire (`Message::NotifyAct`/`NotifyActReply`, serde defaults), the daemon's single act path (shape validation, the pane's live state as refusal authority, reply via existing send+pump, shared kill path, every outcome a notify.act row redacted by the send-path scan), the CLI verb (`notify act`, exit 0/2/1) and the api-slice scenario; B did the TUI panel (r/space/K, reply prompt, optimistic skip + audited act, kill behind confirm) and the tui-slice scenario (103 checks). Independent review: no P1/P2, four P3 — two fixed (skip → Verb::Send both sides; fake wire-shape test deleted), two accepted with reasons. Mutations MUT1/MUT2/MUT3b each redden exactly their test. Battery: 915/0, 14/14 slices, sync 14/14, vet 337, deny 4/4, audit 0, check-targets PASS/SKIP, bench 6/6, clippy 0/0, fmt clean. Evidence `.loop/evidence/T-0094/quick-actions.txt`.
 - 2026-09-15 [turn 27] Persistence slice: the pi-recall check (asks the harness's own model for the codeword) failed twice on an empty model answer — the model's behaviour, not the restore. Softened to a skip that says so; the restore stays proven by the transcript + session-file checks. Slice now 12 passed + skip, 0 failed.
+- 2026-09-15 [turn 28] **T-0105 done** — the deferred update's start path. Promotion inside `Daemon::serve()` (under the socket lock, before the bind, pane list read from the registry, `window_is_open` the only rule); `serve_inherited` never promotes (structural, behaviourally proven); `execv` re-exec on Unix; the loop guard is the version confirmation; `.prev` released only by the confirming start. 9 unit tests (`start_update_tests`), `tests/deferred_start.rs`, 7 new slice checks (the deferred case is 13), docs/release.md. An independent review found **one p1**: step 1 keyed off the *file the marker names*, so a daemon running from a different path announced the new version, cleared the marker and deleted `.prev` while itself serving the old bytes — reproduced against the real binary (a 0.1.0 daemon announced 9.9.9 and destroyed the rollback slot). Fixed by requiring the marker to name *this* process's own image (`same_file`, canonicalized) **and** that image to report the pending version; a marker for another binary is left alone with one honest line. Also fixed: `.prev` released only when the marker was actually cleared; the unreachable `#[cfg(not(unix))]` arm deleted; the older test helpers isolate `ARREO_STATE_DIR` (with the honest note that this is hermeticity, not the guard — the identity fix subsumes the live hazard). 6 mutations, each reddening exactly its test (incl. the env-gated "promotion disabled at start" reddening 3 slice checks). Battery: 925/0, 14/14 slices, sync 14/14, vet 337, deny 4/4, audit 0, check-targets PASS/SKIP, bench 6/6, clippy 0/0, fmt clean. Evidence `.loop/evidence/T-0105/start-path.txt`.
+- 2026-09-15 [turn 28] `handoff-abort` 2/41 in the run immediately after the 13-slice batch, 41/41 in three consecutive runs alone (load-sensitive — it SIGKILLs daemons at sub-second deadlines). Attributed, not a product defect.
