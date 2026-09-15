@@ -1,0 +1,341 @@
+---
+import { loadFrame } from '../../scripts/frames.mjs';
+
+const board = loadFrame('.loop/evidence/T-0076/01-overview.txt');
+const wall = loadFrame('.loop/evidence/T-0076/06-wall-focus.txt');
+const themes = loadFrame('.loop/evidence/T-0076/08-theme-picker.txt');
+---
+
+<!doctype html>
+<html lang="en" data-theme="arreo">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Arreo — the agent runtime</title>
+<meta name="description" content="Run 30 agents on your server. Herd them from anywhere. Daemon-owned PTYs, semantic agent state, code pairing, per-agent RAM truth.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@125,500..900&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+<style>
+  :root, [data-theme="arreo"] {
+    --bg:#121110; --bg-elev:#1A1816; --bg-inset:#0C0B0A;
+    --border:#2A2724; --border-active:#3E3A35;
+    --text:#EDE7DC; --muted:#9A938A;
+    --primary:#6FD3E8; --primary-strong:#A8E4F2; --sand:#D9C6A5;
+    --working:#6FD3E8; --question:#E8B45A; --blocked:#FF9E64;
+    --done:#8FD19E; --error:#E5636F; --idle:#6E6A64;
+  }
+  [data-theme="tokyonight"] {
+    --bg:#1A1B26; --bg-elev:#24283B; --bg-inset:#16161E;
+    --border:#2F334D; --border-active:#414868;
+    --text:#C0CAF5; --muted:#7982A9;
+    --primary:#7DCFFF; --primary-strong:#B4F0FF; --sand:#E0AF68;
+    --working:#7DCFFF; --question:#E0AF68; --blocked:#FF9E64;
+    --done:#9ECE6A; --error:#F7768E; --idle:#565F89;
+  }
+  [data-theme="catppuccin"] {
+    --bg:#1E1E2E; --bg-elev:#313244; --bg-inset:#11111B;
+    --border:#45475A; --border-active:#585B70;
+    --text:#CDD6F4; --muted:#9399B2;
+    --primary:#89DCEB; --primary-strong:#B4F0FF; --sand:#FAB387;
+    --working:#89DCEB; --question:#FAB387; --blocked:#FAB387;
+    --done:#A6E3A1; --error:#F38BA8; --idle:#6C7086;
+  }
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html { scroll-behavior:smooth; }
+  body {
+    background:var(--bg); color:var(--text);
+    font:400 16.5px/1.65 "Inter", system-ui, sans-serif;
+  }
+  .wrap { max-width:1152px; margin:0 auto; padding:0 24px; }
+  nav { border-bottom:1px solid var(--border); position:sticky; top:0; background:var(--bg); z-index:10; }
+  .nav-in { display:flex; align-items:center; gap:28px; height:60px; }
+  .logo { font:700 20px "Archivo", sans-serif; color:var(--text); text-decoration:none; display:flex; gap:10px; align-items:center; }
+  nav a:not(.logo) { color:var(--muted); text-decoration:none; font-size:14.5px; }
+  nav a:not(.logo):hover { color:var(--text); }
+  .lang { margin-left:auto; display:flex; gap:8px; }
+  .lang button { background:none; border:1px solid var(--border); color:var(--muted); border-radius:6px; padding:3px 10px; cursor:pointer; font-size:13px; }
+  .lang button.sel { color:var(--primary); border-color:var(--border-active); }
+  .hero { padding:96px 0 72px; }
+  .kicker { font:500 12px "JetBrains Mono", monospace; text-transform:uppercase; letter-spacing:.2em; color:var(--sand); margin-bottom:18px; }
+  .kicker::before { content:""; display:inline-block; width:24px; height:2px; background:var(--sand); vertical-align:middle; margin-right:10px; }
+  h1 { font:800 clamp(44px, 7vw, 84px)/1.02 "Archivo", sans-serif; letter-spacing:-.02em; font-stretch:125%; max-width:16ch; }
+  h1 em, h2 em { font-style:normal; color:var(--primary); }
+  .sub { color:var(--muted); max-width:62ch; margin:22px 0 30px; font-size:18px; }
+  .install { display:inline-flex; align-items:stretch; border:1px solid var(--border-active); border-radius:10px; overflow:hidden; background:var(--bg-inset); }
+  .install .cmd { font:500 14.5px "JetBrains Mono", monospace; padding:13px 18px; white-space:nowrap; }
+  .install .dollar { color:var(--sand); }
+  .install button { background:var(--primary); color:#0C0B0A; border:0; padding:0 20px; font-weight:600; cursor:pointer; }
+  .badge { display:inline-block; font:500 11.5px "JetBrains Mono", monospace; letter-spacing:.08em; text-transform:uppercase; border:1px solid var(--border-active); border-radius:20px; padding:3px 12px; color:var(--muted); margin-bottom:14px; }
+  .badge.ship { color:var(--done); border-color:var(--done); }
+  .badge.wip { color:var(--question); border-color:var(--question); }
+  .badge.road { color:var(--muted); }
+  .term { background:var(--bg-inset); border:1px solid var(--border); border-radius:12px; padding:18px; overflow-x:auto; margin:26px 0 8px; }
+  .term pre { font:400 12.5px/1.5 "JetBrains Mono", monospace; color:var(--text); }
+  .cap { font:400 12.5px "JetBrains Mono", monospace; color:var(--muted); margin-bottom:34px; }
+  .stats { display:flex; gap:34px; margin:30px 0 6px; flex-wrap:wrap; }
+  .stats div { display:flex; flex-direction:column; }
+  .stats strong { font:800 26px "Archivo", sans-serif; color:var(--text); }
+  .stats span { font:400 12px "JetBrains Mono", monospace; color:var(--muted); text-transform:uppercase; letter-spacing:.1em; }
+  .frametabs { display:flex; gap:8px; margin:22px 0 -14px; }
+  .frametabs button { background:none; border:1px solid var(--border); color:var(--muted); border-radius:18px; padding:5px 16px; cursor:pointer; font:500 12.5px "JetBrains Mono", monospace; }
+  .frametabs button.sel { color:var(--primary); border-color:var(--primary); }
+  .feat .num { font:800 13px "JetBrains Mono", monospace; color:var(--border-active); display:block; margin-bottom:8px; }
+  .feat a.more { display:inline-block; margin-top:12px; margin-right:14px; color:var(--primary); text-decoration:none; font-size:13.5px; }
+  .faq { margin-top:26px; }
+  .faq details { border:1px solid var(--border); border-radius:10px; padding:16px 20px; margin-bottom:10px; background:var(--bg-elev); }
+  .faq summary { cursor:pointer; font-weight:600; font-size:15.5px; }
+  .faq p { color:var(--muted); font-size:14.5px; margin-top:8px; }
+  .faq code { font-family:"JetBrains Mono", monospace; font-size:13px; color:var(--text); }
+  .cap .real { color:var(--done); }
+  .cap .mocktag { color:var(--question); }
+  section.block { padding:72px 0; border-top:1px solid var(--border); }
+  h2 { font:800 clamp(30px, 4vw, 44px)/1.1 "Archivo", sans-serif; letter-spacing:-.01em; font-stretch:125%; margin-bottom:14px; }
+  .featgrid { display:grid; grid-template-columns:repeat(auto-fit, minmax(280px, 1fr)); gap:16px; margin-top:30px; }
+  .feat { border:1px solid var(--border); border-radius:12px; padding:22px; background:var(--bg-elev); }
+  .feat .k { font:500 11.5px "JetBrains Mono", monospace; text-transform:uppercase; letter-spacing:.15em; color:var(--sand); margin-bottom:10px; }
+  .feat h3 { font-size:18px; margin-bottom:8px; }
+  .feat p { color:var(--muted); font-size:14.5px; }
+  .feat .st { display:inline-block; margin-top:12px; font:500 11px "JetBrains Mono", monospace; text-transform:uppercase; letter-spacing:.1em; }
+  .st.ok { color:var(--done); } .st.wip { color:var(--question); } .st.road { color:var(--muted); }
+  .moment { display:grid; grid-template-columns:1fr 1fr; gap:16px; margin-top:30px; }
+  @media (max-width:800px){ .moment{ grid-template-columns:1fr; } }
+  .push { border:1px solid var(--question); border-radius:12px; padding:22px; background:var(--bg-elev); }
+  .push h3 { font-size:16px; margin-bottom:6px; }
+  .push .q { font-family:"JetBrains Mono", monospace; font-size:13.5px; background:var(--bg-inset); border-radius:8px; padding:12px 14px; margin:12px 0; }
+  .push .row { display:flex; gap:10px; }
+  .push .allow { background:var(--done); color:#0C0B0A; border:0; border-radius:8px; padding:8px 18px; font-weight:600; cursor:pointer; }
+  .push .deny { background:none; color:var(--muted); border:1px solid var(--border-active); border-radius:8px; padding:8px 18px; cursor:pointer; }
+  table.cmp { width:100%; border-collapse:collapse; margin-top:26px; font-size:14.5px; }
+  table.cmp th, table.cmp td { text-align:left; padding:11px 14px; border-bottom:1px solid var(--border); }
+  table.cmp th { font-family:"JetBrains Mono", monospace; font-size:12.5px; text-transform:uppercase; letter-spacing:.1em; color:var(--muted); }
+  td.yes { color:var(--done); } td.no { color:var(--muted); }
+  .prices { display:grid; grid-template-columns:repeat(auto-fit, minmax(220px, 1fr)); gap:16px; margin-top:30px; }
+  .price { border:1px solid var(--border); border-radius:12px; padding:24px; background:var(--bg-elev); }
+  .price.hl { border-color:var(--primary); }
+  .price .t { font-family:"JetBrains Mono", monospace; font-size:12.5px; text-transform:uppercase; letter-spacing:.12em; color:var(--sand); }
+  .price .p { font:800 34px "Archivo", sans-serif; margin:8px 0 12px; }
+  .price .p span { font-size:14px; color:var(--muted); font-weight:400; }
+  .price ul { list-style:none; color:var(--muted); font-size:14px; }
+  .price li { margin:5px 0; } .price li::before { content:"— "; color:var(--primary); }
+  .cta { text-align:center; padding:96px 0; border-top:1px solid var(--border); }
+  footer { border-top:1px solid var(--border); padding:26px 0 60px; }
+  .foot-in { display:flex; gap:22px; align-items:center; flex-wrap:wrap; font-size:13.5px; }
+  footer a { color:var(--muted); text-decoration:none; } footer a:hover { color:var(--text); }
+  footer .right { margin-left:auto; color:var(--muted); }
+  .themepick { position:fixed; right:18px; bottom:18px; display:flex; gap:8px; background:var(--bg-elev); border:1px solid var(--border-active); border-radius:24px; padding:8px; z-index:20; }
+  .themepick button { width:26px; height:26px; border-radius:50%; border:2px solid transparent; cursor:pointer; }
+  .themepick button.sel { border-color:var(--primary); }
+  .sr { position:absolute; width:1px; height:1px; overflow:hidden; clip:rect(0 0 0 0); }
+  @media (prefers-reduced-motion: reduce) {
+    html { scroll-behavior:auto; }
+    * { transition:none !important; animation:none !important; }
+  }
+</style>
+</head>
+<body>
+
+<nav aria-label="Main"><div class="wrap nav-in">
+  <a class="logo" href="#top"><svg width="20" height="20" viewBox="0 0 24 24" aria-hidden="true"><path d="M3 15c3-6 6-6 9 0s6 6 9 0" fill="none" stroke="#6FD3E8" stroke-width="2.4" stroke-linecap="round"/><path d="M3 9c3 6 6 6 9 0s6-6 9 0" fill="none" stroke="#6FD3E8" stroke-width="2.4" stroke-linecap="round"/></svg> arreo</a>
+  <a href="#moment">Moment</a><a href="#mesh">Mesh</a><a href="#ops">Ops</a><a href="#themes">Themes</a><a href="#compare">Compare</a><a href="#faq">FAQ</a><a href="#pricing">Pricing</a>
+  <div class="lang" role="group" aria-label="Language">
+    <button id="lang-en" class="sel" onclick="setLang('en')">EN</button>
+    <button id="lang-es" onclick="setLang('es')">ES</button>
+  </div>
+</div></nav>
+
+<header class="hero" id="top"><div class="wrap">
+  <span class="badge ship" data-i18n="hero-badge">Alpha · source build today</span>
+  <h1 data-i18n="hero-title">Run 30 agents on your server. <em>Herd them from anywhere.</em></h1>
+  <p class="sub" data-i18n="hero-sub">A small Rust daemon owns your agents' real terminals. Clients attach — a TUI, a CLI, another server — and every one sees the same truth: live state, per-agent RAM, the exact moment an agent needs you.</p>
+  <div class="install">
+    <span class="cmd"><span class="dollar">$ </span><span data-i18n="install-cmd">git clone https://github.com/ivan-cavero/Arreo &amp;&amp; cd Arreo &amp;&amp; cargo build --workspace</span></span>
+    <button onclick="copyInstall(this)" data-i18n="copy">Copy</button>
+  </div>
+  <!-- Signed one-liner installer: ships here once a signed alpha exists (T-0042).
+  <span class="cmd"><span class="dollar">$ </span>curl -fsSL https://arreo.dev/install.sh | sh</span>
+  -->
+  <div class="stats">
+    <div><strong>600+</strong><span>workspace tests</span></div>
+    <div><strong>12</strong><span>e2e slices green</span></div>
+    <div><strong>30</strong><span>agents, one wall</span></div>
+    <div><strong>3</strong><span>OSes in CI</span></div>
+  </div>
+  <div class="frametabs" role="group" aria-label="Captures">
+    <button class="sel" onclick="showFrame(0,this)">status board</button>
+    <button onclick="showFrame(1,this)">agent wall</button>
+    <button onclick="showFrame(2,this)">theme picker</button>
+  </div>
+  <div class="term" role="img" aria-label="Real Arreo TUI captures"><pre id="frame-0">{board.content}</pre><pre id="frame-1" hidden>{wall.content}</pre><pre id="frame-2" hidden>{themes.content}</pre></div>
+  <p class="cap"><span class="real">■ real captures</span> — {board.source} · {wall.source} · {themes.source} (e2e slices, bytes verbatim; click the tabs, it is one layout)</p>
+  <p class="cap">Built by agents running inside Arreo itself — every feature above was implemented, tested and measured by a fleet it hosts.</p>
+</div></header>
+
+<section class="block" id="moment"><div class="wrap">
+  <div class="kicker">The moment</div>
+  <h2>One agent asks. <em>Every surface lights up.</em></h2>
+  <p class="sub">A <span style="font-family:monospace">question</span> state fires everywhere at once — TUI sidebar, push with quick-reply, web badge. Answering is just input to the PTY: audited, end-to-end encrypted, harness-agnostic.</p>
+  <div class="moment">
+    <div class="push">
+      <span class="badge wip">push · ships with mobile beta</span>
+      <h3>workbox · pi-auth is asking</h3>
+      <div class="q">May I run `sudo apt install`?</div>
+      <div class="row"><button class="allow">Allow</button><button class="deny">Deny</button></div>
+      <p class="cap" style="margin:12px 0 0"><span class="mocktag">◇ mock</span> — interaction design, not a screenshot</p>
+    </div>
+    <div>
+      <div class="term" role="img" aria-label="Real TUI capture: focused agent wall"><pre>{wall.content}</pre></div>
+      <p class="cap"><span class="real">■ real capture</span> — {wall.source}</p>
+    </div>
+  </div>
+</div></section>
+
+<section class="block" id="mesh"><div class="wrap">
+  <div class="kicker">Machines, meshed</div>
+  <h2>Your VPS and your Pi. <em>No SSH setup.</em></h2>
+  <p class="sub">Every actor speaks one Noise-KK MessagePack protocol — a server is just a client with PTYs attached. Pair with a code, attach by name.</p>
+  <div class="term"><pre><span style="color:var(--sand)">$</span> arreo machines
+workbox      VPS          · online · 12 agents · 2 blocked
+raspberry    RPi5         · online · 8 agents  · 0 blocked
+<span style="color:var(--sand)">$</span> arreo attach raspberry      <span style="color:var(--muted)"># E2E, zero inbound ports</span></pre></div>
+  <p class="cap"><span class="real">■</span> transcript shape from <span style="font-family:monospace">docs/machines.md</span> (mesh e2e slice green)</p>
+</div></section>
+
+<section class="block" id="ops"><div class="wrap">
+  <div class="kicker">Fleet ops</div>
+  <h2>Things you shouldn't think about, <em>handled.</em></h2>
+  <div class="featgrid">
+    <div class="feat"><span class="num">01</span><div class="k">state</div><h3>It tells you when it asks</h3><p>Native hooks, universal prompt-shape fallback, assisted API. `question` with payloads, honestly labeled when inferred.</p><span class="st ok">■ shipping</span><a class="more" href="https://github.com/ivan-cavero/Arreo/blob/main/docs/tour.md">tour →</a></div>
+    <div class="feat"><span class="num">02</span><div class="k">mesh</div><h3>VPS ↔ Pi, one protocol</h3><p>Machine directory, presence, per-machine device trust. One machine dropping affects nothing else.</p><span class="st ok">■ shipping</span><a class="more" href="https://github.com/ivan-cavero/Arreo/blob/main/docs/machines.md">machines →</a></div>
+    <div class="feat"><span class="num">03</span><div class="k">resources</div><h3>RAM, per agent, enforced</h3><p>Live meters everywhere; hard caps via cgroups / Job Objects. A hungry agent gets throttled — and you get told.</p><span class="st ok">■ shipping</span><a class="more" href="https://github.com/ivan-cavero/Arreo/blob/main/docs/tour.md">tour →</a></div>
+    <div class="feat"><span class="num">04</span><div class="k">updates</div><h3>Updated without a cut</h3><p>Client swap is atomic with rollback; the server handoff inherits every PTY live — or the old daemon keeps serving.</p><span class="st wip">◐ in progress</span><a class="more" href="https://github.com/ivan-cavero/Arreo/blob/main/docs/release.md">release →</a></div>
+    <div class="feat"><span class="num">05</span><div class="k">sync</div><h3>Edit a provider once</h3><p>Harness configs replicate machine to machine — version vectors, conflict copies, secrets never leave the keychain.</p><span class="st road">○ roadmap</span><a class="more" href="https://github.com/ivan-cavero/Arreo/blob/main/ROADMAP.md">roadmap →</a></div>
+    <div class="feat"><span class="num">06</span><div class="k">extend</div><h3>Sandboxed UI extensions</h3><p>WASM components, capability manifests, hot-loaded. Sidebar widgets, badges, commands.</p><span class="st road">○ roadmap</span><a class="more" href="https://github.com/ivan-cavero/Arreo/blob/main/ROADMAP.md">roadmap →</a></div>
+  </div>
+</div></section>
+
+<section class="block" id="themes"><div class="wrap">
+  <div class="kicker">Themes</div>
+  <h2>Try it right now — <em>this page themes.</em></h2>
+  <p class="sub">One theme JSON drives the TUI, the phone and the web. Truecolor first, terminal-independent, graceful fallback. Use the picker, bottom-right — the same mechanism ships inside Arreo.</p>
+  <div class="term" role="img" aria-label="Real TUI capture: theme picker"><pre>{themes.content}</pre></div>
+  <p class="cap"><span class="real">■ real capture</span> — {themes.source}</p>
+</div></section>
+
+<section class="block" id="compare"><div class="wrap">
+  <div class="kicker">Compare</div>
+  <h2>What nobody else combines.</h2>
+  <table class="cmp">
+    <tr><th></th><th>Arreo</th><th>tmux · zellij</th><th>desktop ADEs</th><th>dashboards</th></tr>
+    <tr><td>Work survives its UI closing</td><td class="yes">daemon owns the PTYs</td><td>detach</td><td>while the app runs</td><td class="no">—</td></tr>
+    <tr><td>State: working · question · blocked · done</td><td class="yes">semantic, 3-tier detection</td><td class="no">—</td><td>partial</td><td>process status</td></tr>
+    <tr><td>Question pushes with quick actions</td><td class="yes">from any harness</td><td class="no">—</td><td>partial</td><td class="no">—</td></tr>
+    <tr><td>Multi-machine mesh, code pairing</td><td class="yes">no SSH, no ports</td><td class="no">—</td><td>SSH only</td><td class="no">—</td></tr>
+    <tr><td>Per-agent RAM meters + hard caps</td><td class="yes">cgroups / Job Objects</td><td class="no">—</td><td class="no">—</td><td class="no">—</td></tr>
+    <tr><td>Updates that never kill an agent</td><td class="yes">live handoff (in progress)</td><td class="no">no</td><td class="no">no</td><td class="no">—</td></tr>
+    <tr><td>Agents drive it (socket API + skill)</td><td class="yes">read · send · wait · spawn · metrics</td><td>scripting</td><td>app APIs</td><td>workflow APIs</td></tr>
+  </table>
+</div></section>
+
+<section class="block" id="faq"><div class="wrap">
+  <div class="kicker">FAQ</div>
+  <h2>Asked already.</h2>
+  <div class="faq">
+    <details><summary>How is this different from tmux?</summary><p>tmux detaches; Arreo understands. Panes carry semantic state (<code>working · question · blocked · done</code>), per-agent RAM with hard caps, and a mesh with code pairing instead of SSH. The socket API (<code>read · send · wait · spawn · metrics</code>) is built for agents to drive each other.</p></details>
+    <details><summary>What happens if I close everything?</summary><p>Nothing. The daemon owns the PTYs — close the TUI, drop the network, reboot the machine: agents keep running and layout, scrollback and state restore. That is the whole point.</p></details>
+    <details><summary>Can the relay read my traffic?</summary><p>No — by construction, not by promise. Pairing is SPAKE2 over a one-time code, transport is Noise-KK with pinned device certs, and the relay only routes ciphertext. Self-host it if you prefer: it is AGPL and included.</p></details>
+    <details><summary>What does it cost the machine?</summary><p>The daemon holds ≤ 120 MB RSS at 30 panes and 5 clients (agents excluded — they dwarf it), ≤ 3 MB overhead per pane, older scrollback on disk. Budgets are enforced in CI, not estimated.</p></details>
+    <details><summary>When is the phone app coming?</summary><p>Mobile (iOS + Android over one shared Rust core) is the next phase after the server update story closes. The web dashboard follows. This page will say so the day they exist — there are no fake screenshots here.</p></details>
+    <details><summary>How do I try it today?</summary><p>Clone, <code>cargo build --workspace</code>, spawn agents, attach the TUI. It is alpha: Linux first, source build, signed release on the way. If that sentence puts you off, watch the repo and come back for the alpha.</p></details>
+  </div>
+</div></section>
+
+<section class="block" id="pricing"><div class="wrap">
+  <div class="kicker">Pricing</div>
+  <h2>Free to self-host. <em>Planned managed tiers.</em></h2>
+  <p class="sub">No billing exists yet — these are the planned tiers. Self-hosting is the whole product, free forever.</p>
+  <div class="prices">
+    <div class="price"><div class="t">Self-host</div><div class="p">$0<span> forever</span></div>
+      <ul><li>Everything, unlimited agents</li><li>AGPL relay included</li><li>All features</li></ul></div>
+    <div class="price"><div class="t">Relay Free</div><div class="p">$0<span> planned</span></div>
+      <ul><li>Managed relay</li><li>2 machines · 7-day inbox</li><li>Push notifications</li></ul></div>
+    <div class="price hl"><div class="t">Personal</div><div class="p">$9<span> /mo planned</span></div>
+      <ul><li>Unlimited machines</li><li>30-day retention</li><li>Config sync</li></ul></div>
+    <div class="price"><div class="t">Pro</div><div class="p">$19<span> /mo planned</span></div>
+      <ul><li>Web dashboard</li><li>1-year metrics</li><li>Approval gates</li></ul></div>
+  </div>
+</div></section>
+
+<section class="cta"><div class="wrap">
+  <h2 data-i18n="cta-title">Run 30 agents. <em>Herd them from your phone.</em></h2>
+  <p style="color:var(--muted); margin:18px 0 30px;" data-i18n="cta-sub">Linux first · Windows/macOS in CI · Apache-2.0 core, AGPL-3.0 relay · signed alpha on the way</p>
+  <div class="install">
+    <span class="cmd"><span class="dollar">$ </span><span data-i18n="install-cmd2">git clone https://github.com/ivan-cavero/Arreo &amp;&amp; cargo build --workspace</span></span>
+    <button onclick="copyInstall(this)" data-i18n="copy2">Copy</button>
+  </div>
+</div></section>
+
+<footer><div class="wrap foot-in">
+  <a class="logo" style="font-size:15px" href="#top"><svg width="16" height="16" viewBox="0 0 24 24" aria-hidden="true"><path d="M3 15c3-6 6-6 9 0s6 6 9 0" fill="none" stroke="#6FD3E8" stroke-width="2.4" stroke-linecap="round"/><path d="M3 9c3 6 6 6 9 0s6-6 9 0" fill="none" stroke="#6FD3E8" stroke-width="2.4" stroke-linecap="round"/></svg> arreo</a>
+  <a href="https://github.com/ivan-cavero/Arreo">Source</a><a href="https://github.com/ivan-cavero/Arreo/blob/main/docs/tour.md">Tour</a><a href="https://github.com/ivan-cavero/Arreo/blob/main/docs/machines.md">Machines</a><a href="#pricing">Pricing</a>
+  <span class="right">© 2026 Arreo · alpha in progress · Apache-2.0 (core) · AGPL-3.0 (relay)</span>
+</div></footer>
+
+<div class="themepick" role="group" aria-label="Theme">
+  <button title="arreo (default)" style="background:#121110" class="sel" onclick="setTheme('arreo',this)" aria-label="arreo theme"></button>
+  <button title="tokyonight" style="background:#1A1B26" onclick="setTheme('tokyonight',this)" aria-label="tokyonight theme"></button>
+  <button title="catppuccin" style="background:#1E1E2E" onclick="setTheme('catppuccin',this)" aria-label="catppuccin theme"></button>
+</div>
+
+<script>
+  const STR = {
+    en: {
+      'hero-badge': 'Alpha · source build today',
+      'hero-title': 'Run 30 agents on your server. <em>Herd them from anywhere.</em>',
+      'hero-sub': "A small Rust daemon owns your agents' real terminals. Clients attach — a TUI, a CLI, another server — and every one sees the same truth: live state, per-agent RAM, the exact moment an agent needs you.",
+      'install-cmd': 'git clone https://github.com/ivan-cavero/Arreo && cd Arreo && cargo build --workspace',
+      'copy': 'Copy', 'copy2': 'Copy',
+      'cta-title': 'Run 30 agents. <em>Herd them from your phone.</em>',
+      'cta-sub': 'Linux first · Windows/macOS in CI · Apache-2.0 core, AGPL-3.0 relay · signed alpha on the way',
+      'install-cmd2': 'git clone https://github.com/ivan-cavero/Arreo && cargo build --workspace',
+    },
+    es: {
+      'hero-badge': 'Alpha · hoy se compila desde fuente',
+      'hero-title': 'Corre 30 agentes en tu servidor. <em>Gobiérnalos desde donde sea.</em>',
+      'hero-sub': 'Un pequeño daemon en Rust posee las terminales reales de tus agentes. Los clientes se conectan — un TUI, un CLI, otro servidor — y todos ven la misma verdad: estado en vivo, RAM por agente, el momento exacto en que un agente te necesita.',
+      'install-cmd': 'git clone https://github.com/ivan-cavero/Arreo && cd Arreo && cargo build --workspace',
+      'copy': 'Copiar', 'copy2': 'Copiar',
+      'cta-title': 'Corre 30 agentes. <em>Gobiérnalos desde el móvil.</em>',
+      'cta-sub': 'Linux primero · Windows/macOS en CI · núcleo Apache-2.0, relay AGPL-3.0 · alpha firmada en camino',
+      'install-cmd2': 'git clone https://github.com/ivan-cavero/Arreo && cargo build --workspace',
+    },
+  };
+  function setLang(lang) {
+    document.documentElement.lang = lang === 'es' ? 'es' : 'en';
+    document.querySelectorAll('[data-i18n]').forEach((el) => {
+      const v = STR[lang][el.getAttribute('data-i18n')];
+      if (v) el.innerHTML = v;
+    });
+    document.getElementById('lang-en').classList.toggle('sel', lang === 'en');
+    document.getElementById('lang-es').classList.toggle('sel', lang === 'es');
+  }
+  function showFrame(n, btn) {
+    for (let i = 0; i < 3; i++) document.getElementById('frame-' + i).hidden = i !== n;
+    document.querySelectorAll('.frametabs button').forEach((b) => b.classList.remove('sel'));
+    btn.classList.add('sel');
+  }
+  function setTheme(name, btn) {
+    document.documentElement.removeAttribute('style');
+    document.documentElement.setAttribute('data-theme', name);
+    document.querySelectorAll('.themepick button').forEach((b) => b.classList.remove('sel'));
+    btn.classList.add('sel');
+  }
+  function copyInstall(btn) {
+    const cmd = btn.parentElement.querySelector('.cmd').innerText.replace(/^\$\s*/, '');
+    navigator.clipboard.writeText(cmd).then(() => {
+      const old = btn.innerText; btn.innerText = '✓';
+      setTimeout(() => { btn.innerText = old; }, 1200);
+    });
+  }
+</script>
+</body>
+</html>

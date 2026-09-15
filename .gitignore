@@ -4,3 +4,8 @@
 .DS_Store
 # Local Pi runtime state
 .atl/
+
+# landing (Astro)
+site/node_modules/
+site/dist/
+site/.astro/

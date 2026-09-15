@@ -1,0 +1,17 @@
+{
+  "name": "arreo-landing",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "astro dev",
+    "build": "astro build",
+    "check-links": "node scripts/check-links.mjs"
+  },
+  "dependencies": {
+    "astro": "7.3.2"
+  },
+  "allowScripts": {
+    "esbuild@0.28.2": true
+  }
+}
