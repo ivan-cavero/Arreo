@@ -199,10 +199,13 @@ impl Inbox {
         let mut conn = self.store.lock()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
 
+        // The sweep attributes each *device's* expiries to that device (see
+        // `sweep_locked`), so this call must not add the sweep's total to the
+        // sender as well: a device that enqueued one message would otherwise be
+        // told it had lost somebody else's. `self.note_expiry` below is the
+        // global record ("this many aged out just now", T-0053) and belongs to
+        // nobody in particular.
         let expired = Self::sweep_locked(&tx, now_ms)?;
-        if expired > 0 {
-            Self::bump_expired(&tx, device, expired)?;
-        }
 
         let (mut queued, mut bytes) = Self::totals_locked(&tx, device)?;
         let mut evicted = Vec::new();
@@ -309,10 +312,13 @@ impl Inbox {
         let mut conn = self.store.lock()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
 
+        // **The sweep's total is not this device's loss.** `sweep_locked`
+        // attributes each device's expiries to *that* device, which is what makes
+        // `dropped` below the truth for the device reading it; adding the sweep's
+        // total here as well would tell a device it had missed twice as many
+        // messages as it did. The total is still reported — as `expired`, the
+        // relay's own "this many aged out just now" — and recorded on the trail.
         let expired = Self::sweep_locked(&tx, now_ms)?;
-        if expired > 0 {
-            Self::bump_expired(&tx, device, expired)?;
-        }
 
         let mut messages = Vec::new();
         {

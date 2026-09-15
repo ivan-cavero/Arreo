@@ -491,6 +491,30 @@ pub enum Message {
     /// (the largest variant still sets it; see
     /// `the_message_enum_stays_at_its_budget`).
     ThemeReply { v: u32, theme: ThemeTokens },
+    /// Server → client: one notification the policy **delivered** (T-0117), as
+    /// the payload a paired device renders.
+    ///
+    /// **It travels inside a seal, never as a bare frame.** The push's route to
+    /// an offline device is the relay's durable inbox, and T-0030's rows are
+    /// ciphertext the relay cannot read (§4); a frame written in the clear would
+    /// put the pane id, the machine name and the agent's own sentence in a
+    /// relay's database. So the bytes on the peer stream are
+    /// [`crate::notify::push::seal_to`]'s output and the plaintext inside is this
+    /// frame — which is why the shape is a `Message` and not a second wire type:
+    /// every surface decodes it with the codec it already speaks.
+    ///
+    /// **Boxed because the variant's size is the enum's size** (the same reason
+    /// [`Message::SyncReply`] boxes its outcome): `PushPayload` is five fields
+    /// wide, and inlining it would raise the budget the enum is held to.
+    ///
+    /// A suppressed notification has no such frame at all: the daemon builds one
+    /// only from [`crate::notify::Decision::Notify`], so "the push that ignored
+    /// the rules engine" is not a branch that can be forgotten here — it is a
+    /// message that is never constructed.
+    NotifyPush {
+        v: u32,
+        payload: Box<crate::notify::push::PushPayload>,
+    },
 }
 
 /// The pane a [`Message::SpawnWorktree`] asks for: everything
@@ -1000,6 +1024,39 @@ mod tests {
         };
         let encoded = codec::encode(&reply).expect("encode");
         assert_eq!(codec::decode(&encoded).expect("decode"), reply);
+    }
+
+    /// **The push payload round-trips** (T-0117): the daemon seals this frame
+    /// and a device decodes it after opening the seal, so the shape has to
+    /// survive the codec byte for byte before anything else about the feature is
+    /// claimed — and it is a `Message` precisely so that device uses this
+    /// decoder rather than one written for the push.
+    #[test]
+    fn the_push_payload_round_trips() {
+        use crate::notify::push::PushPayload;
+        use crate::proto::codec;
+
+        let push = Message::NotifyPush {
+            v: VERSION,
+            payload: Box::new(PushPayload {
+                pane: "build-1".into(),
+                machine: "workbox".into(),
+                state: AgentState::Blocked,
+                sentence: "blocked (inferred:silence)".into(),
+                actions: crate::notify::actions_for(AgentState::Blocked),
+                at_ms: 1_789_398_272_891,
+            }),
+        };
+        let encoded = codec::encode(&push).expect("encode");
+        assert_eq!(codec::decode(&encoded).expect("decode"), push);
+        // And an older peer classifies it as an *event* from the op tag alone,
+        // so a surface that has never heard of a push ignores and counts it
+        // instead of treating it as a request it must refuse (ADR 0017).
+        assert_eq!(codec::classify_op(&encoded), Some(codec::Direction::Event));
+        assert_eq!(
+            codec::decode_op_for_error(&encoded).as_deref(),
+            Some("notify_push")
+        );
     }
 
     /// **`text`'s `#[serde(default)]` is the N−1 mechanism for the field**:

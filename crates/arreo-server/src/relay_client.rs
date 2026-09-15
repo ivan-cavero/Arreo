@@ -10,7 +10,7 @@
 //! peer into a `serve_session` (the same loop the Unix socket runs), and the
 //! boot-time probe of the configured peer.
 
-use arreo_core::identity::{DeviceCert, DeviceId, DeviceKey};
+use arreo_core::identity::{DeviceCert, DeviceId, DeviceKey, VerifyingKey};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -27,6 +27,162 @@ pub use arreo_core::relay::session::{
 };
 
 // ---- the daemon's use of a session (T-0051) ----------------------------------
+
+// ---- the push leg (T-0117) ---------------------------------------------------
+
+/// How many pushes may be waiting for the relay session before the notify tick
+/// is told the queue is full.
+///
+/// A bound rather than an unbounded channel: the producer is a 1 s tick and the
+/// consumer is the session's outbound pump, so a backlog this deep is already a
+/// fault, and the alternative to a bound is memory the daemon cannot account
+/// for. On a full queue the push is **dropped with a line naming the device**,
+/// never silently: the notification's durable record is the audit row (T-0093's
+/// rule — "the log is the memory"), so a push that did not go out is a fact the
+/// operator can still read, and the alternative (blocking the tick) would stop
+/// every pane on the machine from being classified.
+pub const PUSH_QUEUE: usize = 256;
+
+/// One sealed push on its way to the relay session's outbound half.
+///
+/// Already sealed when it is queued: the seal is the sender's business (it needs
+/// the machine's key and the recipient's), and the relay leg must not be able to
+/// put an unsealed payload on the wire even by mistake.
+#[derive(Debug, Clone)]
+pub struct PushJob {
+    /// The paired device the blob is for.
+    peer: DeviceId,
+    /// The framed, sealed push — [`arreo_core::notify::push::seal_to`]'s output.
+    ///
+    /// Sealed before it is queued, and never unsealed on this side: the relay leg
+    /// moves bytes it cannot read, and so does the daemon's own forwarding path.
+    sealed: Vec<u8>,
+}
+
+/// The receiving half of the push channel: what the relay session drains.
+pub type PushInbox = tokio::sync::mpsc::Receiver<PushJob>;
+
+/// The daemon's push sender (T-0117): decides *who* a delivered notification
+/// goes to, seals it for each of them, and hands the blobs to the relay
+/// session.
+///
+/// **Why it is a channel and not a direct call.** The tick holds the registry,
+/// the store and the policy; the relay session lives in this module's task,
+/// reached from `main`'s composition root. A tick that reached for the session
+/// would have to own it (and therefore serialize every pane classification
+/// behind a relay write); a channel keeps the two apart, and the session's
+/// outbound half is already the place bytes for peers go.
+#[derive(Clone)]
+pub struct PushSender {
+    /// The machine's device authority, read **per push**: a device paired a
+    /// minute ago receives the next notification, which a snapshot taken at
+    /// start-up would not.
+    authority: Arc<Mutex<crate::devices::DeviceAuthority>>,
+    /// This machine's own device key. The one-way seal authenticates *both*
+    /// statics, so the receiving device learns the push came from the machine it
+    /// paired with and not from any other device in the account.
+    device: Arc<DeviceKey>,
+    /// This machine's own device id: never an audience member. A machine is not
+    /// a surface that displays notifications, and pushing to itself would have
+    /// the daemon receive its own pushes and open a stream to itself.
+    own: DeviceId,
+    outbox: tokio::sync::mpsc::Sender<PushJob>,
+}
+
+impl PushSender {
+    /// Build the sender and the receiving half the relay session drains.
+    #[must_use]
+    pub fn new(
+        authority: Arc<Mutex<crate::devices::DeviceAuthority>>,
+        device: Arc<DeviceKey>,
+    ) -> (Self, PushInbox) {
+        let own = DeviceId::from_key(&device.public());
+        let (outbox, inbox) = tokio::sync::mpsc::channel(PUSH_QUEUE);
+        (
+            Self {
+                authority,
+                device,
+                own,
+                outbox,
+            },
+            inbox,
+        )
+    }
+
+    /// The devices a delivered notification is pushed to: **every device this
+    /// machine has paired that may still connect, minus the machine itself**.
+    ///
+    /// The *decision* to notify is the policy's (T-0093); "who is told" is the
+    /// machine's device authority, which is the only place that knows who is
+    /// paired. A revoked or rotated-away device is not an audience: it may no
+    /// longer connect, so it may no longer be told about the machine's agents —
+    /// the revocation rule is read from the one function
+    /// (`revocation::may_connect`) that decides it everywhere else.
+    #[must_use]
+    pub fn audience(&self) -> Vec<(DeviceId, VerifyingKey)> {
+        let records = {
+            let authority = match self.authority.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            authority.devices()
+        };
+        records
+            .into_iter()
+            .filter(|record| record.id != self.own)
+            .filter(|record| arreo_core::identity::revocation::may_connect(record).is_ok())
+            .filter_map(|record| {
+                // A record whose key does not parse cannot be sealed for. It
+                // cannot happen for a record this authority issued, and saying
+                // so beats a push that silently goes nowhere.
+                match VerifyingKey::from_bytes(&record.public_key) {
+                    Ok(key) => Some((record.id, key)),
+                    Err(e) => {
+                        eprintln!(
+                            "arreo-server: cannot push to {}: its recorded key is unusable: {e}",
+                            record.id.display_id()
+                        );
+                        None
+                    }
+                }
+            })
+            .collect()
+    }
+
+    /// Seal `payload` for every device in the audience and hand each blob to the
+    /// relay session. Returns how many devices it enqueued for.
+    ///
+    /// Best-effort on purpose, and loudly so: a push that cannot be sealed or
+    /// handed over is a fact about *this* machine's delivery path, not about the
+    /// notification — the audit row is already written by the caller, so nothing
+    /// is lost that the operator cannot read. What is never acceptable is a
+    /// silent failure, which is why every arm prints.
+    pub fn send(&self, payload: &arreo_core::notify::push::PushPayload) -> usize {
+        let mut queued = 0usize;
+        for (peer, key) in self.audience() {
+            let sealed =
+                match arreo_core::notify::push::seal_to(&key, &self.device.noise_static(), payload)
+                {
+                    Ok(sealed) => sealed,
+                    Err(e) => {
+                        eprintln!(
+                            "arreo-server: cannot seal a push for {}: {e}",
+                            peer.display_id()
+                        );
+                        continue;
+                    }
+                };
+            match self.outbox.try_send(PushJob { peer, sealed }) {
+                Ok(()) => queued += 1,
+                Err(e) => eprintln!(
+                    "arreo-server: cannot hand a push to the relay session ({e}); \
+                     the notification's audit row is still on the log"
+                ),
+            }
+        }
+        queued
+    }
+}
 
 /// This machine's own device identity: the key it holds and the certificate it
 /// was paired with.
@@ -139,7 +295,7 @@ pub fn retry_delay(refused: bool, attempt: u32, jitter: f64) -> Duration {
 /// one attempt per ceiling rather than a spin; a *refused* registration carries
 /// the relay's own reason to the log and then waits at the ceiling, so the
 /// reason stays the last thing an operator sees (see [`REFUSED_RETRY`]).
-pub async fn run(settings: RelaySettings, context: RelayContext) {
+pub async fn run(settings: RelaySettings, context: RelayContext, mut pushes: Option<PushInbox>) {
     let mut attempt: u32 = 0;
     loop {
         let mut refused = false;
@@ -159,7 +315,7 @@ pub async fn run(settings: RelaySettings, context: RelayContext) {
                     settings.account,
                     settings.addr
                 );
-                serve(session, &context, settings.peer.as_ref()).await;
+                serve(session, &context, settings.peer.as_ref(), &mut pushes).await;
                 eprintln!("arreo-server: relay session ended; reconnecting");
             }
             Err(e) => {
@@ -295,7 +451,12 @@ async fn assert_directory_row(
 
 /// Serve one live session: drain what was queued, accept peers, and if a peer is
 /// configured, open a session to it.
-async fn serve(mut session: RelaySession, context: &RelayContext, peer: Option<&DeviceId>) {
+async fn serve(
+    mut session: RelaySession,
+    context: &RelayContext,
+    peer: Option<&DeviceId>,
+    pushes: &mut Option<PushInbox>,
+) {
     // Anything the relay queued while this machine was away arrives as ordinary
     // envelopes; draining from the start is what makes "the machine was off" and
     // "the machine is on" the same path (T-0030).
@@ -390,12 +551,30 @@ async fn serve(mut session: RelaySession, context: &RelayContext, peer: Option<&
             );
         });
     }
-    serve_loop(&mut session, context).await;
+    serve_loop(&mut session, context, pushes).await;
 }
 
-/// The accept loop: peers in, session closure out.
-async fn serve_loop(session: &mut RelaySession, context: &RelayContext) {
+/// The accept loop: peers in, session closure out — and the push leg (T-0117).
+///
+/// The pushes are drained **here** rather than in a task of their own, and that
+/// is a decision rather than an accident: a task would have to own the receiver
+/// (so it could not be handed back when the session ends) and would have to be
+/// respawned per session (`serve` runs again after every reconnect), which is a
+/// task that outlives its purpose on every relay outage. Selecting on the inbox
+/// costs one `recv` in the idle loop and keeps the receiver in `run`'s frame, so
+/// a push produced while the session is down *waits* for the next session
+/// instead of being dropped into a closed channel.
+///
+/// The order is the relay's own: one peer stream per device, and the relay's
+/// inbox is drained in `seq` order (T-0030), so what a phone receives is what the
+/// machine sent, in the order it was sent.
+async fn serve_loop(
+    session: &mut RelaySession,
+    context: &RelayContext,
+    pushes: &mut Option<PushInbox>,
+) {
     let closed = session.closed_handle();
+    let outbound = session.outbound_handle();
 
     loop {
         tokio::select! {
@@ -406,7 +585,38 @@ async fn serve_loop(session: &mut RelaySession, context: &RelayContext) {
                 let owned = context.clone();
                 tokio::spawn(async move { serve_peer(stream, &owned, arrived).await });
             }
+            job = next_push(pushes) => {
+                let Some(PushJob { peer, sealed }) = job else { continue };
+                // Sent as one envelope addressed to the peer, never through a
+                // stream: a stream is a *conversation* (opening one replaces the
+                // peer's entry in the session's stream table, which would end
+                // whatever the peer was already doing with this machine), and a
+                // push needs none — the relay delivers it if the device is live
+                // and queues it in the durable inbox if it is not (T-0030). A
+                // failure here is said out loud, because it is the difference
+                // between "the phone was told" and "the row is all there is".
+                if let Err(e) = outbound.send_to_peer(&peer, sealed).await {
+                    eprintln!(
+                        "arreo-server: cannot push to {} through the relay ({e}); \
+                         the notification's audit row is still on the log",
+                        peer.display_id()
+                    );
+                    return;
+                }
+            }
         }
+    }
+}
+
+/// Wait for the next push, or forever when this daemon has no push leg.
+///
+/// `pending()` rather than `None`-and-spin: a `select!` branch that returned
+/// immediately would turn the accept loop into a busy loop on every daemon
+/// without a relay.
+async fn next_push(pushes: &mut Option<PushInbox>) -> Option<PushJob> {
+    match pushes {
+        Some(inbox) => inbox.recv().await,
+        None => std::future::pending().await,
     }
 }
 

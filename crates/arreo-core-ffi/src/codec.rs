@@ -556,6 +556,73 @@ pub enum WireMessage {
     },
     /// Server → client: the resolved tokens.
     ThemeReply { v: u32, theme: WireThemeTokens },
+    /// Server → client: one delivered notification, as a paired device renders
+    /// it (T-0117).
+    ///
+    /// **Mirrored whole, not summarised.** The payload *is* the push — pane,
+    /// machine, state, the sentence, the actions and the timestamp — so a
+    /// surface that had to ask the daemon again would be the second round trip
+    /// the criterion forbids. And it is a mirror of a core variant like every
+    /// other: a phone that can build the frame can read it after opening the
+    /// seal, which is the whole reason the push travels as a `Message`.
+    NotifyPush { v: u32, payload: WirePushPayload },
+}
+
+/// What one delivered notification carries (T-0117), mirroring
+/// `arreo_core::notify::push::PushPayload` field for field.
+///
+/// A record rather than the core struct inlined, because UniFFI needs a named
+/// type for a foreign surface to generate — and the fields are deliberately the
+/// core's names and types, so the two cannot describe one notification
+/// differently.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct WirePushPayload {
+    /// The pane the notification is about.
+    pub pane: String,
+    /// The machine the pane runs on.
+    pub machine: String,
+    /// The state the transition landed in.
+    pub state: WireAgentState,
+    /// The sentence a human reads — the same one T-0093's audit row carries.
+    pub sentence: String,
+    /// The bounded quick actions that answer this notification (T-0094).
+    pub actions: Vec<WireNotifyAction>,
+    /// When the transition happened, in Unix milliseconds.
+    pub at_ms: u64,
+}
+
+impl From<arreo_core::notify::push::PushPayload> for WirePushPayload {
+    fn from(payload: arreo_core::notify::push::PushPayload) -> Self {
+        Self {
+            pane: payload.pane,
+            machine: payload.machine,
+            state: WireAgentState::from(payload.state),
+            sentence: payload.sentence,
+            actions: payload
+                .actions
+                .into_iter()
+                .map(WireNotifyAction::from)
+                .collect(),
+            at_ms: payload.at_ms,
+        }
+    }
+}
+
+impl From<WirePushPayload> for arreo_core::notify::push::PushPayload {
+    fn from(payload: WirePushPayload) -> Self {
+        Self {
+            pane: payload.pane,
+            machine: payload.machine,
+            state: AgentState::from(payload.state),
+            sentence: payload.sentence,
+            actions: payload
+                .actions
+                .into_iter()
+                .map(NotifyAction::from)
+                .collect(),
+            at_ms: payload.at_ms,
+        }
+    }
 }
 
 /// `WireMessage` → the core's `Message`.
@@ -824,6 +891,10 @@ fn to_core(message: WireMessage) -> Result<Message, CodecFfiError> {
         WireMessage::ThemeReply { v, theme } => Message::ThemeReply {
             v,
             theme: theme_from_wire(&theme),
+        },
+        WireMessage::NotifyPush { v, payload } => Message::NotifyPush {
+            v,
+            payload: Box::new(payload.into()),
         },
     })
 }
@@ -1154,6 +1225,10 @@ fn from_core(message: &Message) -> WireMessage {
             v: *v,
             ok: *ok,
             detail: detail.clone(),
+        },
+        Message::NotifyPush { v, payload } => WireMessage::NotifyPush {
+            v: *v,
+            payload: WirePushPayload::from(payload.as_ref().clone()),
         },
     }
 }

@@ -673,6 +673,31 @@ impl OutboundHandle {
             .await
             .map_err(|_| SessionError::Closed)
     }
+
+    /// Send one payload to `peer` as a frame envelope (T-0117).
+    ///
+    /// **Not `stream_to`.** A `RelayStream` is a *session* with the peer — opening
+    /// one installs (and therefore replaces) the peer's entry in the session's
+    /// stream table, so a sender that only wants to hand the peer some bytes would
+    /// end whatever conversation the peer already had with this session. This goes
+    /// straight to the relay as one envelope addressed to `peer`, which is the
+    /// whole of what a push needs: the relay delivers it if the peer is live and
+    /// queues it in the durable inbox if it is not (T-0030), and no local stream
+    /// state is touched.
+    ///
+    /// The payload is one envelope and must fit one
+    /// ([`crate::relay::MAX_ENVELOPE_BYTES`]); the caller owns that bound, because
+    /// only the caller knows what it is sending.
+    pub async fn send_to_peer(
+        &self,
+        peer: &DeviceId,
+        payload: Vec<u8>,
+    ) -> Result<(), SessionError> {
+        self.outbound
+            .send(Outbound::Data(peer.clone(), payload))
+            .await
+            .map_err(|_| SessionError::Closed)
+    }
 }
 
 /// How long until the next heartbeat, given a jitter fraction in `[-1, 1]`.

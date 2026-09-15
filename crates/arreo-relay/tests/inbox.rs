@@ -222,6 +222,47 @@ fn expiry_is_counted_and_lazy() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// **An expiry is counted for the device that lost the message, and for nobody
+/// else.**
+///
+/// The sweep is global — one pass over every device's rows — but its *count* is
+/// not: a device that drains (or a sender that enqueues) triggers a sweep that
+/// may expire somebody else's mail, and crediting that total to whoever happened
+/// to run it tells a device it lost messages it never had. The count a device
+/// reads must be the messages *it* missed, because that number is what it shows
+/// an operator (T-0117's criterion: "a device absent past the window is told how
+/// many it missed").
+#[test]
+fn an_expiry_is_counted_for_the_device_that_lost_the_message() {
+    let (dir, store) = scratch("attribution");
+    let inbox = Inbox::new(store, limits(50, 100, 4096));
+    inbox.enqueue("dev_a", b"a-first", 1_000).expect("a");
+    inbox.enqueue("dev_b", b"b-first", 1_000).expect("b");
+    inbox.enqueue("dev_b", b"b-second", 1_000).expect("b");
+
+    // Past the TTL, `dev_a` drains first: its own sweep expires all three rows,
+    // and the *only* number it may be told is the one it lost.
+    let a = inbox.drain("dev_a", 1, 100, 1_100).expect("a drains");
+    assert_eq!(a.dropped, 1, "dev_a lost exactly its own message");
+    assert_eq!(
+        a.expired, 3,
+        "the sweep's total is the relay's own fact, and it is still reported"
+    );
+
+    // `dev_b`, whose two aged out in the same sweep, is told its own count when
+    // it returns — the sweep already attributed them to it.
+    let b = inbox.drain("dev_b", 1, 100, 1_100).expect("b drains");
+    assert_eq!(b.dropped, 2, "dev_b lost exactly its own two");
+
+    // And the per-device counters an operator reads agree.
+    assert_eq!(inbox.stats("dev_a").expect("stats").expired_total, 1);
+    assert_eq!(inbox.stats("dev_b").expect("stats").expired_total, 2);
+    // …and nobody is told twice.
+    let again = inbox.drain("dev_a", 1, 100, 1_100).expect("a drains again");
+    assert_eq!(again.dropped, 0, "a reported count is not reported twice");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Exactly-once *at the consumer*: unacked rows come back, and the consumer's
 /// `(device, seq)` dedupe is what collapses the redelivery to one delivery.
 #[test]

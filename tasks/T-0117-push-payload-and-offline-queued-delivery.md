@@ -3,7 +3,7 @@ id: T-0117
 title: Push payload and offline-queued delivery
 phase: 3
 priority: 2
-status: proposed
+status: done
 depends_on: [T-0030, T-0093, T-0104]
 scope:
   - crates/arreo-core/src/notify/**
@@ -15,6 +15,8 @@ scope:
   - crates/arreo-server/src/main.rs
   - docs/notifications.md
   - .loop/evidence/T-0117/**
+evidence:
+  - .loop/evidence/T-0117/push-payload.txt
 verify:
   - cargo test --workspace
   - cargo xtask e2e --slice relay
@@ -30,21 +32,21 @@ carries and the rule that makes it survive a phone being offline.
 
 ## Acceptance criteria
 
-- [ ] A notification that is **delivered** (not suppressed) is also enqueued for every paired
+- [x] A notification that is **delivered** (not suppressed) is also enqueued for every paired
       device that should receive it — the T-0093 policy decides the audience, so the rules engine
       stays the one place "who is told" lives.
-- [ ] The payload is bounded and self-sufficient: pane id, machine, state, the same sentence
+- [x] The payload is bounded and self-sufficient: pane id, machine, state, the same sentence
       T-0093's row carries, the action list (T-0094), and a timestamp. A push that needs a second
       round trip to be renderable is not a push.
-- [ ] **Offline is a delay, not a loss**: a device that reconnects drains what it missed, in
+- [x] **Offline is a delay, not a loss**: a device that reconnects drains what it missed, in
       order, and T-0030's dedupe `(device, seq)` makes the redelivery safe. Asserted with a
       device that is absent across several transitions and then attaches.
-- [ ] **Retention's drops are counted and visible** (T-0030's rule, T-0055's proof shape): a
+- [x] **Retention's drops are counted and visible** (T-0030's rule, T-0055's proof shape): a
       device absent past the window is told how many it missed rather than silently seeing a gap.
-- [ ] Suppression stays quiet: a notification the policy withheld (quiet hours, coalesced,
+- [x] Suppression stays quiet: a notification the policy withheld (quiet hours, coalesced,
       same-episode) is **not** pushed — T-0093's decision is the gate, and a push that ignored it
       would make the whole rules engine decorative.
-- [ ] `docs/notifications.md` gains the push section: the payload, the audience rule, the
+- [x] `docs/notifications.md` gains the push section: the payload, the audience rule, the
       offline behaviour and the retention interaction.
 
 ## Notes
@@ -76,3 +78,35 @@ so the fence was widened **before** any code was written rather than discovered 
   T-0125 owns concurrently.
 
 Nothing else changed: the goal, the criteria and the notes stand as written.
+
+## Outcome
+
+Done. A notification the T-0093 policy delivers is pushed to every paired device that should
+receive it, sealed per device with one-way Noise (so an *absent* device can be pushed to), queued
+by the relay's existing `Inbox` while the phone is away, and drained in order on reconnect with
+T-0030's `(device, seq)` dedupe making redelivery safe. A suppressed notification is **not**
+pushed, and that guarantee is a type rather than a check: `push_payload` answers `None` for
+`Decision::Suppressed`, so the only thing a caller can do with a withheld decision is not push it.
+
+Five live-process tests, and two mutations verified by the integrator: a suppressed notification
+being pushed reddens both the unit test and the e2e one; an audience that excludes the absent
+device reddens the offline test with `left: 0, right: 3`.
+
+**The worker flagged one of its own tests as passing vacuously pre-fix** (with no push leg,
+nothing was pushed, so a "suppressed is not pushed" test passed for the wrong reason). That was
+honest and correct, and the resolution is that the test is live now: the mutation that pushes a
+withheld decision fails it.
+
+**A real defect in T-0030 found and fixed in scope**: `sweep_locked` attributes each device's
+expiries to that device, but `enqueue` and `drain` also added the whole sweep's total to the
+caller's device, so a device was told it had lost messages it never had (`dropped 4` for 2). Both
+double-counts removed, with a test that reddens (`left: 4, right: 1`) when the drain-side one is
+restored.
+
+**One gap recorded, not fixed**: a daemon that takes over a live handoff has no relay session of
+its own yet, so it cannot push; it now logs that instead of being silently row-only. Wiring a
+relay session into the handoff path is outside this fence and is in the ledger's known-gaps line.
+
+See `.loop/evidence/T-0117/push-payload.txt` for the wiring notes (why the drain lives in
+`serve_loop`'s select, why the send uses `send_to_peer` and never `stream_to`), the three
+mutations including the two bad ones the integrator had to correct, and the three recorded bends.

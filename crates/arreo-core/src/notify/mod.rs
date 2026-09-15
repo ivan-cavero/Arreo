@@ -61,7 +61,16 @@
 //! both a behaviour change nobody asked for and the sort of trail T-0033 warns
 //! about ("an audit trail that records every poll is a trail nobody reads"). An
 //! operator turns it on by writing the section.
+//!
+//! ## The row, and the push
+//!
+//! A decision has two outputs and they are the *same* decision: the audit row an
+//! operator reads, and — for a delivery — the [`push::PushPayload`] a paired
+//! device is sent (T-0117). Both are built in one place from one
+//! [`Decision::Notify`], which is what makes a withheld notification impossible
+//! to push by accident: the suppressed arm has no payload to give.
 
+pub mod push;
 pub mod quiet;
 
 use crate::proto::AgentState;
@@ -342,6 +351,39 @@ pub fn actions_for(state: AgentState) -> Vec<NotifyAction> {
     actions.push(NotifyAction::Skip);
     actions.push(NotifyAction::Kill);
     actions
+}
+
+/// The push a delivered notification carries, or `None` when the policy
+/// withheld it (T-0117).
+///
+/// **This function is the gate, and it is a function rather than a branch at
+/// the call site for one reason.** A push that ignored [`Policy::decide`] would
+/// make the whole rules engine decorative — quiet hours, coalescing and the
+/// episode rule would be reasons the operator is told about but not reasons
+/// anything obeys — and the failure would look like *success* to any test that
+/// only checked "a push arrived". Here the withheld arm has nothing to return,
+/// so the only thing a caller can do with a suppressed decision is not push it.
+///
+/// Every field is taken from the same two values the audit row is built from:
+/// the sentence is the decision's own `reason` (the row's `prompt`, byte for
+/// byte), the state and pane are the transition's, and the actions come from
+/// [`actions_for`] — the same function the daemon's act gate reads, so the list
+/// a phone renders and the gate that refuses are one rule.
+#[must_use]
+pub fn push_payload(transition: &Transition, decision: &Decision) -> Option<push::PushPayload> {
+    match decision {
+        Decision::Notify { reason } => Some(push::PushPayload {
+            pane: transition.pane.clone(),
+            machine: transition.machine.clone(),
+            state: transition.to,
+            sentence: reason.clone(),
+            actions: actions_for(transition.to),
+            at_ms: transition.at_ms,
+        }),
+        // Not a delivery: nothing to push. See the doc comment — the whole
+        // point is that this arm cannot be made to produce a payload.
+        Decision::Suppressed { .. } => None,
+    }
 }
 
 /// The action-list tail on a notification row's `detail`.
@@ -1259,6 +1301,121 @@ mod tests {
             Decision::Notify { .. } => "notify",
             Decision::Suppressed { reason } => reason.word(),
         }
+    }
+
+    /// **A withheld notification has no payload to push** (T-0117) — every one
+    /// of the four suppress reasons, from the real policy rather than from
+    /// hand-built decisions.
+    ///
+    /// This is the criterion "suppression stays quiet" reduced to its load-
+    /// bearing form: the gate is `push_payload`, and if it ever answered `Some`
+    /// for a suppression, quiet hours, coalescing and the episode rule would all
+    /// become reasons the operator is *told about* but nothing obeys. The test
+    /// drives each reason through the policy so a new suppress reason cannot be
+    /// added without landing here.
+    #[test]
+    fn a_withheld_notification_has_nothing_to_push() {
+        let policy = Policy {
+            coalesce_secs: 60,
+            quiet: Some(QuietHours::parse("22:00-07:00").expect("a window")),
+            ..Policy::default()
+        };
+        let cases: [(&str, Transition, History); 4] = [
+            // 1. No rule claims it.
+            (
+                "no-rule",
+                at("p", AgentState::Blocked, AgentState::Working, 1_000),
+                fresh(),
+            ),
+            // 2. Inside quiet hours (02:00 UTC is inside 22:00-07:00).
+            (
+                "quiet-hours",
+                at("p", AgentState::Working, AgentState::Blocked, 2 * 3_600_000),
+                fresh(),
+            ),
+            // 3. Inside the coalescing window. **12:00 UTC**, not an arbitrary
+            //    millisecond count: the policy asks quiet hours before
+            //    coalescing, so a case that landed at 00:00:31 would be withheld
+            //    for the *window* and this row would be asserting the wrong
+            //    reason.
+            (
+                "coalesced",
+                at(
+                    "p",
+                    AgentState::Working,
+                    AgentState::Blocked,
+                    12 * 3_600_000 + 30_000,
+                ),
+                History {
+                    last_notified_ms: Some(12 * 3_600_000),
+                    last_notified_state: Some(AgentState::Working),
+                },
+            ),
+            // 4. The same episode, told about already.
+            (
+                "same-episode",
+                at(
+                    "p",
+                    AgentState::Blocked,
+                    AgentState::Blocked,
+                    10 * 3_600_000,
+                ),
+                History {
+                    last_notified_ms: Some(9 * 3_600_000),
+                    last_notified_state: Some(AgentState::Blocked),
+                },
+            ),
+        ];
+        for (want, transition, history) in cases {
+            let decision = policy.decide(&transition, &history);
+            assert_eq!(
+                decision_word(&decision),
+                want,
+                "the policy must withhold this for {want}"
+            );
+            assert_eq!(
+                push_payload(&transition, &decision),
+                None,
+                "a {want} suppression must have nothing to push"
+            );
+        }
+    }
+
+    /// **A delivered notification's payload carries exactly the row's facts**
+    /// (T-0117): the pane, the machine, the state, the decision's own sentence
+    /// (which is what the audit row writes to `prompt`), the actions
+    /// [`actions_for`] gives the state, and the transition's timestamp. A phone
+    /// renders the notification from this and nothing else.
+    #[test]
+    fn a_delivered_notification_carries_the_rows_facts() {
+        let policy = Policy::default();
+        let transition = Transition {
+            pane: "build-1".to_string(),
+            machine: "workbox".to_string(),
+            at_ms: 1_789_398_272_891,
+            from: AgentState::Working,
+            to: AgentState::Question,
+            reason: "question: Proceed? [y/n]".to_string(),
+        };
+        let decision = policy.decide(&transition, &fresh());
+        let payload = push_payload(&transition, &decision).expect("a delivery is pushed");
+
+        assert_eq!(payload.pane, "build-1");
+        assert_eq!(payload.machine, "workbox");
+        assert_eq!(payload.state, AgentState::Question);
+        // The sentence is the *decision's*, which is the row's `prompt` — not a
+        // second wording invented for the push.
+        let Decision::Notify { reason } = &decision else {
+            panic!("this transition is a delivery");
+        };
+        assert_eq!(&payload.sentence, reason);
+        assert_eq!(payload.sentence, transition.reason);
+        assert_eq!(payload.actions, actions_for(AgentState::Question));
+        assert_eq!(payload.at_ms, transition.at_ms);
+        // And it survives the seal a phone opens (the frame is a `Message`, so
+        // the seal is the same one both doors use).
+        let framed = push::encode(&payload).expect("encode");
+        assert_eq!(push::decode(&framed).expect("decode"), payload);
     }
 
     /// A scratch config file under the repo's test scratch (never `/tmp`).

@@ -12,7 +12,9 @@
 **One sentence: a notification here is an audit row, not a push** — the daemon
 decides, per state transition, whether to tell you, and writes down *both*
 answers (`notify.sent` when it tells you, `notify.suppressed` when it does not),
-so "why was I not told?" has an answer that outlives the daemon.
+so "why was I not told?" has an answer that outlives the daemon. When it tells
+you *and* the machine is on a relay, the same decision is also pushed to your
+paired devices (§10) — the row is the memory, the push is the delivery.
 
 ```console
 arreo notify --why <pane> [--json] [--socket PATH] [--config PATH]
@@ -404,6 +406,80 @@ action and the reason in `detail`, never a silence.
 | the pane has exited | 2 |
 | usage (unknown action, `reply` without `--text`, `--text` on `skip`/`kill`, over the byte bound) | 2 |
 | any other refusal (state gate, unknown pane, role, an older daemon's "unknown request") | 1 |
+
+## 10. Push — the same decision, sent to your paired devices (T-0117)
+
+**A row is not a push, and §1's "nothing rings" still holds**: a push is a second
+*output* of the one decision, and it goes only where a row goes. When the policy
+**delivers** a notification, the daemon also sends it to every device this
+machine has paired, so a phone can show it without asking the machine anything.
+
+**The audience is the machine's, and the policy's.** "Who should receive it" has
+two halves and each has one owner: *whether* there is anything to send is
+T-0093's decision (§3's four reasons), and *who* is sent is this machine's paired
+device list — the same list `arreo devices` prints. Two consequences worth
+knowing:
+
+- **A suppressed notification is not pushed at all.** Quiet hours, coalescing, a
+  same-episode repeat and a transition no rule claims produce a
+  `notify.suppressed` row and no push. If a push ignored the decision, the whole
+  rules engine would be decorative: your configuration would decide what the
+  *log* says and nothing about what your phone does.
+- **A device in your account that is not paired with *this* machine is not
+  told.** Pairing is per machine (§3.7); an account is not a permission to be
+  told what this machine's agents are doing. Revoked and rotated-away devices
+  are not told either.
+
+**The payload is self-sufficient**, so a notification a phone wakes up to needs
+no second round trip to be renderable:
+
+| Field | What it is |
+| --- | --- |
+| `pane` | the pane id, as `arreo notify --why <pane>` takes it |
+| `machine` | the machine the pane runs on |
+| `state` | the state the transition landed in (`blocked`, `question`, …) |
+| `sentence` | the row's own sentence — `blocked (inferred:silence)`, `question: Proceed?` |
+| `actions` | the bounded quick actions that answer it (§9) |
+| `at_ms` | when the transition happened, in Unix milliseconds — the transition's own timestamp, not when a tick noticed |
+
+It is bounded (8 KiB, and a payload past it is refused rather than truncated —
+a shortened sentence is a notification that lies about what the agent is asking).
+
+**The relay carries it and cannot read it.** Pushes travel the same road as
+everything else — the relay's per-device inbox — and T-0030's rows are
+ciphertext: the payload is sealed to the receiving device's key before it leaves
+the daemon, so the pane id, the machine name and the agent's sentence are never
+in a relay's database. That is also why the push is *one-way*: a device may be
+offline when the push is written, so there is nobody to shake hands with.
+
+### Offline is a delay, not a loss
+
+Because the queue is the relay's durable inbox, the behaviour falls out of
+T-0030 rather than being a second mechanism:
+
+- **A device that is absent drains what it missed, in order**, when it next
+  connects. Nothing has to be "retried" by the machine: the envelope was
+  committed to the inbox when it could not be delivered, and the drain is
+  cursor-ordered by the sender's sequence number.
+- **Redelivery is safe.** The wire is at-least-once — a row leaves the inbox only
+  when the device acknowledges it — so a phone that dies mid-drain sees the same
+  push again, and the receiver's `(device, seq)` dedupe is what collapses that to
+  one delivery.
+- **Retention's drops are counted, not silent.** A device absent past the window
+  (30 days by default, `--inbox-ttl-days`, §3.14) is *told how many it missed* on
+  its next drain rather than being shown a gap, and the relay's own trail records
+  the expiry (`arreo-relay audit export`).
+
+**Push as a wake-up is not here yet.** This is the payload and the queue
+semantics, proven against the real relay. APNs/FCM — the store account, the key,
+the "wake a sleeping app" call — is the transport, and it is a different machine's
+problem; what this feature guarantees is that the notification is waiting for the
+device, correctly, whenever it does come back.
+
+**A machine with no `[relay]` section has no push leg**, and says so in its log
+at start when a `[notify]` section is present: rows are then the only record, and
+an operator who has paired a phone must not have to guess which of the two they
+are getting.
 
 ## See also
 

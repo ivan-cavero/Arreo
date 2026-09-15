@@ -1018,6 +1018,19 @@ pub struct Daemon {
     /// the policy that decides a transition is the one the operator started this
     /// daemon with.
     notify: Option<arreo_core::notify::Policy>,
+    /// The push leg (T-0117): who a delivered notification is sent to, and the
+    /// channel the relay session drains. `None` — the default, and every daemon
+    /// started without a `[relay]` section — means decisions are recorded and
+    /// nothing is pushed.
+    ///
+    /// The tick does not hold the relay session itself, and that is the point:
+    /// the session lives in `relay_client`'s task, reached from `main`'s
+    /// composition root, and a tick that owned it would serialize every pane's
+    /// classification behind a relay write. This handle is the seam — the
+    /// audience is decided here (it is this machine's device authority, which
+    /// the relay does not have) and the bytes go out through the session's own
+    /// outbound half.
+    push: Option<crate::relay_client::PushSender>,
 }
 
 impl Daemon {
@@ -1033,6 +1046,7 @@ impl Daemon {
             stop_accepting: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             worktree: WorktreeSettings::default(),
             notify: None,
+            push: None,
         }
     }
 
@@ -1056,6 +1070,23 @@ impl Daemon {
     #[must_use]
     pub fn with_notify_policy(mut self, policy: Option<arreo_core::notify::Policy>) -> Self {
         self.notify = policy;
+        self
+    }
+
+    /// Run with the push leg wired (T-0117). `None` — the default, and every
+    /// daemon started without a `[relay]` section — means a delivered
+    /// notification is recorded and not pushed, and the daemon says so at start
+    /// rather than letting an operator believe the phone is being told.
+    ///
+    /// Set by the composition root and nowhere else: the sender needs this
+    /// machine's relay identity, which is resolved from the configuration file
+    /// *before* this daemon is built (the same ordering rule T-0106 taught one
+    /// section over) and handed to the relay task from the same values, so the
+    /// key that seals a push and the key the relay authenticates the session
+    /// with cannot disagree.
+    #[must_use]
+    pub fn with_push_sender(mut self, push: Option<crate::relay_client::PushSender>) -> Self {
+        self.push = push;
         self
     }
 
@@ -1460,10 +1491,28 @@ impl Daemon {
         // What *is* gated on the policy is the writing. No `[notify]` section
         // means no store is opened here and no row is written — a daemon that
         // never asked for notifications must not start appending to its audit log.
+        //
+        // The push leg (T-0117) is the second thing gated on configuration, and
+        // its absence is stated rather than silent: an operator who has paired a
+        // phone and written a `[notify]` section must not have to guess whether
+        // the phone is being told. The one shipped path that gets here without a
+        // sender is the daemon that *takes over* a live handoff — it has no relay
+        // session of its own yet — and this line is how that reads in the log.
+        if self.notify.is_some() && self.push.is_none() {
+            eprintln!(
+                "arreo-server: notifications are on but no push leg is wired (no [relay] \
+                 section in this daemon's start): notify.sent rows are the only record"
+            );
+        }
         {
             let registry = Arc::clone(&self.registry);
             let db = self.db.clone();
             let policy = self.notify.clone();
+            // The push leg (T-0117). `None` on a daemon with no relay session —
+            // a local-only machine, or the daemon that takes over a live
+            // handoff — and then the tick records decisions and pushes nothing,
+            // which is said out loud at start (see `serve_on`).
+            let push = self.push.clone();
             // The machine name is a fact about this process, not about a tick:
             // resolved once, at spawn, so a rule scoped to a machine cannot see
             // two answers for one run.
@@ -1533,8 +1582,7 @@ impl Daemon {
                                     arreo_core::notify::state_word(after)
                                 ),
                             };
-                            let decision = policy.decide(&transition, &notify_history(store, &id));
-                            record_notify(store, &transition, &decision);
+                            decide_record_and_push(store, policy, &transition, push.as_ref());
                         }
                         // `from` for the first event of a batch is the state the
                         // tick last saw. Each later event starts where the one
@@ -1553,11 +1601,13 @@ impl Daemon {
                                 reason: notify_sentence(&event, to, &entry),
                             };
                             // One transition, one decision: the policy sees the
-                            // transition and this pane's history, and both
-                            // answers (deliver, withhold) are recorded.
+                            // transition and this pane's history, both answers
+                            // (deliver, withhold) are recorded, and a delivery
+                            // is pushed to this machine's paired devices
+                            // (T-0117) — one function, so the two outputs cannot
+                            // come from two rules.
                             from = to;
-                            let decision = policy.decide(&transition, &notify_history(store, &id));
-                            record_notify(store, &transition, &decision);
+                            decide_record_and_push(store, policy, &transition, push.as_ref());
                         }
                     }
                 }
@@ -2062,6 +2112,39 @@ fn record_notify(
         // read back from this column.
         ..AuditEvent::new(action, AuditKind::Unknown, outcome, transition.at_ms)
     });
+}
+
+/// Put one transition to the policy: decide it, record the decision, and — when
+/// the policy **delivered** it — push it to this machine's paired devices
+/// (T-0117).
+///
+/// **One decision, two outputs, and the gate is a function.** The row an
+/// operator reads and the payload a phone renders are built from the same
+/// [`arreo_core::notify::Decision`], and the push exists only where
+/// [`arreo_core::notify::push_payload`] answered `Some`. That is deliberate
+/// rather than tidy: a push that obeyed a *second* test of "should this go out?"
+/// would be a rules engine the operator's configuration does not control — quiet
+/// hours, coalescing and the episode rule would become reasons the log records
+/// but nothing obeys — and the failure would look like success to every test
+/// that only checked "a push arrived".
+///
+/// The row is written **before** the push: the row is the durable record (the
+/// log is the memory, T-0093), so a phone that is told something must be able to
+/// find it, never the other way round.
+fn decide_record_and_push(
+    store: &arreo_core::store::SessionStore,
+    policy: &arreo_core::notify::Policy,
+    transition: &arreo_core::notify::Transition,
+    push: Option<&crate::relay_client::PushSender>,
+) {
+    let decision = policy.decide(transition, &notify_history(store, &transition.pane));
+    record_notify(store, transition, &decision);
+    if let (Some(sender), Some(payload)) = (
+        push,
+        arreo_core::notify::push_payload(transition, &decision),
+    ) {
+        sender.send(&payload);
+    }
 }
 
 /// Read exactly one framed message (buffering partial reads).
@@ -3200,6 +3283,11 @@ fn verb_of(message: &Message) -> Verb {
         // one, so if it arrives the gate answers with the most privileged verb
         // rather than guessing (the same rule as the other replies).
         Message::ThemeReply { .. } => Verb::Admin,
+        // A push is the server telling a device what happened (T-0117), so it is
+        // in the same group as the other server→client shapes: a peer never
+        // sends one, and if one arrives the gate answers with the most
+        // privileged verb rather than guessing.
+        Message::NotifyPush { .. } => Verb::Admin,
         Message::Welcome { .. }
         | Message::Error { .. }
         | Message::Ok { .. }
@@ -3249,6 +3337,7 @@ fn op_name(message: &Message) -> &'static str {
         Message::NotifyActReply { .. } => "notify_act_reply",
         Message::Theme { .. } => "theme",
         Message::ThemeReply { .. } => "theme_reply",
+        Message::NotifyPush { .. } => "notify_push",
     }
 }
 
@@ -4382,6 +4471,10 @@ async fn dispatch(
         // `Theme` has a real arm above; `ThemeReply` is a server→client shape
         // and reaches here only if a peer sends a reply as a request.
         | Message::ThemeReply { .. }
+        // A push is the daemon's own outbound shape (T-0117): no client sends
+        // one, so a peer that does gets the same loud "unexpected" every other
+        // server→client message gets here.
+        | Message::NotifyPush { .. }
         | Message::Ok { .. }
         | Message::Exited { .. } => Some(Message::Error {
             v: VERSION,

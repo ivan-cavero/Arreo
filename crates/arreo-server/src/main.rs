@@ -143,6 +143,10 @@ async fn main() {
         run_handoff(from, handoff_timeout, worktree_settings, notify).await;
     }
     let socket = socket.unwrap_or_else(default_socket);
+    // The path, owned separately: the ledger, the store and the relay context
+    // each need it, and one clone here is one place they cannot disagree about
+    // which socket this process serves.
+    let socket_path = socket.clone();
     // Bootstrap the device authority before serving: a device-gated session
     // must never be possible against an authority that failed to load.
     let authority = match arreo_server::devices::load_for_socket(&socket) {
@@ -161,12 +165,6 @@ async fn main() {
         &authority.root_fingerprint()[..16],
         authority.devices().len()
     );
-    let daemon = arreo_server::Daemon::new(&socket)
-        .with_worktree_settings(worktree_settings.clone())
-        .with_notify_policy(notify);
-    let registry = daemon.registry();
-    let sessions = daemon.sessions();
-    let socket_path = socket.clone();
 
     // This machine's trust ledger (T-0046), opened before anything is served: a
     // session must never be gated by a ledger that failed to load.
@@ -217,39 +215,25 @@ async fn main() {
     let ledger = arreo_core::mesh::SharedLedger::new(ledger);
     let authority = std::sync::Arc::new(std::sync::Mutex::new(authority));
 
-    // Relay (T-0051). A configuration that enables the relay but is incomplete
-    // is a loud exit rather than a silent no-op: an operator who asked for the
-    // remote path and quietly did not get it has a bug they cannot see.
-    if let Some(path) = &config_path {
+    // Relay (T-0051) configuration and this machine's relay identity, resolved
+    // **before the daemon is built**. A configuration that enables the relay but
+    // is incomplete is a loud exit rather than a silent no-op: an operator who
+    // asked for the remote path and quietly did not get it has a bug they cannot
+    // see.
+    //
+    // **The placement is a requirement, not a tidy-up** (T-0106's lesson, one
+    // section over): the notify tick's push leg (T-0117) seals to this machine's
+    // device key, and the tick is spawned inside `serve` — so an identity
+    // resolved after `Daemon::new` would be one the tick never saw, and the
+    // machine would record delivered notifications while pushing none.
+    let relay: Option<(
+        arreo_server::RelaySettings,
+        std::sync::Arc<arreo_core::identity::DeviceKey>,
+        arreo_core::identity::DeviceCert,
+    )> = if let Some(path) = &config_path {
         match arreo_server::load_config(path) {
             Ok(Some(settings)) => match arreo_server::own_identity() {
-                Ok((device, cert)) => {
-                    let context = arreo_server::RelayContext {
-                        authority: std::sync::Arc::clone(&authority),
-                        registry: std::sync::Arc::clone(&registry),
-                        sessions: std::sync::Arc::clone(&sessions),
-                        db: arreo_server::db_path_for(&socket_path),
-                        device: std::sync::Arc::new(device),
-                        cert: std::sync::Arc::new(cert),
-                        // The name this machine asserts in the account's
-                        // directory (T-0056). Cloned out of the settings before
-                        // they are moved into the relay task, so the log line
-                        // and the join request cannot disagree.
-                        machine_name: settings.name.clone(),
-                        ledger: ledger.clone(),
-                        // A relay peer runs the *same* session loop, so it gets
-                        // the same worktree rules this daemon was started with
-                        // (T-0091) — a peer's `spawn --worktree` lands in the
-                        // repository the operator configured, not in whatever
-                        // the defaults happen to be.
-                        worktree: worktree_settings.clone(),
-                    };
-                    eprintln!(
-                        "arreo-server: relay enabled for account {} via {}",
-                        settings.account, settings.addr
-                    );
-                    tokio::spawn(arreo_server::relay_client::run(settings, context));
-                }
+                Ok((device, cert)) => Some((settings, std::sync::Arc::new(device), cert)),
                 Err(e) => {
                     // **The one moment a stranger is stuck, so the message names the
                     // actual next step** (T-0066). It used to say "pair this machine
@@ -278,12 +262,72 @@ async fn main() {
                     std::process::exit(1);
                 }
             },
-            Ok(None) => {}
+            Ok(None) => None,
             Err(e) => {
                 eprintln!("arreo-server: relay configuration is unusable: {e}");
                 std::process::exit(1);
             }
         }
+    } else {
+        None
+    };
+
+    // The push leg (T-0117): the sender the notify tick publishes to, and the
+    // inbox the relay session drains. Built here because the audience is *this
+    // machine's* device authority (who is paired) and the seal needs *this*
+    // machine's key — neither of which the relay has or should have.
+    let (push, push_inbox) = match &relay {
+        Some((_, device, _)) => {
+            let (sender, inbox) = arreo_server::relay_client::PushSender::new(
+                std::sync::Arc::clone(&authority),
+                std::sync::Arc::clone(device),
+            );
+            (Some(sender), Some(inbox))
+        }
+        None => (None, None),
+    };
+
+    let daemon = arreo_server::Daemon::new(&socket)
+        .with_worktree_settings(worktree_settings.clone())
+        .with_notify_policy(notify)
+        .with_push_sender(push);
+    let registry = daemon.registry();
+    let sessions = daemon.sessions();
+
+    // Relay (T-0051): the session task, with the identity resolved above and the
+    // push inbox it drains (T-0117). Spawned after the daemon exists because the
+    // session serves relay peers through the *same* session loop the local socket
+    // runs — it needs the registry and the live-session table, and those are the
+    // daemon's.
+    if let Some((settings, device, cert)) = relay {
+        let context = arreo_server::RelayContext {
+            authority: std::sync::Arc::clone(&authority),
+            registry: std::sync::Arc::clone(&registry),
+            sessions: std::sync::Arc::clone(&sessions),
+            db: arreo_server::db_path_for(&socket_path),
+            // The same key the push leg seals with: one identity, so a device
+            // that authenticates this machine's session is a device that can
+            // open its pushes.
+            device,
+            cert: std::sync::Arc::new(cert),
+            // The name this machine asserts in the account's directory (T-0056).
+            // Cloned out of the settings before they are moved into the relay
+            // task, so the log line and the join request cannot disagree.
+            machine_name: settings.name.clone(),
+            ledger: ledger.clone(),
+            // A relay peer runs the *same* session loop, so it gets the same
+            // worktree rules this daemon was started with (T-0091) — a peer's
+            // `spawn --worktree` lands in the repository the operator
+            // configured, not in whatever the defaults happen to be.
+            worktree: worktree_settings.clone(),
+        };
+        eprintln!(
+            "arreo-server: relay enabled for account {} via {}",
+            settings.account, settings.addr
+        );
+        tokio::spawn(arreo_server::relay_client::run(
+            settings, context, push_inbox,
+        ));
     }
 
     // Remote transport (T-0023). Shipped posture is zero inbound ports, so this

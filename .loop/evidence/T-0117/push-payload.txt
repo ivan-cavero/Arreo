@@ -1,0 +1,108 @@
+T-0117 — Push payload and offline-queued delivery
+=================================================
+
+ROADMAP §3.5's "push notifications (blocked/done, including offline-queued delivery)".
+T-0093 decides *what* notifies and records every decision; T-0030 built the relay's durable
+per-device inbox. What did not exist is the payload a push carries and the rule that makes it
+survive a phone being offline.
+
+WHAT SHIPPED
+------------
+crates/arreo-core/src/notify/push.rs        PushPayload, encode/decode, seal_to/open_from
+crates/arreo-core/src/notify/mod.rs         push_payload(transition, decision) -> Option<Payload>
+crates/arreo-core/src/proto/message.rs      Message::NotifyPush (boxed payload) + round trip
+crates/arreo-core/src/proto/codec.rs        classify_op: notify_push -> Event
+crates/arreo-core/src/relay/session.rs      OutboundHandle::send_to_peer
+crates/arreo-core-ffi/src/codec.rs          WirePushPayload + both exhaustive mirror arms
+crates/arreo-relay/src/inbox.rs             expiry attribution fix (see below)
+crates/arreo-relay/tests/inbox.rs           the attribution test
+crates/arreo-server/src/daemon.rs           the push field/builder, decide_record_and_push,
+                                            verb_of/op_name/dispatch arms, the no-push-leg line
+crates/arreo-server/src/relay_client.rs     PushSender/PushJob/PushInbox + the drain
+crates/arreo-server/src/main.rs             the relay identity resolved before Daemon::new
+crates/arreo-server/tests/notify_push.rs    5 live-process tests
+docs/notifications.md                       §10, the push section
+
+THE DESIGN
+----------
+**The gate is a type, not a check.** `push_payload(transition, decision) -> Option<Payload>`
+answers `Some` only for `Decision::Notify`; the `Suppressed` arm has nothing to return, so the
+only thing a caller *can* do with a withheld decision is not push it. That matters more than a
+test, because the failure mode looks like success: a push that ignored the decision would make
+quiet hours, coalescing and the episode rule into reasons the operator is told about but nothing
+obeys — and any test that only checked "a push arrived" would pass.
+
+**The audience is the daemon's** (the T-0093 policy and the paired-device list both live there),
+and it is `authority.devices()` minus this machine minus anything that `may_connect` refuses — so
+a revoked or rotated device is not told.
+
+**Offline is a delay**: the daemon seals per device with one-way Noise
+(`Noise_K_25519_ChaChaPoly_BLAKE2s`, no handshake, so an *absent* device can be pushed to), the
+relay's `Inbox::enqueue` queues it while the device is away, and the device drains on reconnect
+with T-0030's `(device, seq)` dedupe making redelivery safe. No new queue was written: the work
+was choosing the right devices and wiring a sender the notify tick did not have.
+
+WIRING NOTES WORTH KEEPING
+--------------------------
+- The relay session **drains** the push inbox inside `serve_loop`'s `select`, not in a task of
+  its own — so it survives reconnects rather than dying with one.
+- The send goes through `OutboundHandle::send_to_peer`, **never `stream_to`** — a stream would
+  replace the peer's conversation entry, which is exactly the T-0114 defect one layer down.
+
+A REAL T-0030 DEFECT, FOUND AND FIXED IN SCOPE
+----------------------------------------------
+`sweep_locked` attributes each device's expiries to *that* device, but both `enqueue` and `drain`
+**also** added the whole sweep's total to the caller's device — so a device was told it had lost
+messages it never had (observed: `dropped 4` for 2). Both double-counts removed; `expired` and
+`note_expiry` still report the global sweep fact (it belongs to the relay, not to a device). New
+test: `an_expiry_is_counted_for_the_device_that_lost_the_message`.
+
+MUTATIONS — verified by the integrator, not only reported
+---------------------------------------------------------
+M1  a suppressed notification IS pushed (the `Suppressed` arm builds a payload)
+      → RED twice over: the unit test `notify::tests::a_withheld_notification_has_nothing_to_push`
+        with `left: Some(PushPayload { … sentence: "no-rule" … }), right: None`, **and** the e2e
+        `a_withheld_notification_is_not_pushed`.
+      → That second red answers the worker's own honest note. It reported that the e2e test was
+        **green pre-fix because nothing was pushed at all** — a vacuous pass it flagged rather
+        than hid. Now that the push leg exists the test is live, and M1 proves it: the same test
+        fails when a withheld decision is pushed. So it earns its place, for the reason the worker
+        gave.
+M2  an absent device loses what it missed (the audience never includes anyone)
+      → RED: `an_absent_device_drains_what_it_missed_in_order`, `left: 0, right: 3`.
+M3  the drain-side double-count restored
+      → RED: `an_expiry_is_counted_for_the_device_that_lost_the_message`,
+        `left: 4, right: 1` — the exact "dropped 4 for 2" shape the defect was found by.
+
+**Two of the integrator's own first attempts at M2 and M3 came back GREEN, and both were bad
+mutations rather than weak tests** — recorded because a green mutation is a finding either way.
+M2 filtered the audience on `record.issued_at_ms` (a certificate timestamp, not presence), which
+changed no behaviour; M3 restored the double-count on `enqueue` while the test exercises `drain`.
+Each was corrected and re-run to a real red.
+
+BENDS, RECORDED RATHER THAN HIDDEN
+----------------------------------
+- `machine` in the payload is `mesh::default_machine_name()` (this host's name), not the
+  `[relay] name` a config sets — because T-0093's tick builds every `Transition` with
+  `default_machine_name()`, and a `machine = "…"` rule matches *that*. Changing it is T-0093's
+  decision; the test asserts against the daemon's own name so the push and the rule cannot
+  diverge.
+- Retention's "told how many it missed" is met by `DrainReport::dropped` (the durable
+  per-device counter). `expired` is the per-drain *sweep* count and was 0 on the phone's next
+  drain, because the daemon's own reconnect drain swept the rows first — asserting `expired == 2`
+  would have been asserting scheduling.
+- **A daemon that takes over a live handoff has no push leg** (it is built by `Daemon::new` with
+  no relay session of its own yet); it now logs "notifications are on but no push leg is wired"
+  instead of being silently row-only. Wiring a relay session into the handoff path is outside
+  this fence and is recorded in the ledger as a known gap.
+- Push as a *wake-up* (APNs/FCM) is deliberately absent, matching the task's own note: this is
+  the payload and the queue semantics, not the transport.
+
+VERIFIED (integrated tree)
+--------------------------
+cargo test --workspace: 969 passed / 0 failed.
+clippy --workspace --all-targets: 0 findings (pinned + stable). fmt clean.
+15/15 slices (ffi, api = 2 suites, compat, lifecycle, persistence, enforcement, relay, chaos,
+theme 43, tui 103, reattach 11, update 27, worktree 9, mesh 36+1, handoff-abort 41).
+sync 14/14. vet 375. deny 4/4. audit 0. check-targets PASS/SKIP. workspace_deps 8/8.
+bench 6/6 (19 MB RSS, 211 KB/pane, 0 ms detect, 62 ms sweep).
