@@ -1,102 +1,99 @@
 --- `arreo attach` stdout (the pane's transcript) ---
-tick-1 pid=3238598
-tick-2 pid=3238598
-tick-3 pid=3238598
-tick-4 pid=3238598
-tick-5 pid=3238598
-tick-6 pid=3238598
-tick-7 pid=3238598
-tick-8 pid=3238598
-tick-9 pid=3238598
-tick-10 pid=3238598
-tick-11 pid=3238598
-tick-12 pid=3238598
-tick-13 pid=3238598
-tick-14 pid=3238598
-tick-15 pid=3238598
-tick-16 pid=3238598
-tick-17 pid=3238598
-tick-18 pid=3238598
-tick-19 pid=3238598
-tick-20 pid=3238598
-tick-21 pid=3238598
-tick-22 pid=3238598
+tick-1 pid=3454755
+tick-2 pid=3454755
+tick-3 pid=3454755
+tick-4 pid=3454755
+tick-5 pid=3454755
+tick-6 pid=3454755
+tick-7 pid=3454755
+tick-8 pid=3454755
+tick-9 pid=3454755
+tick-10 pid=3454755
+tick-11 pid=3454755
+tick-12 pid=3454755
+tick-13 pid=3454755
+tick-14 pid=3454755
+tick-15 pid=3454755
+tick-16 pid=3454755
+tick-17 pid=3454755
+tick-18 pid=3454755
+tick-19 pid=3454755
+tick-20 pid=3454755
+tick-21 pid=3454755
+tick-22 pid=3454755
 got:CUT-1
+tick-23 pid=3454755
 got:CUT-2
-tick-23 pid=3238598
 got:CUT-3
+tick-24 pid=3454755
 got:CUT-4
 got:CUT-5
-tick-24 pid=3238598
 got:CUT-6
+tick-25 pid=3454755
 got:CUT-7
-tick-25 pid=3238598
 got:CUT-8
+tick-26 pid=3454755
 got:CUT-9
-got:CUT-10
-tick-26 pid=3238598
+tick-27 pid=3454755
 got:CUT-11
 got:CUT-12
-tick-27 pid=3238598
+tick-28 pid=3454755
 got:CUT-13
 got:CUT-14
-tick-28 pid=3238598
 got:CUT-15
+tick-29 pid=3454755
 got:CUT-16
 got:CUT-17
-tick-29 pid=3238598
+tick-30 pid=3454755
 got:CUT-18
-tick-30 pid=3238598
+got:CUT-19
+tick-31 pid=3454755
 got:CUT-20
 got:CUT-21
+tick-32 pid=3454755
 got:CUT-22
-tick-31 pid=3238598
 got:CUT-23
+tick-33 pid=3454755
 got:CUT-24
-tick-32 pid=3238598
+tick-34 pid=3454755
 got:CUT-25
 got:CUT-26
 got:CUT-27
-tick-33 pid=3238598
+tick-35 pid=3454755
 got:CUT-28
 got:CUT-29
-tick-34 pid=3238598
+tick-36 pid=3454755
 got:CUT-30
 got:CUT-31
-tick-35 pid=3238598
 got:CUT-32
+tick-37 pid=3454755
 got:CUT-33
 got:CUT-34
-tick-36 pid=3238598
+tick-38 pid=3454755
 got:CUT-35
 got:CUT-36
-tick-37 pid=3238598
 got:CUT-37
+tick-39 pid=3454755
 got:CUT-38
+tick-40 pid=3454755
 got:CUT-39
-tick-38 pid=3238598
 got:CUT-40
+tick-41 pid=3454755
 got:CUT-41
-tick-39 pid=3238598
-got:CUT-42
-got:CUT-43
-tick-40 pid=3238598
-got:CUT-44
-got:CUT-45
-got:CUT-19
-tick-41 pid=3238598
-tick-42 pid=3238598
-tick-43 pid=3238598
-tick-44 pid=3238598
-tick-45 pid=3238598
-tick-46 pid=3238598
+tick-42 pid=3454755
+got:CUT-10
+tick-43 pid=3454755
+tick-44 pid=3454755
+tick-45 pid=3454755
+tick-46 pid=3454755
+tick-47 pid=3454755
 
 --- `arreo attach` stderr (reconnect notices) ---
 attach: connection lost: server closed connection
-attach: reconnected after the daemon was replaced — resuming from line 23
+attach: reconnected after the daemon was replaced — resuming from line 24
 attach: connection lost: server closed connection
-attach: daemon not reachable (attempt 1): cannot connect to /tmp/arreo-e2e-reattach-3238571/a.sock: Connection refused (os error 111) (is arreo-server running?) — retrying in 0.3s
-attach: daemon not reachable (attempt 2): cannot connect to /tmp/arreo-e2e-reattach-3238571/a.sock: Connection refused (os error 111) (is arreo-server running?) — retrying in 0.5s
-attach: daemon not reachable (attempt 3): cannot connect to /tmp/arreo-e2e-reattach-3238571/a.sock: Connection refused (os error 111) (is arreo-server running?) — retrying in 1.1s
-attach: daemon not reachable (attempt 4): cannot connect to /tmp/arreo-e2e-reattach-3238571/a.sock: Connection refused (os error 111) (is arreo-server running?) — retrying in 2.4s
-attach: daemon not reachable (attempt 5): cannot connect to /tmp/arreo-e2e-reattach-3238571/a.sock: Connection refused (os error 111) (is arreo-server running?) — retrying in 4.1s
+attach: daemon not reachable (attempt 1): cannot connect to /tmp/arreo-e2e-reattach-3454728/a.sock: Connection refused (os error 111) (is arreo-server running?) — retrying in 0.3s
+attach: daemon not reachable (attempt 2): cannot connect to /tmp/arreo-e2e-reattach-3454728/a.sock: Connection refused (os error 111) (is arreo-server running?) — retrying in 0.6s
+attach: daemon not reachable (attempt 3): cannot connect to /tmp/arreo-e2e-reattach-3454728/a.sock: Connection refused (os error 111) (is arreo-server running?) — retrying in 1.1s
+attach: daemon not reachable (attempt 4): cannot connect to /tmp/arreo-e2e-reattach-3454728/a.sock: Connection refused (os error 111) (is arreo-server running?) — retrying in 2.3s
+attach: daemon not reachable (attempt 5): cannot connect to /tmp/arreo-e2e-reattach-3454728/a.sock: Connection refused (os error 111) (is arreo-server running?) — retrying in 4.8s

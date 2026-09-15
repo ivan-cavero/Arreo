@@ -1,43 +1,38 @@
 ## State snapshot          ← REWRITTEN (not appended) at every checkpoint
 
-Task: **T-0114 done** — the FFI metrics reads, over one long-lived conversation per peer.
-Where you are: committing. Phase 3's first provable task landed, and it is the one worth reading:
-**the first implementation passed the entire battery and was broken against a real daemon.**
-A security review found it — the read opened a fresh Noise handshake per call and "closed" by
-dropping the session, but nothing goes on the wire when it drops and a daemon keeps its session
-open after a verb, so the second call's bytes landed in the stale session and timed out. The
-contract test passed because its fixture closed after each answer (the client's expectation, not
-a daemon's behaviour). Fixed as a decided shape: one cached conversation per peer under one
-mutex, unconditional invalidation on error, bounded send, fail-fast on a non-truncated frame
-error, the Noise hint derived from this device's own key, the fixture rewritten to model a real
-daemon, and a wrong-but-valid key as the pinning falsification. Seven mutations, two honestly
-GREEN (one exposed dead code; one green-on-first-run test was strengthened). The real-daemon
-proof is captured in `.loop/evidence/T-0114/` (probe source + a run against real processes) and
-its durable home is filed as **T-0125**.
-Battery: **939 tests, 0 failed; 14/14 slices; sync 14/14; vet 375; deny 4/4; audit 0;
-check-targets PASS/SKIP; bench 6/6; clippy 0 on both toolchains; fmt clean.**
-The review's two design verdicts are TRUE and independently re-checked: the peer key is genuinely
-pinned (it becomes Noise-KK's remote static) and the per-verb gate applies (a Viewer may read
-metrics — the intended `Capability::Observe`).
-Next step: integrate `FfiActDoor` (T-0115) and `ThemePush` (T-0116) — dispatched in parallel
-because they are genuinely disjoint (`crates/arreo-core-ffi` + `docs/mobile.md` vs
-`arreo-core/src/theme` + proto + daemon + CLI + `docs/themes.md`). Each was given the T-0114
-lesson explicitly: a fixture that closes its session after each answer hides a real daemon's
-behaviour, so the act door's fixture must answer N verbs on one conversation.
-Then T-0125 (the durable real-daemon FFI slice — deliberately after T-0115 so one slice covers
-both verbs), then T-0095 (approval gates, p3) or T-0111 (p3).
-Open workers: FfiActDoor (T-0115), ThemePush (T-0116) — both running, disjoint scopes.
+Task: **T-0115 + T-0116 done** — the FFI act door, and the server-pushed theme.
+Where you are: committing. Two parallel workers on disjoint scopes; one crashed mid-flight
+(`FfiActDoor`, exit 1, after landing code + tests but before verifying) and the planner finished
+that unit (four mutations, the docs, the battery). The other (`ThemePush`) delivered complete.
+Battery on the integrated tree: **954 tests, 0 failed; 14/14 slices (theme 43, up from 33);
+sync 14/14; vet 375; deny 4/4; audit 0; check-targets PASS/SKIP; bench 6/6; clippy 0 on both
+toolchains; fmt clean.**
+**T-0115** — `RelaySessionHandle::notify_act` over T-0094's existing `NotifyAct`, riding
+T-0114's cached per-peer conversation. All three actions cross; every refusal is the machine's
+own sentence byte for byte; no client-side bound check and no client-side capability check, both
+so a rule has one definition (the daemon refuses *and* audits, and the viewer refusal the phone
+shows is one the machine actually applied). A phone that answers is an owner (`Capability::Control`).
+The test asserts **seven verbs on one handshake**, with the refusal sentences built by the
+daemon's own rules rather than typed as literals.
+**T-0116** — the wire carries the **resolved token map** (`ThemeTokens`), the shape pinned before
+dispatch; the third mutation is the proof it matters (shipping the document reddens the TUI
+checks because the client has no resolver). Depth fallback stays a client-side property.
+**Integration the planner did**: the FFI's `WireMessage` mirrors `Message` variant for variant
+with an exhaustive match, so T-0116's new variants were a compile error — honoured as the tripwire
+it is (`WireThemeTokens`, both arms, the core's own `Color`/`Display`) plus `tests/theme_mirror.rs`,
+because the match catches a *missing* variant but not a *wrong* mapping. Three clippy findings
+fixed.
+Next step: **T-0125** (the durable real-daemon FFI slice — now worth more, since it can cover the
+read *and* the act on one conversation), then T-0117 (push payload + offline-queued delivery) or
+T-0118 (the pairing payload a camera can scan). T-0095 (approval gates, p3) and T-0111 (p3) remain.
+Open workers: none.
 Known broken: T-0063 (CI never-green — the user's, untouched) · Parked: T-0048 needs-human
-**Phase 3's queue** (drafted last turn, T-0113..T-0124): provable here — T-0115 the act door,
-T-0116 the server pushes a theme, T-0117 the push payload + offline-queued delivery, T-0118 the
-pairing payload a camera can scan, T-0125 the real-daemon FFI slice; `needs-human` for a different
-machine or a purchase — T-0119/T-0121 (iOS), T-0120/T-0122 (Android), T-0123 (store beta tracks),
-T-0124 (the phase-exit demo). T-0113 (make the core separable so the phone artifact drops SQLite).
-**This session's units.** T-0093 (notification rules engine, then corrected by review), T-0112
-(a persistence-slice marker outlived by its own waits), T-0110 (the wait-provenance regression),
-T-0094 (quick actions), T-0105 (the deferred start path), T-0104 (UniFFI bindings), T-0114 (the
-FFI metrics reads, then corrected by a security review), plus RUSTSEC-2026-0285 (rustls 0.23.45).
-Filed: T-0113, T-0125.
+**Phase 3's queue** (T-0113..T-0125): done — T-0104, T-0114, T-0115, T-0116. Provable here —
+T-0117, T-0118, T-0125. `needs-human` for a different machine or a purchase — T-0119/T-0121 (iOS),
+T-0120/T-0122 (Android), T-0123 (store beta tracks), T-0124 (the phase-exit demo). T-0113 (make
+the core separable so the phone artifact drops SQLite).
+**This session's units.** T-0093, T-0112, T-0110, T-0094, T-0105, T-0104, T-0114, T-0115, T-0116,
+plus RUSTSEC-2026-0285 (rustls 0.23.45). Filed: T-0113, T-0125.
 **Slice failures during verification, all attributed.** `handoff-abort` 2/41 in the run right after
 a 13-slice batch and 41/41 alone (load-sensitive). Earlier: the persistence recall check (the
 harness's own model answering empty — a skip that says so) and batch contention on tui/mesh.
@@ -273,3 +268,6 @@ harness's own model answering empty — a skip that says so) and batch contentio
 - 2026-09-15 [turn 31] **T-0114 done** — the FFI metrics reads (history/series over T-0040's existing verbs, typed `MetricsSeriesInfo` with the tier served and the downshift note). **The lesson is the deliverable**: the first implementation passed the entire battery (936 tests, 14/14 slices, bench 6/6, vet/deny/audit/check-targets) and was broken against a real daemon — one-shot, because it handshook per call and "closed" by dropping the session while the daemon keeps its session open after a verb, so the second call's bytes landed in the stale session and its pump waited on a 25 KB frame that never came. The contract test could not see it: its fixture closed after each answer, which is the client's expectation, not a daemon's behaviour. **A security review found it and established the two things the design rests on, both TRUE and independently re-checked here**: the peer key is genuinely pinned (it becomes Noise-KK's remote static, so a substituted key cannot complete the handshake) and the per-verb gate applies (same `serve_session`, same `check_verb` + trust ledger; `MetricsHistory` needs `Capability::Observe`, which a Viewer holds — the intended rule). Fixed as a decided shape pinned before dispatch: one cached conversation per peer under one mutex (the lock also prevents concurrent reads interleaving two conversations on one channel), unconditional invalidation on error, a bounded send, fail-fast on a non-truncated frame error, the Noise hint derived from this device's own key with a dial-time assertion, the fixture rewritten to model a real daemon, and a wrong-but-valid key as the pinning falsification. Seven mutations; two honestly GREEN (M4 behaviourally invisible, M6 exposed **dead code** — the `conversation_survives` predicate was unreachable because a refusal is an answered `Message::Error`, so it was deleted); M2 was green on first run and the test was strengthened until red.
 - 2026-09-15 [turn 31] T-0114's real-daemon proof, and the gap it leaves. A scratch probe (captured in `.loop/evidence/T-0114/`) spawns a real `arreo-relay` + `arreo-server`, pins a viewer through the real CLI, spawns a real pane, and reads metrics **twice on one conversation** — re-run by the integrator: `read #1 ok step_ms=10000 downshifted=true rows=1`, `read #2 ok …`, wrong key refused, PASS. Reverting the cache reddens read #2 on those real processes (the p1 reproduced). The probe also found a real defect in the shipped docs: the peer to dial is the device id of the published `daemon_key`, not the directory row's `machine_id`. **The probe lives under gitignored `target/`, so the proof would evaporate** — captured as evidence, and the durable home is filed as **T-0125**: `cargo xtask e2e --slice ffi` over real binaries, with the pre-fix red as its acceptance evidence.
 - 2026-09-15 [turn 31] **T-0115 + T-0116 dispatched in parallel** (disjoint scopes, one `tasks[]` batch). T-0115 (`FfiActDoor`) adds the act door for quick answers to the FFI boundary over T-0094's existing `NotifyAct`, riding T-0114's cached conversation — it was given the T-0114 lesson explicitly: a fixture that closes its session after each answer hides a real daemon's behaviour, so its fixture must answer N verbs on one conversation and include a two-verbs case. T-0116 (`ThemePush`) makes the server able to push a theme, with the wire shape pinned in the task file last turn (the **resolved token map**, not the on-disk `RawTheme` document and not the brand document — sending either would push `defs` resolution and token validation onto every client, so a phone and a browser would each carry the resolver and each be a place it could diverge; T-0104's boundary already exports `theme_from_tokens`/`with_depth`, which is what makes depth fallback a client-side property). Both were told the mutation discipline: report a **green** mutation as a finding, not as a failure to mention — T-0114 produced two, one of which exposed dead code.
+- 2026-09-15 [turn 32] **T-0115 done** — the FFI act door: `RelaySessionHandle::notify_act` over T-0094's existing `NotifyAct`, riding T-0114's cached per-peer conversation. All three actions cross; every refusal is the machine's own sentence byte for byte; deliberately no client-side bound check (the daemon refuses *and* records the audit row) and no client-side capability check (a viewer's act is sent, and the daemon refuses it, so the phone shows a sentence the machine actually applied). A phone that answers notifications is an **owner** (`Capability::Control`). The test asserts **seven verbs on one handshake** with the sentences built by the daemon's own rules (`notify::state_word`, `MAX_REPLY_BYTES`, `PANE_EXITED`) rather than typed as literals. **The worker crashed mid-flight** (exit 1) after landing code + tests + the golden symbol but before verifying; the tree compiled and its suite was green, so the planner finished the unit rather than re-dispatching (four mutations, all RED — one a per-call handshake reddening in 10.32 s, T-0114's p1 signature; the docs; the battery).
+- 2026-09-15 [turn 32] **T-0116 done** — the server can push a theme. `Message::Theme`/`ThemeReply` carrying `ThemeTokens` (the **resolved** token map, the shape pinned before dispatch). An unknown name is a typed refusal naming it and listing the built-ins; an unconfigured machine answers with the built-in default; `Verb::Read`, no audit row (reads are unaudited); `size_of::<Message>() == 112` still holds. The TUI renders a received theme, `arreo theme export` prints what the verb returns, the slice grew 33 → 43 checks at both depths. Three mutations all RED — and the third is the design's proof: shipping the document's own values reddens three server tests **and both TUI checks, because the client has no resolver**.
+- 2026-09-15 [turn 32] **Integration the planner did, and why it is the interesting part of this batch.** T-0116 added two `Message` variants, and the FFI's `WireMessage` mirrors `Message` variant for variant with an **exhaustive** match — so the workspace did not compile. That tripwire is a feature (it forces a decision rather than letting the mirror fall behind), so it was honoured rather than worked around: `WireThemeTokens`, both variants, both match arms, the theme spelled through the core's own `Color`/`Display` rather than a format string written in the FFI. The match catches a *missing* variant but not a *wrong* mapping, so the round trip is asserted in its own `tests/theme_mirror.rs` (kept separate so the two units could be two commits) — a mutation that drops the variant reddens it. Also three clippy findings the workers were correctly told not to chase.

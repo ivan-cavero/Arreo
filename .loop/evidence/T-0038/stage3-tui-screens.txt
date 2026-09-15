@@ -1,31 +1,31 @@
 post-cut screen (pane region):
 ┌this machine · socket─────┐┌▶ ● tick [working] ▏█▏ peak    4M ────────────────────────────────────────────────────────┐
-│  ● working               ││tick-1 pid=3238598                                                                        │
-│ ▸ tick        2M █░░░░░░░││tick-2 pid=3238598                                                                        │
-│                          ││tick-3 pid=3238598                                                                        │
-│                          ││tick-4 pid=3238598                                                                        │
-│                          ││tick-5 pid=3238598                                                                        │
-│                          ││tick-6 pid=3238598                                                                        │
-│                          ││tick-7 pid=3238598                                                                        │
-│                          ││tick-8 pid=3238598                                                                        │
-│                          ││tick-9 pid=3238598                                                                        │
-│                          ││tick-10 pid=3238598                                                                       │
-│                          ││tick-11 pid=3238598                                                                       │
-│                          ││tick-12 pid=3238598                                                                       │
-│                          ││tick-13 pid=3238598                                                                       │
-│                          ││tick-14 pid=3238598                                                                       │
-│                          ││tick-15 pid=3238598                                                                       │
-│                          ││tick-16 pid=3238598                                                                       │
-│                          ││tick-17 pid=3238598                                                                       │
-│                          ││tick-18 pid=3238598                                                                       │
-│                          ││tick-19 pid=3238598                                                                       │
-│                          ││tick-20 pid=3238598                                                                       │
-│                          ││tick-21 pid=3238598                                                                       │
-│                          ││tick-22 pid=3238598                                                                       │
+│  ● working               ││tick-1 pid=3454755                                                                        │
+│ ▸ tick        3M █░░░░░░░││tick-2 pid=3454755                                                                        │
+│                          ││tick-3 pid=3454755                                                                        │
+│                          ││tick-4 pid=3454755                                                                        │
+│                          ││tick-5 pid=3454755                                                                        │
+│                          ││tick-6 pid=3454755                                                                        │
+│                          ││tick-7 pid=3454755                                                                        │
+│                          ││tick-8 pid=3454755                                                                        │
+│                          ││tick-9 pid=3454755                                                                        │
+│                          ││tick-10 pid=3454755                                                                       │
+│                          ││tick-11 pid=3454755                                                                       │
+│                          ││tick-12 pid=3454755                                                                       │
+│                          ││tick-13 pid=3454755                                                                       │
+│                          ││tick-14 pid=3454755                                                                       │
+│                          ││tick-15 pid=3454755                                                                       │
+│                          ││tick-16 pid=3454755                                                                       │
+│                          ││tick-17 pid=3454755                                                                       │
+│                          ││tick-18 pid=3454755                                                                       │
+│                          ││tick-19 pid=3454755                                                                       │
+│                          ││tick-20 pid=3454755                                                                       │
+│                          ││tick-21 pid=3454755                                                                       │
+│                          ││tick-22 pid=3454755                                                                       │
 │                          ││got:CUT-1                                                                                 │
+│                          ││tick-23 pid=3454755                                                                       │
 │                          ││got:CUT-2                                                                                 │
-│                          ││tick-23 pid=3238598                                                                       │
 │                          ││got:CUT-3                                                                                 │
-│                          ││got:CUT-4                                                                                 │
+│                          ││tick-24 pid=3454755                                                                       │
 └──────────────────────────┘└──────────────────────────────────────────────────────────────────────────────────────────┘
-daemon unreachable: mesh client handshake: no daemon at /tmp/arreo-e2e-reattach-3238571/a.sock · j/k move · Enter attac…
+daemon unreachable: mesh client handshake: no daemon at /tmp/arreo-e2e-reattach-3454728/a.sock · j/k move · Enter attac…
